@@ -3,15 +3,95 @@
 
 set -e
 
-VERSION="0.1.1"
+PYPROJECT_FILE="pyproject.toml"
 REPO="PyroMind-Dynamics/pyromind-sdk"
-TAG="v${VERSION}"
 
-# Parse command line arguments
+# Parse command line arguments (--version, --delete, --help)
 DELETE_RELEASE=false
-if [ "$1" = "--delete" ] || [ "$1" = "-d" ]; then
-    DELETE_RELEASE=true
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --version|-v)
+            if [ -n "${2:-}" ]; then
+                VERSION="$2"
+                shift 2
+            else
+                echo "Error: --version requires a value (e.g. 0.1.2)"
+                exit 1
+            fi
+            ;;
+        --delete|-d)
+            DELETE_RELEASE=true
+            shift
+            ;;
+        --help|-h)
+            echo "Usage: $0 [--version VERSION | -v VERSION] [--delete | -d]"
+            echo "  --version, -v   Set version and update pyproject.toml (e.g. 0.1.2)"
+            echo "  --delete, -d   Delete existing release and tag before creating"
+            echo "  --help, -h     Show this help"
+            echo "Version can also be set via: PYROMIND_VERSION or VERSION"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1 (use --help)"
+            exit 1
+            ;;
+    esac
+done
+
+VERSION="${VERSION:-${PYROMIND_VERSION:-}}"
+
+if [ -n "$VERSION" ]; then
+    if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*$ ]]; then
+        echo "Error: invalid version '${VERSION}'"
+        echo "Expected format like: 0.1.2 or 0.1.2-rc1"
+        exit 1
+    fi
+    if [ ! -f "$PYPROJECT_FILE" ]; then
+        echo "Error: ${PYPROJECT_FILE} not found"
+        exit 1
+    fi
+
+    echo "Updating ${PYPROJECT_FILE} version to ${VERSION}..."
+    python - "$PYPROJECT_FILE" "$VERSION" <<'PY'
+import pathlib
+import re
+import sys
+
+file_path = pathlib.Path(sys.argv[1])
+new_version = sys.argv[2]
+content = file_path.read_text(encoding="utf-8")
+updated, count = re.subn(
+    r'(?m)^version\s*=\s*"[^"]*"\s*$',
+    f'version = "{new_version}"',
+    content,
+    count=1,
+)
+if count != 1:
+    raise SystemExit("Error: failed to locate [project] version in pyproject.toml")
+file_path.write_text(updated, encoding="utf-8")
+PY
 fi
+
+if [ -z "$VERSION" ]; then
+    if [ ! -f "$PYPROJECT_FILE" ]; then
+        echo "Error: ${PYPROJECT_FILE} not found"
+        exit 1
+    fi
+    VERSION=$(python - "$PYPROJECT_FILE" <<'PY'
+import pathlib
+import re
+import sys
+
+content = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+match = re.search(r'(?m)^version\s*=\s*"([^"]*)"\s*$', content)
+if not match:
+    raise SystemExit("Error: failed to read version from pyproject.toml")
+print(match.group(1))
+PY
+)
+fi
+
+TAG="v${VERSION}"
 
 # Check if GITHUB_TOKEN is set
 if [ -z "$GITHUB_TOKEN" ]; then

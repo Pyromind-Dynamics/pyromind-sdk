@@ -1,0 +1,11 @@
+{
+  "owner": "PyroMind-Dynamics",
+  "slug": "pyromind-sdk",
+  "displayName": "PyroMind SDK",
+  "latest": {
+    "version": "1.0.0",
+    "publishedAt": 1737878400000,
+    "commit": "https://github.com/PyroMind-Dynamics/pyromind-sdk/commit/HEAD"
+  },
+  "history": []
+}
