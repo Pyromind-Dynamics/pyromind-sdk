@@ -6,6 +6,7 @@ These scripts are customer-facing helpers for common local tasks.
 
 - Python 3.8+
 - `pyromind-sdk` installed
+- API docs: https://api.pyromind.ai/api/v1/docs
 
 ```bash
 pip install pyromind-sdk
@@ -69,6 +70,28 @@ python skill/scripts/api_examples.py --mode sandbox --name demo-sandbox --cpu 2 
 
 - `--api-key` and `--base-url` can override environment variables
 - `--mode` is required: `jupyter`, `inference`, or `sandbox`
+- Safety check: script checks same-name resources before create (to avoid duplicate instances)
+- Add `--allow-duplicate` only if you explicitly want to bypass this check
+
+### 6) CRUD examples (create / update / delete)
+
+```bash
+python skill/scripts/crud_examples.py --mode jupyter --name demo-jupyter --updated-name demo-jupyter-v2
+
+python skill/scripts/crud_examples.py --mode inference \
+  --name demo-infer \
+  --updated-name demo-infer-v2 \
+  --model-path /workspace/models/qwen \
+  --framework vllm \
+  --gpu 1 --gpu-card L40S
+
+python skill/scripts/crud_examples.py --mode sandbox --name demo-sandbox --updated-name demo-sandbox-v2
+```
+
+- Default behavior: create -> update -> delete
+- Built-in checks: verifies creation/update by calling `get_*` APIs after each write
+- Add `--keep` to skip delete and keep the updated resource
+- Add `--allow-duplicate` only if you explicitly want to bypass pre-create duplicate check
 
 ## Notes
 

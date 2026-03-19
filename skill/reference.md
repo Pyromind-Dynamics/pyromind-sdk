@@ -18,6 +18,7 @@ from pyromind_sdk.client.workflow import (
 - Repository: https://github.com/PyroMind-Dynamics/pyromind-sdk
 - Package: `pip install pyromind-sdk`
 - Examples: `pyromind_sdk/examples/` (after install or clone)
+- API docs: https://api.pyromind.ai/api/v1/docs
 
 ## Script entrypoints
 

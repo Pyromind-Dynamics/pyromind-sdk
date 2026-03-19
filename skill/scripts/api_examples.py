@@ -25,6 +25,22 @@ def _build_client(api_key: Optional[str], base_url: Optional[str]) -> PyroMindAP
     return PyroMindAPIClient(api_key=api_key, base_url=base_url)
 
 
+def _ensure_no_duplicate(mode: str, client: PyroMindAPIClient, name: str) -> None:
+    if mode == "jupyter":
+        duplicates = [x for x in client.instance.list() if x.name == name]
+    elif mode == "inference":
+        duplicates = [x for x in client.inference.list() if x.name == name]
+    else:
+        duplicates = [x for x in client.sandboxes.list() if x.name == name]
+
+    if duplicates:
+        duplicate_ids = ", ".join(str(x.id) for x in duplicates)
+        raise ValueError(
+            f"Found existing {mode} resource(s) with name '{name}': {duplicate_ids}. "
+            "Use a different --name or pass --allow-duplicate."
+        )
+
+
 def run_jupyter(client: PyroMindAPIClient, name: str, cpu: int, memory: int) -> None:
     instance = client.instance.create(
         JupyterRequest(
@@ -32,10 +48,13 @@ def run_jupyter(client: PyroMindAPIClient, name: str, cpu: int, memory: int) -> 
             resources=ResourceConfig(cpu=cpu, memory=memory),
         )
     )
+    verified = client.instance.get_instance(instance.id)
+
     print("Created Jupyter instance")
-    print(f"- id: {instance.id}")
-    print(f"- status: {instance.status}")
-    print(f"- url: {instance.url}")
+    print(f"- id: {verified.id}")
+    print(f"- status: {verified.status}")
+    print(f"- url: {verified.url}")
+    print("- verification: get_instance succeeded")
 
 
 def run_inference(
@@ -66,6 +85,7 @@ def run_inference(
     print(f"- id: {job.id}")
     print(f"- status: {job.status}")
     print(f"- endpoint: {job.endpoint_url}")
+    print("- verification: get_job succeeded")
 
 
 def run_sandbox(client: PyroMindAPIClient, name: str, cpu: int, memory: int) -> None:
@@ -76,9 +96,11 @@ def run_sandbox(client: PyroMindAPIClient, name: str, cpu: int, memory: int) -> 
             name=name,
         )
     )
+    verified = client.sandboxes.get_sandbox(sandbox.id)
     print("Created sandbox")
-    print(f"- id: {sandbox.id}")
-    print(f"- status: {sandbox.status}")
+    print(f"- id: {verified.id}")
+    print(f"- status: {verified.status}")
+    print("- verification: get_sandbox succeeded")
 
     vnc = client.sandboxes.get_vnc(sandbox.id)
     print(f"- web_vnc_url: {vnc.get('web_vnc_url')}")
@@ -109,10 +131,18 @@ def main() -> int:
     )
     parser.add_argument("--gpu", type=int, default=1, help="GPU count (inference mode).")
     parser.add_argument("--gpu-card", default=None, help="GPU card (e.g., L40S).")
+    parser.add_argument(
+        "--allow-duplicate",
+        action="store_true",
+        help="Allow creating resource even if same-name resource already exists.",
+    )
     args = parser.parse_args()
 
     client = _build_client(api_key=args.api_key, base_url=args.base_url)
     try:
+        if not args.allow_duplicate:
+            _ensure_no_duplicate(args.mode, client, args.name)
+
         if args.mode == "jupyter":
             run_jupyter(client, args.name, args.cpu, args.memory)
         elif args.mode == "inference":

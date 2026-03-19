@@ -13,6 +13,8 @@ Lightweight SDK for defining nodes from YAML and converting or validating PyroMi
 pip install pyromind-sdk
 ```
 
+API docs: https://api.pyromind.ai/api/v1/docs
+
 Optional: clone repo for examples and CLI:
 
 ```bash
@@ -73,6 +75,27 @@ python skill/scripts/api_examples.py --mode inference \
 
 python skill/scripts/api_examples.py --mode sandbox --name demo-sandbox --cpu 2 --memory 4
 ```
+
+Safety: this script checks same-name resources before create to avoid duplicate instances.
+Use `--allow-duplicate` only when you intentionally want duplicate names.
+
+### CRUD examples (create / update / delete)
+
+```bash
+python skill/scripts/crud_examples.py --mode jupyter --name demo-jupyter --updated-name demo-jupyter-v2
+
+python skill/scripts/crud_examples.py --mode inference \
+  --name demo-infer \
+  --updated-name demo-infer-v2 \
+  --model-path /workspace/models/qwen \
+  --framework vllm \
+  --gpu 1 --gpu-card L40S
+
+python skill/scripts/crud_examples.py --mode sandbox --name demo-sandbox --updated-name demo-sandbox-v2
+```
+
+Safety: this script verifies each create/update by calling `get_*` APIs, and checks duplicates before create.
+Use `--allow-duplicate` only when you intentionally want duplicate names.
 
 More script details: `skill/scripts/README.md`.
 

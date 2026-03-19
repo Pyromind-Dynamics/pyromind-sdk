@@ -86,7 +86,7 @@ class PyroMindAPIClient:
         
         # Get base URL from parameter, environment variable, or use default
         if base_url is None:
-            base_url = os.getenv("PYROMIND_BASE_URL", "https://api.pre2-pyromind.ai/api/v1")
+            base_url = os.getenv("PYROMIND_BASE_URL", "https://api.pyromind.ai/api/v1")
         
         self._base_client = PyroMindClient(
             api_key=api_key,
