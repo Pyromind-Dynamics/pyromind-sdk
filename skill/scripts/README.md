@@ -76,20 +76,26 @@ python skill/scripts/api_examples.py --mode sandbox --name demo-sandbox --cpu 2 
 ### 6) CRUD examples (create / update / delete)
 
 ```bash
-python skill/scripts/crud_examples.py --mode jupyter --name demo-jupyter --updated-name demo-jupyter-v2
+python skill/scripts/crud_examples.py --mode jupyter \
+  --name demo-jupyter --updated-name demo-jupyter-v2 \
+  --cpu 2 --memory 4 --updated-cpu 4 --updated-memory 8
 
 python skill/scripts/crud_examples.py --mode inference \
   --name demo-infer \
   --updated-name demo-infer-v2 \
   --model-path /workspace/models/qwen \
   --framework vllm \
+  --cpu 4 --memory 16 --updated-cpu 8 --updated-memory 32 \
   --gpu 1 --gpu-card L40S
 
-python skill/scripts/crud_examples.py --mode sandbox --name demo-sandbox --updated-name demo-sandbox-v2
+python skill/scripts/crud_examples.py --mode sandbox \
+  --name demo-sandbox --updated-name demo-sandbox-v2 \
+  --cpu 2 --memory 4 --updated-cpu 4 --updated-memory 8
 ```
 
 - Default behavior: create -> update -> delete
 - Built-in checks: verifies creation/update by calling `get_*` APIs after each write
+- `--cpu`/`--memory`: resources at create; `--updated-cpu`/`--updated-memory`: resources at update
 - Add `--keep` to skip delete and keep the updated resource
 - Add `--allow-duplicate` only if you explicitly want to bypass pre-create duplicate check
 

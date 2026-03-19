@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import argparse
 import os
-from typing import Optional
+import time
+from typing import Optional, Union
 
 from pyromind_sdk import PyroMindAPIClient
 from pyromind_sdk.client.models import (
@@ -40,7 +41,16 @@ def _ensure_no_duplicate(mode: str, client: PyroMindAPIClient, name: str) -> Non
         )
 
 
-def jupyter_crud(client: PyroMindAPIClient, name: str, updated_name: str, cpu: int, memory: int, keep: bool) -> None:
+def jupyter_crud(
+    client: PyroMindAPIClient,
+    name: str,
+    updated_name: str,
+    cpu: Union[int, str],
+    memory: Union[int, str],
+    updated_cpu: Union[int, str],
+    updated_memory: Union[int, str],
+    keep: bool,
+) -> None:
     created = client.instance.create(
         JupyterRequest(
             name=name,
@@ -55,7 +65,7 @@ def jupyter_crud(client: PyroMindAPIClient, name: str, updated_name: str, cpu: i
         created.id,
         JupyterRequest(
             name=updated_name,
-            resources=ResourceConfig(cpu=cpu, memory=memory + 1),
+            resources=ResourceConfig(cpu=updated_cpu, memory=updated_memory),
         ),
     )
     updated_verified = client.instance.get_instance(updated.id)
@@ -63,6 +73,9 @@ def jupyter_crud(client: PyroMindAPIClient, name: str, updated_name: str, cpu: i
     print("[check] jupyter update verified by get_instance")
 
     if not keep:
+        client.instance.pause(created.id)
+        print(f"[pause]  jupyter id={created.id} (waiting for pause)")
+        time.sleep(10)
         client.instance.delete(created.id)
         print(f"[delete] jupyter id={created.id}")
 
@@ -73,9 +86,11 @@ def inference_crud(
     updated_name: str,
     model_path: str,
     framework: str,
-    cpu: int,
-    memory: int,
-    gpu: int,
+    cpu: Union[int, str],
+    memory: Union[int, str],
+    updated_cpu: Union[int, str],
+    updated_memory: Union[int, str],
+    gpu: Union[int, str],
     gpu_card: Optional[str],
     keep: bool,
 ) -> None:
@@ -97,7 +112,7 @@ def inference_crud(
             name=updated_name,
             model_path=model_path,
             inference_framework=framework,
-            resources=ResourceConfig(cpu=cpu, memory=memory + 1, gpu=gpu, gpu_card=gpu_card),
+            resources=ResourceConfig(cpu=updated_cpu, memory=updated_memory, gpu=gpu, gpu_card=gpu_card),
         ),
     )
     updated_verified = client.inference.get_job(created_id)
@@ -105,11 +120,23 @@ def inference_crud(
     print("[check] inference update verified by get_job")
 
     if not keep:
+        client.inference.pause(created_id)
+        print(f"[pause]  inference id={created_id} (waiting for pause)")
+        time.sleep(10)
         client.inference.delete(created_id)
         print(f"[delete] inference id={created_id}")
 
 
-def sandbox_crud(client: PyroMindAPIClient, name: str, updated_name: str, cpu: int, memory: int, keep: bool) -> None:
+def sandbox_crud(
+    client: PyroMindAPIClient,
+    name: str,
+    updated_name: str,
+    cpu: Union[int, str],
+    memory: Union[int, str],
+    updated_cpu: Union[int, str],
+    updated_memory: Union[int, str],
+    keep: bool,
+) -> None:
     created = client.sandboxes.create(
         SandboxRequest(
             sandbox_type=SandboxType.LINUX,
@@ -125,7 +152,7 @@ def sandbox_crud(client: PyroMindAPIClient, name: str, updated_name: str, cpu: i
         created.id,
         SandboxRequest(
             sandbox_type=SandboxType.LINUX,
-            resources=ResourceConfig(cpu=cpu, memory=memory + 1),
+            resources=ResourceConfig(cpu=updated_cpu, memory=updated_memory),
             name=updated_name,
         ),
     )
@@ -134,6 +161,9 @@ def sandbox_crud(client: PyroMindAPIClient, name: str, updated_name: str, cpu: i
     print("[check] sandbox update verified by get_sandbox")
 
     if not keep:
+        client.sandboxes.pause(created.id)
+        print(f"[pause]  sandbox id={created.id} (waiting for pause)")
+        time.sleep(10)
         client.sandboxes.delete(created.id)
         print(f"[delete] sandbox id={created.id}")
 
@@ -145,8 +175,10 @@ def main() -> int:
     parser.add_argument("--base-url", default=None, help="PyroMind base URL (or set PYROMIND_BASE_URL).")
     parser.add_argument("--name", default="crud-demo", help="Name used at create.")
     parser.add_argument("--updated-name", default="crud-demo-updated", help="Name used at update.")
-    parser.add_argument("--cpu", type=int, default=2, help="CPU cores.")
-    parser.add_argument("--memory", type=int, default=4, help="Memory in Gi.")
+    parser.add_argument("--cpu", type=int, default=2, help="CPU cores at create.")
+    parser.add_argument("--memory", type=int, default=4, help="Memory in Gi at create.")
+    parser.add_argument("--updated-cpu", type=int, default=4, help="CPU cores at update.")
+    parser.add_argument("--updated-memory", type=int, default=8, help="Memory in Gi at update.")
     parser.add_argument("--model-path", default="/workspace/models/qwen", help="Inference model path.")
     parser.add_argument("--framework", default="vllm", help="Inference framework.")
     parser.add_argument("--gpu", type=int, default=1, help="Inference GPU count.")
@@ -165,7 +197,16 @@ def main() -> int:
             _ensure_no_duplicate(args.mode, client, args.name)
 
         if args.mode == "jupyter":
-            jupyter_crud(client, args.name, args.updated_name, args.cpu, args.memory, args.keep)
+            jupyter_crud(
+                client,
+                args.name,
+                args.updated_name,
+                args.cpu,
+                args.memory,
+                args.updated_cpu,
+                args.updated_memory,
+                args.keep,
+            )
         elif args.mode == "inference":
             inference_crud(
                 client,
@@ -175,12 +216,23 @@ def main() -> int:
                 args.framework,
                 args.cpu,
                 args.memory,
+                args.updated_cpu,
+                args.updated_memory,
                 args.gpu,
                 args.gpu_card,
                 args.keep,
             )
         else:
-            sandbox_crud(client, args.name, args.updated_name, args.cpu, args.memory, args.keep)
+            sandbox_crud(
+                client,
+                args.name,
+                args.updated_name,
+                args.cpu,
+                args.memory,
+                args.updated_cpu,
+                args.updated_memory,
+                args.keep,
+            )
     finally:
         client.close()
     return 0

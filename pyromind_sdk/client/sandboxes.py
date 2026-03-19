@@ -4,6 +4,7 @@ SandBoxes API Client
 This module provides a client for managing sandboxes via the PyroMind API.
 """
 
+import time
 from typing import List, Optional, Dict, Any
 from .base import PyroMindClient
 from .models import (
@@ -110,7 +111,7 @@ class SandboxesClient(PyroMindClient):
         Returns:
             SandboxResponse object
         """
-        response = self.post("/sandboxes", json_data=request.model_dump())
+        response = self.post("/sandboxes", json_data=request.model_dump(exclude_none=True))
         # API returns {success: True, data: {...}} format
         data = self._extract_data(response)
         
@@ -139,6 +140,74 @@ class SandboxesClient(PyroMindClient):
             data = self._convert_sandbox_data(data, sandbox_id)
         
         return SandboxResponse(**data)
+
+    def wait_for_sandbox_status(
+        self,
+        sandbox_id: str,
+        target_status: str,
+        timeout: int = 300,
+        check_interval: int = 3,
+        intermediate_statuses: Optional[List[str]] = None,
+    ) -> bool:
+        """
+        Poll sandbox status until it reaches `target_status`.
+
+        Returns:
+            True if `target_status` is reached within timeout; otherwise False.
+        """
+        if intermediate_statuses is None:
+            intermediate_statuses = ["creating", "pending", "starting"]
+
+        target_lower = target_status.lower()
+        waited = 0
+
+        while waited < timeout:
+            try:
+                sandbox = self.get_sandbox(sandbox_id)
+                current_status = (sandbox.status or "").lower()
+
+                if current_status in ["failed", "error"]:
+                    return False
+                if current_status == target_lower:
+                    return True
+                if current_status not in intermediate_statuses:
+                    return False
+            except Exception:
+                # Transient network/API issues can happen during provisioning.
+                pass
+
+            time.sleep(check_interval)
+            waited += check_interval
+
+        return False
+
+    def create_and_wait(
+        self,
+        request: SandboxRequest,
+        target_status: str,
+        timeout: int = 300,
+        check_interval: int = 3,
+        intermediate_statuses: Optional[List[str]] = None,
+    ) -> SandboxResponse:
+        """
+        Create a sandbox and poll until it reaches `target_status`.
+
+        Even if polling fails, this method returns the best-effort latest
+        sandbox object for diagnostics.
+        """
+        sandbox = self.create(request)
+        self.wait_for_sandbox_status(
+            sandbox.id,
+            target_status=target_status,
+            timeout=timeout,
+            check_interval=check_interval,
+            intermediate_statuses=intermediate_statuses,
+        )
+
+        try:
+            return self.get_sandbox(sandbox.id)
+        except Exception:
+            return sandbox
     
     def update(self, sandbox_id: str, request) -> SandboxResponse:
         """

@@ -151,6 +151,7 @@ class PyroMindClient:
             PyroMindAPIError: If the request fails
         """
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
+        request_context = f"{method.upper()} {url}"
         
         try:
             response = self.session.request(
@@ -170,13 +171,19 @@ class PyroMindClient:
                 except:
                     error_data = {"message": response.text}
                 
+                # Avoid flooding logs with very large payloads.
+                if isinstance(error_data, dict) and isinstance(error_data.get("message"), str):
+                    msg = error_data["message"]
+                    if len(msg) > 500:
+                        error_data["message"] = msg[:500] + "..."
+                
                 # Provide more detailed error messages for specific status codes
                 if response.status_code == 400:
                     error_message = (
                         "Bad Request (400). The request was invalid or malformed. "
                         "This usually means there's an issue with the request parameters, "
                         "request body format, or missing required fields."
-                    ) + f"\nResponse: {response.text}"
+                    ) + f"\nResponse: {response.text[:500]}{'...' if len(response.text) > 500 else ''}"
                 elif response.status_code == 401:
                     error_message = (
                         "Authentication failed (401). Please check your API key. "
@@ -225,7 +232,7 @@ class PyroMindClient:
                         error_message += f"\nDetails: {error_data.get('detail')}"
                 
                 raise PyroMindAPIError(
-                    message=error_message,
+                    message=f"{request_context} failed: {error_message}",
                     status_code=response.status_code,
                     response=error_data
                 )
@@ -237,7 +244,7 @@ class PyroMindClient:
 
         except requests.exceptions.RequestException as e:
             raise PyroMindAPIError(
-                message=f"Request failed: {str(e)}",
+                message=f"{request_context} request failed: {str(e)}",
                 status_code=None
             )
     

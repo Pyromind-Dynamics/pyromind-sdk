@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
-from typing import Optional
+from typing import Optional, Union
 
 from pyromind_sdk import PyroMindAPIClient
 from pyromind_sdk.client.models import (
@@ -41,7 +41,7 @@ def _ensure_no_duplicate(mode: str, client: PyroMindAPIClient, name: str) -> Non
         )
 
 
-def run_jupyter(client: PyroMindAPIClient, name: str, cpu: int, memory: int) -> None:
+def run_jupyter(client: PyroMindAPIClient, name: str, cpu: Union[int, str], memory: Union[int, str]) -> None:
     instance = client.instance.create(
         JupyterRequest(
             name=name,
@@ -62,9 +62,9 @@ def run_inference(
     name: str,
     model_path: str,
     framework: str,
-    cpu: int,
-    memory: int,
-    gpu: int,
+    cpu: Union[int, str],
+    memory: Union[int, str],
+    gpu: Union[int, str],
     gpu_card: Optional[str],
 ) -> None:
     job_id = client.inference.create(
@@ -88,7 +88,7 @@ def run_inference(
     print("- verification: get_job succeeded")
 
 
-def run_sandbox(client: PyroMindAPIClient, name: str, cpu: int, memory: int) -> None:
+def run_sandbox(client: PyroMindAPIClient, name: str, cpu: Union[int, str], memory: Union[int, str]) -> None:
     sandbox = client.sandboxes.create(
         SandboxRequest(
             sandbox_type=SandboxType.LINUX,

@@ -449,6 +449,122 @@ class TestCreateSandbox:
         
         print(f"[TEST] Sandbox verification passed: id={sandbox.id}, name={sandbox.name}, status={sandbox.status}")
 
+    @pytest.mark.parametrize("sandbox_type", [SandboxType.WINDOWS, SandboxType.LINUX])
+    def test_sandbox_resource_boundary_cpu_memory(
+        self,
+        client,
+        sandbox_tracker,
+        sandbox_type: SandboxType,
+    ):
+        """Compare resource boundary configs: 1CPU+2Gi vs 2CPU+4Gi.
+
+        Notes:
+        - 2CPU+4Gi should be the "stable" baseline.
+        - 1CPU+2Gi is treated as a boundary case: if it fails, we assert that
+          the SDK error carries useful diagnostics.
+        """
+        suffix = f"{sandbox_type.value}-{int(time.time())}"
+
+        # Baseline: 2 CPU + 4Gi memory
+        request_baseline = SandboxRequest(
+            name=f"test-sandbox-boundary-2c-4g-{suffix}",
+            sandbox_type=sandbox_type,
+            resources=ResourceConfig(cpu="2", memory="4Gi", gpu=0),
+            configuration=SandboxConfiguration(
+                screen_resolution=ScreenResolution(width=1920, height=1080),
+            ),
+        )
+        try:
+            baseline_sb = client.sandboxes.create(request_baseline)
+            sandbox_tracker.add(baseline_sb.id)
+            print(
+                f"[TEST] Baseline create: sandbox_type={sandbox_type.value} id={baseline_sb.id} "
+                f"status={baseline_sb.status}"
+            )
+            reached = wait_for_sandbox_status(
+                client,
+                baseline_sb.id,
+                "running",
+                timeout=180,
+                check_interval=3,
+            )
+            if not reached:
+                final_sb = get_sandbox_example(baseline_sb.id)
+                assert final_sb is not None
+                final_status = (final_sb.status or "").lower()
+                # If not reached running, it still should not end up as failed/error.
+                assert final_status not in ["failed", "error"], (
+                    f"Baseline sandbox ended in {final_status}: {final_sb}"
+                )
+        except PyroMindAPIError as e:
+            # Baseline should be stable: fail loudly with diagnostics.
+            print(
+                f"[ERROR] Baseline create failed: status_code={e.status_code} message={e.message} "
+                f"response={e.response}"
+            )
+            raise
+        except Exception as e:
+            print(f"[ERROR] Unexpected baseline error: {type(e).__name__}: {str(e)}")
+            raise
+
+        # Boundary case: 1 CPU + 2Gi memory
+        request_boundary = SandboxRequest(
+            name=f"test-sandbox-boundary-1c-2g-{suffix}",
+            sandbox_type=sandbox_type,
+            resources=ResourceConfig(cpu="1", memory="2Gi", gpu=0),
+            configuration=SandboxConfiguration(
+                screen_resolution=ScreenResolution(width=1920, height=1080),
+            ),
+        )
+        try:
+            boundary_sb = client.sandboxes.create(request_boundary)
+            sandbox_tracker.add(boundary_sb.id)
+            print(
+                f"[TEST] Boundary create: sandbox_type={sandbox_type.value} id={boundary_sb.id} "
+                f"status={boundary_sb.status}"
+            )
+
+            reached = wait_for_sandbox_status(
+                client,
+                boundary_sb.id,
+                "running",
+                timeout=180,
+                check_interval=3,
+            )
+            final_sb = get_sandbox_example(boundary_sb.id)
+            assert final_sb is not None
+            final_status = (final_sb.status or "").lower()
+
+            # Either "unexpected success" or "expected failure" are both informative.
+            if reached and final_status == "running":
+                print(
+                    "[WARN] Boundary case unexpectedly reached running state "
+                    f"(sandbox_id={boundary_sb.id})"
+                )
+            elif final_status in ["failed", "error"]:
+                print(
+                    "[INFO] Boundary case failed as expected "
+                    f"(sandbox_id={boundary_sb.id}, status={final_status})"
+                )
+            else:
+                print(
+                    "[INFO] Boundary case ended in non-running stable state "
+                    f"(sandbox_id={boundary_sb.id}, status={final_status})"
+                )
+        except PyroMindAPIError as e:
+            # Failure path: assert diagnostics are present (or gracefully absent on network errors).
+            print(
+                f"[ERROR] Boundary create failed: status_code={e.status_code} message={e.message} "
+                f"response={e.response}"
+            )
+            assert e.message
+            assert e.status_code is None or isinstance(e.status_code, int)
+            if e.response is not None:
+                assert isinstance(e.response, dict)
+        except Exception as e:
+            print(f"[ERROR] Unexpected boundary error: {type(e).__name__}: {str(e)}")
+            raise
+
     
     def test_create_sandbox_example_function(self, sandbox_tracker):
         """Test the create_sandbox_example function"""

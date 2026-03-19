@@ -82,16 +82,21 @@ Use `--allow-duplicate` only when you intentionally want duplicate names.
 ### CRUD examples (create / update / delete)
 
 ```bash
-python skill/scripts/crud_examples.py --mode jupyter --name demo-jupyter --updated-name demo-jupyter-v2
+python skill/scripts/crud_examples.py --mode jupyter \
+  --name demo-jupyter --updated-name demo-jupyter-v2 \
+  --cpu 2 --memory 4 --updated-cpu 4 --updated-memory 8
 
 python skill/scripts/crud_examples.py --mode inference \
   --name demo-infer \
   --updated-name demo-infer-v2 \
   --model-path /workspace/models/qwen \
   --framework vllm \
+  --cpu 4 --memory 16 --updated-cpu 8 --updated-memory 32 \
   --gpu 1 --gpu-card L40S
 
-python skill/scripts/crud_examples.py --mode sandbox --name demo-sandbox --updated-name demo-sandbox-v2
+python skill/scripts/crud_examples.py --mode sandbox \
+  --name demo-sandbox --updated-name demo-sandbox-v2 \
+  --cpu 2 --memory 4 --updated-cpu 4 --updated-memory 8
 ```
 
 Safety: this script verifies each create/update by calling `get_*` APIs, and checks duplicates before create.
@@ -167,7 +172,7 @@ client = PyroMindAPIClient(api_key="YOUR_API_KEY")
 jupyter = client.instance.create(
     JupyterRequest(
         name="demo-jupyter",
-        resources=ResourceConfig(cpu=2, memory=8),
+        resources=ResourceConfig(cpu="2", memory="8Gi"),
     )
 )
 print(jupyter.id, jupyter.url, jupyter.status)
@@ -178,7 +183,7 @@ job_id = client.inference.create(
         name="demo-inference",
         model_path="/workspace/models/qwen",
         inference_framework="vllm",
-        resources=ResourceConfig(cpu=4, memory=16, gpu=1, gpu_card="L40S"),
+        resources=ResourceConfig(cpu="4", memory="16Gi", gpu="1", gpu_card="L40S"),
     )
 )
 job = client.inference.get_job(job_id)
@@ -188,7 +193,7 @@ print(job.id, job.status, job.endpoint_url)
 sandbox = client.sandboxes.create(
     SandboxRequest(
         sandbox_type=SandboxType.LINUX,  # API value: code
-        resources=ResourceConfig(cpu=2, memory=4),
+        resources=ResourceConfig(cpu="2", memory="4Gi"),
         name="demo-sandbox",
     )
 )
@@ -196,6 +201,85 @@ vnc = client.sandboxes.get_vnc(sandbox.id)
 print(sandbox.id, sandbox.status, vnc.get("web_vnc_url"))
 
 client.close()
+```
+
+### ResourceConfig field reference
+
+`ResourceConfig` is used by all three resource types (Jupyter, Inference, Sandbox):
+
+| Field | Type | Required | Description | Example |
+|-------|------|----------|-------------|---------|
+| `cpu` | int \| str | Yes | Number of CPU cores | `2`, `"4"` |
+| `memory` | int \| str | Yes | Memory in Gi — passing an int auto-appends `"Gi"` | `8` → `"8Gi"`, `"16Gi"` |
+| `gpu` | int \| str | Inference only | Number of GPUs | `1`, `"2"` |
+| `gpu_card` | str | Inference only | GPU card model | `"L40S"`, `"H100"` |
+
+```python
+# Jupyter / Sandbox — CPU + memory only
+ResourceConfig(cpu="2", memory="8Gi")
+
+# Inference — CPU + memory + GPU required
+ResourceConfig(cpu="4", memory="16Gi", gpu="1", gpu_card="L40S")
+```
+
+> The validators also accept plain integers as a shorthand: `cpu=2` → `"2"`, `memory=8` → `"8Gi"`, `gpu=1` → `"1"`.
+
+### ⚠️ Instance Management Best Practices
+
+#### 1. Pause before delete
+
+Deleting a Running instance returns `400 Bad Request`. Always pause first:
+
+```python
+import time
+
+# Step 1: pause the instance
+client.instance.pause("jp-xxx")
+
+# Step 2: wait for the pause to complete
+time.sleep(10)
+
+# Step 3: delete
+client.instance.delete("jp-xxx")
+```
+
+#### 2. Bulk cleanup (keep a specific instance)
+
+`client.instance.list()` returns `List[JupyterResponse]` — access fields via attributes (`.id`, `.name`, `.status`), not dict keys.
+
+```python
+import time
+
+instances = client.instance.list()  # List[JupyterResponse]
+
+keep_id = "jp-0b8e936dc9d7"
+to_delete = [inst.id for inst in instances if inst.id != keep_id]
+
+for inst_id in to_delete:
+    client.instance.pause(inst_id)
+
+time.sleep(10)
+
+for inst_id in to_delete:
+    client.instance.delete(inst_id)
+```
+
+#### 3. InstanceClient methods
+
+```python
+instances = client.instance.list()           # List[JupyterResponse]
+detail    = client.instance.get_instance("jp-xxx")  # JupyterResponse
+client.instance.pause("jp-xxx")             # Running → Paused
+client.instance.resume("jp-xxx")            # Paused  → Running
+client.instance.delete("jp-xxx")            # must be Paused first
+```
+
+#### 4. Status check
+
+```python
+instances = client.instance.list()  # List[JupyterResponse]
+for inst in instances:
+    print(f"{inst.id}: {inst.status}")  # Running, Paused, Stopped, etc.
 ```
 
 ## YAML node format
@@ -236,3 +320,4 @@ Rules: In standard format, only **connected** inputs appear in the node `inputs`
 ## More detail
 
 - Imports and format summary: [reference.md](reference.md)
+

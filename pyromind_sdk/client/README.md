@@ -83,12 +83,12 @@ from pyromind_sdk.client.models import (
 sandbox = client.sandboxes.create(
     SandboxRequest(
         name="my-sandbox",
-        type=SandboxType.LINUX,
+        sandbox_type=SandboxType.WINDOWS,
+        resources=ResourceConfig(cpu="2", memory="16Gi"),
         configuration=SandboxConfiguration(
-            image="ubuntu:22.04",
-            resources=ResourceConfig(cpu="2", memory="4Gi", gpu=1),
-            screen_resolution=ScreenResolution(width=1920, height=1080)
-        )
+            screen_resolution=ScreenResolution(width=1920, height=1080),
+            auto_destroy=True,
+        ),
     )
 )
 print(f"Created sandbox: {sandbox.id}")
