@@ -18,7 +18,7 @@ DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_RETRIES = 3
 ENV_API_KEY = "PYROMIND_API_KEY"
 ENV_BASE_URL = "PYROMIND_BASE_URL"
-RETRY_STATUS_CODES = [429, 500, 502, 503, 504]
+RETRY_STATUS_CODES = []
 RETRY_ALLOWED_METHODS = ["GET", "POST", "PUT", "DELETE"]
 
 
@@ -162,7 +162,6 @@ class PyroMindClient:
                 timeout=self.timeout,
                 **kwargs
             )
-            
             # Handle non-2xx responses
             if not response.ok:
                 error_data = None
@@ -227,7 +226,39 @@ class PyroMindClient:
                     if error_data.get("detail"):
                         error_message += f"\nValidation details: {error_data.get('detail')}"
                 else:
-                    error_message = error_data.get("message", f"API request failed with status {response.status_code}")
+                    error_code = ""
+                    payload_message: str = ""
+                    if isinstance(error_data, dict):
+                        # Try common error code locations.
+                        error_obj = error_data.get("error")
+                        if isinstance(error_obj, dict):
+                            if isinstance(error_obj.get("message"), str):
+                                payload_message = error_obj.get("message", "")
+                            error_code = (
+                                error_obj.get("code")
+                                or error_obj.get("error_code")
+                                or ""
+                            )
+                        detail = error_data.get("detail")
+                        if not error_code and isinstance(detail, dict):
+                            nested_error = detail.get("error")
+                            if isinstance(nested_error, dict):
+                                if isinstance(nested_error.get("message"), str):
+                                    payload_message = nested_error.get("message", "")
+                                error_code = (
+                                    nested_error.get("code")
+                                    or nested_error.get("error_code")
+                                    or ""
+                                )
+
+                    error_message = payload_message or error_data.get(
+                        "message",
+                        "",
+                    )
+                    if not error_message:
+                        error_message = f"API request failed with status {response.status_code}"
+                    if error_code:
+                        error_message = f"{error_code}: {error_message}"
                     if error_data.get("detail"):
                         error_message += f"\nDetails: {error_data.get('detail')}"
                 
@@ -244,7 +275,7 @@ class PyroMindClient:
 
         except requests.exceptions.RequestException as e:
             raise PyroMindAPIError(
-                message=f"{request_context} request failed: {str(e)}",
+                message=f"{request_context} request failed: {type(e).__name__}: {str(e)}",
                 status_code=None
             )
     
