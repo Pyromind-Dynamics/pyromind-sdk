@@ -10,10 +10,13 @@ Validation includes:
 - Business logic validation (orphan nodes, duplicate IDs, etc.)
 """
 
+import logging
 import re
 import uuid
 from typing import Dict, List, Any, Tuple, Optional, Set
 from ..base import PyroMindAPIError
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -1666,14 +1669,14 @@ def validate_workflow_lite(
     is_valid, errors = validate_lite_format(data, node_info)
     for error in errors:
         if not error.startswith("Warning:"):
-            print(f"✗ {error}")
+            logger.info(f"✗ {error}")
         else:
-            print(f"⚠ {error}")
+            logger.info(f"⚠ {error}")
 
     if is_valid:
-        print(f"✓ Lite format validation passed ({len(data.get('nodes', {}))} nodes)")
+        logger.info(f"✓ Lite format validation passed ({len(data.get('nodes', {}))} nodes)")
     else:
-        print("✗ Lite format validation failed")
+        logger.info("✗ Lite format validation failed")
 
     return is_valid
 
@@ -1690,14 +1693,14 @@ def validate_workflow_standard(
     is_valid, errors = validate_standard_format(data, node_info)
     for error in errors:
         if not error.startswith("Warning:"):
-            print(f"✗ {error}")
+            logger.info(f"✗ {error}")
         else:
-            print(f"⚠ {error}")
+            logger.info(f"⚠ {error}")
 
     if is_valid:
-        print(f"✓ Standard format validation passed ({len(data.get('nodes', []))} nodes, {len(data.get('links', []))} links)")
+        logger.info(f"✓ Standard format validation passed ({len(data.get('nodes', []))} nodes, {len(data.get('links', []))} links)")
     else:
-        print("✗ Standard format validation failed")
+        logger.info("✗ Standard format validation failed")
 
     return is_valid
 

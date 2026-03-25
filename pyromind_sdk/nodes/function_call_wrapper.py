@@ -7,6 +7,7 @@ When executing in Pod, this module is called and is responsible for:
 3. Calling the specified Python function
 """
 
+import logging
 import sys
 import os
 import json
@@ -14,6 +15,8 @@ import importlib.util
 import argparse
 from pathlib import Path
 from typing import Dict, Any, List, Optional
+
+logger = logging.getLogger(__name__)
 
 # Import type conversion functions to avoid code duplication
 try:
@@ -254,21 +257,21 @@ def main():
     try:
         input_types = json.loads(args.input_types)
     except json.JSONDecodeError as e:
-        print(f"Error parsing input_types JSON: {e}", file=sys.stderr)
+        logger.error(f"Error parsing input_types JSON: {e}")
         sys.exit(1)
     
     # Parse output paths
     try:
         output_paths = json.loads(args.output_paths)
     except json.JSONDecodeError as e:
-        print(f"Error parsing output_paths JSON: {e}", file=sys.stderr)
+        logger.error(f"Error parsing output_paths JSON: {e}")
         sys.exit(1)
     
     # Parse input parameters (required parameters)
     try:
         inputs = json.loads(args.inputs)
     except json.JSONDecodeError as e:
-        print(f"Error parsing inputs JSON: {e}", file=sys.stderr)
+        logger.error(f"Error parsing inputs JSON: {e}")
         sys.exit(1)
     
     # Parse return types and names (optional, for type validation)
@@ -278,13 +281,13 @@ def main():
         try:
             return_types = json.loads(args.return_types)
         except json.JSONDecodeError as e:
-            print(f"Error parsing return_types JSON: {e}", file=sys.stderr)
+            logger.error(f"Error parsing return_types JSON: {e}")
             sys.exit(1)
     if args.return_names:
         try:
             return_names = json.loads(args.return_names)
         except json.JSONDecodeError as e:
-            print(f"Error parsing return_names JSON: {e}", file=sys.stderr)
+            logger.error(f"Error parsing return_names JSON: {e}")
             sys.exit(1)
     
     # Call wrapper
@@ -299,7 +302,7 @@ def main():
             return_names=return_names
         )
     except Exception as e:
-        print(f"Error executing function: {e}", file=sys.stderr)
+        logger.error(f"Error executing function: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)

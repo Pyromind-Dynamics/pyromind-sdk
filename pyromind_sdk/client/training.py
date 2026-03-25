@@ -4,13 +4,17 @@ Training API Client
 This module provides a client for managing training tasks via the PyroMind API.
 """
 
+import logging
 from typing import List, Dict, Any, Optional
 from .base import PyroMindClient
 from .models import (
+
     TrainingTaskCreateRequest,
     TrainingTaskCreateResponse,
     TrainingTaskResponse,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class TrainingClient(PyroMindClient):
@@ -150,9 +154,9 @@ class TrainingClient(PyroMindClient):
             ```python
             outputs = client.training.get_node_output(task_id="123", node_id="5")
             if outputs:
-                print(f"Exit code: {outputs.get('exit_code')}")
+                logger.info(f"Exit code: {outputs.get('exit_code')}")
                 for param in outputs.get('parameters', []):
-                    print(f"{param['name']}: {param['value']}")
+                    logger.info(f"{param['name']}: {param['value']}")
             ```
         """
         response = self.get(f"/training/tasks/{task_id}/nodes/{node_id}/output")
@@ -188,10 +192,10 @@ class TrainingClient(PyroMindClient):
             ```python
             node_info = client.training.get_node_info()
             for node_name, info in node_info.items():
-                print(f"Node: {info['display_name']}")
-                print(f"  Category: {info.get('category', 'N/A')}")
-                print(f"  Inputs: {info.get('input', {})}")
-                print(f"  Outputs: {info.get('output', [])}")
+                logger.info(f"Node: {info['display_name']}")
+                logger.info(f"  Category: {info.get('category', 'N/A')}")
+                logger.info(f"  Inputs: {info.get('input', {})}")
+                logger.info(f"  Outputs: {info.get('output', [])}")
             ```
         """
         response = self.get("/training/node_info")

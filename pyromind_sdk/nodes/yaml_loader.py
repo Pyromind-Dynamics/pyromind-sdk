@@ -5,11 +5,14 @@ Dynamically create node classes from YAML configuration files,
 replacing Python class definition approach.
 """
 
+import logging
 import yaml
 import os
 import re
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple, Set, Callable
+
+logger = logging.getLogger(__name__)
 
 # Import constants from common module
 try:
@@ -77,7 +80,7 @@ try:
         EndpointNode,
         NodeType,
     )
-    print(f"INFO: Using platform SDK")
+    logger.info(f"Using platform SDK")
 except ImportError:
     try:
         from pyromind_sdk.common.node_sdk import (
@@ -88,7 +91,7 @@ except ImportError:
             DaemonPodExecutionNode,
             EndpointNode,
         )
-        print(f"INFO: Using pyromind_sdk.common.node_sdk")
+        logger.info(f"Using pyromind_sdk.common.node_sdk")
     except ImportError:
         # Final fallback: use local implementation of pyromind_sdk
         from ..common.node_sdk import (
@@ -99,7 +102,7 @@ except ImportError:
             DaemonPodExecutionNode,
             EndpointNode,
         )
-        print(f"INFO: Using ..common.node_sdk")
+        logger.info(f"Using ..common.node_sdk")
 
 # Base class mapping table
 BASE_CLASS_MAP = {
@@ -764,26 +767,26 @@ def load_all_nodes_from_directory(directory: str) -> Dict[str, type]:
     
     for yaml_file in directory_path.glob("*.yaml"):
         if file_count >= MAX_DIRECTORY_FILES:
-            print(f"Warning: Reached maximum file limit ({MAX_DIRECTORY_FILES}), stopping directory scan")
+            logger.warning(f"Warning: Reached maximum file limit ({MAX_DIRECTORY_FILES}), stopping directory scan")
             break
         try:
             nodes = load_nodes_from_yaml(str(yaml_file))
             all_nodes.update(nodes)
             file_count += 1
         except Exception as e:
-            print(f"Error loading {yaml_file}: {e}")
+            logger.error(f"Error loading {yaml_file}: {e}")
             continue
     
     for yaml_file in directory_path.glob("*.yml"):
         if file_count >= MAX_DIRECTORY_FILES:
-            print(f"Warning: Reached maximum file limit ({MAX_DIRECTORY_FILES}), stopping directory scan")
+            logger.warning(f"Warning: Reached maximum file limit ({MAX_DIRECTORY_FILES}), stopping directory scan")
             break
         try:
             nodes = load_nodes_from_yaml(str(yaml_file))
             all_nodes.update(nodes)
             file_count += 1
         except Exception as e:
-            print(f"Error loading {yaml_file}: {e}")
+            logger.error(f"Error loading {yaml_file}: {e}")
             continue
     
     return all_nodes

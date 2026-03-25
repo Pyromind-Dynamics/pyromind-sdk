@@ -17,6 +17,7 @@ from .nodes import (
     create_node_class_from_yaml,
     convert_node_class_to_yaml,
     yaml_to_node_class,
+    python_function_to_yaml,
 )
 
 # Export API client functionality
@@ -47,6 +48,7 @@ __all__ = [
     "create_node_class_from_yaml",
     "convert_node_class_to_yaml",
     "yaml_to_node_class",
+    "python_function_to_yaml",
     # API client functionality
     "PyroMindClient",
     "PyroMindAPIError",

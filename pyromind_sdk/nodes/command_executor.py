@@ -4,6 +4,7 @@ Command template execution utility
 Provides common functionality for executing PodExecutionNode's COMMAND_TEMPLATE.
 """
 
+import logging
 import os
 import re
 import json
@@ -13,6 +14,8 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Set, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 def extract_placeholders(command_template: List[str]) -> Set[str]:
@@ -77,151 +80,151 @@ def read_output_file(file_path: str) -> Optional[str]:
 
 def print_node_info(node_name: str, node_class: type, validation: Dict[str, Any], execution_result: Optional[Dict[str, Any]] = None):
     """Print detailed node information"""
-    print(f"\n{'='*60}")
-    print(f"Node: {node_name} ({node_class.__name__})")
-    print(f"{'='*60}")
-    print(f"Valid: {validation['valid']}")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Node: {node_name} ({node_class.__name__})")
+    logger.info(f"{'='*60}")
+    logger.info(f"Valid: {validation['valid']}")
     
     if validation["errors"]:
-        print(f"\nErrors:")
+        logger.info(f"\nErrors:")
         for error in validation["errors"]:
-            print(f"  ✗ {error}")
+            logger.info(f"  ✗ {error}")
     
     if validation["warnings"]:
-        print(f"\nWarnings:")
+        logger.info(f"\nWarnings:")
         for warning in validation["warnings"]:
-            print(f"  ⚠ {warning}")
+            logger.info(f"  ⚠ {warning}")
     
-    print(f"\nBasic Info:")
+    logger.info(f"\nBasic Info:")
     info = validation["info"]
-    print(f"  Category: {info.get('category', 'N/A')}")
-    print(f"  Display Name: {info.get('display_name', 'N/A')}")
-    print(f"  Description: {info.get('description', 'N/A')}")
-    print(f"  Base Classes: {', '.join(info.get('base_classes', []))}")
-    print(f"  Node Type: {info.get('node_type', 'N/A')}")
+    logger.info(f"  Category: {info.get('category', 'N/A')}")
+    logger.info(f"  Display Name: {info.get('display_name', 'N/A')}")
+    logger.info(f"  Description: {info.get('description', 'N/A')}")
+    logger.info(f"  Base Classes: {', '.join(info.get('base_classes', []))}")
+    logger.info(f"  Node Type: {info.get('node_type', 'N/A')}")
     
     # Input information
     if "detailed_inputs" in info:
-        print(f"\n{'─'*60}")
-        print("Inputs:")
-        print(f"{'─'*60}")
+        logger.info(f"\n{'─'*60}")
+        logger.info("Inputs:")
+        logger.info(f"{'─'*60}")
         for input_name, input_info in info["detailed_inputs"].items():
             req_mark = "[REQUIRED]" if input_info.get("required") else "[OPTIONAL]"
-            print(f"  {input_name} {req_mark}")
-            print(f"    Type: {input_info.get('type', 'Unknown')}")
+            logger.info(f"  {input_name} {req_mark}")
+            logger.info(f"    Type: {input_info.get('type', 'Unknown')}")
             default = input_info.get('default', None)
             if default is not None:
                 default_str = json.dumps(default) if isinstance(default, (str, dict, list)) else str(default)
-                print(f"    Default: {default_str}")
+                logger.info(f"    Default: {default_str}")
     
     # Output information
     if "outputs" in info:
-        print(f"\n{'─'*60}")
-        print("Outputs:")
-        print(f"{'─'*60}")
+        logger.info(f"\n{'─'*60}")
+        logger.info("Outputs:")
+        logger.info(f"{'─'*60}")
         for output_name, output_info in info["outputs"].items():
-            print(f"  {output_name}")
-            print(f"    Type: {output_info.get('type', 'Unknown')}")
-            print(f"    Index: {output_info.get('index', 'Unknown')}")
+            logger.info(f"  {output_name}")
+            logger.info(f"    Type: {output_info.get('type', 'Unknown')}")
+            logger.info(f"    Index: {output_info.get('index', 'Unknown')}")
     
     # Customer Use information (including inputs and outputs)
     if "customer_use" in info:
-        print(f"\n{'─'*60}")
-        print("Customer Use:")
-        print(f"{'─'*60}")
+        logger.info(f"\n{'─'*60}")
+        logger.info("Customer Use:")
+        logger.info(f"{'─'*60}")
         customer_use = info["customer_use"]
         if customer_use:
             for param_name in customer_use:
-                print(f"  {param_name}")
+                logger.info(f"  {param_name}")
         else:
-            print("  (none)")
+            logger.info("  (none)")
     
     # Command template
     if "command_template" in info:
-        print(f"\n{'─'*60}")
-        print("Command Template:")
-        print(f"{'─'*60}")
+        logger.info(f"\n{'─'*60}")
+        logger.info("Command Template:")
+        logger.info(f"{'─'*60}")
         cmd_template = info["command_template"]
         if isinstance(cmd_template, list):
             # Display command template, keep placeholder form
             cmd_str = ' '.join(str(part) for part in cmd_template)
-            print(f"  {cmd_str}")
+            logger.info(f"  {cmd_str}")
             
             # Display placeholders
             placeholders = extract_placeholders(cmd_template)
             if placeholders:
-                print(f"\n  Placeholders:")
+                logger.info(f"\n  Placeholders:")
                 for placeholder in sorted(placeholders):
-                    print(f"    {{{{ {placeholder} }}}}")
+                    logger.info(f"    {{{{ {placeholder} }}}}")
         else:
-            print(f"  {cmd_template}")
+            logger.info(f"  {cmd_template}")
     
     # Resource information
     if "resources" in info:
-        print(f"\n{'─'*60}")
-        print("Resources:")
-        print(f"{'─'*60}")
+        logger.info(f"\n{'─'*60}")
+        logger.info("Resources:")
+        logger.info(f"{'─'*60}")
         for key, value in info["resources"].items():
-            print(f"  {key}: {value}")
+            logger.info(f"  {key}: {value}")
     
     # Execution result (if provided)
     if execution_result:
-        print(f"\n{'─'*60}")
-        print("Execution Result:")
-        print(f"{'─'*60}")
+        logger.info(f"\n{'─'*60}")
+        logger.info("Execution Result:")
+        logger.info(f"{'─'*60}")
         
         # Return code
         returncode = execution_result.get('returncode', 'N/A')
         status = "✓" if returncode == 0 else "✗"
-        print(f"  {status} Return code: {returncode}")
+        logger.info(f"  {status} Return code: {returncode}")
         
         # Output content
         if execution_result.get("outputs"):
-            print(f"\n  Outputs:")
+            logger.info(f"\n  Outputs:")
             for output_name, output_value in execution_result["outputs"].items():
                 value_preview = str(output_value).strip()
                 # For multiline output, show first few lines
                 lines = value_preview.split('\n')
                 if len(lines) > 5:
                     value_preview = '\n'.join(lines[:5]) + f"\n    ... ({len(lines) - 5} more lines)"
-                print(f"    {output_name}: {value_preview}")
+                logger.info(f"    {output_name}: {value_preview}")
         
         # Standard output
         if execution_result.get("stdout"):
             stdout = execution_result["stdout"].strip()
             if stdout:
-                print(f"\n  Stdout:")
+                logger.info(f"\n  Stdout:")
                 stdout_lines = stdout.split('\n')
                 for line in stdout_lines[:10]:  # Show at most 10 lines
                     if line.strip():
-                        print(f"    {line}")
+                        logger.info(f"    {line}")
                 if len(stdout_lines) > 10:
                     more_lines = len(stdout_lines) - 10
-                    print(f"    ... ({more_lines} more lines)")
+                    logger.info(f"    ... ({more_lines} more lines)")
         
         # Standard error
         if execution_result.get("stderr"):
             stderr = execution_result["stderr"].strip()
             if stderr:
-                print(f"\n  Stderr:")
+                logger.info(f"\n  Stderr:")
                 stderr_lines = stderr.split('\n')
                 for line in stderr_lines[:10]:  # Show at most 10 lines
                     if line.strip():
-                        print(f"    {line}")
+                        logger.info(f"    {line}")
                 if len(stderr_lines) > 10:
                     more_lines = len(stderr_lines) - 10
-                    print(f"    ... ({more_lines} more lines)")
+                    logger.info(f"    ... ({more_lines} more lines)")
         
         # Errors and warnings
         if execution_result.get("errors"):
-            print(f"\n  Errors:")
+            logger.info(f"\n  Errors:")
             for error in execution_result["errors"]:
-                print(f"    ✗ {error}")
+                logger.info(f"    ✗ {error}")
         
         if execution_result.get("warnings"):
-            print(f"\n  Warnings:")
+            logger.info(f"\n  Warnings:")
             for warning in execution_result["warnings"]:
-                print(f"    ⚠ {warning}")
+                logger.info(f"    ⚠ {warning}")
 
 
 def prepare_command_template(

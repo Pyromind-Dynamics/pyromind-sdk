@@ -14,6 +14,7 @@ from .yaml_loader import (
 from .python_to_yaml import (
     convert_node_class_to_yaml,
     yaml_to_node_class,
+    python_function_to_yaml,
 )
 from .python_function_executor import (
     build_command_template,
@@ -46,6 +47,7 @@ __all__ = [
     "create_node_class_from_yaml",
     "convert_node_class_to_yaml",
     "yaml_to_node_class",
+    "python_function_to_yaml",
     "build_command_template",
     "resolve_python_file_path",
     "convert_string_to_python_type",

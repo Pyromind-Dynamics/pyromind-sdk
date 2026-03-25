@@ -132,6 +132,43 @@ def calculate(input0: float, input1: float) -> dict:
     }
 ```
 
+### Auto Generate: Python Function -> YAML
+
+You can generate YAML config directly from a Python function signature and a return dict literal:
+
+```python
+from pyromind_sdk import python_function_to_yaml
+
+config = python_function_to_yaml(
+    python_file_path="pyromind_sdk/examples/nodes/utils/calculator.py",
+    function_name="calculate",
+    node_name="PythonCalculatorNode",
+    output_path="pyromind_sdk/examples/nodes/python_calculator_node.generated.yaml",
+)
+```
+
+Auto-generate rules:
+- Inputs are generated from function parameters in order
+- Input `dtype` is inferred from annotations (`str/int/float/bool`)
+- Inputs are generated as `required_type: optional` with no default
+- Outputs are generated only from `return { ... }` dict literals
+- Return dict keys must be string literals
+- Unknown types fall back to `STRING`
+- Generated YAML `python_code` is emitted as an absolute path
+
+CLI 用法（写入到 YAML 文件）:
+
+```bash
+python -m pyromind_sdk.cli python-to-yaml \
+  pyromind_sdk/examples/nodes/utils/calculator.py \
+  calculate \
+  --node-name PythonCalculatorNode \
+  --output pyromind_sdk/examples/nodes/python_calculator_node.generated.yaml
+```
+
+如果不传 `--output`，会把 YAML 直接打印到 stdout。
+
+
 **Note on Python file paths:**
 - Relative paths are resolved relative to the YAML file's directory
 - Absolute paths are used as-is

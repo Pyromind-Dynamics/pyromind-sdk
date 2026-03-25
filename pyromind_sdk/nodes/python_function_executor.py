@@ -5,10 +5,13 @@ Generates command templates for executing Python functions in Pod.
 Uses function_call_wrapper module to handle actual function calls.
 """
 
+import logging
 import json
 import shlex
 from typing import Dict, Any, List, Optional
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def build_command_template(
@@ -96,8 +99,8 @@ def build_command_template(
         conda_env = "base"
     #if conda not exists, raise a warning
     if conda_env is not None and not Path("/workspace/.conda/bin/activate").exists():
-        print(f"Warning: Conda environment {conda_env} not found, using conda_env = None")
-        conda_env = None
+        logger.warning(f"Warning: Conda environment {conda_env} not found")
+        # conda_env = None
 
     # Build bash command
     bash_commands = []
