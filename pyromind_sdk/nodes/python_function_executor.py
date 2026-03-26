@@ -8,6 +8,7 @@ Uses function_call_wrapper module to handle actual function calls.
 import logging
 import json
 import shlex
+import uuid
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 
@@ -66,8 +67,11 @@ def build_command_template(
     all_inputs = {**input_types.get("required", {}), **input_types.get("optional", {})}
     input_names = list(all_inputs.keys())
     
-    # Build input parameter JSON dictionary (using placeholders, will be replaced at runtime)
-    inputs_dict = {name: f"{{{{{name}}}}}" for name in input_names}
+    # Build input parameter JSON dictionary.
+    #
+    # Important: We intentionally pass /tmp/<input_name> paths here and put the real values
+    # into those files via heredoc blocks, to avoid shell/JSON escaping issues with large prompts.
+    inputs_dict = {name: f"/tmp/{name}" for name in input_names}
     inputs_json = json.dumps(inputs_dict, ensure_ascii=False)
     inputs_escaped = shlex.quote(inputs_json)
     
@@ -122,14 +126,42 @@ def build_command_template(
     if workdir:
         workdir_escaped = shlex.quote(str(workdir))
         bash_commands.append(f"cd {workdir_escaped}")
+    else:
+        # Make sure imports inside `python_code` work (e.g. node_functions.py under
+        # `/path/to/data_preprocess/` importing `data_preprocess.*`).
+        python_code_dir = str(Path(python_code).resolve().parent)
+        python_code_dir_escaped = shlex.quote(python_code_dir)
+        bash_commands.append(f"cd {python_code_dir_escaped}")
     
-    
+    # 2.1 Write each input into /tmp/<input_name> using heredoc.
+    # The platform replaces {{<input_name>}} placeholders at runtime before executing bash -c.
+    heredoc_commands: List[str] = []
+    for input_name in input_names:
+        tmp_path = f"/tmp/{input_name}"
+        tmp_path_escaped = shlex.quote(tmp_path)
+        delim = f"PYROMIND_{uuid.uuid4().hex}"
+        placeholder = f"{{{{{input_name}}}}}"
+        # Ensure the delimiter is on its own line (bash heredoc requirement).
+        heredoc_commands.append(
+            "cat "
+            f"> {tmp_path_escaped} "
+            f"<<'{delim}'\n"
+            f"{placeholder}\n"
+            f"{delim}\n"
+        )
+
+    bash_commands.extend(heredoc_commands)
+
     # 4. Execute wrapper command
     wrapper_cmd_full = " ".join([wrapper_cmd] + wrapper_args)
     bash_commands.append(wrapper_cmd_full)
     
-    # Combine all commands
-    full_command = " && ".join(bash_commands)
+    # Combine all commands.
+    #
+    # Use newlines (instead of `&&`) to avoid bash parse issues around heredoc
+    # terminators (e.g. `DELIM\n && next_cmd` can be rejected by bash).
+    # We still want "fail fast" behavior, so enable `set -e`.
+    full_command = "\n".join(["set -e ; true"] + bash_commands)
     command_parts = ["bash", "-c", full_command]
     return command_parts
 

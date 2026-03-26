@@ -25,3 +25,4 @@ htmlcov/
 
 # Ignore test_storage.sh in root directory only
 /test_storage.sh
+build/
