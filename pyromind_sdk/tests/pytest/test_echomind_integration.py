@@ -599,7 +599,7 @@ class TestUpdateEchoMindInstance:
             )
         )
         instance_tracker.add(pending_id)
-
+        wait_for_instance_status(client, pending_id, 'running')
         try:
             updated_instance = client.echomind.update(
                 job_id=pending_id,
