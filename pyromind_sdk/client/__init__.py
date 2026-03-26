@@ -10,6 +10,7 @@ from .instance import InstanceClient
 from .inference import InferenceClient
 from .training import TrainingClient
 from .storage import StorageClient
+from .echomind import EchoMindClient
 from .client import PyroMindAPIClient
 from .workflow import (
     validate_workflow,
@@ -24,6 +25,7 @@ __all__ = [
     "InferenceClient",
     "TrainingClient",
     "StorageClient",
+    "EchoMindClient",
     "PyroMindAPIClient",
     "validate_workflow",
     "ValidationError",

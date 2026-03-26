@@ -30,6 +30,15 @@ from .client import (
     TrainingClient,
     StorageClient,
     PyroMindAPIClient,
+    EchoMindClient,
+)
+
+# Export models
+from .client.models import (
+    ApiMode,
+    EchoMindJobRequest,
+    EchoMindJobResponse,
+    ResourceConfig,
 )
 
 # Export workflow functionality
@@ -58,6 +67,12 @@ __all__ = [
     "TrainingClient",
     "StorageClient",
     "PyroMindAPIClient",
+    "EchoMindClient",
+    # Models
+    "ApiMode",
+    "EchoMindJobRequest",
+    "EchoMindJobResponse",
+    "ResourceConfig",
     # Workflow functionality
     "WorkflowLiteConverter",
     "LayoutGenerator",

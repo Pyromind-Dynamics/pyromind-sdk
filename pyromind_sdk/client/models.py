@@ -606,3 +606,92 @@ class TrainingTaskListAPIResponse(BaseModel):
 class TrainingTaskAPIResponse(BaseModel):
     """Single training job API response"""
     job: TrainingTaskResponse
+
+
+# EchoMind Models
+class ApiMode(str, Enum):
+    """API mode enumeration for EchoMind"""
+    OPENAI = "openai"
+    GEMINI = "gemini"
+    ANTHROPIC = "anthropic"
+
+
+class EchoMindJobRequest(BaseModel):
+    """Request model for creating/updating an EchoMind instance"""
+    name: str
+    api_url: str
+    api_mode: str = "openai"
+    origin_model: str
+    access_key: str
+    training_model: str
+    training_batch_size: int
+    trajectory_buffer_size: int
+    time_per_round: float
+    training_round: int
+    training_save_path: str
+    resources: Optional[ResourceConfig] = None
+
+    @field_validator('api_mode', mode='before')
+    @classmethod
+    def validate_api_mode(cls, v: str) -> str:
+        """Validate and normalize api_mode field"""
+        if v is None:
+            raise ValueError("api_mode is required")
+        
+        # Normalize to lowercase
+        v_lower = v.lower().strip() if isinstance(v, str) else str(v).lower().strip()
+        
+        # Map common variations to valid values
+        mode_mapping = {
+            'openai': 'openai',
+            'gpt': 'openai',
+            'google gemini api': 'gemini',
+            'gemini': 'gemini',
+            'google': 'gemini',
+            'anthropic': 'anthropic',
+            'claude': 'anthropic',
+        }
+        
+        normalized = mode_mapping.get(v_lower, v_lower)
+        
+        valid_modes = ['openai', 'gemini', 'anthropic']
+        if normalized not in valid_modes:
+            raise ValueError(f"api_mode must be one of {valid_modes}, got: {v}")
+        
+        return normalized
+
+
+class EchoMindJobResponse(BaseModel):
+    """EchoMind instance response model"""
+    job_id: str
+    name: Optional[str] = None
+    status: str
+    api_url: Optional[str] = None
+    api_mode: Optional[str] = None
+    origin_model: Optional[str] = None
+    access_key: Optional[str] = None
+    training_model: Optional[str] = None
+    training_batch_size: Optional[str] = None
+    trajectory_buffer_size: Optional[str] = None
+    time_per_round: Optional[str] = None
+    training_round: Optional[str] = None
+    training_save_path: Optional[str] = None
+    secret_key: Optional[str] = None
+    resources: Optional[ResourceConfig] = None
+    created_at: Optional[Union[str, datetime]] = None
+
+
+class EchoMindJobListAPIResponse(BaseModel):
+    """List EchoMind instances API response"""
+    echomind_jobs: List[EchoMindJobResponse] = Field(default_factory=list)
+    pagination: Optional[Dict[str, Any]] = None
+
+
+class EchoMindJobAPIResponse(BaseModel):
+    """Single EchoMind instance API response"""
+    job: EchoMindJobResponse
+
+
+class EchoMindJobCreateAPIResponse(BaseModel):
+    """Create EchoMind instance API response"""
+    job_id: str

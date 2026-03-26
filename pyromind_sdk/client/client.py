@@ -11,6 +11,7 @@ from .sandboxes import SandboxesClient
 from .instance import InstanceClient
 from .inference import InferenceClient
 from .training import TrainingClient
+from .echomind import EchoMindClient
 
 
 class PyroMindAPIClient:
@@ -120,6 +121,12 @@ class PyroMindAPIClient:
             timeout=timeout,
             max_retries=max_retries
         )
+        self.echomind = EchoMindClient(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=max_retries
+        )
     
     def close(self):
         """Close all client sessions"""
@@ -128,6 +135,7 @@ class PyroMindAPIClient:
         self.instance.close()
         self.inference.close()
         self.training.close()
+        self.echomind.close()
     
     def __enter__(self):
         """Context manager entry"""
