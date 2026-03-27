@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Integration tests for Inference Job Management Example
+Integration tests for Inference Job Management.
 
-This module provides pytest-based integration tests for the inference_example.py
-functions, using real API calls (no mocks).
+This module provides pytest-based integration tests for inference job operations,
+using real API calls (no mocks).
 
 Environment variables required:
 - PYROMIND_API_KEY: API key for authentication
@@ -13,8 +13,6 @@ These tests will create, manage, and delete actual inference jobs.
 """
 
 import atexit
-import os
-# Import the example functions
 import sys
 import time
 from pathlib import Path
@@ -28,12 +26,12 @@ from pyromind_sdk.client.models import (
     ResourceConfig,
 )
 
-# From pyromind_sdk/tests/pytest/ to pyromind_sdk/examples/openapi/
+# Add examples directory to path for importing example functions
 EXAMPLES_DIR = Path(__file__).parent.parent.parent / "examples" / "openapi"
 if str(EXAMPLES_DIR) not in sys.path:
     sys.path.insert(0, str(EXAMPLES_DIR))
 
-# Import using importlib to handle module loading
+# Import inference_example module using importlib
 import importlib.util
 inference_example_path = EXAMPLES_DIR / "inference_example.py"
 if not inference_example_path.exists():
@@ -54,43 +52,9 @@ update_inference_job_example = inference_example.update_inference_job_example
 delete_inference_job_example = inference_example.delete_inference_job_example
 
 
-@pytest.fixture(scope="module")
-def api_key():
-    """Get API key from environment variable"""
-    api_key = os.getenv("PYROMIND_API_KEY")
-    if not api_key:
-        pytest.skip(
-            "PYROMIND_API_KEY environment variable not set. "
-            "Please set this environment variable to run integration tests."
-        )
-    print(f"[INFO] Using API key: {api_key[:10]}...{api_key[-4:] if len(api_key) > 14 else '***'}")
-    return api_key
-
-
-@pytest.fixture(scope="module")
-def base_url():
-    """Get base URL from environment variable or use default"""
-    url = os.getenv("PYROMIND_BASE_URL", "https://api.pyromind.ai/api/v1")
-    print(f"[INFO] Using base URL: {url}")
-    return url
-
-
-@pytest.fixture(scope="module")
-def client(api_key, base_url):
-    """Create a PyroMind API client"""
-    return PyroMindAPIClient(api_key=api_key, base_url=base_url)
-
-
-@pytest.fixture(scope="session")
-def session_client():
-    """Create a session-scoped PyroMind API client for cleanup"""
-    api_key = os.getenv("PYROMIND_API_KEY")
-    base_url = os.getenv("PYROMIND_BASE_URL", "https://api.pyromind.ai/api/v1")
-    if not api_key:
-        # If API key is not set, return None (cleanup will be skipped)
-        return None
-    return PyroMindAPIClient(api_key=api_key, base_url=base_url)
-
+# =============================================================================
+# Job Tracking and Cleanup
+# =============================================================================
 
 # Global set to track all created jobs across all tests
 _created_jobs: Set[str] = set()
@@ -101,18 +65,18 @@ def _cleanup_all_jobs(client: Optional[PyroMindAPIClient]):
     """Clean up all tracked jobs: delete them"""
     if not _created_jobs:
         return
-    
+
     if client is None:
         print(f"[FINAL_CLEANUP] Client is None, cannot cleanup {len(_created_jobs)} job(s)")
         _created_jobs.clear()
         return
-    
+
     print(f"[FINAL_CLEANUP] Starting cleanup for {len(_created_jobs)} job(s)")
-    
+
     for job_id in list(_created_jobs):
         if not job_id:
             continue
-        
+
         print(f"[FINAL_CLEANUP] Cleaning up job: {job_id}")
         try:
             # Check if job still exists before deleting
@@ -126,7 +90,7 @@ def _cleanup_all_jobs(client: Optional[PyroMindAPIClient]):
                     continue
                 else:
                     raise
-            
+
             # Check if job is in a deletable state
             # According to API, jobs in Running status cannot be deleted
             if job.status.lower() == "running":
@@ -163,7 +127,7 @@ def _cleanup_all_jobs(client: Optional[PyroMindAPIClient]):
                         print(f"[FINAL_CLEANUP] Cannot check job status after pause failure. Skipping deletion.")
                         _created_jobs.discard(job_id)
                         continue
-            
+
             # Try to delete the job
             print(f"[FINAL_CLEANUP] Attempting to delete job {job_id}...")
             client.inference.delete(job_id)
@@ -174,11 +138,138 @@ def _cleanup_all_jobs(client: Optional[PyroMindAPIClient]):
             # Don't remove from set if deletion failed, it might be a transient error
         except Exception as e:
             print(f"[FINAL_CLEANUP] Unexpected error during cleanup for job {job_id}: {type(e).__name__}: {str(e)}")
-    
+
     # Clear remaining jobs (even if deletion failed)
     _created_jobs.clear()
     print(f"[FINAL_CLEANUP] Cleanup completed")
 
+
+# =============================================================================
+# Session-Scoped Cleanup Fixture
+# =============================================================================
+
+@pytest.fixture(scope="session", autouse=True)
+def inference_job_cleanup(request, client):
+    """
+    Session-scoped autouse fixture for cleaning up inference jobs.
+
+    This fixture automatically cleans up all tracked inference jobs at the
+    end of the test session. It uses the shared client fixture from conftest.py.
+
+    Args:
+        request: pytest request object for adding finalizers
+        client: Shared PyroMindAPIClient from conftest.py
+
+    Yields:
+        None
+    """
+    global _cleanup_registered
+
+    # Register cleanup to run at session end
+    def final_cleanup():
+        _cleanup_all_jobs(client)
+
+    # Register with pytest's finalizer
+    request.addfinalizer(final_cleanup)
+
+    # Also register with atexit as backup
+    if not _cleanup_registered:
+        atexit.register(final_cleanup)
+        _cleanup_registered = True
+
+    yield
+
+
+# =============================================================================
+# Test Helper Fixtures
+# =============================================================================
+
+@pytest.fixture(scope="session")
+def job_tracker() -> Set[str]:
+    """
+    Track all created jobs for final cleanup.
+
+    Returns:
+        The set of tracked job IDs.
+    """
+    yield _created_jobs
+
+
+@pytest.fixture(scope="function")
+def test_job_id(client, job_tracker) -> str:
+    """
+    Create a test inference job and return its ID.
+
+    The job is automatically tracked for cleanup.
+
+    Args:
+        client: Shared PyroMindAPIClient from conftest.py
+        job_tracker: Set of tracked job IDs
+
+    Yields:
+        The created job ID.
+
+    Raises:
+        PyroMindAPIError: If job creation fails.
+    """
+    job_id = None
+
+    try:
+        # Create a test job
+        print(f"[TEST] Creating test job for fixture...")
+        job_id = client.inference.create(
+            InferenceJobRequest(
+                name=f"test-inference-{int(time.time())}",
+                model_path="/workspace/models/Qwen/Qwen3-0.6B/",
+                inference_framework="sglang",
+                timeout=3600,
+                resources=ResourceConfig(
+                    cpu="4",
+                    memory="32Gi",
+                    gpu=1,
+                    gpu_card="L40S"
+                ),
+                environment_variables={
+                    "MODEL_PATH": "/workspace/models/Qwen/Qwen3-0.6B/",
+                }
+            )
+        )
+        # Register job for final cleanup
+        job_tracker.add(job_id)
+        print(f"[TEST] Test job created: {job_id}")
+        yield job_id
+
+    except Exception as e:
+        print(f"[ERROR] Failed to create test job in fixture: {type(e).__name__}: {str(e)}")
+        raise
+    finally:
+        # Clean up: delete the test job
+        if job_id:
+            print(f"[CLEANUP] Starting cleanup for test job: {job_id}")
+            try:
+                if wait_for_instance_status(client, job_id, 'running'):
+                    print(f"[CLEANUP] Job {job_id} is running, pausing...")
+                    client.inference.pause(job_id)
+                if wait_for_instance_status(client, job_id, 'stopped'):
+                    print(f"[CLEANUP] Job {job_id} is stopped")
+                client.inference.delete(job_id)
+                print(f"[CLEANUP] Successfully deleted job {job_id}")
+                # Remove from tracker since we cleaned it up
+                job_tracker.discard(job_id)
+            except PyroMindAPIError as e:
+                # Log but don't fail the test if cleanup fails
+                print(f"[WARNING] Failed to delete test job {job_id}: {e.message} (status_code: {e.status_code})")
+                if e.response:
+                    print(f"[WARNING] Error response: {e.response}")
+                # Keep in tracker for final cleanup if deletion failed
+            except Exception as e:
+                # Log but don't fail the test if cleanup fails
+                print(f"[WARNING] Unexpected error during cleanup for job {job_id}: {type(e).__name__}: {str(e)}")
+
+
+# =============================================================================
+# Test Helper Functions
+# =============================================================================
 
 def wait_for_instance_status(
         client: PyroMindAPIClient,
@@ -228,97 +319,15 @@ def wait_for_instance_status(
     return False
 
 
-@pytest.fixture(scope="session", autouse=True)
-def register_job_cleanup(request, session_client):
-    """Register cleanup function to run after all tests complete"""
-    global _cleanup_registered
-    
-    # Register cleanup to run at session end
-    def final_cleanup():
-        _cleanup_all_jobs(session_client)
-    
-    # Register with pytest's finalizer
-    request.addfinalizer(final_cleanup)
-    
-    # Also register with atexit as backup
-    if not _cleanup_registered:
-        atexit.register(final_cleanup)
-        _cleanup_registered = True
-    
-    yield
+# =============================================================================
+# Test Classes
+# =============================================================================
 
+class TestInferenceBasics:
+    """Test cases for basic inference job operations."""
 
-@pytest.fixture(scope="session")
-def job_tracker():
-    """Track all created jobs for final cleanup"""
-    yield _created_jobs
-
-
-@pytest.fixture(scope="function")
-def test_job_id(client, job_tracker):
-    """
-    Create a test inference job and return its ID.
-    Clean up after test completes.
-    """
-    job_id = None
-    
-    try:
-        # Create a test job
-        print(f"[TEST] Creating test job for fixture...")
-        job_id = client.inference.create(
-            InferenceJobRequest(
-                name=f"test-inference-{int(time.time())}",
-                model_path="/workspace/models/Qwen/Qwen3-0.6B/",
-                inference_framework="sglang",
-                timeout=3600,
-                resources=ResourceConfig(
-                    cpu="4",
-                    memory="32Gi",
-                    gpu=1,
-                    gpu_card="L40S"
-                ),
-                environment_variables={
-                    "MODEL_PATH": "/workspace/models/Qwen/Qwen3-0.6B/",
-                }
-            )
-        )
-        # Register job for final cleanup
-        job_tracker.add(job_id)
-        print(f"[TEST] Test job created: {job_id}")
-        yield job_id
-        
-    except Exception as e:
-        print(f"[ERROR] Failed to create test job in fixture: {type(e).__name__}: {str(e)}")
-        raise
-    finally:
-        # Clean up: delete the test job
-        if job_id:
-            print(f"[CLEANUP] Starting cleanup for test job: {job_id}")
-            try:
-                if wait_for_instance_status(client, job_id, 'running'):
-                    print(f"[CLEANUP] Job {job_id} is running, pausing...")
-                    client.inference.pause(job_id)
-                if wait_for_instance_status(client, job_id, 'stopped'):
-                    print(f"[CLEANUP] Job {job_id} is stopped")
-                client.inference.delete(job_id)
-                print(f"[CLEANUP] Successfully deleted job {job_id}")
-            except PyroMindAPIError as e:
-                # Log but don't fail the test if cleanup fails
-                print(f"[WARNING] Failed to delete test job {job_id}: {e.message} (status_code: {e.status_code})")
-                if e.response:
-                    print(f"[WARNING] Error response: {e.response}")
-                # Keep in tracker for final cleanup if deletion failed
-            except Exception as e:
-                # Log but don't fail the test if cleanup fails
-                print(f"[WARNING] Unexpected error during cleanup for job {job_id}: {type(e).__name__}: {str(e)}")
-                # Keep in tracker for final cleanup if deletion failed
-
-
-class TestListInferenceJobs:
-    """Test cases for listing inference jobs"""
-    
     def test_list_inference_jobs(self, client):
-        """Test listing all inference jobs"""
+        """Test listing all inference jobs."""
         print("[TEST] Testing list_inference_jobs...")
         try:
             jobs = client.inference.list()
@@ -326,10 +335,10 @@ class TestListInferenceJobs:
         except Exception as e:
             print(f"[ERROR] Failed to list jobs: {type(e).__name__}: {str(e)}")
             raise
-        
+
         # Should return a list (may be empty)
         assert isinstance(jobs, list), f"Expected list, got {type(jobs).__name__}"
-        
+
         # If jobs exist, verify their structure
         for idx, job in enumerate(jobs):
             assert hasattr(job, 'id'), f"Job at index {idx} missing 'id' attribute"
@@ -341,20 +350,16 @@ class TestListInferenceJobs:
             assert job.status is not None, f"Job at index {idx} has None 'status'"
             assert job.model_path is not None, f"Job at index {idx} has None 'model_path'"
             print(f"[TEST] Job {idx + 1}: id={job.id}, name={job.name}, status={job.status}, model_path={job.model_path}")
-    
+
     def test_list_inference_jobs_example_function(self):
-        """Test the list_inference_jobs_example function"""
+        """Test the list_inference_jobs_example function."""
         jobs = list_inference_jobs_example()
-        
+
         # Should return a list (may be empty)
         assert isinstance(jobs, list)
 
-
-class TestCreateInferenceJob:
-    """Test cases for creating inference jobs"""
-    
     def test_create_inference_job(self, client, job_tracker):
-        """Test creating an inference job"""
+        """Test creating an inference job."""
         print(f"[TEST] Creating inference job...")
         name = f"test-inference-{int(time.time())}"
         try:
@@ -386,7 +391,7 @@ class TestCreateInferenceJob:
         except Exception as e:
             print(f"[ERROR] Unexpected error creating job: {type(e).__name__}: {str(e)}")
             raise
-        
+
         # Verify job was created
         assert job_id is not None, "Job creation returned None"
         assert isinstance(job_id, str), f"Expected string job_id, got {type(job_id).__name__}"
@@ -395,13 +400,13 @@ class TestCreateInferenceJob:
             print(f"[TEST] Job {job_id} is running")
         else:
             raise PyroMindAPIError(f"inference {name} create failed")
-        
+
         print(f"[TEST] Job verification passed: id={job_id}")
-    
+
     def test_create_inference_job_example_function(self, client, job_tracker):
-        """Test the create_inference_job_example function"""
+        """Test the create_inference_job_example function."""
         job_id = create_inference_job_example()
-        
+
         # Should return a job ID or None
         if job_id:
             assert isinstance(job_id, str)
@@ -413,12 +418,8 @@ class TestCreateInferenceJob:
             else:
                 raise PyroMindAPIError(f"inference {job_id} create failed")
 
-
-class TestGetInferenceJob:
-    """Test cases for getting inference job details"""
-    
     def test_get_inference_job(self, client, test_job_id):
-        """Test getting a specific inference job"""
+        """Test getting a specific inference job."""
         print(f"[TEST] Getting inference job: {test_job_id}")
         try:
             job = client.inference.get_job(test_job_id)
@@ -431,18 +432,16 @@ class TestGetInferenceJob:
         except Exception as e:
             print(f"[ERROR] Unexpected error getting job: {type(e).__name__}: {str(e)}")
             raise
-        
+
         # Verify job details
         assert job is not None, f"Job is None for ID: {test_job_id}"
         assert job.id == test_job_id, f"Job ID mismatch. Expected: {test_job_id}, got: {job.id}"
         assert job.name is not None, f"Job name is None for ID: {test_job_id}"
         assert job.status is not None, f"Job status is None for ID: {test_job_id}"
         assert job.model_path is not None, f"Job model_path is None for ID: {test_job_id}"
-        # image field is optional and may be None
-        # assert job.image is not None, f"Job image is None for ID: {test_job_id}"
-    
+
     def test_get_inference_job_example_function(self, test_job_id):
-        """Test the get_inference_job_example function"""
+        """Test the get_inference_job_example function."""
         print(f"[TEST] Testing get_inference_job_example function with job: {test_job_id}")
         try:
             job = get_inference_job_example(test_job_id)
@@ -450,56 +449,50 @@ class TestGetInferenceJob:
         except Exception as e:
             print(f"[ERROR] Function failed: {type(e).__name__}: {str(e)}")
             raise
-        
+
         # Verify job details
         assert job is not None, f"get_inference_job_example returned None for ID: {test_job_id}"
         assert job.id == test_job_id, f"Job ID mismatch. Expected: {test_job_id}, got: {job.id}"
         assert job.name is not None, f"Job name is None for ID: {test_job_id}"
         assert job.status is not None, f"Job status is None for ID: {test_job_id}"
         assert job.model_path is not None, f"Job model_path is None for ID: {test_job_id}"
-        # image field is optional and may be None
-        # assert job.image is not None, f"Job image is None for ID: {test_job_id}"
-    
+
     def test_get_nonexistent_job(self, client):
-        """Test getting a non-existent job should raise an error"""
+        """Test getting a non-existent job should raise an error."""
         fake_id = "non-existent-job-id-12345"
         print(f"[TEST] Attempting to get non-existent job: {fake_id}")
         with pytest.raises(PyroMindAPIError) as exc_info:
             client.inference.get_job(fake_id)
-        
+
         error = exc_info.value
         print(f"[TEST] Correctly raised PyroMindAPIError: {error.message} (status_code: {error.status_code})")
         assert error.status_code in [404, 400], f"Expected 404 or 400 status code, got: {error.status_code}"
 
-
-class TestUpdateInferenceJob:
-    """Test cases for updating inference jobs"""
-    
     def test_update_inference_job_failed(self, client, job_tracker):
-
+        """Test that updating a pending job fails with appropriate error."""
         # Wait for job to be in a modifiable state (Running or Stopped)
-        print(f"[TEST] Waiting for job to be in modifiable state...")
-        pending_id = client.inference.create(request= InferenceJobRequest(
-                    model_path="/workspace/models/Qwen/Qwen3-0.6B/",
-                    inference_framework="sglang",
-                    timeout=7200,
-                    resources=ResourceConfig(
-                        cpu="4",
-                        memory="64Gi",
-                        gpu=9,
-                        gpu_card="H100"
-                    ),
-                    name=f"pending-inference-example-{int(time.time())}",
-                    environment_variables={
-                        "MODEL_PATH": "/workspace/models/Qwen/Qwen3-0.6B/",
-                    }
-                ))
+        print(f"[TEST] Testing update on pending job...")
+        pending_id = client.inference.create(request=InferenceJobRequest(
+            model_path="/workspace/models/Qwen/Qwen3-0.6B/",
+            inference_framework="sglang",
+            timeout=7200,
+            resources=ResourceConfig(
+                cpu="4",
+                memory="64Gi",
+                gpu=9,
+                gpu_card="H100"
+            ),
+            name=f"pending-inference-example-{int(time.time())}",
+            environment_variables={
+                "MODEL_PATH": "/workspace/models/Qwen/Qwen3-0.6B/",
+            }
+        ))
         job_tracker.add(pending_id)
         try:
             # Update only the name
             updated_job = client.inference.update(
                 job_id=pending_id,
-                request= InferenceJobRequest(
+                request=InferenceJobRequest(
                     model_path="/workspace/models/Qwen/Qwen3-0.6B/",
                     inference_framework="sglang",
                     timeout=7200,
@@ -518,14 +511,14 @@ class TestUpdateInferenceJob:
             print(f"[TEST] Job updated successfully: id={updated_job.id}, name={updated_job.name}")
         except PyroMindAPIError as e:
             print(f"[ERROR] Failed to update job: {e.message} (status_code: {e.status_code})")
-            ## 校验异常信息中有 “instance`s status is pending, can not modify!”才正常，否则不行
+            # 校验异常信息中有 "instance`s status is pending, can not modify!"才正常，否则不行
             assert "instance`s status is pending, can not modify!" in e.message, f"Unexpected error message: {e.message}"
         except Exception as e:
             print(f"[ERROR] Unexpected error updating job: {type(e).__name__}: {str(e)}")
             raise
-    
+
     def test_update_inference_job_example_function(self, job_tracker):
-        """Test the update_inference_job_example function"""
+        """Test the update_inference_job_example function."""
         test_job_id = None
         for test_job_id in job_tracker:
             example = get_inference_job_example(test_job_id)
@@ -546,18 +539,14 @@ class TestUpdateInferenceJob:
         except Exception as e:
             print(f"[ERROR] Function failed: {type(e).__name__}: {str(e)}")
             raise
-        
+
         # Verify job was updated (may return None if update fails)
         if updated_job:
             assert updated_job.id == test_job_id, f"Job ID mismatch. Expected: {test_job_id}, got: {updated_job.id}"
             assert updated_job.name is not None, f"Updated job name is None for ID: {test_job_id}"
 
-
-class TestDeleteInferenceJob:
-    """Test cases for deleting inference jobs"""
-    
     def test_delete_inference_job(self, client, job_tracker):
-        """Test deleting an inference job"""
+        """Test deleting an inference job."""
         # Create a temporary job to delete
         job_id = client.inference.create(
             InferenceJobRequest(
@@ -576,13 +565,13 @@ class TestDeleteInferenceJob:
                 }
             )
         )
-        
+
         # Register job for final cleanup (in case deletion fails)
         job_tracker.add(job_id)
-        
+
         # Wait for job to be ready
         time.sleep(5)
-        
+
         # Check job status and pause if running
         try:
             job = client.inference.get_job(job_id)
@@ -593,14 +582,16 @@ class TestDeleteInferenceJob:
                 time.sleep(5)
         except Exception as e:
             print(f"[TEST] Warning: Could not check/pause job status: {type(e).__name__}: {str(e)}")
-        
+
         # Delete the job
         try:
             client.inference.delete(job_id)
+            # Remove from tracker since we successfully deleted it
+            job_tracker.discard(job_id)
         except PyroMindAPIError as e:
             # If delete fails, re-raise
             raise
-        
+
         # Verify job was deleted - wait a bit and check
         # Note: Deletion may be asynchronous, so we check status or wait for error
         time.sleep(5)
@@ -618,21 +609,21 @@ class TestDeleteInferenceJob:
         except PyroMindAPIError:
             # Good, job was deleted (raises error when getting)
             pass
-    
+
     def test_delete_inference_job_example_function(self, client, job_tracker):
-        """Test the delete_inference_job_example function"""
+        """Test the delete_inference_job_example function."""
         # Create a temporary job to delete
         job_id = create_inference_job_example()
-        
+
         if not job_id:
             pytest.skip("Cannot create job, skipping delete test")
-        
+
         # Register job for final cleanup (in case deletion fails)
         job_tracker.add(job_id)
-        
+
         # Wait for job to be ready
         time.sleep(5)
-        
+
         # Check job status and pause if running
         try:
             job = get_inference_job_example(job_id)
@@ -647,10 +638,12 @@ class TestDeleteInferenceJob:
         # Delete the job
         try:
             delete_inference_job_example(job_id)
+            # Remove from tracker since we successfully deleted it
+            job_tracker.discard(job_id)
         except Exception as e:
             # If delete fails, re-raise
             raise
-        
+
         # Verify job was deleted - wait a bit and check
         # Note: Deletion may be asynchronous
         time.sleep(5)
@@ -671,13 +664,59 @@ class TestDeleteInferenceJob:
             pass
 
 
+class TestInferenceLifecycle:
+    """Test cases for inference job lifecycle operations."""
+
+    def test_pause_running_job(self, client, job_tracker):
+        """Test pausing a running inference job."""
+        # Create a job
+        job_id = client.inference.create(
+            InferenceJobRequest(
+                model_path="/workspace/models/Qwen/Qwen3-0.6B/",
+                inference_framework="sglang",
+                timeout=3600,
+                resources=ResourceConfig(
+                    cpu="4",
+                    memory="32Gi",
+                    gpu=1,
+                    gpu_card="L40S"
+                ),
+                name=f"test-pause-{int(time.time())}",
+                environment_variables={
+                    "MODEL_PATH": "/workspace/models/Qwen/Qwen3-0.6B/",
+                }
+            )
+        )
+        job_tracker.add(job_id)
+
+        # Wait for job to be running
+        if not wait_for_instance_status(client, job_id, 'running'):
+            pytest.skip(f"Job {job_id} did not reach running status")
+
+        # Pause the job
+        print(f"[TEST] Pausing job: {job_id}")
+        try:
+            paused_job = client.inference.pause(job_id)
+            print(f"[TEST] Job paused: id={paused_job.id}, status={paused_job.status}")
+        except PyroMindAPIError as e:
+            print(f"[ERROR] Failed to pause job: {e.message} (status_code: {e.status_code})")
+            raise
+
+        # Verify job is paused/stopped
+        assert paused_job is not None
+        assert paused_job.id == job_id
+        # Job should be in stopping or stopped state after pause
+        assert paused_job.status.lower() in ['stopping', 'stopped', 'paused'], \
+            f"Expected stopping/stopped/paused status, got: {paused_job.status}"
+
+
 class TestCompleteWorkflow:
-    """Test complete workflow: create -> get -> delete"""
-    
+    """Test complete workflow: create -> get -> delete."""
+
     def test_complete_workflow(self, client, job_tracker):
-        """Test a complete workflow of inference job management"""
+        """Test a complete workflow of inference job management."""
         job_id = None
-        
+
         try:
             # Step 1: Create job
             job_id = client.inference.create(
@@ -700,17 +739,15 @@ class TestCompleteWorkflow:
             # Register job for final cleanup
             job_tracker.add(job_id)
             assert job_id is not None
-            
+
             # Step 2: Get job
             job = client.inference.get_job(job_id)
             assert job.id == job_id
-            
+
             # Step 3: Verify job details
             assert job.model_path is not None
-            # image field is optional and may be None
-            # assert job.image is not None
             assert job.status is not None
-            
+
             # Step 4: Delete job
             # Check job status and pause if running
             try:
@@ -722,9 +759,11 @@ class TestCompleteWorkflow:
                     time.sleep(5)
             except Exception as e:
                 print(f"[TEST] Warning: Could not check/pause job status: {type(e).__name__}: {str(e)}")
-            
+
             client.inference.delete(job_id)
-            
+            # Remove from tracker since we successfully deleted it
+            job_tracker.discard(job_id)
+
             # Verify deletion - wait a bit and check
             # Note: Deletion may be asynchronous
             time.sleep(5)
@@ -743,7 +782,7 @@ class TestCompleteWorkflow:
             except PyroMindAPIError:
                 # Good, job was deleted (raises error when getting)
                 pass
-            
+
         except Exception as e:
             # Clean up on error
             if job_id:
