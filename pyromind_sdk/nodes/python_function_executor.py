@@ -115,12 +115,26 @@ def build_command_template(
             value_escaped = shlex.quote(str(value))
             bash_commands.append(f"export {key}={value_escaped}")
     
-    # 3. Conda environment
+    # 3. Python environment activation (prefer micromamba, fallback to conda)
     if conda_env:
         conda_env_escaped = shlex.quote(str(conda_env))
-        # Use explicit bash -c for conda activation to ensure proper execution
-        bash_commands.append(f"source /workspace/.conda/bin/activate")
-        bash_commands.append(f"conda activate {conda_env_escaped}")
+        bash_commands.append(
+            "if [ -x /root/.local/bin/micromamba ]; then "
+            "eval \"$(/root/.local/bin/micromamba shell hook -s bash)\"; "
+            f"/root/.local/bin/micromamba activate {conda_env_escaped}; "
+            "elif command -v micromamba >/dev/null 2>&1; then "
+            "eval \"$(micromamba shell hook -s bash)\"; "
+            f"micromamba activate {conda_env_escaped}; "
+            "elif [ -f /workspace/.conda/bin/activate ]; then "
+            "source /workspace/.conda/bin/activate; "
+            f"conda activate {conda_env_escaped}; "
+            "elif command -v conda >/dev/null 2>&1; then "
+            f"conda activate {conda_env_escaped}; "
+            "else "
+            "echo 'Neither micromamba (/root/.local/bin/micromamba or PATH) nor conda is available for environment activation.' >&2; "
+            "exit 1; "
+            "fi"
+        )
         
     # 2. Working directory
     if workdir:
