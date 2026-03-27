@@ -269,6 +269,11 @@ def prepare_command_template(
         if isinstance(part, str):
             # Check if contains parameters that need processing (special parameters for Python nodes)
             if "--output-paths" in part or "--inputs" in part:
+                # If command contains heredoc syntax, avoid shlex.split(),
+                # because it will destroy newlines/structure and break heredoc delimiters.
+                if ("<<'" in part) or ('<<"' in part):
+                    command_parts.append(part)
+                    continue
                 # Use shlex.split to correctly parse command line arguments
                 try:
                     parsed_args = shlex.split(part)

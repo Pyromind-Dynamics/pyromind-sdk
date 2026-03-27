@@ -26,6 +26,37 @@ except ImportError:
     from pyromind_sdk.nodes.type_converter import convert_string_to_python_type, convert_inputs, validate_output_type
 
 
+def _read_tmp_file_if_exists(value: Any) -> Any:
+    """
+    If `value` is a string pointing to an existing `/tmp/*` file,
+    read the file content and return it. Otherwise return the original value.
+
+    This supports passing large strings (e.g. system prompts) through heredoc files,
+    avoiding shell quoting/escaping issues.
+    """
+    if not isinstance(value, str):
+        return value
+
+    if not value.startswith("/tmp/"):
+        return value
+
+    path = Path(value)
+    if not path.is_file():
+        return value
+
+    # Remove only heredoc-added trailing newline(s), preserve other whitespace.
+    return path.read_text(encoding="utf-8").rstrip("\n")
+
+
+def _resolve_inputs_from_tmp_files(obj: Any) -> Any:
+    """Recursively resolve `/tmp/*` string values into their file contents."""
+    if isinstance(obj, dict):
+        return {k: _resolve_inputs_from_tmp_files(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_resolve_inputs_from_tmp_files(v) for v in obj]
+    return _read_tmp_file_if_exists(obj)
+
+
 def load_python_module(python_file: Path):
     """
     Load Python module
@@ -115,6 +146,8 @@ def function_call_wrapper(
     func = get_function_from_module(module, function_name)
     
     # 3. Type conversion
+    # Resolve /tmp/* file indirections back into real string content.
+    inputs = _resolve_inputs_from_tmp_files(inputs)
     converted_inputs = convert_inputs(inputs, input_types)
     
     # 4. Call function
