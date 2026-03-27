@@ -120,10 +120,11 @@ def build_command_template(
         conda_env_escaped = shlex.quote(str(conda_env))
         bash_commands.append(
             "if [ -x /root/.local/bin/micromamba ]; then "
-            "eval \"$(/root/.local/bin/micromamba shell hook -s bash)\"; "
-            f"/root/.local/bin/micromamba activate {conda_env_escaped}; "
+            "export MAMBA_EXE=/root/.local/bin/micromamba; "
+            "eval \"$($MAMBA_EXE shell hook --shell bash)\"; "
+            f"micromamba activate {conda_env_escaped}; "
             "elif command -v micromamba >/dev/null 2>&1; then "
-            "eval \"$(micromamba shell hook -s bash)\"; "
+            "eval \"$(micromamba shell hook --shell bash)\"; "
             f"micromamba activate {conda_env_escaped}; "
             "elif [ -f /workspace/.conda/bin/activate ]; then "
             "source /workspace/.conda/bin/activate; "
