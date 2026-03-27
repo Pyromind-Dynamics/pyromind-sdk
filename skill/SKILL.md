@@ -7,41 +7,41 @@ description: Use the PyroMind SDK to define nodes from YAML, convert and validat
 
 Lightweight SDK for defining nodes from YAML and converting or validating PyroMind workflows.
 
-## 目录
+## Table of Contents
 
-- [快速入门](#快速入门)
-- [核心概念](#核心概念)
-- [配置](#配置)
-- [命令行工具](#命令行工具)
+- [Quick Start](#quick-start)
+- [Core Concepts](#core-concepts)
+- [Configuration](#configuration)
+- [Command Line Tools](#command-line-tools)
 - [Python API](#python-api)
-  - [基础用法](#基础用法)
-  - [数据类型定义](#数据类型定义)
-  - [错误处理](#错误处理)
-- [最佳实践](#最佳实践)
-- [端到端示例](#端到端示例)
-- [故障排除 FAQ](#故障排除-faq)
-- [附录](#附录)
+  - [Basic Usage](#basic-usage)
+  - [Data Type Definitions](#data-type-definitions)
+  - [Error Handling](#error-handling)
+- [Best Practices](#best-practices)
+- [End-to-End Examples](#end-to-end-examples)
+- [Troubleshooting FAQ](#troubleshooting-faq)
+- [Appendix](#appendix)
 
 ---
 
-## 快速入门
+## Quick Start
 
-### 5 分钟上手
+### 5-Minute Setup
 
 ```bash
-# 1. 安装 SDK
+# 1. Install SDK
 pip install pyromind-sdk
 
-# 2. 设置环境变量
+# 2. Set environment variables
 export PYROMIND_API_KEY="your_api_key_here"
 export PYROMIND_BASE_URL="https://api.pyromind.ai"
 
-# 3. 创建第一个 Jupyter 实例
+# 3. Create your first Jupyter instance
 python - << 'EOF'
 from pyromind_sdk import PyroMindAPIClient
 from pyromind_sdk.client.models import JupyterRequest, ResourceConfig
 
-client = PyroMindAPIClient()  # 自动从环境变量读取配置
+client = PyroMindAPIClient()  # Reads config from environment variables
 jupyter = client.instance.create(
     JupyterRequest(
         name="quick-start",
@@ -53,51 +53,51 @@ client.close()
 EOF
 ```
 
-### 验证安装
+### Verify Installation
 
 ```bash
-python -c "from pyromind_sdk import load_nodes_from_yaml, PyroMindAPIClient; print('安装成功!')"
+python -c "from pyromind_sdk import load_nodes_from_yaml, PyroMindAPIClient; print('Installation successful!')"
 ```
 
 ---
 
-## 核心概念
+## Core Concepts
 
-### 三种资源类型
+### Three Resource Types
 
-| 类型 | 用途 | 特点 |
-|------|------|------|
-| **Jupyter** | 交互式开发环境 | 仅需 CPU + 内存，返回访问 URL |
-| **Inference** | 模型推理服务 | 需要 GPU，支持多种框架 (vLLM, TGI, etc.) |
-| **Sandbox** | 隔离执行环境 | 支持 Linux/Windows，提供 VNC 远程桌面 |
+| Type | Purpose | Characteristics |
+|------|---------|-----------------|
+| **Jupyter** | Interactive development | CPU + memory only, returns access URL |
+| **Inference** | Model inference service | Requires GPU, supports multiple frameworks (vLLM, TGI, etc.) |
+| **Sandbox** | Isolated execution environment | Supports Linux/Windows, provides VNC remote desktop |
 
-### 工作流格式
+### Workflow Formats
 
-| 格式 | 用途 | 结构 |
-|------|------|------|
-| **Standard** | 平台/UI、API 提交 | `nodes` (列表), `links` (数组), `widgets_values` |
-| **Lite** | 编辑、AI 生成、可读性 | `nodes` 为 `{name: {type, inputs, outputs}}` |
+| Format | Use Case | Structure |
+|--------|----------|-----------|
+| **Standard** | Platform/UI, API submission | `nodes` (list), `links` (array), `widgets_values` per node |
+| **Lite** | Editing, AI generation, readability | `nodes` as `{name: {type, inputs, outputs}}`; connections in `inputs` as `{node_id, output_name}` |
 
-**转换原则**: Standard ↔️ Lite 可互相转换，Lite 格式更易于人工编辑和 AI 处理。
+**Conversion Principle**: Standard ↔️ Lite are bidirectional. Lite format is more human-readable and AI-friendly.
 
-### YAML 节点
+### YAML Nodes
 
-通过 YAML 配置文件定义工作流节点，支持自定义输入/输出参数、执行命令和 Python 函数。
+Define workflow nodes via YAML configuration files with support for custom input/output parameters, execution commands, and Python functions.
 
 ---
 
-## 配置
+## Configuration
 
-### 环境变量
+### Environment Variables
 
-| 变量 | 必需 | 说明 | 示例 |
-|------|------|------|------|
-| `PYROMIND_API_KEY` | 是 | API 认证密钥 | `sk-xxx...` |
-| `PYROMIND_BASE_URL` | 否 | API 基础 URL | `https://api.pyromind.ai` |
-| `PYROMIND_TIMEOUT` | 否 | 请求超时(秒) | `30` |
-| `PYROMIND_LOG_LEVEL` | 否 | 日志级别 | `DEBUG`, `INFO`, `WARNING` |
+| Variable | Required | Description | Example |
+|----------|----------|-------------|---------|
+| `PYROMIND_API_KEY` | Yes | API authentication key | `sk-xxx...` |
+| `PYROMIND_BASE_URL` | No | API base URL | `https://api.pyromind.ai` |
+| `PYROMIND_TIMEOUT` | No | Request timeout in seconds | `30` |
+| `PYROMIND_LOG_LEVEL` | No | Log level | `DEBUG`, `INFO`, `WARNING` |
 
-### 代理配置
+### Proxy Configuration
 
 ```python
 import os
@@ -108,24 +108,24 @@ from pyromind_sdk import PyroMindAPIClient
 client = PyroMindAPIClient()
 ```
 
-### 超时配置
+### Timeout Configuration
 
 ```python
-# 方式1: 通过环境变量
+# Method 1: via environment variable
 import os
-os.environ['PYROMIND_TIMEOUT'] = '60'  # 60秒
+os.environ['PYROMIND_TIMEOUT'] = '60'  # 60 seconds
 
-# 方式2: 通过客户端参数
+# Method 2: via client parameter
 client = PyroMindAPIClient(timeout=60)
 ```
 
 ---
 
-## 命令行工具
+## Command Line Tools
 
-> 以下脚本需要从仓库根目录运行
+> The following scripts must be run from the repository root directory
 
-### 安装开发版本
+### Install Development Version
 
 ```bash
 git clone https://github.com/PyroMind-Dynamics/pyromind-sdk.git
@@ -133,7 +133,7 @@ cd pyromind-sdk
 pip install -e ".[dev]"
 ```
 
-### 工作流转换
+### Workflow Conversion
 
 ```bash
 # Standard -> Lite
@@ -143,88 +143,88 @@ python skill/scripts/convert_workflow.py workflow.json workflow.lite.json
 python skill/scripts/convert_workflow.py --to-standard workflow.lite.json output.json
 ```
 
-### 工作流验证
+### Workflow Validation
 
 ```bash
-# 自动检测格式
+# Auto-detect format
 python skill/scripts/validate_workflow.py workflow.json
 python skill/scripts/validate_workflow.py workflow.lite.json
 
-# 强制指定格式
+# Force specific format
 python skill/scripts/validate_workflow.py --format standard workflow.json
 python skill/scripts/validate_workflow.py --format lite workflow.lite.json
 ```
 
-### 往返健康检查
+### Round-trip Health Check
 
 ```bash
-# 验证 Standard -> Lite -> Standard 转换无损
+# Verify Standard -> Lite -> Standard conversion is lossless
 python skill/scripts/roundtrip_check.py workflow.json --output regenerated.json
 ```
 
-### YAML 节点检查
+### YAML Node Inspection
 
 ```bash
-# 以 JSON 格式输出节点详情
+# Output node details in JSON format
 python skill/scripts/inspect_yaml_node.py my_node.yaml --json
 ```
 
-### API 示例脚本
+### API Example Scripts
 
 ```bash
-# 创建 Jupyter 实例
+# Create Jupyter instance
 python skill/scripts/api_examples.py --mode jupyter \
   --name demo-jupyter --cpu 2 --memory 8
 
-# 创建推理任务
+# Create inference job
 python skill/scripts/api_examples.py --mode inference \
   --name demo-inference \
   --model-path /workspace/models/qwen \
   --framework vllm \
   --cpu 4 --memory 16 --gpu 1 --gpu-card L40S
 
-# 创建沙箱环境
+# Create sandbox
 python skill/scripts/api_examples.py --mode sandbox \
   --name demo-sandbox --cpu 2 --memory 4
 ```
 
-> **安全提示**: 脚本会在创建前检查同名资源，避免重复。使用 `--allow-duplicate` 可允许重复。
+> **Safety Note**: Scripts check for existing resources with the same name before creating. Use `--allow-duplicate` to allow duplicates.
 
-### CRUD 操作示例
+### CRUD Operation Examples
 
 ```bash
-# 创建并更新 Jupyter 实例
+# Create and update Jupyter instance
 python skill/scripts/crud_examples.py --mode jupyter \
   --name demo-jupyter --updated-name demo-jupyter-v2 \
   --cpu 2 --memory 4 --updated-cpu 4 --updated-memory 8
 ```
 
-更多脚本详情: `skill/scripts/README.md`
+For more script details: `skill/scripts/README.md`
 
 ---
 
 ## Python API
 
-### 基础用法
+### Basic Usage
 
-#### YAML 节点加载
+#### Loading YAML Nodes
 
 ```python
 from pyromind_sdk import load_nodes_from_yaml, load_all_nodes_from_directory
 
-# 从单个文件加载
+# Load from single file
 nodes = load_nodes_from_yaml("my_node.yaml")
 MyNode = nodes["MyNode"]
 
-# 查看节点信息
+# View node information
 print(MyNode.DESCRIPTION)
 print(MyNode.BASE_INPUT_TYPES())
 
-# 从目录加载所有节点
+# Load all nodes from directory
 all_nodes = load_all_nodes_from_directory("./nodes/")
 ```
 
-#### 工作流转换与验证
+#### Workflow Conversion and Validation
 
 ```python
 from pyromind_sdk.client.workflow import (
@@ -235,21 +235,21 @@ from pyromind_sdk.client.workflow import (
     WorkflowLiteConverter,
 )
 
-# 格式转换
+# Format conversion
 lite = to_workflow_lite(standard_workflow)
 standard = to_workflow_standard(lite_workflow)
 
-# 验证格式
+# Validate format
 is_valid, errors = validate_standard_format(standard_workflow)
 if not is_valid:
     for error in errors:
-        print(f"错误: {error}")
+        print(f"Error: {error}")
 
-# 带节点信息的严格验证
+# Strict validation with node_info
 is_valid, errors = validate_lite_format(lite_workflow, node_info=node_info)
 ```
 
-#### 使用自定义节点信息转换
+#### Converting with Custom Node Info
 
 ```python
 from pyromind_sdk.client.workflow import WorkflowLiteConverter
@@ -259,7 +259,7 @@ lite = converter.to_lite(standard_workflow)
 standard = converter.to_standard(lite_workflow, original_workflow=original)
 ```
 
-#### 创建 Jupyter 实例
+#### Creating Jupyter Instance
 
 ```python
 from pyromind_sdk import PyroMindAPIClient
@@ -281,7 +281,7 @@ print(f"Status: {jupyter.status}")
 client.close()
 ```
 
-#### 创建推理任务
+#### Creating Inference Job
 
 ```python
 from pyromind_sdk.client.models import InferenceJobRequest, ResourceConfig
@@ -300,109 +300,109 @@ job_id = client.inference.create(
     )
 )
 
-# 获取任务状态
+# Get job status
 job = client.inference.get_job(job_id)
 print(f"Status: {job.status}")
 print(f"Endpoint: {job.endpoint_url}")
 ```
 
-#### 创建沙箱环境
+#### Creating Sandbox
 
 ```python
 from pyromind_sdk.client.models import SandboxRequest, SandboxType, ResourceConfig
 
 sandbox = client.sandboxes.create(
     SandboxRequest(
-        sandbox_type=SandboxType.LINUX,  # API 值为 "code"
+        sandbox_type=SandboxType.LINUX,  # API value: "code"
         resources=ResourceConfig(cpu="2", memory="4Gi"),
         name="my-sandbox",
     )
 )
 
-# 获取 VNC 连接
+# Get VNC connection
 vnc = client.sandboxes.get_vnc(sandbox.id)
 print(f"VNC URL: {vnc.get('web_vnc_url')}")
 ```
 
-### 数据类型定义
+### Data Type Definitions
 
 #### ResourceConfig
 
-所有资源类型通用的资源配置：
+Common resource configuration for all resource types:
 
-| 字段 | 类型 | 必需 | 适用类型 | 说明 | 示例 |
-|------|------|------|----------|------|------|
-| `cpu` | int \| str | 是 | 全部 | CPU 核心数 | `2`, `"4"` |
-| `memory` | int \| str | 是 | 全部 | 内存 (Gi) — 传 int 自动添加 `"Gi"` | `8` → `"8Gi"` |
-| `gpu` | int \| str | 否 | Inference | GPU 数量 | `1`, `"2"` |
-| `gpu_card` | str | 否 | Inference | GPU 型号 | `"L40S"`, `"H100"` |
+| Field | Type | Required | Applicable Types | Description | Example |
+|-------|------|----------|------------------|-------------|---------|
+| `cpu` | int \| str | Yes | All | Number of CPU cores | `2`, `"4"` |
+| `memory` | int \| str | Yes | All | Memory in Gi — passing int auto-appends `"Gi"` | `8` → `"8Gi"` |
+| `gpu` | int \| str | No | Inference only | Number of GPUs | `1`, `"2"` |
+| `gpu_card` | str | No | Inference only | GPU card model | `"L40S"`, `"H100"` |
 
 ```python
-# Jupyter / Sandbox — 仅需 CPU + 内存
+# Jupyter / Sandbox — CPU + memory only
 ResourceConfig(cpu="2", memory="8Gi")
 
-# Inference — 需要 CPU + 内存 + GPU
+# Inference — CPU + memory + GPU required
 ResourceConfig(cpu="4", memory="16Gi", gpu="1", gpu_card="L40S")
 
-# 简写形式（自动转换）
+# Shorthand form (auto-converts)
 ResourceConfig(cpu=2, memory=8)  # → cpu="2", memory="8Gi"
 ```
 
 #### JupyterResponse
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `id` | str | 实例 ID (格式: `jp-xxx`) |
-| `name` | str | 实例名称 |
-| `status` | str | 状态: `Running`, `Paused`, `Stopped` |
-| `url` | str | Jupyter 访问 URL |
-| `resources` | ResourceConfig | 资源配置 |
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | str | Instance ID (format: `jp-xxx`) |
+| `name` | str | Instance name |
+| `status` | str | Status: `Running`, `Paused`, `Stopped` |
+| `url` | str | Jupyter access URL |
+| `resources` | ResourceConfig | Resource configuration |
 
 #### InferenceJobResponse
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `id` | str | 任务 ID |
-| `name` | str | 任务名称 |
-| `status` | str | 状态: `Pending`, `Running`, `Completed`, `Failed` |
-| `endpoint_url` | str | 推理服务端点 URL |
-| `model_path` | str | 模型路径 |
-| `inference_framework` | str | 推理框架 |
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | str | Job ID |
+| `name` | str | Job name |
+| `status` | str | Status: `Pending`, `Running`, `Completed`, `Failed` |
+| `endpoint_url` | str | Inference service endpoint URL |
+| `model_path` | str | Model path |
+| `inference_framework` | str | Inference framework |
 
 #### SandboxResponse
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `id` | str | 沙箱 ID |
-| `name` | str | 沙箱名称 |
-| `status` | str | 状态 |
-| `sandbox_type` | SandboxType | 沙箱类型 |
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | str | Sandbox ID |
+| `name` | str | Sandbox name |
+| `status` | str | Status |
+| `sandbox_type` | SandboxType | Sandbox type |
 
-#### 实例状态枚举
+#### Instance Status Enumeration
 
-| 状态 | 说明 | 可执行操作 |
-|------|------|------------|
-| `Running` | 运行中 | pause, resume |
-| `Paused` | 已暂停 | resume, delete |
-| `Stopped` | 已停止 | delete |
-| `Pending` | 启动中 | 等待完成 |
+| Status | Description | Available Actions |
+|--------|-------------|-------------------|
+| `Running` | Running | pause, resume |
+| `Paused` | Paused | resume, delete |
+| `Stopped` | Stopped | delete |
+| `Pending` | Starting | Wait for completion |
 
-### 错误处理
+### Error Handling
 
-#### 异常类型
+#### Exception Types
 
 ```python
 from pyromind_sdk.exceptions import (
-    PyroMindAPIError,      # 基础 API 错误
-    AuthenticationError,   # 认证失败
-    ResourceNotFoundError, # 资源不存在
-    ValidationError,       # 请求验证失败
-    RateLimitError,        # 速率限制
-    TimeoutError,          # 请求超时
+    PyroMindAPIError,      # Base API error
+    AuthenticationError,   # Authentication failed
+    ResourceNotFoundError, # Resource not found
+    ValidationError,       # Request validation failed
+    RateLimitError,        # Rate limit exceeded
+    TimeoutError,          # Request timeout
 )
 ```
 
-#### 基础错误处理
+#### Basic Error Handling
 
 ```python
 from pyromind_sdk import PyroMindAPIClient
@@ -418,106 +418,106 @@ try:
             resources=ResourceConfig(cpu="2", memory="8Gi"),
         )
     )
-    print(f"创建成功: {jupyter.url}")
+    print(f"Created successfully: {jupyter.url}")
 
 except AuthenticationError as e:
-    print(f"认证失败，请检查 API Key: {e}")
+    print(f"Authentication failed, please check API Key: {e}")
 
 except ResourceNotFoundError as e:
-    print(f"资源不存在: {e}")
+    print(f"Resource not found: {e}")
 
 except ValidationError as e:
-    print(f"请求参数验证失败: {e}")
+    print(f"Request validation failed: {e}")
 
 except PyroMindAPIError as e:
-    print(f"API 错误 (状态码 {e.status_code}): {e.message}")
+    print(f"API error (status {e.status_code}): {e.message}")
 
 finally:
     client.close()
 ```
 
-#### 带重试的错误处理
+#### Error Handling with Retry
 
 ```python
 import time
 from pyromind_sdk.exceptions import RateLimitError, TimeoutError
 
 def create_with_retry(client, request, max_retries=3, delay=5):
-    """创建实例，失败时自动重试"""
+    """Create instance with automatic retry on failure"""
     for attempt in range(max_retries):
         try:
             return client.instance.create(request)
         except RateLimitError as e:
             if attempt < max_retries - 1:
-                wait_time = delay * (2 ** attempt)  # 指数退避
-                print(f"限流，等待 {wait_time} 秒后重试...")
+                wait_time = delay * (2 ** attempt)  # Exponential backoff
+                print(f"Rate limited, waiting {wait_time} seconds before retry...")
                 time.sleep(wait_time)
             else:
                 raise
         except TimeoutError:
             if attempt < max_retries - 1:
-                print(f"超时，重试 ({attempt + 1}/{max_retries})...")
+                print(f"Timeout, retrying ({attempt + 1}/{max_retries})...")
                 time.sleep(delay)
             else:
                 raise
-    raise Exception("创建失败: 超过最大重试次数")
+    raise Exception("Creation failed: max retries exceeded")
 
-# 使用
+# Usage
 jupyter = create_with_retry(client, request)
 ```
 
-#### 上下文管理器 (推荐)
+#### Context Manager (Recommended)
 
 ```python
 from pyromind_sdk import PyroMindAPIClient
 
-# 使用 with 语句自动管理连接
+# Use with statement for automatic connection management
 with PyroMindAPIClient() as client:
     jupyter = client.instance.create(request)
     print(jupyter.url)
-    # 自动关闭连接
+    # Connection automatically closed
 ```
 
 ---
 
-## 最佳实践
+## Best Practices
 
-### 实例管理
+### Instance Management
 
-#### 1. 删除前先暂停
+#### 1. Pause Before Delete
 
-删除 `Running` 状态的实例会返回 `400 Bad Request`，必须先暂停：
+Deleting a `Running` instance returns `400 Bad Request`. You must pause first:
 
 ```python
 import time
 
 def safe_delete_instance(client, instance_id):
-    """安全删除实例：先暂停，再删除"""
-    # 1. 暂停
+    """Safely delete instance: pause first, then delete"""
+    # 1. Pause
     client.instance.pause(instance_id)
 
-    # 2. 等待暂停完成
-    for _ in range(10):  # 最多等待 10 次
+    # 2. Wait for pause to complete
+    for _ in range(10):  # Max 10 attempts
         detail = client.instance.get_instance(instance_id)
         if detail.status in ["Paused", "Stopped"]:
             break
         time.sleep(2)
 
-    # 3. 删除
+    # 3. Delete
     client.instance.delete(instance_id)
-    print(f"实例 {instance_id} 已删除")
+    print(f"Instance {instance_id} deleted")
 
-# 使用
+# Usage
 safe_delete_instance(client, "jp-xxx")
 ```
 
-#### 2. 批量清理 (保留指定实例)
+#### 2. Bulk Cleanup (Keep Specific Instance)
 
 ```python
 import time
 
 def cleanup_instances(client, keep_name=None):
-    """清理所有实例，可选保留指定名称的实例"""
+    """Clean up all instances, optionally keep one by name"""
     instances = client.instance.list()
 
     to_delete = [
@@ -525,57 +525,57 @@ def cleanup_instances(client, keep_name=None):
         if keep_name is None or inst.name != keep_name
     ]
 
-    # 批量暂停
+    # Bulk pause
     for inst in to_delete:
         if inst.status == "Running":
             client.instance.pause(inst.id)
 
     time.sleep(10)
 
-    # 批量删除
+    # Bulk delete
     for inst in to_delete:
         client.instance.delete(inst.id)
-        print(f"已删除: {inst.name} ({inst.id})")
+        print(f"Deleted: {inst.name} ({inst.id})")
 
-# 使用
+# Usage
 cleanup_instances(client, keep_name="my-dev-environment")
 ```
 
-#### 3. 等待实例就绪
+#### 3. Wait for Instance Ready
 
 ```python
 import time
 
 def wait_for_running(client, instance_id, timeout=300):
-    """等待实例进入 Running 状态"""
+    """Wait for instance to reach Running status"""
     start = time.time()
     while time.time() - start < timeout:
         detail = client.instance.get_instance(instance_id)
         if detail.status == "Running":
             return detail
         elif detail.status in ["Failed", "Stopped"]:
-            raise Exception(f"实例启动失败: {detail.status}")
+            raise Exception(f"Instance startup failed: {detail.status}")
         time.sleep(5)
-    raise TimeoutError(f"等待超时: {timeout}秒")
+    raise TimeoutError(f"Wait timeout: {timeout} seconds")
 
-# 使用
+# Usage
 jupyter = client.instance.create(...)
 ready_jupyter = wait_for_running(client, jupyter.id)
-print(f"实例就绪: {ready_jupyter.url}")
+print(f"Instance ready: {ready_jupyter.url}")
 ```
 
-### 日志记录
+### Logging
 
-#### 启用调试日志
+#### Enable Debug Logging
 
 ```python
 import logging
 import os
 
-# 方式1: 环境变量
+# Method 1: via environment variable
 os.environ['PYROMIND_LOG_LEVEL'] = 'DEBUG'
 
-# 方式2: 代码配置
+# Method 2: via code configuration
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -584,10 +584,10 @@ logging.basicConfig(
 from pyromind_sdk import PyroMindAPIClient
 
 client = PyroMindAPIClient()
-# 现在所有 API 请求都会打印详细信息
+# All API requests will now print detailed information
 ```
 
-#### 自定义日志处理器
+#### Custom Log Handler
 
 ```python
 import logging
@@ -595,32 +595,32 @@ import logging
 logger = logging.getLogger('pyromind_sdk')
 logger.setLevel(logging.DEBUG)
 
-# 添加文件处理器
+# Add file handler
 file_handler = logging.FileHandler('pyromind_debug.log')
 file_handler.setLevel(logging.DEBUG)
 logger.addHandler(file_handler)
 
-# 添加控制台处理器 (仅 ERROR 及以上)
+# Add console handler (ERROR and above only)
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.ERROR)
 logger.addHandler(console_handler)
 ```
 
-### 安全建议
+### Security Recommendations
 
-1. **不要硬编码 API Key**
+1. **Don't hardcode API Keys**
 ```python
-# ❌ 错误
+# ❌ Wrong
 client = PyroMindAPIClient(api_key="sk-1234567890")
 
-# ✅ 正确
+# ✅ Correct
 import os
 client = PyroMindAPIClient(api_key=os.getenv('PYROMIND_API_KEY'))
 ```
 
-2. **使用环境变量或配置文件**
+2. **Use environment variables or config files**
 ```bash
-# ~/.env 或项目 .env 文件
+# ~/.env or project .env file
 PYROMIND_API_KEY=sk_xxx
 PYROMIND_BASE_URL=https://api.pyromind.ai
 ```
@@ -631,25 +631,25 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from pyromind_sdk import PyroMindAPIClient
-client = PyroMindAPIClient()  # 自动读取环境变量
+client = PyroMindAPIClient()  # Automatically reads environment variables
 ```
 
-3. **限制 API Key 权限** — 为不同环境使用不同的 API Key
+3. **Limit API Key permissions** — Use different API keys for different environments
 
 ---
 
-## 端到端示例
+## End-to-End Examples
 
-### 示例 1: 完整的推理任务生命周期
+### Example 1: Complete Inference Job Lifecycle
 
 ```python
 """
-完整的推理任务生命周期：
-1. 创建推理任务
-2. 等待任务就绪
-3. 获取服务端点
-4. 调用推理服务
-5. 清理资源
+Complete inference job lifecycle:
+1. Create inference job
+2. Wait for job to be ready
+3. Get service endpoint
+4. Call inference service
+5. Clean up resources
 """
 import time
 import os
@@ -658,11 +658,11 @@ from pyromind_sdk.client.models import InferenceJobRequest, ResourceConfig
 from pyromind_sdk.exceptions import PyroMindAPIError
 
 def run_inference_lifecycle():
-    """完整的推理任务生命周期管理"""
+    """Complete inference job lifecycle management"""
 
     with PyroMindAPIClient() as client:
-        # 1. 创建推理任务
-        print("创建推理任务...")
+        # 1. Create inference job
+        print("Creating inference job...")
         job_id = client.inference.create(
             InferenceJobRequest(
                 name="end-to-end-demo",
@@ -676,48 +676,48 @@ def run_inference_lifecycle():
                 ),
             )
         )
-        print(f"任务 ID: {job_id}")
+        print(f"Job ID: {job_id}")
 
-        # 2. 等待任务就绪
-        print("等待任务就绪...")
-        max_wait = 600  # 10 分钟
+        # 2. Wait for job to be ready
+        print("Waiting for job to be ready...")
+        max_wait = 600  # 10 minutes
         start = time.time()
 
         while time.time() - start < max_wait:
             job = client.inference.get_job(job_id)
-            print(f"当前状态: {job.status}")
+            print(f"Current status: {job.status}")
 
             if job.status == "Running":
-                print(f"✅ 任务就绪!")
-                print(f"推理端点: {job.endpoint_url}")
+                print(f"✅ Job ready!")
+                print(f"Inference endpoint: {job.endpoint_url}")
                 break
             elif job.status in ["Failed", "Stopped"]:
-                raise Exception(f"任务失败: {job.status}")
+                raise Exception(f"Job failed: {job.status}")
 
             time.sleep(10)
 
-        # 3. 这里可以调用推理服务 (使用 job.endpoint_url)
+        # 3. Here you can call the inference service (using job.endpoint_url)
         # ...
 
-        # 4. 清理 (生产环境可能不需要)
-        print("清理资源...")
-        # client.inference.delete(job_id)  # 如果 API 支持删除
+        # 4. Cleanup (production may not need this)
+        print("Cleaning up resources...")
+        # client.inference.delete(job_id)  # If API supports deletion
 
         return job
 
 if __name__ == "__main__":
     try:
         job = run_inference_lifecycle()
-        print(f"完成! 端点: {job.endpoint_url}")
+        print(f"Complete! Endpoint: {job.endpoint_url}")
     except PyroMindAPIError as e:
-        print(f"错误: {e}")
+        print(f"Error: {e}")
 ```
 
-### 示例 2: 工作流验证和转换
+### Example 2: Workflow Validation and Conversion
 
 ```python
 """
-工作流格式验证和转换的完整流程
+Complete workflow format validation and conversion pipeline
 """
 import json
 from pyromind_sdk.client.workflow import (
@@ -728,67 +728,67 @@ from pyromind_sdk.client.workflow import (
 )
 
 def workflow_validation_pipeline(standard_file, lite_file):
-    """工作流验证和转换管道"""
+    """Workflow validation and conversion pipeline"""
 
     print("=" * 50)
-    print("工作流验证和转换管道")
+    print("Workflow Validation and Conversion Pipeline")
     print("=" * 50)
 
-    # 1. 读取标准格式工作流
-    print(f"\n1. 读取标准格式: {standard_file}")
+    # 1. Read standard format workflow
+    print(f"\n1. Reading standard format: {standard_file}")
     with open(standard_file) as f:
         standard_workflow = json.load(f)
 
-    # 2. 验证标准格式
-    print("2. 验证标准格式...")
+    # 2. Validate standard format
+    print("2. Validating standard format...")
     is_valid, errors = validate_standard_format(standard_workflow)
     if is_valid:
-        print("   ✅ 标准格式验证通过")
+        print("   ✅ Standard format validation passed")
     else:
-        print("   ❌ 标准格式验证失败:")
+        print("   ❌ Standard format validation failed:")
         for error in errors:
             print(f"      - {error}")
         return False
 
-    # 3. 转换为 Lite 格式
-    print("3. 转换为 Lite 格式...")
+    # 3. Convert to Lite format
+    print("3. Converting to Lite format...")
     lite_workflow = to_workflow_lite(standard_workflow)
-    print(f"   ✅ 转换完成，节点数: {len(lite_workflow['nodes'])}")
+    print(f"   ✅ Conversion complete, node count: {len(lite_workflow['nodes'])}")
 
-    # 4. 验证 Lite 格式
-    print("4. 验证 Lite 格式...")
+    # 4. Validate Lite format
+    print("4. Validating Lite format...")
     is_valid, errors = validate_lite_format(lite_workflow)
     if is_valid:
-        print("   ✅ Lite 格式验证通过")
+        print("   ✅ Lite format validation passed")
     else:
-        print("   ❌ Lite 格式验证失败:")
+        print("   ❌ Lite format validation failed:")
         for error in errors:
             print(f"      - {error}")
         return False
 
-    # 5. 保存 Lite 格式
-    print(f"5. 保存 Lite 格式: {lite_file}")
+    # 5. Save Lite format
+    print(f"5. Saving Lite format: {lite_file}")
     with open(lite_file, 'w') as f:
         json.dump(lite_workflow, f, indent=2, ensure_ascii=False)
 
-    # 6. 往返转换验证
-    print("6. 往返转换验证 (Lite -> Standard)...")
+    # 6. Round-trip conversion validation
+    print("6. Round-trip validation (Lite -> Standard)...")
     regenerated = to_workflow_standard(lite_workflow)
     is_valid, errors = validate_standard_format(regenerated)
     if is_valid:
-        print("   ✅ 往返转换验证通过")
+        print("   ✅ Round-trip validation passed")
     else:
-        print("   ❌ 往返转换失败:")
+        print("   ❌ Round-trip validation failed:")
         for error in errors:
             print(f"      - {error}")
         return False
 
     print("\n" + "=" * 50)
-    print("✅ 所有验证通过!")
+    print("✅ All validations passed!")
     print("=" * 50)
     return True
 
-# 使用
+# Usage
 if __name__ == "__main__":
     workflow_validation_pipeline(
         standard_file="workflow.json",
@@ -796,11 +796,11 @@ if __name__ == "__main__":
     )
 ```
 
-### 示例 3: 批量创建和监控
+### Example 3: Batch Creation and Monitoring
 
 ```python
 """
-批量创建多个 Jupyter 实例并监控状态
+Batch create multiple Jupyter instances and monitor status
 """
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -808,12 +808,12 @@ from pyromind_sdk import PyroMindAPIClient
 from pyromind_sdk.client.models import JupyterRequest, ResourceConfig
 
 def create_and_monitor_jupyter(name_suffix):
-    """创建并监控单个 Jupyter 实例"""
+    """Create and monitor a single Jupyter instance"""
     with PyroMindAPIClient() as client:
         name = f"batch-jupyter-{name_suffix}"
 
         try:
-            # 创建
+            # Create
             jupyter = client.instance.create(
                 JupyterRequest(
                     name=name,
@@ -821,8 +821,8 @@ def create_and_monitor_jupyter(name_suffix):
                 )
             )
 
-            # 等待就绪
-            for _ in range(30):  # 最多 1 分钟
+            # Wait for ready
+            for _ in range(30):  # Max 1 minute
                 detail = client.instance.get_instance(jupyter.id)
                 if detail.status == "Running":
                     return {
@@ -839,9 +839,9 @@ def create_and_monitor_jupyter(name_suffix):
             return {"name": name, "status": "error", "error": str(e)}
 
 def batch_create_jupyters(count=3):
-    """批量创建多个 Jupyter 实例"""
+    """Batch create multiple Jupyter instances"""
 
-    print(f"开始批量创建 {count} 个 Jupyter 实例...")
+    print(f"Starting batch creation of {count} Jupyter instances...")
 
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
@@ -860,32 +860,32 @@ def batch_create_jupyters(count=3):
             if status == "success":
                 print(f"✅ {name}: {result['url']}")
             elif status == "timeout":
-                print(f"⏱️ {name}: 启动超时")
+                print(f"⏱️ {name}: Startup timeout")
             else:
                 print(f"❌ {name}: {result.get('error')}")
 
     success_count = sum(1 for r in results if r.get("status") == "success")
-    print(f"\n完成: {success_count}/{count} 成功")
+    print(f"\nComplete: {success_count}/{count} successful")
 
     return results
 
-# 使用
+# Usage
 if __name__ == "__main__":
     batch_create_jupyters(count=3)
 ```
 
-### 示例 4: YAML 节点定义与使用
+### Example 4: YAML Node Definition and Usage
 
 ```python
 """
-从 YAML 定义节点并在代码中使用
+Load nodes from YAML definitions and use them in code
 """
 from pyromind_sdk import load_nodes_from_yaml
 
-# 示例 YAML 文件: my_custom_node.yaml
+# Example YAML file: my_custom_node.yaml
 """
 name: DataProcessor
-description: "处理输入数据并生成输出"
+description: "Process input data and generate output"
 category: "Custom"
 base_class: PodExecutionNode
 command_template: ["python", "-c", "{code}"]
@@ -900,18 +900,18 @@ parameters:
 """
 
 def use_custom_node():
-    """加载和使用自定义节点"""
+    """Load and use custom nodes"""
 
-    # 1. 加载节点定义
+    # 1. Load node definitions
     nodes = load_nodes_from_yaml("my_custom_node.yaml")
     DataProcessor = nodes["DataProcessor"]
 
-    # 2. 查看节点信息
-    print(f"节点名称: {DataProcessor.name}")
-    print(f"节点描述: {DataProcessor.DESCRIPTION}")
-    print(f"输入类型: {DataProcessor.BASE_INPUT_TYPES()}")
+    # 2. View node information
+    print(f"Node name: {DataProcessor.name}")
+    print(f"Node description: {DataProcessor.DESCRIPTION}")
+    print(f"Input types: {DataProcessor.BASE_INPUT_TYPES()}")
 
-    # 3. 在工作流中使用
+    # 3. Use in workflow
     lite_workflow = {
         "nodes": {
             "processor1": {
@@ -926,89 +926,89 @@ def use_custom_node():
         "output_node": "processor1"
     }
 
-    print("工作流节点:")
+    print("Workflow nodes:")
     for name, node in lite_workflow["nodes"].items():
         print(f"  - {name}: {node['type']}")
 
     return lite_workflow
 
-# 使用
+# Usage
 if __name__ == "__main__":
     workflow = use_custom_node()
 ```
 
 ---
 
-## 故障排除 FAQ
+## Troubleshooting FAQ
 
-### Q1: 认证失败 "Unauthorized"
+### Q1: Authentication Failed "Unauthorized"
 
-**错误信息**: `401 Unauthorized` 或 `AuthenticationError`
+**Error**: `401 Unauthorized` or `AuthenticationError`
 
-**可能原因**:
-- API Key 错误或已过期
-- API Key 格式不正确
+**Possible causes**:
+- API key is incorrect or expired
+- API key format is invalid
 
-**解决方案**:
+**Solutions**:
 ```python
 import os
 
-# 检查环境变量是否设置
+# Check if environment variable is set
 api_key = os.getenv('PYROMIND_API_KEY')
 if not api_key:
-    print("请设置 PYROMIND_API_KEY 环境变量")
+    print("Please set PYROMIND_API_KEY environment variable")
 
-# 验证格式
+# Verify format
 if not api_key.startswith('sk-'):
-    print("API Key 格式可能不正确，应以 'sk-' 开头")
+    print("API key format may be incorrect, should start with 'sk-'")
 
-# 手动指定测试
+# Manual specification for testing
 from pyromind_sdk import PyroMindAPIClient
 client = PyroMindAPIClient(api_key="your_actual_key")
 ```
 
-### Q2: 删除实例失败 "400 Bad Request"
+### Q2: Instance Delete Failed "400 Bad Request"
 
-**错误信息**: `400 Bad Request` when deleting instance
+**Error**: `400 Bad Request` when deleting instance
 
-**可能原因**: 实例处于 `Running` 状态，必须先暂停
+**Possible cause**: Instance is in `Running` status, must be paused first
 
-**解决方案**:
+**Solution**:
 ```python
-# 错误方式
-client.instance.delete("jp-xxx")  # 如果是 Running 状态会失败
+# Wrong way
+client.instance.delete("jp-xxx")  # Fails if in Running status
 
-# 正确方式
+# Correct way
 client.instance.pause("jp-xxx")
-time.sleep(10)  # 等待暂停完成
+time.sleep(10)  # Wait for pause to complete
 client.instance.delete("jp-xxx")
 ```
 
-### Q3: 请求超时
+### Q3: Request Timeout
 
-**错误信息**: `TimeoutError` 或请求长时间无响应
+**Error**: `TimeoutError` or long wait without response
 
-**可能原因**:
-- 网络延迟
-- 资源正在启动中
-- API 服务负载高
+**Possible causes**:
+- Network latency
+- Resource is starting up
+- API service under high load
 
-**解决方案**:
+**Solutions**:
 ```python
-# 增加超时时间
+# Increase timeout
 from pyromind_sdk import PyroMindAPIClient
-client = PyroMindAPIClient(timeout=60)  # 60 秒
+client = PyroMindAPIClient(timeout=60)  # 60 seconds
 
-# 或使用环境变量
+# Or use environment variable
 import os
 os.environ['PYROMIND_TIMEOUT'] = '60'
 ```
 
-### Q4: 限流错误 "Rate Limit Exceeded"
+### Q4: Rate Limit Error "Rate Limit Exceeded"
 
-**错误信息**: `429 Too Many Requests` 或 `RateLimitError`
+**Error**: `429 Too Many Requests` or `RateLimitError`
 
-**解决方案**: 使用指数退避重试
+**Solution**: Use exponential backoff retry
 ```python
 import time
 
@@ -1018,69 +1018,69 @@ def create_with_backoff(client, request, max_retries=5):
             return client.instance.create(request)
         except RateLimitError:
             if attempt < max_retries - 1:
-                wait = 2 ** attempt  # 1, 2, 4, 8, 16 秒
-                print(f"限流，等待 {wait} 秒...")
+                wait = 2 ** attempt  # 1, 2, 4, 8, 16 seconds
+                print(f"Rate limited, waiting {wait} seconds...")
                 time.sleep(wait)
             else:
                 raise
 ```
 
-### Q5: 工作流验证失败
+### Q5: Workflow Validation Failed
 
-**错误信息**: `ValidationError` with field details
+**Error**: `ValidationError` with field details
 
-**常见问题**:
-- 缺少必需字段
-- 字段类型不匹配
-- 连接引用不存在
+**Common issues**:
+- Missing required fields
+- Field type mismatch
+- Connection references don't exist
 
-**调试方法**:
+**Debug approach**:
 ```python
 is_valid, errors = validate_lite_format(workflow)
 if not is_valid:
-    print("验证错误:")
+    print("Validation errors:")
     for error in errors:
         print(f"  - {error}")
 
-    # 打印工作流结构帮助调试
+    # Print workflow structure to help debugging
     import json
-    print("\n工作流结构:")
+    print("\nWorkflow structure:")
     print(json.dumps(workflow, indent=2))
 ```
 
-### Q6: 资源验证失败
+### Q6: Resource Validation Failed
 
-**错误信息**: `Invalid resource configuration`
+**Error**: `Invalid resource configuration`
 
-**常见问题**:
-- GPU 相关配置用于 Jupyter/Sandbox
-- 内存/CPU 数值超出允许范围
+**Common issues**:
+- GPU-related config used for Jupyter/Sandbox
+- Memory/CPU values out of allowed range
 
-**检查清单**:
+**Checklist**:
 ```python
-# Jupyter / Sandbox: 不应包含 gpu/gpu_card
+# Jupyter / Sandbox: should not include gpu/gpu_card
 jupyter_request = JupyterRequest(
-    resources=ResourceConfig(cpu=2, memory=8)  # ✅ 正确
+    resources=ResourceConfig(cpu=2, memory=8)  # ✅ Correct
 )
 jupyter_request = JupyterRequest(
-    resources=ResourceConfig(cpu=2, memory=8, gpu=1)  # ❌ 错误
+    resources=ResourceConfig(cpu=2, memory=8, gpu=1)  # ❌ Wrong
 )
 
-# Inference: 必须包含 gpu/gpu_card
+# Inference: must include gpu/gpu_card
 inference_request = InferenceJobRequest(
-    resources=ResourceConfig(cpu=4, memory=16, gpu=1, gpu_card="L40S")  # ✅ 正确
+    resources=ResourceConfig(cpu=4, memory=16, gpu=1, gpu_card="L40S")  # ✅ Correct
 )
 ```
 
-### Q7: 如何启用详细日志？
+### Q7: How to Enable Verbose Logging?
 
 ```python
 import logging
 
-# 启用 SDK 调试日志
+# Enable SDK debug logging
 logging.basicConfig(level=logging.DEBUG)
 
-# 或仅针对 PyroMind SDK
+# Or only for PyroMind SDK
 logger = logging.getLogger('pyromind_sdk')
 logger.setLevel(logging.DEBUG)
 handler = logging.StreamHandler()
@@ -1088,20 +1088,20 @@ handler.setLevel(logging.DEBUG)
 logger.addHandler(handler)
 ```
 
-### Q8: 实例状态一直是 Pending
+### Q8: Instance Status Stuck at Pending
 
-**可能原因**: 资源分配中，等待集群资源
+**Possible cause**: Resource allocation in progress, waiting for cluster resources
 
-**解决方案**:
+**Solution**:
 ```python
 def wait_with_timeout(client, instance_id, timeout=600):
-    """等待实例就绪，带超时"""
+    """Wait for instance ready with timeout"""
     import time
     start = time.time()
 
     while time.time() - start < timeout:
         detail = client.instance.get_instance(instance_id)
-        print(f"状态: {detail.status}")
+        print(f"Status: {detail.status}")
 
         if detail.status == "Running":
             return True
@@ -1112,43 +1112,43 @@ def wait_with_timeout(client, instance_id, timeout=600):
 
     return False
 
-# 使用
+# Usage
 if not wait_with_timeout(client, jupyter_id):
-    print("实例启动超时，请联系管理员")
+    print("Instance startup timeout, please contact administrator")
 ```
 
 ---
 
-## 附录
+## Appendix
 
-### YAML 节点格式参考
+### YAML Node Format Reference
 
 ```yaml
 name: MyCustomNode
-description: "我的自定义节点"
+description: "My custom node"
 category: "Custom"
-base_class: PodExecutionNode  # 或 GpuPodExecutionNode, JupyterLabPodExecutionNode, EndpointNode
+base_class: PodExecutionNode  # Or GpuPodExecutionNode, JupyterLabPodExecutionNode, EndpointNode
 command_template: ["sh", "-c", "echo {input}"]
 
-# 参数定义
+# Parameter definitions
 parameters:
   - name: input_text
     dtype: "STRING"      # STRING, INT, FLOAT, BOOL, MODEL, etc.
-    type: "input"        # input 或 output
-    required_type: "required"  # required 或 optional
+    type: "input"        # input or output
+    required_type: "required"  # required or optional
 
   - name: result
     dtype: "STRING"
     type: "output"
 
-# Python 函数节点 (可选)
+# Python function node (optional)
 python_code: "path/to/processor.py"
 function_name: "process_data"
 ```
 
-### 工作流格式对比
+### Workflow Format Comparison
 
-**Standard 格式** (平台内部使用):
+**Standard format** (Platform internal use):
 ```json
 {
   "nodes": [
@@ -1163,7 +1163,7 @@ function_name: "process_data"
 }
 ```
 
-**Lite 格式** (编辑/生成使用):
+**Lite format** (Editing/Generation use):
 ```json
 {
   "nodes": {
@@ -1178,14 +1178,14 @@ function_name: "process_data"
 }
 ```
 
-### 集成建议
+### Integration Notes
 
-- 提交工作流到平台: 使用 `to_workflow_standard()` 转换后提交
-- AI 生成工作流: 使用 Lite 格式生成，然后转换
-- 严格验证: 传递 `node_info` 参数进行类型检查
+- Submit workflow to platform: Use `to_workflow_standard()` to convert before submitting
+- AI-generated workflows: Generate in Lite format, then convert
+- Strict validation: Pass `node_info` parameter for type checking
 
-### 更多资源
+### Additional Resources
 
-- **API 文档**: https://api.pyromind.ai/api/v1/docs
-- **示例代码**: `pyromind_sdk/examples/`
-- **问题反馈**: https://github.com/PyroMind-Dynamics/pyromind-sdk/issues
+- **API Documentation**: https://api.pyromind.ai/api/v1/docs
+- **Example Code**: `pyromind_sdk/examples/`
+- **Issue Tracker**: https://github.com/PyroMind-Dynamics/pyromind-sdk/issues
