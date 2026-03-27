@@ -1,45 +1,45 @@
-# Issue #7: Missing Type Hints on Client Methods
+# Issue #7: 客户端方法缺少类型提示
 
-## Severity
-**HIGH** - Should fix before production release
+## 严重程度
+**高** - 生产版本发布前应修复
 
-## Locations
-- `pyromind_sdk/client/sandboxes.py:212` - `request` parameter
-- `pyromind_sdk/client/inference.py:88` - `request` parameter
-- `pyromind_sdk/client/training.py` - various parameters
-- `pyromind_sdk/client/storage.py` - various parameters
+## 位置
+- `pyromind_sdk/client/sandboxes.py:212` - `request` 参数
+- `pyromind_sdk/client/inference.py:88` - `request` 参数
+- `pyromind_sdk/client/training.py` - 各种参数
+- `pyromind_sdk/client/storage.py` - 各种参数
 
-## Description
-Public functions missing type hints reduce IDE autocomplete effectiveness, prevent type checking with mypy, and reduce code documentation value.
+## 描述
+缺少类型提示的公共函数会降低 IDE 自动完成效果，阻止使用 mypy 进行类型检查，并降低代码文档价值。
 
-## Example
+## 示例
 ```python
-# Current - Missing type hint
+# 当前 - 缺少类型提示
 def update(self, sandbox_id: str, request) -> SandboxResponse:
-    """Update a sandbox."""
-    # What type is 'request'? Users have to read implementation.
+    """更新沙盒。"""
+    # 'request' 是什么类型？用户必须阅读实现代码。
 
-# Expected - With type hint
+# 预期 - 带有类型提示
 def update(self, sandbox_id: str, request: Union[SandboxRequest, dict]) -> SandboxResponse:
-    """Update a sandbox."""
-    # Clear that request can be either SandboxRequest or dict
+    """更新沙盒。"""
+    # 明确表示 request 可以是 SandboxRequest 或 dict
 ```
 
-## Risk
-- **Poor IDE support**: Autocomplete doesn't work for parameters
-- **No type checking**: Can't use mypy to catch type errors
-- **Hidden requirements**: Users must read source to understand types
-- **Runtime errors**: Type mismatches only caught at runtime
+## 风险
+- **IDE 支持差**: 参数的自动完成不起作用
+- **无类型检查**: 无法使用 mypy 捕获类型错误
+- **隐藏要求**: 用户必须阅读源代码才能理解类型
+- **运行时错误**: 类型不匹配只能在运行时捕获
 
-## Reproduction Steps
-1. Run the validation script:
+## 复现步骤
+1. 运行验证脚本：
    ```bash
    python docs/validation/07_missing_type_hints.py
    ```
-2. Observe functions with missing type hints
+2. 观察缺少类型提示的函数
 
-## Expected Behavior
-All public functions should have complete type hints:
+## 预期行为
+所有公共函数都应有完整的类型提示：
 ```python
 from typing import Union, Optional, List, Dict, Any
 
@@ -48,27 +48,27 @@ def update(
     sandbox_id: str,
     request: Union[SandboxRequest, dict]
 ) -> SandboxResponse:
-    """Update a sandbox.
+    """更新沙盒。
 
     Args:
-        sandbox_id: The sandbox ID
-        request: Update request (SandboxRequest or dict)
+        sandbox_id: 沙盒 ID
+        request: 更新请求（SandboxRequest 或 dict）
 
     Returns:
-        SandboxResponse: Updated sandbox data
+        SandboxResponse: 更新后的沙盒数据
 
     Raises:
-        PyroMindAPIError: If update fails
+        PyroMindAPIError: 如果更新失败
     """
     ...
 ```
 
-## Impact
-- **Severity:** HIGH
-- **Affected Code:** All client modules
-- **Developer Experience:** Reduced IDE support and type safety
+## 影响
+- **严重程度:** 高
+- **受影响代码:** 所有客户端模块
+- **开发体验**: 降低 IDE 支持和类型安全性
 
-## Fix Pattern
+## 修复模式
 ```diff
 + from typing import Union
 
@@ -76,10 +76,10 @@ def update(
 + def update(self, sandbox_id: str, request: Union[SandboxRequest, dict]) -> SandboxResponse:
 ```
 
-## Validation
-After fix, run:
+## 验证
+修复后运行：
 ```bash
 python docs/validation/07_missing_type_hints.py
 mypy pyromind_sdk/client/ --ignore-missing-imports
 ```
-Expected: All public functions have type hints
+预期结果: 所有公共函数都有类型提示

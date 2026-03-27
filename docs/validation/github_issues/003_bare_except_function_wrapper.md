@@ -1,49 +1,49 @@
-# Issue #3: Bare Except Clause in nodes/function_call_wrapper.py
+# Issue #3: nodes/function_call_wrapper.py 中的裸 except 子句
 
-## Severity
-**CRITICAL** - Must fix before production release
+## 严重程度
+**严重** - 生产版本发布前必须修复
 
-## Location
-- **File:** `pyromind_sdk/nodes/function_call_wrapper.py`
-- **Line:** 246
-- **Function:** Environment variable parsing
+## 位置
+- **文件:** `pyromind_sdk/nodes/function_call_wrapper.py`
+- **行号:** 246
+- **函数:** 环境变量解析
 
-## Description
-A bare `except:` clause is used when parsing the `PYTHON_NODE_INPUTS` environment variable. Invalid JSON is silently ignored, making configuration debugging very difficult.
+## 描述
+在解析 `PYTHON_NODE_INPUTS` 环境变量时使用了裸 `except:` 子句。无效的 JSON 被静默忽略，使配置调试变得非常困难。
 
-## Code
+## 代码
 ```python
-# Line 246
+# 第 246 行
 inputs_json = os.environ.get('PYTHON_NODE_INPUTS', '{}')
 try:
     inputs.update(json.loads(inputs_json))
 except:
-    pass  # Silently ignore invalid JSON
+    pass  # 静默忽略无效的 JSON
 ```
 
-## Risk
-- **Silent failures**: Invalid JSON in environment variables is ignored
-- **No debugging information**: Users can't tell why their configuration isn't working
-- **Catches critical exceptions**: `SystemExit`, `KeyboardInterrupt`
+## 风险
+- **静默失败**: 环境变量中的无效 JSON 被忽略
+- **无调试信息**: 用户无法判断配置为何不起作用
+- **捕获关键异常**: `SystemExit`、`KeyboardInterrupt`
 
-## Reproduction Steps
-1. Run the validation script:
+## 复现步骤
+1. 运行验证脚本：
    ```bash
    python docs/validation/03_bare_except_function_wrapper.py
    ```
-2. Observe the output confirming bare except at line 246
+2. 观察输出，确认第 246 行存在裸 except
 
-## Example Scenario
+## 示例场景
 ```bash
-# User sets invalid JSON
+# 用户设置了无效的 JSON
 export PYTHON_NODE_INPUTS='{invalid json}'
 
-# Expected: Error message showing JSON parse failure
-# Actual: Silent failure, inputs treated as empty dict
+# 预期: 显示 JSON 解析失败的错误消息
+# 实际: 静默失败，输入被当作空字典处理
 ```
 
-## Expected Behavior
-Should catch specific JSON parsing exceptions and log them:
+## 预期行为
+应该捕获特定的 JSON 解析异常并记录：
 ```python
 import json
 import logging
@@ -52,20 +52,20 @@ inputs_json = os.environ.get('PYTHON_NODE_INPUTS', '{}')
 try:
     inputs.update(json.loads(inputs_json))
 except json.JSONDecodeError as e:
-    logging.debug(f"Failed to parse PYTHON_NODE_INPUTS as JSON: {e}")
-    # Continue with default inputs
+    logging.debug(f"无法将 PYTHON_NODE_INPUTS 解析为 JSON: {e}")
+    # 继续使用默认输入
 ```
 
-## Impact
-- **Severity:** CRITICAL
-- **Affected Code:** Function call wrapper, environment variable parsing
-- **User Impact:** Configuration issues are extremely difficult to debug
+## 影响
+- **严重程度:** 严重
+- **受影响代码:** 函数调用包装器、环境变量解析
+- **用户影响:** 配置问题极难调试
 
-## Related Issues
-- Issue #1: Bare except in base.py
-- Issue #2: Bare except in command_executor.py
+## 相关 Issue
+- Issue #1: base.py 中的裸 except
+- Issue #2: command_executor.py 中的裸 except
 
-## Fix
+## 修复方案
 ```diff
 + import json
 + import logging
@@ -76,12 +76,12 @@ except json.JSONDecodeError as e:
 - except:
 -     pass
 + except json.JSONDecodeError as e:
-+     logging.debug(f"Failed to parse PYTHON_NODE_INPUTS as JSON: {e}")
++     logging.debug(f"无法将 PYTHON_NODE_INPUTS 解析为 JSON: {e}")
 ```
 
-## Validation
-After fix, run:
+## 验证
+修复后运行：
 ```bash
 python docs/validation/03_bare_except_function_wrapper.py
 ```
-Expected: Exit code 0 (no issues found)
+预期结果: 退出码为 0（未发现问题）

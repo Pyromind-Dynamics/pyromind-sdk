@@ -1,63 +1,63 @@
-# Issue #1: Bare Except Clause in client/base.py
+# Issue #1: client/base.py 中的裸 except 子句
 
-## Severity
-**CRITICAL** - Must fix before production release
+## 严重程度
+**严重** - 生产版本发布前必须修复
 
-## Location
-- **File:** `pyromind_sdk/client/base.py`
-- **Line:** 170
-- **Function:** `_request()`
+## 位置
+- **文件:** `pyromind_sdk/client/base.py`
+- **行号:** 170
+- **函数:** `_request()`
 
-## Description
-A bare `except:` clause is used when parsing JSON error responses. This catches ALL exceptions including `SystemExit`, `KeyboardInterrupt`, and `GeneratorExit`, which should never be caught.
+## 描述
+在解析 JSON 错误响应时使用了裸 `except:` 子句。这会捕获**所有**异常，包括 `SystemExit`、`KeyboardInterrupt` 和 `GeneratorExit`，而这些异常绝不应该被捕获。
 
-## Code
+## 代码
 ```python
-# Line 170
+# 第 170 行
 except:
     error_data = {"message": response.text}
 ```
 
-## Risk
-- **Hides critical errors**: Unexpected exceptions are silently caught
-- **Prevents application termination**: `SystemExit` and `KeyboardInterrupt` are caught
-- **Makes debugging impossible**: No way to trace unexpected failures
+## 风险
+- **隐藏关键错误**: 意外的异常被静默捕获
+- **阻止应用退出**: `SystemExit` 和 `KeyboardInterrupt` 被捕获
+- **使调试成为不可能**: 无法追踪意外失败
 
-## Reproduction Steps
-1. Run the validation script:
+## 复现步骤
+1. 运行验证脚本：
    ```bash
    python docs/validation/01_bare_except_base.py
    ```
-2. Observe the output confirming bare except at line 170
+2. 观察输出，确认第 170 行存在裸 except
 
-## Expected Behavior
-Should catch specific exception types:
+## 预期行为
+应该捕获特定的异常类型：
 ```python
 except (json.JSONDecodeError, ValueError, AttributeError):
     error_data = {"message": response.text}
 ```
 
-## Impact
-- **Severity:** CRITICAL
-- **Affected Code:** Error handling for all API requests
-- **User Impact:** Application may become unresponsive to termination signals
+## 影响
+- **严重程度:** 严重
+- **受影响代码:** 所有 API 请求的错误处理
+- **用户影响:** 应用可能对终止信号无响应
 
-## Related Issues
-- Issue #2: Bare except in command_executor.py
-- Issue #3: Bare except in function_call_wrapper.py
+## 相关 Issue
+- Issue #2: command_executor.py 中的裸 except
+- Issue #3: function_call_wrapper.py 中的裸 except
 
-## Fix
+## 修复方案
 ```diff
 - except:
 + except (json.JSONDecodeError, ValueError, AttributeError):
       error_data = {"message": response.text}
 ```
 
-Also ensure `json` is imported at the top of the file.
+同时确保在文件顶部导入了 `json` 模块。
 
-## Validation
-After fix, run:
+## 验证
+修复后运行：
 ```bash
 python docs/validation/01_bare_except_base.py
 ```
-Expected: Exit code 0 (no issues found)
+预期结果: 退出码为 0（未发现问题）

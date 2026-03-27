@@ -1,56 +1,56 @@
-# Issue #8: Magic Numbers Without Named Constants
+# Issue #8: 未使用命名常量的魔法数字
 
-## Severity
-**MEDIUM** - Should fix for better code maintainability
+## 严重程度
+**中等** - 应修复以提高代码可维护性
 
-## Locations
-- `pyromind_sdk/client/base.py` - `500` (max error message length)
-- `pyromind_sdk/nodes/command_executor.py` - `0.1` (sleep delay), `5` (max preview lines)
+## 位置
+- `pyromind_sdk/client/base.py` - `500`（最大错误消息长度）
+- `pyromind_sdk/nodes/command_executor.py` - `0.1`（睡眠延迟）、`5`（最大预览行数）
 
-## Description
-Magic numbers are hardcoded numeric values without clear meaning. They make code harder to understand and maintain.
+## 描述
+魔法数字是没有明确含义的硬编码数值。它们使代码更难理解和维护。
 
-## Examples
+## 示例
 ```python
-# base.py:175 - Why 500?
+# base.py:175 - 为什么是 500？
 if len(msg) > 500:
     error_data["message"] = msg[:500] + "..."
 
-# command_executor.py:531 - Why 0.1?
+# command_executor.py:531 - 为什么是 0.1？
 time.sleep(0.1)
 
-# command_executor.py:198 - Why 5?
+# command_executor.py:198 - 为什么是 5？
 if len(lines) > 5:
     # ...
 ```
 
-## Risk
-- **Hard to understand**: What does `500` represent?
-- **Hard to modify**: If value needs to change, must find all occurrences
-- **Inconsistent values**: Different parts of code might use different values
+## 风险
+- **难以理解**: `500` 代表什么？
+- **难以修改**: 如果值需要更改，必须找到所有出现的位置
+- **不一致的值**: 代码的不同部分可能使用不同的值
 
-## Reproduction Steps
-1. Run the validation script:
+## 复现步骤
+1. 运行验证脚本：
    ```bash
    python docs/validation/08_magic_numbers.py
    ```
-2. Observe magic numbers in the code
+2. 观察代码中的魔法数字
 
-## Expected Behavior
-Define constants in `pyromind_sdk/common/constants.py`:
+## 预期行为
+在 `pyromind_sdk/common/constants.py` 中定义常量：
 
 ```python
-# Error handling limits
+# 错误处理限制
 MAX_ERROR_MESSAGE_LENGTH = 500
 
-# Command execution timing
-OUTPUT_FILE_READ_DELAY = 0.1  # seconds
+# 命令执行时间
+OUTPUT_FILE_READ_DELAY = 0.1  # 秒
 
-# Display limits
+# 显示限制
 MAX_PREVIEW_LINES = 5
 ```
 
-Then use them in code:
+然后在代码中使用它们：
 ```python
 # base.py
 from pyromind_sdk.common.constants import MAX_ERROR_MESSAGE_LENGTH
@@ -67,19 +67,19 @@ if len(lines) > MAX_PREVIEW_LINES:
     # ...
 ```
 
-## Impact
-- **Severity:** MEDIUM
-- **Affected Code:** Error handling, command execution
-- **Maintainability**: Code is easier to understand and modify
+## 影响
+- **严重程度:** 中等
+- **受影响代码:** 错误处理、命令执行
+- **可维护性**: 代码更易于理解和修改
 
-## Benefits
-- **Self-documenting**: `MAX_ERROR_MESSAGE_LENGTH` is clearer than `500`
-- **Single source of truth**: Change in one place affects all uses
-- **Consistency**: All code uses the same values
+## 好处
+- **自文档化**: `MAX_ERROR_MESSAGE_LENGTH` 比 `500` 更清晰
+- **单一事实来源**: 在一处更改会影响所有使用
+- **一致性**: 所有代码使用相同的值
 
-## Validation
-After fix, run:
+## 验证
+修复后运行：
 ```bash
 python docs/validation/08_magic_numbers.py
 ```
-Expected: No magic numbers found
+预期结果: 未发现魔法数字

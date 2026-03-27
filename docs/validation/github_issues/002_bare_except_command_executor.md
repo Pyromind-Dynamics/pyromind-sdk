@@ -1,77 +1,77 @@
-# Issue #2: Bare Except Clauses in nodes/command_executor.py
+# Issue #2: nodes/command_executor.py 中的多个裸 except 子句
 
-## Severity
-**CRITICAL** - Must fix before production release
+## 严重程度
+**严重** - 生产版本发布前必须修复
 
-## Location
-- **File:** `pyromind_sdk/nodes/command_executor.py`
-- **Lines:** 280, 458
-- **Functions:** `execute_command_template()`, command parsing logic
+## 位置
+- **文件:** `pyromind_sdk/nodes/command_executor.py`
+- **行号:** 280, 458
+- **函数:** `execute_command_template()`、命令解析逻辑
 
-## Description
-Multiple bare `except:` clauses in command execution logic. These catch ALL exceptions including critical ones.
+## 描述
+命令执行逻辑中存在多个裸 `except:` 子句。这些会捕获**所有**异常，包括关键异常。
 
-## Code
+## 代码
 ```python
-# Line 280 - Command parsing
+# 第 280 行 - 命令解析
 except:
     parsed_args = part.split()
 
-# Line 458 - JSON handling
+# 第 458 行 - JSON 处理
 except:
     pass
 ```
 
-## Risk
-- **Silent failures**: Errors are caught and ignored
-- **No debugging information**: Can't trace command execution failures
-- **Catches critical exceptions**: `SystemExit`, `KeyboardInterrupt`
+## 风险
+- **静默失败**: 错误被捕获并忽略
+- **无调试信息**: 无法追踪命令执行失败
+- **捕获关键异常**: `SystemExit`、`KeyboardInterrupt`
 
-## Reproduction Steps
-1. Run the validation script:
+## 复现步骤
+1. 运行验证脚本：
    ```bash
    python docs/validation/02_bare_except_command_executor.py
    ```
-2. Observe the output confirming bare except at lines 280 and 458
+2. 观察输出，确认第 280 和 458 行存在裸 except
 
-## Expected Behavior
-Line 280 should catch parsing-specific exceptions:
+## 预期行为
+第 280 行应捕获解析相关的特定异常：
 ```python
 except (ValueError, AttributeError):
     parsed_args = part.split()
 ```
 
-Line 458 should catch JSON-specific exceptions:
+第 458 行应捕获 JSON 相关的特定异常：
 ```python
 except (ValueError, KeyError, json.JSONDecodeError):
     pass
 ```
 
-## Impact
-- **Severity:** CRITICAL
-- **Affected Code:** Command execution, JSON parsing
-- **User Impact:** Node command failures are hidden, no error messages
+## 影响
+- **严重程度:** 严重
+- **受影响代码:** 命令执行、JSON 解析
+- **用户影响:** 节点命令失败被隐藏，无错误消息
 
-## Related Issues
-- Issue #1: Bare except in base.py
-- Issue #3: Bare except in function_call_wrapper.py
+## 相关 Issue
+- Issue #1: base.py 中的裸 except
+- Issue #3: function_call_wrapper.py 中的裸 except
 
-## Fix
+## 修复方案
 ```diff
-# Line 280
+# 第 280 行
 - except:
 + except (ValueError, AttributeError):
       parsed_args = part.split()
 
-# Line 458
+# 第 458 行
 - except:
 + except (ValueError, KeyError, json.JSONDecodeError):
       pass
 ```
 
-## Validation
-After fix, run:
+## 验证
+修复后运行：
 ```bash
 python docs/validation/02_bare_except_command_executor.py
 ```
-Expected: Exit code 0 (no issues found)
+预期结果: 退出码为 0（未发现问题）
