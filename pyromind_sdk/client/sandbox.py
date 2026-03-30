@@ -5,7 +5,7 @@ This module provides a client for managing sandboxes via the PyroMind API.
 """
 
 import time
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 from .base import PyroMindClient
 from .models import (
     SandboxRequest,
@@ -209,7 +209,7 @@ class SandboxClient(PyroMindClient):
         except Exception:
             return sandbox
     
-    def update(self, sandbox_id: str, request) -> SandboxResponse:
+    def update(self, sandbox_id: str, request: SandboxRequest) -> SandboxResponse:
         """
         Update a sandbox
         
@@ -220,8 +220,6 @@ class SandboxClient(PyroMindClient):
         Returns:
             SandboxResponse object
         """
-        # Import here to avoid circular dependency
-        from .models import SandboxRequest
         if not isinstance(request, SandboxRequest):
             request = SandboxRequest(**request)
         

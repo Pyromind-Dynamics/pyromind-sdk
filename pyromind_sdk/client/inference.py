@@ -85,7 +85,7 @@ class InferenceClient(PyroMindClient):
         # Backend returns the job data directly in the data field
         return InferenceJobResponse(**data)
     
-    def update(self, job_id: str, request) -> InferenceJobResponse:
+    def update(self, job_id: str, request: InferenceJobRequest) -> InferenceJobResponse:
         """
         Update an inference job
         
@@ -96,8 +96,6 @@ class InferenceClient(PyroMindClient):
         Returns:
             InferenceJobResponse object
         """
-        # Import here to avoid circular dependency
-        from .models import InferenceJobRequest
         if not isinstance(request, InferenceJobRequest):
             request = InferenceJobRequest(**request)
         
