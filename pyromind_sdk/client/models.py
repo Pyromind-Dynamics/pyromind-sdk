@@ -76,9 +76,6 @@ class SandboxType(str, Enum):
     """Sandbox type enumeration"""
     LINUX = "code"
     WINDOWS = "win"
-    MAC = "mac"
-    ANDROID = "android"
-    SEARCH = "search"
     
     @classmethod
     def from_api(cls, value: str) -> 'SandboxType':
@@ -289,7 +286,8 @@ class JupyterAPIResponse(BaseModel):
 class InferenceJobRequest(BaseModel):
     """Request model for creating an inference job"""
     model_path: str
-    inference_framework: str
+    ## inference_framework 目前只支持 sglang,加校验
+    inference_framework: Optional[str] = Field(default="sglang", pattern="^(sglang)$")
     timeout: Optional[int] = None
     resources: Optional[ResourceConfig] = None
     environment_variables: Optional[Dict[str, str]] = None
@@ -644,12 +642,8 @@ class EchoMindJobRequest(BaseModel):
         # Map common variations to valid values
         mode_mapping = {
             'openai': 'openai',
-            'gpt': 'openai',
-            'google gemini api': 'gemini',
             'gemini': 'gemini',
-            'google': 'gemini',
             'anthropic': 'anthropic',
-            'claude': 'anthropic',
         }
         
         normalized = mode_mapping.get(v_lower, v_lower)

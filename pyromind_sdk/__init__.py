@@ -24,7 +24,7 @@ from .nodes import (
 from .client import (
     PyroMindClient,
     PyroMindAPIError,
-    SandboxesClient,
+    SandboxClient,
     InstanceClient,
     InferenceClient,
     TrainingClient,
@@ -61,7 +61,7 @@ __all__ = [
     # API client functionality
     "PyroMindClient",
     "PyroMindAPIError",
-    "SandboxesClient",
+    "SandboxClient",
     "InstanceClient",
     "InferenceClient",
     "TrainingClient",

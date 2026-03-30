@@ -7,7 +7,7 @@ This module provides the main client class that integrates all resource clients.
 import os
 from typing import Optional
 from .base import PyroMindClient
-from .sandboxes import SandboxesClient
+from .sandbox import SandboxClient
 from .instance import InstanceClient
 from .inference import InferenceClient
 from .training import TrainingClient
@@ -97,7 +97,7 @@ class PyroMindAPIClient:
         )
         
         # Initialize resource clients
-        self.sandboxes = SandboxesClient(
+        self.sandboxes = SandboxClient(
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,

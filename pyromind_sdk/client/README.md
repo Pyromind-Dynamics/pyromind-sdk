@@ -507,10 +507,10 @@ except PyroMindAPIError as e:
 You can also use individual resource clients directly:
 
 ```python
-from pyromind_sdk import SandboxesClient
+from pyromind_sdk import SandboxClient
 
-sandboxes_client = SandboxesClient(api_key="your-api-key")
-sandboxes = sandboxes_client.list()
+sandbox_client = SandboxClient(api_key="your-api-key")
+sandboxes = sandbox_client.list()
 ```
 
 ### Custom base URL and timeout

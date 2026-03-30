@@ -451,10 +451,10 @@ class TestCreateSandbox:
 
     @pytest.mark.parametrize("sandbox_type", [SandboxType.WINDOWS, SandboxType.LINUX])
     def test_sandbox_resource_boundary_cpu_memory(
-        self,
-        client,
-        sandbox_tracker,
-        sandbox_type: SandboxType,
+            self,
+            client,
+            sandbox_tracker,
+            sandbox_type: SandboxType,
     ):
         """Compare resource boundary configs: 1CPU+2Gi vs 2CPU+4Gi.
 
@@ -465,6 +465,33 @@ class TestCreateSandbox:
         """
         suffix = f"{sandbox_type.value}-{int(time.time())}"
 
+        # ===================== 核心修复：LINUX 预期 422 错误 =====================
+        if sandbox_type == SandboxType.LINUX:
+            # 构造请求
+            request = SandboxRequest(
+                name=f"test-sandbox-linux-expect-fail-{suffix}",
+                sandbox_type=sandbox_type,
+                resources=ResourceConfig(cpu="2", memory="4Gi", gpu=0),
+                configuration=SandboxConfiguration(
+                    screen_resolution=ScreenResolution(width=1920, height=1080),
+                ),
+            )
+            # 预期抛出 422 错误
+            with pytest.raises(PyroMindAPIError) as excinfo:
+                client.sandboxes.create(request)
+
+            err = excinfo.value
+            print(f"[TEST] Linux 预期错误：{err.status_code} | {err.message}")
+
+            # 校验错误码 + 错误信息
+            assert err.status_code == 422, f"预期422，实际{err.status_code}"
+            assert "Input should be 'win'" in err.message, f"错误信息不正确：{err.message}"
+            assert "sandbox_type" in err.message
+
+            print("[INFO] ✅ LINUX沙箱校验通过：后端正确拒绝code类型")
+            return  # 直接结束，不继续跑
+
+        # ===================== 以下是原来的 WINDOWS 正常流程 =====================
         # Baseline: 2 CPU + 4Gi memory
         request_baseline = SandboxRequest(
             name=f"test-sandbox-boundary-2c-4g-{suffix}",

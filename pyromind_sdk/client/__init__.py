@@ -5,7 +5,7 @@ This module provides a Python client SDK for interacting with the PyroMind API v
 """
 
 from .base import PyroMindClient, PyroMindAPIError
-from .sandboxes import SandboxesClient
+from .sandbox import SandboxClient
 from .instance import InstanceClient
 from .inference import InferenceClient
 from .training import TrainingClient
@@ -20,7 +20,7 @@ from .workflow import (
 __all__ = [
     "PyroMindClient",
     "PyroMindAPIError",
-    "SandboxesClient",
+    "SandboxClient",
     "InstanceClient",
     "InferenceClient",
     "TrainingClient",

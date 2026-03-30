@@ -18,7 +18,7 @@ from .models import (
 )
 
 
-class SandboxesClient(PyroMindClient):
+class SandboxClient(PyroMindClient):
     """
     Client for managing sandboxes
     
