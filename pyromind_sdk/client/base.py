@@ -167,7 +167,7 @@ class PyroMindClient:
                 error_data = None
                 try:
                     error_data = response.json()
-                except:
+                except Exception as e:
                     error_data = {"message": response.text}
                 
                 # Avoid flooding logs with very large payloads.

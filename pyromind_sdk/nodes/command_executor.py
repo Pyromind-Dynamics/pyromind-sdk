@@ -277,7 +277,8 @@ def prepare_command_template(
                 # Use shlex.split to correctly parse command line arguments
                 try:
                     parsed_args = shlex.split(part)
-                except:
+                except Exception as e:
+                    logger.error(f"Error parsing command template: {part}")
                     parsed_args = part.split()
                 
                 # Process each argument, keep placeholders unchanged
@@ -454,7 +455,7 @@ def execute_command_template(
                         # Parse command parts, replace placeholders in special parameters
                         try:
                             parsed_args = shlex.split(part)
-                        except:
+                        except Exception as e:
                             parsed_args = part.split()
                         
                         new_parts = []

@@ -243,7 +243,8 @@ def parse_inputs_from_env() -> Dict[str, Any]:
     inputs_json = os.environ.get('PYTHON_NODE_INPUTS', '{}')
     try:
         inputs.update(json.loads(inputs_json))
-    except:
+    except Exception as e:
+        logger.error(f"Failed to parse PYTHON_NODE_INPUTS: {e}")
         pass
     
     # Method 2: Get each input from separate environment variable (higher priority)

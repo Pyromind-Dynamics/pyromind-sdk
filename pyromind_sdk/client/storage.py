@@ -518,7 +518,7 @@ class StorageClient:
                         bucket_name=bucket_name
                     )
                     results.append(result)
-                except Exception as e:
+                except ValueError as e:
                     results.append({
                         "object_name": object_name,
                         "error": str(e)
@@ -620,7 +620,12 @@ class StorageClient:
                         "local_path": str(target),
                         "size": obj.size,
                     })
-                except Exception as e:
+                except FileNotFoundError as e:
+                    results.append({
+                        "object_name": obj.object_name,
+                        "error": str(e),
+                    })
+                except ValueError as e:
                     results.append({
                         "object_name": obj.object_name,
                         "error": str(e),

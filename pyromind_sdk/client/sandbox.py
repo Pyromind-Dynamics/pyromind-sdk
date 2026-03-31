@@ -172,7 +172,7 @@ class SandboxClient(PyroMindClient):
                     return True
                 if current_status not in intermediate_statuses:
                     return False
-            except Exception:
+            except Exception as e:
                 # Transient network/API issues can happen during provisioning.
                 pass
 
@@ -206,7 +206,7 @@ class SandboxClient(PyroMindClient):
 
         try:
             return self.get_sandbox(sandbox.id)
-        except Exception:
+        except Exception as e:
             return sandbox
     
     def update(self, sandbox_id: str, request: SandboxRequest) -> SandboxResponse:
