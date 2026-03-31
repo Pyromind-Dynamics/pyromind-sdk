@@ -9,6 +9,7 @@ import os
 import requests
 from typing import Optional, Dict, Any, Union
 from requests.adapters import HTTPAdapter
+from urllib.parse import urlparse
 from urllib3.util.retry import Retry
 
 

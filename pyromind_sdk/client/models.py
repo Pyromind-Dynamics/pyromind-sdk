@@ -7,7 +7,7 @@ This module defines Pydantic models for request and response data structures.
 from typing import Optional, List, Dict, Any, Literal, Union
 from datetime import datetime, timedelta
 from enum import Enum
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # Common Models
@@ -689,3 +689,77 @@ class EchoMindJobAPIResponse(BaseModel):
 class EchoMindJobCreateAPIResponse(BaseModel):
     """Create EchoMind instance API response"""
     job_id: str
+
+
+class AvatarInfo(BaseModel):
+    """Avatar information model"""
+    filename: Optional[str] = None
+    object_path: Optional[str] = None
+    size_mb: Optional[float] = None
+    etag: Optional[str] = None
+    version_id: Optional[str] = None
+    url: Optional[str] = None
+
+
+class ProfileUserInfo(BaseModel):
+    """Profile user information model"""
+    avatar_info: Optional[AvatarInfo] = None
+    avatar_url: Optional[str] = None
+    email: Optional[str] = None
+    full_phone_num: Optional[str] = None
+    username: Optional[str] = None
+    uid: Optional[Union[str, int]] = None
+    group_id: Optional[int] = None
+    user_tier: Optional[str] = None
+    credit_amount: Optional[Union[int, float, str]] = None
+    cash_balance: Optional[str] = None
+    available_credit: Optional[str] = None
+    currency: Optional[str] = None
+    account_restricted: Optional[bool] = None
+
+
+class ProfileUserInfoResponse(BaseModel):
+    """Profile user info response model"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    is_logged_in: bool = Field(alias="isLoggedIn")
+    user: ProfileUserInfo
+
+
+class ProfileAccessKeyResponse(BaseModel):
+    """Profile access key response model"""
+    access_key: str = Field(alias="accessKey")
+
+
+class ProfileStorageInfoResponse(BaseModel):
+    """Profile storage info response model"""
+    access_key: str
+    secret_key: Optional[str] = None
+    url: Optional[str] = None
+    uid: Optional[str] = None
+
+
+class UserPubKeyRequest(BaseModel):
+    """User public key request model"""
+    name: Optional[str] = None
+    key: Optional[str] = None
+    id: Optional[int] = None
+
+
+class UserPubKey(BaseModel):
+    """User public key model"""
+    id: Optional[int] = None
+    user_id: Optional[int] = None
+    pub_key: Optional[str] = None
+    name: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    feature: Optional[Union[str, Dict[str, Any]]] = None
+    is_deleted: Optional[int] = None
+    version: Optional[int] = None
+    key_type: Optional[str] = None
+
+
+class UserPubKeyListResponse(BaseModel):
+    """User public key list response model"""
+    keys: List[UserPubKey] = Field(default_factory=list)

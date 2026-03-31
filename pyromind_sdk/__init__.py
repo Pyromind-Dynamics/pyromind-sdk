@@ -31,6 +31,7 @@ from .client import (
     StorageClient,
     PyroMindAPIClient,
     EchoMindClient,
+    ProfileClient,
 )
 
 # Export models
@@ -68,6 +69,7 @@ __all__ = [
     "StorageClient",
     "PyroMindAPIClient",
     "EchoMindClient",
+    "ProfileClient",
     # Models
     "ApiMode",
     "EchoMindJobRequest",
@@ -79,4 +81,3 @@ __all__ = [
     "to_workflow_lite",
     "to_workflow_standard",
 ]
-
