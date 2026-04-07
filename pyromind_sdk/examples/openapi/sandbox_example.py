@@ -36,8 +36,8 @@ def create_sandbox_example():
                 name=f"example-sandbox-{int(time.time())}",
                 sandbox_type=SandboxType.WINDOWS,
                 resources=ResourceConfig(
-                    cpu="2",
-                    memory="4Gi",
+                    cpu="4",
+                    memory="8Gi",
                     gpu=0
                 ),
                 configuration=SandboxConfiguration(
@@ -76,8 +76,8 @@ def update_sandbox_example(sandbox_id: str):
             request=SandboxRequest(
                 name=f"updated-sandbox-{int(time.time())}",
                 resources=ResourceConfig(
-                    cpu="4",
-                    memory="8Gi",
+                    cpu="5",
+                    memory="10Gi",
                     gpu=0
                 ),
                 configuration=SandboxConfiguration(
