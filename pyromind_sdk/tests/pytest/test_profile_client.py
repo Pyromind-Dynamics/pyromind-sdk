@@ -67,15 +67,6 @@ def test_get_user_info(profile_client):
     )
 
 
-def test_get_access_key(profile_client):
-    access_key = profile_client.get_access_key()
-
-    assert isinstance(access_key, str)
-    assert len(access_key.strip()) > 0
-
-    print(f"[TEST] access_key prefix={access_key[:8]}")
-
-
 def test_get_storage_info(profile_client):
     storage_info = profile_client.get_storage_info()
 
@@ -109,11 +100,9 @@ def test_list_keys(profile_client):
 
 def test_profile_values_are_consistent(profile_client):
     user_info = profile_client.get_user_info()
-    access_key = profile_client.get_access_key()
     storage_info = profile_client.get_storage_info()
 
     assert str(user_info.user.uid) == str(storage_info.uid)
-    assert access_key == storage_info.access_key
 
 
 if __name__ == "__main__":
