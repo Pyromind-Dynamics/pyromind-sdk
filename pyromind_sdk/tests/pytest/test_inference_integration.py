@@ -486,8 +486,8 @@ class TestUpdateInferenceJob:
                     resources=ResourceConfig(
                         cpu="4",
                         memory="64Gi",
-                        gpu=9,
-                        gpu_card="H100"
+                        gpu=1,
+                        gpu_card="L40S"
                     ),
                     name=f"pending-inference-example-{int(time.time())}",
                     environment_variables={
