@@ -405,23 +405,27 @@ class StorageClient:
             if e.code == "NoSuchKey":
                 return False
             raise ValueError(f"Failed to check file existence: {e.message}")
-    
+
     def upload_file(
-        self,
-        file_path: Union[str, Path, BinaryIO],
-        object_name: str,
-        bucket_name: Optional[str] = None,
-        content_type: Optional[str] = None
+            self,
+            file_path: Union[str, Path, BinaryIO],
+            object_name: str,
+            bucket_name: Optional[str] = None,
+            content_type: Optional[str] = None,
+            part_size: int = 0,  # 0 表示由 MinIO 自动计算（最小 5MB，最大 5GB）
+            num_parallel_uploads: int = 3  # 分块并发上传的线程数，大文件建议调大（如 5 或 10）
     ) -> Dict[str, Any]:
         """
-        Upload a file to storage
-        
+        Upload a file to storage (Automatically handles multipart upload for large files)
+
         Args:
             file_path: Local file path or file-like object to upload
             object_name: Destination object name in storage (e.g., "documents/file.txt")
             bucket_name: Bucket name (uses default if not provided)
             content_type: MIME type of the file (auto-detected if not provided)
-        
+            part_size: Size of each multipart chunk in bytes (0 for auto-calculation， Minimum 5MB, maximum 5GB)
+            num_parallel_uploads: Number of concurrent parallel uploads for chunks（default：3，big file override 5 -10）
+
         Returns:
             Dictionary containing upload result:
             - object_name: Uploaded object name
@@ -430,14 +434,14 @@ class StorageClient:
         """
         bucket = self._get_bucket(bucket_name)
         self._ensure_bucket(bucket)
-        
+
         # Handle file path or file-like object
         original_path = None
         if isinstance(file_path, (str, Path)):
             original_path = Path(file_path)
             if not original_path.exists():
                 raise FileNotFoundError(f"File not found: {original_path}")
-            
+
             file_size = original_path.stat().st_size
             file_obj = open(original_path, "rb")
             should_close = True
@@ -448,7 +452,7 @@ class StorageClient:
             file_size = file_obj.tell()
             file_obj.seek(0)  # Seek back to start
             should_close = False
-        
+
         try:
             # Auto-detect content type if not provided
             if content_type is None and original_path is not None:
@@ -456,14 +460,17 @@ class StorageClient:
                 if content_type is None:
                     content_type = DEFAULT_CONTENT_TYPE
 
+            # put_object natively handles multipart uploads
             result = self.client.put_object(
                 bucket_name=bucket,
                 object_name=object_name,
                 data=file_obj,
                 length=file_size,
-                content_type=content_type or DEFAULT_CONTENT_TYPE
+                content_type=content_type or DEFAULT_CONTENT_TYPE,
+                part_size=part_size,
+                num_parallel_uploads=num_parallel_uploads
             )
-            
+
             return {
                 "object_name": object_name,
                 "etag": result.etag,
@@ -475,47 +482,54 @@ class StorageClient:
         finally:
             if should_close:
                 file_obj.close()
-    
+
     def upload_folder(
-        self,
-        folder_path: Union[str, Path],
-        object_prefix: str = "",
-        bucket_name: Optional[str] = None
+            self,
+            folder_path: Union[str, Path],
+            object_prefix: str = "",
+            bucket_name: Optional[str] = None,
+            part_size: int = 0,
+            num_parallel_uploads: int = 3
     ) -> List[Dict[str, Any]]:
         """
         Upload a folder and all its contents recursively
-        
+
         Args:
             folder_path: Local folder path to upload
             object_prefix: Prefix for object names in storage (e.g., "backups/2024/")
             bucket_name: Bucket name (uses default if not provided)
-        
+            part_size: Size of each multipart chunk in bytes for large files
+            num_parallel_uploads: Number of concurrent parallel chunk uploads per file
+
         Returns:
             List of upload results for each file
         """
         folder_path = Path(folder_path)
         if not folder_path.is_dir():
             raise ValueError(f"Path is not a directory: {folder_path}")
-        
+
         results = []
-        
+
         # Walk through all files in the folder
         for file_path in folder_path.rglob("*"):
             if file_path.is_file():
                 # Calculate relative path from folder_path
                 relative_path = file_path.relative_to(folder_path)
-                
+
                 # Construct object name with prefix
                 if object_prefix:
                     object_name = f"{object_prefix.rstrip('/')}/{relative_path.as_posix()}"
                 else:
                     object_name = relative_path.as_posix()
-                
+
                 try:
+                    # Pass the large file configuration to upload_file
                     result = self.upload_file(
                         file_path=file_path,
                         object_name=object_name,
-                        bucket_name=bucket_name
+                        bucket_name=bucket_name,
+                        part_size=part_size,
+                        num_parallel_uploads=num_parallel_uploads
                     )
                     results.append(result)
                 except ValueError as e:
@@ -523,7 +537,7 @@ class StorageClient:
                         "object_name": object_name,
                         "error": str(e)
                     })
-        
+
         return results
     
     def download_file(
