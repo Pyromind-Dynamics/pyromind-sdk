@@ -131,3 +131,36 @@ class InferenceClient(PyroMindClient):
         data = self._extract_data(response)
         
         return InferenceJobResponse(**data)
+    
+    def get_framework(self) -> List[str]:
+        """
+        Get the list of inference frameworks
+        
+        Returns:
+            List of framework names
+        """
+        response = self.get("/inference/get_framework")
+        # API returns {success: True, data: {frameworks: [...]}, metadata: {...}} format
+        data = self._extract_data(response)
+        
+        if isinstance(data, dict) and "frameworks" in data:
+            return data["frameworks"]
+        return []
+    
+    def get_inf_image(self, framework: str) -> List[str]:
+        """
+        Get the list of inference images for a specific framework
+        
+        Args:
+            framework: The framework name to get images for
+            
+        Returns:
+            List of image names
+        """
+        response = self.get("/inference/get_inf_image", params={"framework": framework})
+        # API returns {success: True, data: {images: [...]}, metadata: {...}} format
+        data = self._extract_data(response)
+        
+        if isinstance(data, dict) and "images" in data:
+            return data["images"]
+        return []

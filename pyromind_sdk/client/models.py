@@ -284,14 +284,18 @@ class JupyterAPIResponse(BaseModel):
 
 # Inference Models
 class InferenceJobRequest(BaseModel):
-    """Request model for creating an inference job"""
+    """
+    Request model for creating an inference job
+        @inf_image 从get_inf_image 获取
+        @inference_framework 从get_framework获取
+    """
     model_path: str
-    ## inference_framework 目前只支持 sglang,加校验
-    inference_framework: Optional[str] = Field(default="sglang", pattern="^(sglang)$")
+    inference_framework: Optional[str] = None
     timeout: Optional[int] = None
     resources: Optional[ResourceConfig] = None
     environment_variables: Optional[Dict[str, str]] = None
     name: Optional[str] = None
+    inf_image: Optional[str] = None
 
 
 

@@ -25,11 +25,36 @@ def create_inference_job_example():
     client = PyroMindAPIClient()
     
     try:
+        # First, get available frameworks and images
+        print("Fetching available inference frameworks...")
+        frameworks = client.inference.get_framework()
+        if not frameworks:
+            print("✗ No inference frameworks available")
+            return None
+        
+        # Use the first available framework
+        selected_framework = frameworks[0]
+        print(f"  Available frameworks: {frameworks}")
+        print(f"  Using framework: {selected_framework}")
+        
+        # Get images for the selected framework
+        print(f"Fetching images for framework '{selected_framework}'...")
+        images = client.inference.get_inf_image(selected_framework)
+        if not images:
+            print(f"✗ No images available for framework '{selected_framework}'")
+            return None
+        
+        # Use the first available image
+        selected_image = images[0]
+        print(f"  Available images: {images}")
+        print(f"  Using image: {selected_image}")
+        
         print("Creating a new inference job...")
         job_id = client.inference.create(
             InferenceJobRequest(
                 model_path="/workspace/models/Qwen/Qwen3-0.6B/",
-                inference_framework="sglang",
+                inference_framework=selected_framework,
+                inf_image=selected_image,
                 timeout=7200,
                 resources=ResourceConfig(
                     cpu="4",
@@ -132,12 +157,37 @@ def update_inference_job_example(job_id: str):
     client = PyroMindAPIClient()
     
     try:
+        # First, get available frameworks and images
+        print("Fetching available inference frameworks...")
+        frameworks = client.inference.get_framework()
+        if not frameworks:
+            print("✗ No inference frameworks available")
+            return None
+        
+        # Use the first available framework
+        selected_framework = frameworks[0]
+        print(f"  Available frameworks: {frameworks}")
+        print(f"  Using framework: {selected_framework}")
+        
+        # Get images for the selected framework
+        print(f"Fetching images for framework '{selected_framework}'...")
+        images = client.inference.get_inf_image(selected_framework)
+        if not images:
+            print(f"✗ No images available for framework '{selected_framework}'")
+            return None
+        
+        # Use the first available image
+        selected_image = images[0]
+        print(f"  Available images: {images}")
+        print(f"  Using image: {selected_image}")
+        
         print(f"Updating inference job {job_id}...")
         updated_job = client.inference.update(
             job_id=job_id,
             request=InferenceJobRequest(
                 model_path="/workspace/models/Qwen/Qwen3-0.6B/",
-                inference_framework="sglang",
+                inference_framework=selected_framework,
+                inf_image=selected_image,
                 timeout=7200,
                 resources=ResourceConfig(
                     cpu="4",
