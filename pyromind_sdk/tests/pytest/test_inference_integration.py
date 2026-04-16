@@ -28,6 +28,22 @@ from pyromind_sdk.client.models import (
     ResourceConfig,
 )
 
+
+def skip_if_insufficient_resources(error: Exception) -> None:
+    """
+    Check if error contains INSUFFICIENT_RESOURCES and skip test if so.
+    
+    Args:
+        error: The exception to check
+        
+    Raises:
+        pytest.skip: If error contains INSUFFICIENT_RESOURCES
+    """
+    error_str = str(error).upper()
+    if "INSUFFICIENT_RESOURCES" in error_str:
+        pytest.skip(f"Skipping test due to INSUFFICIENT_RESOURCES: {error}")
+
+
 # From pyromind_sdk/tests/pytest/ to pyromind_sdk/examples/openapi/
 EXAMPLES_DIR = Path(__file__).parent.parent.parent / "examples" / "openapi"
 if str(EXAMPLES_DIR) not in sys.path:
@@ -298,6 +314,7 @@ def test_job_id(client, job_tracker):
             InferenceJobRequest(
                 name=f"test-inference-{int(time.time())}",
                 model_path="/workspace/models/Qwen/Qwen3-0.6B/",
+                model_name="glm-5",
                 inference_framework=framework,
                 inf_image=image,
                 timeout=3600,
@@ -319,6 +336,7 @@ def test_job_id(client, job_tracker):
         
     except Exception as e:
         print(f"[ERROR] Failed to create test job in fixture: {type(e).__name__}: {str(e)}")
+        skip_if_insufficient_resources(e)
         raise
     finally:
         # Clean up: delete the test job
@@ -355,6 +373,7 @@ class TestListInferenceJobs:
             print(f"[TEST] Retrieved {len(jobs)} job(s)")
         except Exception as e:
             print(f"[ERROR] Failed to list jobs: {type(e).__name__}: {str(e)}")
+            skip_if_insufficient_resources(e)
             raise
         
         # Should return a list (may be empty)
@@ -397,6 +416,7 @@ class TestCreateInferenceJob:
             job_id = client.inference.create(
                 InferenceJobRequest(
                     model_path="/workspace/models/Qwen/Qwen3-0.6B/",
+                    model_name="glm-5",
                     inference_framework=framework,
                     inf_image=image,
                     timeout=7200,
@@ -419,9 +439,11 @@ class TestCreateInferenceJob:
             print(f"[ERROR] Failed to create job: {e.message} (status_code: {e.status_code})")
             if e.response:
                 print(f"[ERROR] Error response: {e.response}")
+            skip_if_insufficient_resources(e)
             raise
         except Exception as e:
             print(f"[ERROR] Unexpected error creating job: {type(e).__name__}: {str(e)}")
+            skip_if_insufficient_resources(e)
             raise
         
         # Verify job was created
@@ -464,9 +486,11 @@ class TestGetInferenceJob:
             print(f"[ERROR] Failed to get job: {e.message} (status_code: {e.status_code})")
             if e.response:
                 print(f"[ERROR] Error response: {e.response}")
+            skip_if_insufficient_resources(e)
             raise
         except Exception as e:
             print(f"[ERROR] Unexpected error getting job: {type(e).__name__}: {str(e)}")
+            skip_if_insufficient_resources(e)
             raise
         
         # Verify job details
@@ -486,6 +510,7 @@ class TestGetInferenceJob:
             print(f"[TEST] Function returned job: id={job.id if job else None}, name={job.name if job else None}, status={job.status if job else None}")
         except Exception as e:
             print(f"[ERROR] Function failed: {type(e).__name__}: {str(e)}")
+            skip_if_insufficient_resources(e)
             raise
         
         # Verify job details
@@ -523,6 +548,7 @@ class TestUpdateInferenceJob:
         print(f"[TEST] Using framework: {framework}, image: {image}")
         pending_id = client.inference.create(request= InferenceJobRequest(
                     model_path="/workspace/models/Qwen/Qwen3-0.6B/",
+                    model_name="glm-5",
                     inference_framework=framework,
                     inf_image=image,
                     timeout=7200,
@@ -544,6 +570,7 @@ class TestUpdateInferenceJob:
                 job_id=pending_id,
                 request= InferenceJobRequest(
                     model_path="/workspace/models/Qwen/Qwen3-0.6B/",
+                    model_name="glm-5",
                     inference_framework=framework,
                     image=image,
                     timeout=7200,
@@ -566,6 +593,7 @@ class TestUpdateInferenceJob:
             assert "instance`s status is pending, can not modify!" in e.message, f"Unexpected error message: {e.message}"
         except Exception as e:
             print(f"[ERROR] Unexpected error updating job: {type(e).__name__}: {str(e)}")
+            skip_if_insufficient_resources(e)
             raise
     
     def test_update_inference_job_example_function(self, job_tracker):
@@ -589,6 +617,7 @@ class TestUpdateInferenceJob:
             print(f"[TEST] Function returned updated job: id={updated_job.id if updated_job else None}, name={updated_job.name if updated_job else None}")
         except Exception as e:
             print(f"[ERROR] Function failed: {type(e).__name__}: {str(e)}")
+            skip_if_insufficient_resources(e)
             raise
         
         # Verify job was updated (may return None if update fails)
@@ -613,6 +642,7 @@ class TestDeleteInferenceJob:
         job_id = client.inference.create(
             InferenceJobRequest(
                 model_path="/workspace/models/Qwen/Qwen3-0.6B/",
+                model_name="glm-5",
                 inference_framework=framework,
                 inf_image=image,
                 timeout=3600,
@@ -742,6 +772,7 @@ class TestCompleteWorkflow:
             job_id = client.inference.create(
                 InferenceJobRequest(
                     model_path="/workspace/models/Qwen/Qwen3-0.6B/",
+                    model_name="glm-5",
                     inference_framework=framework,
                     inf_image=image,
                     timeout=3600,
@@ -825,6 +856,7 @@ class TestGetFrameworkAndImages:
             print(f"[TEST] Retrieved {len(frameworks)} framework(s): {frameworks}")
         except Exception as e:
             print(f"[ERROR] Failed to get frameworks: {type(e).__name__}: {str(e)}")
+            skip_if_insufficient_resources(e)
             raise
         
         # Should return a list (may be empty)
@@ -844,6 +876,7 @@ class TestGetFrameworkAndImages:
             print(f"[TEST] Retrieved {len(frameworks)} framework(s): {frameworks}")
         except Exception as e:
             print(f"[ERROR] Failed to get frameworks: {type(e).__name__}: {str(e)}")
+            skip_if_insufficient_resources(e)
             raise
         
         # If no frameworks available, skip this test
@@ -859,6 +892,7 @@ class TestGetFrameworkAndImages:
             print(f"[TEST] Retrieved {len(images)} image(s) for framework '{framework}': {images}")
         except Exception as e:
             print(f"[ERROR] Failed to get images for framework '{framework}': {type(e).__name__}: {str(e)}")
+            skip_if_insufficient_resources(e)
             raise
         
         # Should return a list (may be empty)
@@ -879,6 +913,7 @@ class TestGetFrameworkAndImages:
             print(f"[TEST] Retrieved {len(images)} image(s) for invalid framework: {images}")
         except Exception as e:
             print(f"[ERROR] Failed to get images for invalid framework: {type(e).__name__}: {str(e)}")
+            skip_if_insufficient_resources(e)
             raise
         
         # Should return an empty list for invalid framework

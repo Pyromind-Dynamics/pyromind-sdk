@@ -296,6 +296,8 @@ class InferenceJobRequest(BaseModel):
     environment_variables: Optional[Dict[str, str]] = None
     name: Optional[str] = None
     inf_image: Optional[str] = None
+    model_name: Optional[str] = None
+    model_length: Optional[int] = None
 
 
 
@@ -312,6 +314,8 @@ class InferenceJobResponse(BaseModel):
     endpoint_url: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    model_name: Optional[str] = None
+    model_length: Optional[int] = None
 
 
 class InferenceJobListAPIResponse(BaseModel):

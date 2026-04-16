@@ -53,6 +53,7 @@ def create_inference_job_example():
         job_id = client.inference.create(
             InferenceJobRequest(
                 model_path="/workspace/models/Qwen/Qwen3-0.6B/",
+                model_name="glm-5",
                 inference_framework=selected_framework,
                 inf_image=selected_image,
                 timeout=7200,
@@ -186,6 +187,7 @@ def update_inference_job_example(job_id: str):
             job_id=job_id,
             request=InferenceJobRequest(
                 model_path="/workspace/models/Qwen/Qwen3-0.6B/",
+                model_name="glm-5",
                 inference_framework=selected_framework,
                 inf_image=selected_image,
                 timeout=7200,

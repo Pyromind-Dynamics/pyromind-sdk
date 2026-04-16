@@ -59,4 +59,7 @@ norecursedirs = []
 testpaths = ["pyromind_sdk/tests"]
 # Exclude test_yaml_nodes.py specifically
 python_functions = ["test_*"]
+# Asyncio configuration for async tests (use STRICT mode to avoid auto-detection)
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
 
