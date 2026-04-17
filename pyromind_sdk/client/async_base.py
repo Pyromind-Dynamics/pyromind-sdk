@@ -6,6 +6,7 @@ HTTP requests, and error handling for all async API clients.
 """
 
 import os
+import logging
 import aiohttp
 from typing import Optional, Dict, Any
 
@@ -16,9 +17,24 @@ DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_RETRIES = 3
 ENV_API_KEY = "PYROMIND_API_KEY"
 ENV_BASE_URL = "PYROMIND_BASE_URL"
+ENV_LOG_FORMAT = "PYROMIND_LOG_FORMAT"
 RETRY_STATUS_CODES = [500, 502, 503, 504]
 
 ERROR_MESSAGE_MAX_LENGTH = 500
+
+# Default log format
+DEFAULT_LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+
+# Configure logger (always enabled)
+logger = logging.getLogger("pyromind_sdk.async")
+logger.setLevel(logging.INFO)
+
+# Configure handler with format from environment variable or default
+_log_format = os.getenv(ENV_LOG_FORMAT, DEFAULT_LOG_FORMAT)
+_handler = logging.StreamHandler()
+_handler.setLevel(logging.INFO)
+_handler.setFormatter(logging.Formatter(_log_format))
+logger.addHandler(_handler)
 
 
 class PyroMindAsyncAPIError(Exception):
@@ -285,6 +301,10 @@ class PyroMindAsyncClient:
         error_data = self._truncate_error_message(error_data)
         error_message = self._format_error_message(response, error_data)
 
+        # Log error (single line)
+        safe_error_data = self._mask_sensitive_data(error_data)
+        logger.error(f"[ERROR] {request_context} - Status: {response.status} | message: {error_message} | response: {safe_error_data}")
+
         raise PyroMindAsyncAPIError(
             message=f"{request_context} failed: {error_message}",
             status_code=response.status,
@@ -321,6 +341,17 @@ class PyroMindAsyncClient:
         request_context = self._build_request_context(method, url)
         session = await self._get_session()
 
+        # Log request
+        logger.info(f"[REQUEST] {request_context}")
+        if params:
+            logger.info(f"[REQUEST] params: {params}")
+        if json_data:
+            safe_json = self._mask_sensitive_data(json_data)
+            logger.info(f"[REQUEST] body: {safe_json}")
+        # Log request headers (mask authorization)
+        safe_headers = {k: '***' if k.lower() == 'authorization' else v for k, v in session.headers.items()}
+        logger.info(f"[REQUEST] headers: {safe_headers}")
+
         last_exception = None
         for attempt in range(self.max_retries):
             try:
@@ -331,6 +362,16 @@ class PyroMindAsyncClient:
                     json=json_data,
                     **kwargs
                 ) as response:
+                    # Log response
+                    logger.info(f"[RESPONSE] {request_context} - Status: {response.status}")
+                    try:
+                        if response.content:
+                            resp_json = await response.json()
+                            safe_resp = self._mask_sensitive_data(resp_json)
+                            logger.info(f"[RESPONSE] body: {safe_resp}")
+                    except Exception:
+                        logger.info(f"[RESPONSE] body: <non-JSON content>")
+
                     # Handle non-2xx responses
                     if not response.ok:
                         await self._handle_error_response(response, request_context)
@@ -342,6 +383,8 @@ class PyroMindAsyncClient:
 
             except aiohttp.ClientError as e:
                 last_exception = e
+                # Log exception
+                logger.error(f"[ERROR] {request_context} - {type(e).__name__}: {str(e)} (attempt {attempt + 1}/{self.max_retries})")
                 if attempt < self.max_retries - 1:
                     import asyncio
                     await asyncio.sleep(1 ** attempt)  # Exponential backoff
@@ -352,10 +395,38 @@ class PyroMindAsyncClient:
                 )
 
         # If we get here, all retries failed
+        logger.error(f"[ERROR] {request_context} - All {self.max_retries} retries failed")
         raise PyroMindAsyncAPIError(
             message=f"{request_context} request failed after {self.max_retries} retries: {str(last_exception)}",
             status_code=None
         )
+    
+    def _mask_sensitive_data(self, data: Any, mask: str = "***") -> Any:
+        """
+        Mask sensitive data in logs
+        
+        Args:
+            data: Data to mask
+            mask: Mask string to use
+            
+        Returns:
+            Data with sensitive fields masked
+        """
+        sensitive_keys = {'password', 'api_key', 'apikey', 'token', 'secret', 'authorization'}
+        
+        if isinstance(data, dict):
+            masked = {}
+            for key, value in data.items():
+                if key.lower() in sensitive_keys:
+                    masked[key] = mask
+                elif isinstance(value, (dict, list)):
+                    masked[key] = self._mask_sensitive_data(value, mask)
+                else:
+                    masked[key] = value
+            return masked
+        elif isinstance(data, list):
+            return [self._mask_sensitive_data(item, mask) for item in data]
+        return data
 
     async def get(self, endpoint: str, params: Optional[Dict[str, Any]] = None, **kwargs) -> Dict[str, Any]:
         """Make an async GET request"""

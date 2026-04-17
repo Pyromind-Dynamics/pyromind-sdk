@@ -6,6 +6,7 @@ HTTP requests, and error handling for all API clients.
 """
 
 import os
+import logging
 import requests
 from typing import Optional, Dict, Any, Union
 from requests.adapters import HTTPAdapter
@@ -19,10 +20,25 @@ DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_RETRIES = 3
 ENV_API_KEY = "PYROMIND_API_KEY"
 ENV_BASE_URL = "PYROMIND_BASE_URL"
+ENV_LOG_FORMAT = "PYROMIND_LOG_FORMAT"
 RETRY_STATUS_CODES = [500, 502, 503, 504]
 RETRY_ALLOWED_METHODS = ["GET", "POST", "PUT", "DELETE"]
 
 ERROR_MESSAGE_MAX_LENGTH = 500
+
+# Default log format
+DEFAULT_LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+
+# Configure logger (always enabled)
+logger = logging.getLogger("pyromind_sdk")
+logger.setLevel(logging.INFO)
+
+# Configure handler with format from environment variable or default
+_log_format = os.getenv(ENV_LOG_FORMAT, DEFAULT_LOG_FORMAT)
+_handler = logging.StreamHandler()
+_handler.setLevel(logging.INFO)
+_handler.setFormatter(logging.Formatter(_log_format))
+logger.addHandler(_handler)
 
 
 class PyroMindAPIError(Exception):
@@ -292,6 +308,10 @@ class PyroMindClient:
         error_data = self._truncate_error_message(error_data)
         error_message = self._format_error_message(response, error_data)
         
+        # Log error (single line)
+        safe_error_data = self._mask_sensitive_data(error_data)
+        logger.error(f"[ERROR] {request_context} - Status: {response.status_code} | message: {error_message} | response: {safe_error_data}")
+        
         raise PyroMindAPIError(
             message=f"{request_context} failed: {error_message}",
             status_code=response.status_code,
@@ -327,6 +347,17 @@ class PyroMindClient:
         url = self._build_url(endpoint)
         request_context = self._build_request_context(method, url)
         
+        # Log request (single line with all info)
+        safe_headers = {k: '***' if k.lower() == 'authorization' else v for k, v in self.session.headers.items()}
+        safe_json = self._mask_sensitive_data(json_data) if json_data else None
+        log_parts = [f"[REQUEST] {request_context}"]
+        if params:
+            log_parts.append(f"params={params}")
+        log_parts.append(f"headers={safe_headers}")
+        if safe_json:
+            log_parts.append(f"body={safe_json}")
+        logger.info(" | ".join(log_parts))
+        
         try:
             response = self.session.request(
                 method=method,
@@ -336,6 +367,17 @@ class PyroMindClient:
                 timeout=self.timeout,
                 **kwargs
             )
+            
+            # Log response (single line)
+            resp_log = f"[RESPONSE] {request_context} - Status: {response.status_code}"
+            try:
+                if response.content:
+                    resp_json = response.json()
+                    safe_resp = self._mask_sensitive_data(resp_json)
+                    resp_log += f" | body={safe_resp}"
+            except Exception:
+                pass
+            logger.info(resp_log)
             
             # Handle non-2xx responses
             if not response.ok:
@@ -347,10 +389,39 @@ class PyroMindClient:
             return {}
 
         except requests.exceptions.RequestException as e:
+            # Log exception
+            logger.error(f"[ERROR] {request_context} - {type(e).__name__}: {str(e)}")
             raise PyroMindAPIError(
                 message=f"{request_context} request failed: {type(e).__name__}: {str(e)}",
                 status_code=None
             )
+    
+    def _mask_sensitive_data(self, data: Any, mask: str = "***") -> Any:
+        """
+        Mask sensitive data in logs
+        
+        Args:
+            data: Data to mask
+            mask: Mask string to use
+            
+        Returns:
+            Data with sensitive fields masked
+        """
+        sensitive_keys = {'password', 'api_key', 'apikey', 'token', 'secret', 'authorization'}
+        
+        if isinstance(data, dict):
+            masked = {}
+            for key, value in data.items():
+                if key.lower() in sensitive_keys:
+                    masked[key] = mask
+                elif isinstance(value, (dict, list)):
+                    masked[key] = self._mask_sensitive_data(value, mask)
+                else:
+                    masked[key] = value
+            return masked
+        elif isinstance(data, list):
+            return [self._mask_sensitive_data(item, mask) for item in data]
+        return data
     
     def get(self, endpoint: str, params: Optional[Dict[str, Any]] = None, **kwargs) -> Dict[str, Any]:
         """Make a GET request"""
