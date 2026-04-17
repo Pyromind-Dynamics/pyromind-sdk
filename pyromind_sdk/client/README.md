@@ -119,6 +119,41 @@ action = client.sandboxes.execute_action(
 print(f"Action status: {action.result.status}")
 ```
 
+### Execute batch actions
+
+```python
+from pyromind_sdk.client.models import BatchActionRequest, ActionRequest, ActionParameters
+
+batch_request = BatchActionRequest(
+    actions=[
+        ActionRequest(
+            action="run_command",
+            parameters=ActionParameters(command="echo 'Command 1'")
+        ),
+        ActionRequest(
+            action="run_command",
+            parameters=ActionParameters(command="echo 'Command 2'")
+        ),
+    ]
+)
+
+batch_response = client.sandboxes.execute_batch_action(
+    sandbox_id="sandbox-id",
+    request=batch_request
+)
+
+for action in batch_response.actions:
+    print(f"Action: {action.action}, Status: {action.status}")
+```
+
+### Get VNC connection info
+
+```python
+vnc_info = client.sandboxes.get_vnc(sandbox_id="sandbox-id")
+print(f"Web VNC URL: {vnc_info.web_vnc_url}")
+print(f"Password: {vnc_info.password}")
+```
+
 ### Delete a sandbox
 
 ```python
@@ -487,6 +522,140 @@ if result["errors"]:
         print(f"  Error: {err}")
 ```
 
+## EchoMind
+
+### List all EchoMind instances
+
+```python
+jobs = client.echomind.list()
+for job in jobs:
+    print(f"EchoMind: {job.name} - Status: {job.status}")
+```
+
+### Create an EchoMind instance
+
+```python
+from pyromind_sdk.client.models import EchoMindJobRequest, ApiMode
+
+job = client.echomind.create(
+    EchoMindJobRequest(
+        name="my-echomind",
+        api_url="https://api.openai.com/v1",
+        api_mode=ApiMode.OPENAI,
+        origin_model="gpt-4",
+        access_key="your-access-key",
+        training_model="gpt-3.5-turbo",
+        training_batch_size=10,
+        trajectory_buffer_size=100,
+        time_per_round=60.0,
+        training_round=5,
+        training_save_path="/models/echomind",
+        resources=ResourceConfig(cpu="4", memory="8Gi", gpu=1)
+    )
+)
+print(f"Created EchoMind job: {job}")
+```
+
+### Get an EchoMind instance
+
+```python
+job = client.echomind.get_job(job_id="job-id")
+print(f"Job status: {job.status}")
+```
+
+### Update an EchoMind instance
+
+```python
+updated = client.echomind.update(
+    job_id="job-id",
+    request=EchoMindJobRequest(
+        name="updated-echomind",
+        api_url="https://api.openai.com/v1",
+        api_mode=ApiMode.OPENAI,
+        origin_model="gpt-4",
+        access_key="your-access-key",
+        training_model="gpt-3.5-turbo",
+        training_batch_size=20,
+        trajectory_buffer_size=200,
+        time_per_round=60.0,
+        training_round=10,
+        training_save_path="/models/echomind"
+    )
+)
+```
+
+### Pause/Resume an EchoMind instance
+
+```python
+# Pause
+client.echomind.pause(job_id="job-id")
+
+# Resume
+client.echomind.resume(job_id="job-id")
+```
+
+### Delete an EchoMind instance
+
+```python
+client.echomind.delete(job_id="job-id")
+```
+
+## User Profile
+
+### Get user information
+
+```python
+from pyromind_sdk import ProfileClient
+
+profile_client = ProfileClient(api_key="your-api-key")
+
+# Get basic user information
+user_info = profile_client.get_user_info()
+print(f"Username: {user_info.user.username}")
+print(f"Email: {user_info.user.email}")
+print(f"UID: {user_info.user.uid}")
+
+# Get with credit information
+user_info_with_credit = profile_client.get_user_info(credit_info=True)
+print(f"Credit Amount: {user_info_with_credit.user.credit_amount}")
+print(f"Cash Balance: {user_info_with_credit.user.cash_balance}")
+```
+
+### Get access key
+
+```python
+access_key = profile_client.get_access_key()
+print(f"Access Key: {access_key}")
+```
+
+### Get storage information
+
+```python
+storage_info = profile_client.get_storage_info()
+print(f"Access Key: {storage_info.access_key}")
+print(f"Secret Key: {storage_info.secret_key}")
+print(f"URL: {storage_info.url}")
+```
+
+### Manage SSH public keys
+
+```python
+from pyromind_sdk.client.models import UserPubKeyRequest
+
+# Add SSH public key
+profile_client.add_key(
+    UserPubKeyRequest(
+        name="my-key",
+        key="ssh-rsa AAAAB3NzaC1..."
+    )
+)
+
+# List all SSH public keys
+keys = profile_client.list_keys()
+for key in keys:
+    print(f"Key: {key.name}, ID: {key.id}")
+```
+
 ## Error Handling
 
 ```python
@@ -532,6 +701,178 @@ client = PyroMindAPIClient(
 )
 ```
 
+## Workflow Validation
+
+The SDK provides workflow validation functionality, supporting both standard and lite formats.
+
+### Validate Workflow
+
+```python
+from pyromind_sdk.client.workflow import validate_workflow, ValidationError
+
+# Validate workflow (auto-detect format)
+try:
+    result = validate_workflow(workflow_data)
+    print(f"Valid: {result.is_valid}")
+    if not result.is_valid:
+        for error in result.errors:
+            print(f"Error: {error}")
+except ValidationError as e:
+    print(f"Validation error: {e}")
+```
+
+### Validate Specific Format
+
+```python
+from pyromind_sdk.client.workflow import (
+    validate_lite_format,
+    validate_standard_format,
+    validate_workflow_lite,
+    validate_workflow_standard,
+    validate_workflow_legacy,
+)
+
+# Validate lite format
+result = validate_lite_format(workflow_data)
+
+# Validate standard format
+result = validate_standard_format(workflow_data)
+
+# Validate lite workflow
+result = validate_workflow_lite(workflow_data)
+
+# Validate standard workflow
+result = validate_workflow_standard(workflow_data)
+
+# Validate legacy format
+result = validate_workflow_legacy(workflow_data)
+```
+
+### Workflow Format Conversion
+
+```python
+from pyromind_sdk.client.workflow import (
+    to_workflow_lite,
+    to_workflow_standard,
+    WorkflowLiteConverter,
+    LayoutGenerator,
+)
+
+# Convert standard workflow to lite format
+lite_workflow = to_workflow_lite(standard_workflow)
+
+# Convert lite workflow to standard format
+standard_workflow = to_workflow_standard(lite_workflow)
+
+# Use converter
+converter = WorkflowLiteConverter()
+converted = converter.to_lite(standard_workflow)
+
+# Use layout generator
+layout_gen = LayoutGenerator()
+layout_workflow = layout_gen.generate(workflow_data)
+```
+
+## Async Clients
+
+The SDK also provides async versions of clients, supporting async operations:
+
+```python
+import asyncio
+from pyromind_sdk import PyroMindAsyncAPIClient
+
+async def main():
+    async with PyroMindAsyncAPIClient(api_key="your-api-key") as client:
+        # List sandboxes
+        sandboxes = await client.sandboxes.list()
+        
+        # Create sandbox
+        sandbox = await client.sandboxes.create(
+            SandboxRequest(
+                name="my-sandbox",
+                sandbox_type=SandboxType.LINUX,
+                resources=ResourceConfig(cpu="2", memory="4Gi")
+            )
+        )
+        
+        # Get Jupyter instance
+        instance = await client.instance.get_instance(jupyter_id="jupyter-id")
+        
+        # Create training task
+        job = await client.training.create(
+            TrainingTaskCreateRequest(
+                name="my-training",
+                framework=TrainingFramework.verl,
+                workflow={}
+            )
+        )
+
+asyncio.run(main())
+```
+
+### Async Client List
+
+- `PyroMindAsyncAPIClient`: Async main client
+- `PyroMindAsyncClient`: Async base client
+- `AsyncSandboxClient`: Async sandbox client
+- `AsyncInstanceClient`: Async instance client
+- `AsyncInferenceClient`: Async inference client
+- `AsyncTrainingClient`: Async training client
+- `AsyncEchoMindClient`: Async EchoMind client
+- `PyroMindAsyncAPIError`: Async API error exception
+
 ## API Reference
 
 For detailed API documentation, see [PyroMind API v1 Docs](https://pyromind.ai/api/v1/docs).
+
+## Data Models
+
+### Common Models
+
+- `ResourceConfig`: Resource configuration (CPU, memory, GPU)
+- `APIResponse`: Base API response model
+
+### Sandbox Models
+
+- `SandboxType`: Sandbox type enum (LINUX, WINDOWS)
+- `SandboxStatus`: Sandbox status enum
+- `SandboxRequest`: Create sandbox request
+- `SandboxResponse`: Sandbox response
+- `SandboxConfiguration`: Sandbox configuration
+- `ScreenResolution`: Screen resolution
+- `ActionRequest`: Action request
+- `ActionResponse`: Action response
+- `ActionParameters`: Action parameters
+- `ActionResult`: Action result
+- `VNCResponse`: VNC connection info
+
+### Instance Models
+
+- `JupyterRequest`: Create/update Jupyter instance request
+- `JupyterResponse`: Jupyter instance response
+
+### Inference Models
+
+- `InferenceJobRequest`: Create inference job request
+- `InferenceJobResponse`: Inference job response
+
+### Training Models
+
+- `TrainingFramework`: Training framework enum (verl, slime)
+- `TrainingTaskCreateRequest`: Create training task request
+- `TrainingTaskResponse`: Training task response
+- `TrainingTaskNodeInfo`: Training task node info
+
+### EchoMind Models
+
+- `ApiMode`: API mode enum (OPENAI, GEMINI, ANTHROPIC)
+- `EchoMindJobRequest`: Create/update EchoMind instance request
+- `EchoMindJobResponse`: EchoMind instance response
+
+### Profile Models
+
+- `ProfileUserInfo`: User information
+- `ProfileAccessKeyResponse`: Access key response
+- `ProfileStorageInfoResponse`: Storage info response
+- `UserPubKey`: SSH public key
+- `UserPubKeyRequest`: SSH public key request
