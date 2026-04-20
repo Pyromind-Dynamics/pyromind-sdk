@@ -1,158 +1,262 @@
 {
-  "id": "189cc5d9-cb63-4b03-9a92-9a5b43ae17cc",
-  "revision": 0,
-  "last_node_id": 3,
-  "last_link_id": 2,
+  "id": "85775e02-5495-4611-8865-ecfe63985ab9",
+  "name": "test-xyflow",
   "nodes": [
     {
-      "id": 2,
-      "type": "CloneAndCacheModel",
-      "pos": [
-        -862.0645751953125,
-        387.37481689453125
-      ],
-      "size": [
-        270,
-        82
-      ],
-      "flags": {},
-      "order": 0,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "model_path",
-          "type": "MODEL",
-          "links": [
-            1
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "CloneAndCacheModel"
+      "id": "CloneAndCacheModel-1773129755364",
+      "type": "default",
+      "position": {
+        "x": -862.0645751953125,
+        "y": 387.37481689453125
       },
-      "widgets_values": [
-        "Qwen/Qwen3-0.6B",
-        "/workspace/models/"
-      ]
-    },
-    {
-      "id": 3,
-      "type": "TestLLMNode",
-      "pos": [
-        -174.81687927246094,
-        374.64208984375
-      ],
-      "size": [
-        270,
-        130
-      ],
-      "flags": {},
-      "order": 2,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "endpoint",
-          "type": "STRING",
-          "widget": {
-            "name": "endpoint"
-          },
-          "link": 2
-        }
-      ],
-      "outputs": [
-        {
-          "name": "result",
-          "type": "STRING",
-          "links": null
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "TestLLMNode"
-      },
-      "widgets_values": [
-        "http://localhost:30000",
-        "Hello, how are you?",
-        100,
-        0.7
-      ]
-    },
-    {
-      "id": 1,
-      "type": "Inference",
-      "pos": [
-        -521.1500854492188,
-        367.2784729003906
-      ],
-      "size": [
-        270,
-        126
-      ],
-      "flags": {},
-      "order": 1,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "model_path",
-          "type": "STRING",
-          "link": 1
+      "data": {
+        "label": "CloneAndCacheModel",
+        "nodeType": "CloneAndCacheModel",
+        "config": {
+          "model": "Qwen/Qwen3-0.6B",
+          "target_path": "/workspace/models/"
         },
-        {
-          "name": "environment",
-          "shape": 7,
-          "type": "ENV",
-          "link": null
-        }
-      ],
-      "outputs": [
-        {
-          "name": "endpoint",
-          "type": "STRING",
-          "links": [
-            2
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "Inference"
+        "nodeDefinition": {
+          "input": {
+            "required": {
+              "model": [
+                [
+                  "Qwen/Qwen3-0.6B",
+                  "Qwen/Qwen3-1.7B",
+                  "Qwen/Qwen3-14B",
+                  "Qwen/Qwen3-235B-A22B-FP8",
+                  "Qwen/Qwen3-32B",
+                  "Qwen/Qwen3-32B-FP8",
+                  "Qwen/Qwen3-4B",
+                  "Qwen/Qwen3-8B",
+                  "Qwen/Qwen3-VL-235B-A22B-Instruct",
+                  "Qwen/Qwen3-VL-32B-Instruct",
+                  "Qwen/Qwen3-VL-4B-Instruct",
+                  "openai/clip-vit-base-patch32",
+                  "openpi/big_vision",
+                  "openpi/pi05_base",
+                  "pretrained/gui-ck900-lora",
+                  "stabilityai/stable-video-diffusion-img2vid"
+                ],
+                {
+                  "default": "Qwen/Qwen3-0.6B"
+                }
+              ],
+              "target_path": [
+                [
+                  "/workspace/models/"
+                ],
+                {
+                  "default": "/workspace/models/"
+                }
+              ]
+            }
+          },
+          "output": [
+            "MODEL"
+          ],
+          "output_is_list": [
+            false
+          ],
+          "output_name": [
+            "model_path"
+          ],
+          "name": "CloneAndCacheModel",
+          "display_name": "Clone Model",
+          "description": "Clone models for training and evaluation. The model is stored in the pyromind environment, so you can clone it very fast.",
+          "python_module": "test_nodes",
+          "category": "models",
+          "output_node": false,
+          "experimental": false,
+          "deprecated": false
+        },
+        "dystatus": "Succeeded",
+        "isReadOnly": true
       },
-      "widgets_values": [
-        "path/to/model",
-        3000,
-        1,
-        "NVIDIA-L40S"
-      ]
+      "measured": {
+        "width": 150,
+        "height": 133
+      },
+      "properties": {
+        "dystatus": "Succeeded"
+      }
+    },
+    {
+      "id": "TestLLMNode-1773129755365",
+      "type": "default",
+      "position": {
+        "x": -174.81687927246094,
+        "y": 374.64208984375
+      },
+      "data": {
+        "label": "TestLLMNode",
+        "nodeType": "TestLLMNode",
+        "config": {},
+        "nodeDefinition": {
+          "input": {
+            "required": {
+              "endpoint": [
+                "STRING",
+                {
+                  "default": "http://localhost:30000"
+                }
+              ],
+              "prompt": [
+                "STRING",
+                {
+                  "default": "Hello, how are you?"
+                }
+              ],
+              "max_tokens": [
+                "INT",
+                {
+                  "default": 100,
+                  "min": 1,
+                  "max": 4096
+                }
+              ],
+              "temperature": [
+                "FLOAT",
+                {
+                  "default": 0.7,
+                  "min": 0,
+                  "max": 2
+                }
+              ]
+            }
+          },
+          "output": [
+            "STRING"
+          ],
+          "output_is_list": [
+            false
+          ],
+          "output_name": [
+            "result"
+          ],
+          "name": "TestLLMNode",
+          "display_name": "LLM Test",
+          "description": "Test sglang endpoint by sending a prompt and returning the result",
+          "python_module": "test_nodes",
+          "category": "utils",
+          "output_node": false,
+          "experimental": false,
+          "deprecated": false
+        },
+        "dystatus": "Succeeded",
+        "isReadOnly": true
+      },
+      "measured": {
+        "width": 150,
+        "height": 170
+      },
+      "properties": {
+        "dystatus": "Succeeded"
+      }
+    },
+    {
+      "id": "Inference-1773129755363",
+      "type": "default",
+      "position": {
+        "x": -521.1500854492188,
+        "y": 367.2784729003906
+      },
+      "data": {
+        "label": "Inference",
+        "nodeType": "Inference",
+        "config": {
+          "environment": "path/to/model",
+          "gpu_product": "NVIDIA-L40S"
+        },
+        "nodeDefinition": {
+          "input": {
+            "required": {
+              "model_path": [
+                "MODEL"
+              ],
+              "port": [
+                "INT",
+                {
+                  "default": 3000,
+                  "min": 1,
+                  "max": 8000
+                }
+              ],
+              "gpu_count": [
+                "INT",
+                {
+                  "default": 1,
+                  "min": 1,
+                  "max": 8
+                }
+              ],
+              "gpu_product": [
+                [
+                  "NVIDIA-H100-NVL",
+                  "NVIDIA-L40S"
+                ],
+                {
+                  "default": "NVIDIA-H100-NVL"
+                }
+              ]
+            },
+            "optional": {
+              "environment": [
+                "ENV"
+              ]
+            }
+          },
+          "output": [
+            "STRING"
+          ],
+          "output_is_list": [
+            false
+          ],
+          "output_name": [
+            "endpoint"
+          ],
+          "name": "Inference",
+          "display_name": "Inference (SGlang)",
+          "description": "Run Inference in the workflow, specifying for LLM-as-a-judge jobs.",
+          "python_module": "test_nodes",
+          "category": "inference",
+          "output_node": false,
+          "experimental": false,
+          "deprecated": false
+        },
+        "dystatus": "Succeeded",
+        "isReadOnly": true
+      },
+      "measured": {
+        "width": 150,
+        "height": 217
+      },
+      "selected": false,
+      "properties": {
+        "dystatus": "Succeeded"
+      }
     }
   ],
-  "links": [
-    [
-      1,
-      2,
-      0,
-      1,
-      0,
-      "MODEL"
-    ],
-    [
-      2,
-      1,
-      0,
-      3,
-      0,
-      "STRING"
-    ]
-  ],
-  "groups": [],
-  "config": {},
-  "extra": {
-    "ds": {
-      "scale": 0.7893635922852432,
-      "offset": [
-        1014.32824718605,
-        45.92025368778984
-      ]
+  "edges": [
+    {
+      "id": "xy-edge__CloneAndCacheModel-1773129755364model_path-Inference-1773129755363model_path",
+      "source": "CloneAndCacheModel-1773129755364",
+      "target": "Inference-1773129755363",
+      "sourceHandle": "model_path",
+      "targetHandle": "model_path"
     },
-    "frontendVersion": "1.20.0"
+    {
+      "id": "xy-edge__Inference-1773129755363endpoint-TestLLMNode-1773129755365endpoint",
+      "source": "Inference-1773129755363",
+      "target": "TestLLMNode-1773129755365",
+      "sourceHandle": "endpoint",
+      "targetHandle": "endpoint"
+    }
+  ],
+  "viewport": {
+    "x": 1890.3814544677734,
+    "y": -235.55694580078125,
+    "zoom": 2
   },
-  "version": 0.4
+  "timestamp": "2026-03-17T07:36:17.386Z"
 }

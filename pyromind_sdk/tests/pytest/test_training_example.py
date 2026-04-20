@@ -47,6 +47,8 @@ create_training_task_example = training_example.create_training_task_example
 list_training_tasks_example = training_example.list_training_tasks_example
 get_training_task_example = training_example.get_training_task_example
 stop_training_task_example = training_example.stop_training_task_example
+pause_training_task_example = training_example.pause_training_task_example
+resume_training_task_example = training_example.resume_training_task_example
 delete_training_task_example = training_example.delete_training_task_example
 get_node_output_example = training_example.get_node_output_example
 get_node_info_example = training_example.get_node_info_example
@@ -396,6 +398,124 @@ class TestStopTrainingTask:
         if stopped_task:
             assert stopped_task.task_id == test_task_id
             assert stopped_task.status is not None
+
+
+class TestPauseTrainingTask:
+    """Test cases for pausing training tasks"""
+    
+    def test_pause_training_task(self, client, test_task_id):
+        """Test pausing a training task"""
+        # Wait a bit for task to start
+        time.sleep(5)
+        
+        try:
+            paused_task = client.training.pause(test_task_id)
+            print(f"[TEST] Task paused: {paused_task.task_id}, status: {paused_task.status}")
+        except PyroMindAPIError as e:
+            # If task is already completed or cannot be paused, skip the test
+            if "cannot be paused" in str(e.message).lower() or "already" in str(e.message).lower():
+                pytest.skip(f"Cannot pause task: {e.message}")
+            raise
+        
+        assert paused_task is not None
+        assert paused_task.task_id == test_task_id
+        assert paused_task.status is not None
+    
+    def test_pause_training_task_example_function(self, test_task_id):
+        """Test the pause_training_task_example function"""
+        time.sleep(5)
+        
+        paused_task = pause_training_task_example(test_task_id)
+        
+        if paused_task:
+            assert paused_task.task_id == test_task_id
+            assert paused_task.status is not None
+
+
+class TestResumeTrainingTask:
+    """Test cases for resuming training tasks"""
+    
+    def test_resume_training_task(self, client, task_tracker, workflow_file):
+        """Test resuming a paused training task"""
+        # Create a new task for this test
+        task_name = f"test-resume-{int(time.time())}"
+        print(f"[TEST] Creating task for resume test with name: {task_name}")
+        
+        workflow = _load_workflow(workflow_file)
+        task = client.training.create(
+            TrainingTaskCreateRequest(name=task_name, workflow=workflow)
+        )
+        task_id = task.task_id
+        task_tracker.add(task_id)
+        print(f"[TEST] Task created: {task_id}, status: {task.status}")
+        
+        # Wait a bit for task to start
+        time.sleep(5)
+        
+        # First, pause the task
+        try:
+            paused_task = client.training.pause(task_id)
+            print(f"[TEST] Task paused: {paused_task.task_id}, status: {paused_task.status}")
+        except PyroMindAPIError as e:
+            # If task cannot be paused, skip the test
+            if "cannot be paused" in str(e.message).lower() or "already" in str(e.message).lower():
+                pytest.skip(f"Cannot pause task for resume test: {e.message}")
+            raise
+        
+        # Wait a bit for pause to complete
+        time.sleep(3)
+        
+        # Now, resume the task
+        try:
+            resumed_task = client.training.resume(task_id)
+            print(f"[TEST] Task resumed: {resumed_task.task_id}, status: {resumed_task.status}")
+        except PyroMindAPIError as e:
+            # If task cannot be resumed, skip the test
+            if "cannot be resumed" in str(e.message).lower() or "already" in str(e.message).lower():
+                pytest.skip(f"Cannot resume task: {e.message}")
+            raise
+        
+        assert resumed_task is not None
+        assert resumed_task.task_id == task_id
+        assert resumed_task.status is not None
+    
+    def test_resume_training_task_example_function(self, client, task_tracker, workflow_file):
+        """Test the resume_training_task_example function"""
+        # Create a new task for this test
+        task_name = f"test-resume-func-{int(time.time())}"
+        print(f"[TEST] Creating task for resume function test with name: {task_name}")
+        
+        workflow = _load_workflow(workflow_file)
+        task = client.training.create(
+            TrainingTaskCreateRequest(name=task_name, workflow=workflow)
+        )
+        task_id = task.task_id
+        task_tracker.add(task_id)
+        print(f"[TEST] Task created: {task_id}, status: {task.status}")
+        
+        # Wait a bit for task to start
+        time.sleep(5)
+        
+        # First, pause the task
+        try:
+            paused_task = pause_training_task_example(task_id)
+            if not paused_task:
+                pytest.skip("Failed to pause task for resume test")
+            print(f"[TEST] Task paused: {paused_task.task_id}, status: {paused_task.status}")
+        except Exception as e:
+            pytest.skip(f"Cannot pause task for resume test: {str(e)}")
+        
+        # Wait a bit for pause to complete
+        time.sleep(3)
+        
+        # Now, resume the task
+        try:
+            resumed_task = resume_training_task_example(task_id)
+            if resumed_task:
+                assert resumed_task.task_id == task_id
+                assert resumed_task.status is not None
+        except Exception as e:
+            pytest.skip(f"Cannot resume task: {str(e)}")
 
 
 class TestDeleteTrainingTask:

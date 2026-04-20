@@ -33,10 +33,13 @@ from .client import (
 
 # Export workflow functionality
 from .client.workflow import (
-    WorkflowLiteConverter,
+    TypeResolver,
     LayoutGenerator,
-    to_workflow_lite,
-    to_workflow_standard,
+    XyflowConverter,
+    XyflowNodeMapper,
+    XyflowEdgeBuilder,
+    to_xyflow,
+    to_xyflow_lite,
 )
 
 __all__ = [
@@ -57,9 +60,12 @@ __all__ = [
     "StorageClient",
     "PyroMindAPIClient",
     # Workflow functionality
-    "WorkflowLiteConverter",
+    "TypeResolver",
     "LayoutGenerator",
-    "to_workflow_lite",
-    "to_workflow_standard",
+    "XyflowConverter",
+    "XyflowNodeMapper",
+    "XyflowEdgeBuilder",
+    "to_xyflow",
+    "to_xyflow_lite",
 ]
 

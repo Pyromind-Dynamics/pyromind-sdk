@@ -2,18 +2,20 @@
 Workflow Tools
 
 This module provides tools for working with workflows:
-- Converter: Convert between standard and lite workflow formats
-- Validator: Validate workflows in both formats with comprehensive checks
+- XyflowConverter: Convert between Xyflow and lite workflow formats
+- Validator: Validate workflows with comprehensive checks
 """
 
 from .converter import (
-    WorkflowLiteConverter,
-    WorkflowMapper,
+    # Core components
     TypeResolver,
-    LinkBuilder,
     LayoutGenerator,
-    to_workflow_lite,
-    to_workflow_standard
+    # Xyflow converter
+    XyflowConverter,
+    XyflowNodeMapper,
+    XyflowEdgeBuilder,
+    to_xyflow,
+    to_xyflow_lite,
 )
 
 from .validator import (
@@ -23,21 +25,22 @@ from .validator import (
     TypeValidationError,
     validate_workflow,
     validate_lite_format,
-    validate_standard_format,
     validate_workflow_lite,
-    validate_workflow_standard,
-    validate_workflow_legacy,
+    # Xyflow validation
+    validate_xyflow_workflow,
+    validate_workflow_auto,
 )
 
 __all__ = [
-    # Converter
-    "WorkflowLiteConverter",
-    "WorkflowMapper",
+    # Core components
     "TypeResolver",
-    "LinkBuilder",
     "LayoutGenerator",
-    "to_workflow_lite",
-    "to_workflow_standard",
+    # Xyflow Converter
+    "XyflowConverter",
+    "XyflowNodeMapper",
+    "XyflowEdgeBuilder",
+    "to_xyflow",
+    "to_xyflow_lite",
     # Validator
     "ValidationError",
     "SchemaValidationError",
@@ -45,8 +48,8 @@ __all__ = [
     "TypeValidationError",
     "validate_workflow",
     "validate_lite_format",
-    "validate_standard_format",
     "validate_workflow_lite",
-    "validate_workflow_standard",
-    "validate_workflow_legacy",
+    # Xyflow Validation
+    "validate_xyflow_workflow",
+    "validate_workflow_auto",
 ]

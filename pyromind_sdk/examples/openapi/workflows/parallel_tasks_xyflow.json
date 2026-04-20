@@ -1,0 +1,175 @@
+{
+  "id": "parallel-tasks-example",
+  "name": "Parallel Tasks Workflow",
+  "description": "Demonstrates parallel execution of multiple independent tasks",
+  "nodes": [
+    {
+      "id": "model-clone-1",
+      "type": "CloneAndCacheModel",
+      "position": {
+        "x": 100,
+        "y": 100
+      },
+      "data": {
+        "label": "Clone Model A",
+        "nodeType": "CloneAndCacheModel",
+        "config": {
+          "model": "Qwen/Qwen3-0.6B",
+          "target_path": "/workspace/models/model-a/"
+        }
+      }
+    },
+    {
+      "id": "model-clone-2",
+      "type": "CloneAndCacheModel",
+      "position": {
+        "x": 100,
+        "y": 300
+      },
+      "data": {
+        "label": "Clone Model B",
+        "nodeType": "CloneAndCacheModel",
+        "config": {
+          "model": "Qwen/Qwen3-1.7B",
+          "target_path": "/workspace/models/model-b/"
+        }
+      }
+    },
+    {
+      "id": "inference-1",
+      "type": "Inference",
+      "position": {
+        "x": 400,
+        "y": 100
+      },
+      "data": {
+        "label": "Inference A",
+        "nodeType": "Inference",
+        "config": {
+          "model_path": "/workspace/models/model-a/",
+          "port": 30001,
+          "gpu_count": 1,
+          "gpu_product": "NVIDIA-L40S"
+        }
+      }
+    },
+    {
+      "id": "inference-2",
+      "type": "Inference",
+      "position": {
+        "x": 400,
+        "y": 300
+      },
+      "data": {
+        "label": "Inference B",
+        "nodeType": "Inference",
+        "config": {
+          "model_path": "/workspace/models/model-b/",
+          "port": 30002,
+          "gpu_count": 1,
+          "gpu_product": "NVIDIA-L40S"
+        }
+      }
+    },
+    {
+      "id": "test-llm-1",
+      "type": "TestLLMNode",
+      "position": {
+        "x": 700,
+        "y": 100
+      },
+      "data": {
+        "label": "Test Model A",
+        "nodeType": "TestLLMNode",
+        "config": {
+          "endpoint": "http://localhost:30001",
+          "prompt": "What is machine learning?",
+          "max_tokens": 100,
+          "temperature": 0.7
+        }
+      }
+    },
+    {
+      "id": "test-llm-2",
+      "type": "TestLLMNode",
+      "position": {
+        "x": 700,
+        "y": 300
+      },
+      "data": {
+        "label": "Test Model B",
+        "nodeType": "TestLLMNode",
+        "config": {
+          "endpoint": "http://localhost:30002",
+          "prompt": "What is deep learning?",
+          "max_tokens": 100,
+          "temperature": 0.7
+        }
+      }
+    },
+    {
+      "id": "merge-results",
+      "type": "MergeResults",
+      "position": {
+        "x": 1000,
+        "y": 200
+      },
+      "data": {
+        "label": "Merge Results",
+        "nodeType": "MergeResults",
+        "config": {
+          "output_path": "/workspace/results/merged_output.json"
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "source": "model-clone-1",
+      "sourceHandle": "model_path",
+      "target": "inference-1",
+      "targetHandle": "model_path"
+    },
+    {
+      "id": "e2",
+      "source": "model-clone-2",
+      "sourceHandle": "model_path",
+      "target": "inference-2",
+      "targetHandle": "model_path"
+    },
+    {
+      "id": "e3",
+      "source": "inference-1",
+      "sourceHandle": "endpoint",
+      "target": "test-llm-1",
+      "targetHandle": "endpoint"
+    },
+    {
+      "id": "e4",
+      "source": "inference-2",
+      "sourceHandle": "endpoint",
+      "target": "test-llm-2",
+      "targetHandle": "endpoint"
+    },
+    {
+      "id": "e5",
+      "source": "test-llm-1",
+      "sourceHandle": "results",
+      "target": "merge-results",
+      "targetHandle": "input_a"
+    },
+    {
+      "id": "e6",
+      "source": "test-llm-2",
+      "sourceHandle": "results",
+      "target": "merge-results",
+      "targetHandle": "input_b"
+    }
+  ],
+  "viewport": {
+    "x": 0,
+    "y": 0,
+    "zoom": 0.8
+  }
+}

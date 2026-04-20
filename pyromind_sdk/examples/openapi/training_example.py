@@ -220,6 +220,58 @@ def stop_training_task_example(task_id: str) -> Optional[object]:
         client.close()
 
 
+def pause_training_task_example(task_id: str) -> Optional[object]:
+    """
+    Example: Pause a training task.
+    
+    Args:
+        task_id: ID of the training task to pause
+        
+    Returns:
+        Training task object if successful, None otherwise
+    """
+    client = PyroMindAPIClient()
+    
+    try:
+        print(f"Pausing training task {task_id}...")
+        task = client.training.pause(task_id)
+        print(f"✓ Training task paused!")
+        print(f"  Status: {task.status}")
+        return task
+        
+    except PyroMindAPIError as e:
+        print(f"✗ Failed to pause training task: {e.message}")
+        return None
+    finally:
+        client.close()
+
+
+def resume_training_task_example(task_id: str) -> Optional[object]:
+    """
+    Example: Resume a paused training task.
+    
+    Args:
+        task_id: ID of the training task to resume
+        
+    Returns:
+        Training task object if successful, None otherwise
+    """
+    client = PyroMindAPIClient()
+    
+    try:
+        print(f"Resuming training task {task_id}...")
+        task = client.training.resume(task_id)
+        print(f"✓ Training task resumed!")
+        print(f"  Status: {task.status}")
+        return task
+        
+    except PyroMindAPIError as e:
+        print(f"✗ Failed to resume training task: {e.message}")
+        return None
+    finally:
+        client.close()
+
+
 def delete_training_task_example(task_id: str) -> None:
     """Delete a training task."""
     client = PyroMindAPIClient()
@@ -354,9 +406,11 @@ def wait_for_task_completion(task_id: str, target_status: str = "Succeeded",
         time.sleep(check_interval)
 
 
-def parse_workflow_graph(workflow: dict) -> Tuple[Dict[int, dict], Dict[int, List[Tuple[int, str]]]]:
+def parse_workflow_graph(workflow: dict) -> Tuple[Dict[str, dict], Dict[str, List[Tuple[str, str]]]]:
     """
     Parse workflow JSON to extract node information and connections.
+    
+    Supports Xyflow format (nodes + edges) only.
     
     Args:
         workflow: Workflow JSON dictionary
@@ -367,36 +421,38 @@ def parse_workflow_graph(workflow: dict) -> Tuple[Dict[int, dict], Dict[int, Lis
         - adjacency_list: Dictionary mapping node_id to list of (target_node_id, connection_type) tuples
     """
     nodes_dict = {}
-    adjacency_list: Dict[int, List[Tuple[int, str]]] = {}
+    adjacency_list: Dict[str, List[Tuple[str, str]]] = {}
     
     # Parse nodes
     for node in workflow.get("nodes", []):
-        node_id = node.get("id")
+        node_id = str(node.get("id"))  # Ensure string ID for consistency
         if node_id is None:
             continue
         
+        node_type = node.get("type", "Unknown")
+        data = node.get("data", {})
+        
         nodes_dict[node_id] = {
             "id": node_id,
-            "type": node.get("type", "Unknown"),
-            "name": node.get("properties", {}).get("Node name for S&R", node.get("type", "Unknown")),
+            "type": node_type,
+            "name": data.get("label", node_type),
             "inputs": node.get("inputs", []),
             "outputs": node.get("outputs", []),
         }
         adjacency_list[node_id] = []
     
-    # Parse links to build adjacency list
-    # Link format: [link_id, source_node_id, source_socket_index, target_node_id, target_socket_index, type]
-    for link in workflow.get("links", []):
-        if len(link) >= 6:
-            source_node_id = link[1]
-            target_node_id = link[3]
-            connection_type = link[5] if len(link) > 5 else "unknown"
-            
-            if source_node_id in adjacency_list and target_node_id in nodes_dict:
-                # Check if connection already exists
-                existing = any(tid == target_node_id for tid, _ in adjacency_list[source_node_id])
-                if not existing:
-                    adjacency_list[source_node_id].append((target_node_id, connection_type))
+    # Parse Xyflow edges
+    # Edge format: {id, source, sourceHandle, target, targetHandle}
+    for edge in workflow.get("edges", []):
+        source_node_id = str(edge.get("source"))
+        target_node_id = str(edge.get("target"))
+        connection_type = edge.get("type", "unknown")
+        
+        if source_node_id in adjacency_list and target_node_id in nodes_dict:
+            # Check if connection already exists
+            existing = any(tid == target_node_id for tid, _ in adjacency_list[source_node_id])
+            if not existing:
+                adjacency_list[source_node_id].append((target_node_id, connection_type))
     
     return nodes_dict, adjacency_list
 
@@ -440,6 +496,8 @@ def draw_workflow_graph(workflow: dict) -> None:
     Draw workflow graph showing input nodes pointing to output nodes.
     Also prints input/output information for each node.
     
+    Supports Xyflow format (nodes + edges) only.
+    
     Args:
         workflow: Workflow JSON dictionary
     """
@@ -464,8 +522,8 @@ def draw_workflow_graph(workflow: dict) -> None:
     print("-" * 60)
     
     # Find nodes with no inputs (entry nodes)
-    entry_nodes: Set[int] = set()
-    all_targets: Set[int] = set()
+    entry_nodes: Set[str] = set()
+    all_targets: Set[str] = set()
     for source_id, targets in adjacency_list.items():
         if targets:
             all_targets.update(tid for tid, _ in targets)
@@ -485,9 +543,9 @@ def draw_workflow_graph(workflow: dict) -> None:
         entry_nodes = set(nodes_dict.keys())
     
     # Build a simple text-based graph
-    visited: Set[int] = set()
+    visited: Set[str] = set()
     
-    def print_connections(node_id: int, indent: str = "", prefix: str = ""):
+    def print_connections(node_id: str, indent: str = "", prefix: str = ""):
         """Recursively print node connections."""
         if node_id in visited:
             return
@@ -548,7 +606,9 @@ def main():
     get_node_info_example()
     
     # Then process workflow files
-    workflow_files = ["llm_test.json", "join_path.json", "clone.json"]
+    # workflow_files = ["llm_test.json", "join_path.json", "clone.json"]
+    workflow_files = ["llm_inference_xyflow.json","model_clone_xyflow.json","llm_test.json","clone_model_dataset_xyflow.json","clone_model_dataset_with_definition_xyflow.json","conditional_flow_xyflow.json","parallel_tasks_xyflow.json"]
+    # workflow_files = [ "llm_inference_xyflow.json"]
     workflows_dir = Path(__file__).parent / "workflows"
     
     for workflow_file in workflow_files:
@@ -570,7 +630,7 @@ def main():
         if task:
             workflow = _load_workflow(workflow_path)
             draw_workflow_graph(workflow)
-            delete_training_task_example(task_id)
+            # delete_training_task_example(task_id)
 
 
 if __name__ == "__main__":

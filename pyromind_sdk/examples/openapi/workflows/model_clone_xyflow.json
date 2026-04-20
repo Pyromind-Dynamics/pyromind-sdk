@@ -1,0 +1,28 @@
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "name": "Model Clone Workflow",
+  "nodes": [
+    {
+      "id": "clone-1",
+      "type": "CloneAndCacheModel",
+      "position": {
+        "x": 100,
+        "y": 200
+      },
+      "data": {
+        "label": "Clone Model",
+        "nodeType": "CloneAndCacheModel",
+        "config": {
+          "model": "Qwen/Qwen3-0.6B",
+          "target_path": "/workspace/models/"
+        }
+      }
+    }
+  ],
+  "edges": [],
+  "viewport": {
+    "x": 0,
+    "y": 0,
+    "zoom": 1.0
+  }
+}

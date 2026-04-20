@@ -3,7 +3,6 @@ Training API Client
 
 This module provides a client for managing training tasks via the PyroMind API.
 """
-
 from typing import List, Dict, Any, Optional
 from .base import PyroMindClient
 from .models import (
@@ -56,7 +55,18 @@ class TrainingClient(PyroMindClient):
         Returns:
             TrainingTaskCreateResponse object
         """
-        response = self.post("/training/tasks", json_data=request.model_dump())
+        import json
+        request_data = request.model_dump()
+        print(f"[DEBUG] Creating training task with request: {json.dumps(request_data, indent=2, ensure_ascii=False)}")
+        
+        # 临时启用 debug 模式以打印完整的响应信息（包括响应头）
+        old_debug = self.debug
+        self.debug = True
+        try:
+            response = self.post("/training/tasks", json_data=request_data)
+        finally:
+            self.debug = old_debug
+        
         # API returns {success: True, data: {...}} format
         data = self._extract_data(response)
         
@@ -114,6 +124,48 @@ class TrainingClient(PyroMindClient):
             TrainingTaskResponse object
         """
         response = self.post(f"/training/tasks/{task_id}/stop")
+        # API returns {success: True, data: {...}} format
+        data = self._extract_data(response)
+        
+        # Backend returns task_id and status in the data field
+        # Fetch the full task to return complete information
+        if isinstance(data, dict) and "task_id" in data:
+            return self.get_job(data["task_id"])
+        # Fallback: try to construct from available data
+        return TrainingTaskResponse(**data)
+    
+    def pause(self, task_id: str) -> TrainingTaskResponse:
+        """
+        Pause a running training task
+        
+        Args:
+            task_id: ID of the training task to pause (can be int or str)
+            
+        Returns:
+            TrainingTaskResponse object
+        """
+        response = self.post(f"/training/tasks/{task_id}/pause")
+        # API returns {success: True, data: {...}} format
+        data = self._extract_data(response)
+        
+        # Backend returns task_id and status in the data field
+        # Fetch the full task to return complete information
+        if isinstance(data, dict) and "task_id" in data:
+            return self.get_job(data["task_id"])
+        # Fallback: try to construct from available data
+        return TrainingTaskResponse(**data)
+    
+    def resume(self, task_id: str) -> TrainingTaskResponse:
+        """
+        Resume a paused training task
+        
+        Args:
+            task_id: ID of the training task to resume (can be int or str)
+            
+        Returns:
+            TrainingTaskResponse object
+        """
+        response = self.post(f"/training/tasks/{task_id}/resume")
         # API returns {success: True, data: {...}} format
         data = self._extract_data(response)
         

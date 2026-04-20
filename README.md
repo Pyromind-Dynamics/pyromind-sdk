@@ -286,6 +286,157 @@ Check the `examples/` directory for more examples:
 - ✅ **Resource Management**: Configure CPU, memory, and GPU resources
 - ✅ **Customer Inputs**: Mark inputs/outputs for customer-specific use
 - ✅ **Security**: Built-in validation and security checks
+- ✅ **Xyflow Workflow Format**: Modern workflow format with nodes and edges
+
+## Xyflow Workflow Format
+
+PyroMind SDK uses the **Xyflow format** for workflow definitions. This format provides a clean, modern structure for defining workflows with nodes and edges.
+
+### Format Structure
+
+```json
+{
+  "id": "workflow-uuid",
+  "name": "Workflow Name",
+  "nodes": [
+    {
+      "id": "node-1",
+      "type": "NodeTypeName",
+      "position": { "x": 100, "y": 200 },
+      "data": {
+        "label": "Node Label",
+        "nodeType": "NodeTypeName",
+        "config": {
+          "param1": "value1",
+          "param2": "value2"
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "edge-1",
+      "source": "node-1",
+      "sourceHandle": "output_name",
+      "target": "node-2",
+      "targetHandle": "input_name"
+    }
+  ],
+  "viewport": { "x": 0, "y": 0, "zoom": 1.0 }
+}
+```
+
+### Key Differences from ComfyUI Format
+
+| Feature | Xyflow Format | ComfyUI Format (Deprecated) |
+|---------|---------------|----------------------------|
+| Node ID | String (`"node-1"`) | Integer (`1`) |
+| Position | Object `{x, y}` | Array `[x, y]` |
+| Connections | `edges` array | `links` array |
+| Edge Format | `{id, source, sourceHandle, target, targetHandle}` | `[id, source, slot, target, slot, type]` |
+
+### Workflow Validation
+
+```python
+from pyromind_sdk.client import PyroMindAPIClient
+from pyromind_sdk.client.workflow import validate_workflow, validate_xyflow_workflow
+
+client = PyroMindAPIClient()
+
+# Auto-detect format and validate
+is_valid, errors = validate_workflow(workflow_dict, client)
+if not is_valid:
+    for error in errors:
+        print(f"Error: {error}")
+
+# Explicitly validate Xyflow format
+is_valid, errors = validate_xyflow_workflow(workflow_dict, client)
+```
+
+### Format Conversion
+
+```python
+from pyromind_sdk.client.workflow import XyflowConverter
+
+# Convert between formats
+converter = XyflowConverter()
+
+# Xyflow to Lite format (for internal processing)
+lite_format = converter.to_xyflow_lite(xyflow_workflow)
+
+# Lite to Xyflow format
+xyflow_format = converter.to_xyflow(lite_workflow)
+```
+
+## Migration Guide: ComfyUI to Xyflow
+
+If you have existing workflows in ComfyUI format, here's how to migrate:
+
+### 1. Node ID Conversion
+
+Change numeric IDs to strings:
+```python
+# Before (ComfyUI)
+"nodes": [{"id": 1, "type": "MyNode"}]
+
+# After (Xyflow)
+"nodes": [{"id": "node-1", "type": "MyNode"}]
+```
+
+### 2. Position Format
+
+Change array to object:
+```python
+# Before (ComfyUI)
+"pos": [100, 200]
+
+# After (Xyflow)
+"position": {"x": 100, "y": 200}
+```
+
+### 3. Links to Edges
+
+Convert link arrays to edge objects:
+```python
+# Before (ComfyUI)
+"links": [[0, 1, 0, 2, 0, "STRING"]]
+
+# After (Xyflow)
+"edges": [{
+  "id": "e0",
+  "source": "1",
+  "sourceHandle": "0",
+  "target": "2",
+  "targetHandle": "0"
+}]
+```
+
+### 4. Node Data Structure
+
+Move parameters to data.config:
+```python
+# Before (ComfyUI)
+{"id": 1, "type": "MyNode", "widgets_values": ["value"]}
+
+# After (Xyflow)
+{
+  "id": "node-1",
+  "type": "MyNode",
+  "data": {
+    "label": "MyNode",
+    "config": {"param": "value"}
+  }
+}
+```
+
+### Example Workflows
+
+The SDK includes example workflows in Xyflow format:
+
+- `llm_inference_xyflow.json`: LLM inference pipeline
+- `model_clone_xyflow.json`: Model cloning workflow
+- `parallel_tasks_xyflow.json`: Parallel task execution
+- `conditional_flow_xyflow.json`: Conditional workflow branching
 
 ## Requirements
 

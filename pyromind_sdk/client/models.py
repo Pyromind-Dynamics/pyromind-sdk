@@ -606,3 +606,120 @@ class TrainingTaskListAPIResponse(BaseModel):
 class TrainingTaskAPIResponse(BaseModel):
     """Single training job API response"""
     job: TrainingTaskResponse
+
+
+# ============================================================================
+# Xyflow Workflow Format Models
+# ============================================================================
+
+class XyflowPosition(BaseModel):
+    """Position model for Xyflow nodes (object format with x, y)"""
+    x: float = 0.0
+    y: float = 0.0
+
+
+class XyflowViewport(BaseModel):
+    """Viewport model for Xyflow workflow"""
+    x: float = 0.0
+    y: float = 0.0
+    zoom: float = 1.0
+
+
+class XyflowNodeDefinition(BaseModel):
+    """Node definition model containing input/output specifications"""
+    input: Optional[Dict[str, Any]] = None
+    output: Optional[List[str]] = None
+    output_name: Optional[List[str]] = None
+    display_name: Optional[str] = None
+    description: Optional[str] = None
+    category: Optional[str] = None
+
+
+class XyflowNodeData(BaseModel):
+    """Data model for Xyflow node content"""
+    label: Optional[str] = None
+    config: Optional[Dict[str, Any]] = None  # Parameter configuration
+    nodeDefinition: Optional[XyflowNodeDefinition] = None  # Node definition for validation
+    nodeType: Optional[str] = None  # Node type identifier
+
+
+class XyflowNode(BaseModel):
+    """Node model for Xyflow workflow format"""
+    id: str  # String ID
+    type: str  # Node type
+    position: XyflowPosition
+    data: XyflowNodeData = Field(default_factory=XyflowNodeData)
+    
+    @field_validator('id', mode='before')
+    @classmethod
+    def ensure_string_id(cls, v):
+        """Ensure id is a string"""
+        if isinstance(v, int):
+            return str(v)
+        return v
+
+
+class XyflowEdge(BaseModel):
+    """Edge model for Xyflow workflow format"""
+    id: str
+    source: str  # Source node id (string)
+    target: str  # Target node id (string)
+    sourceHandle: Optional[str] = None  # Source port/handle name
+    targetHandle: Optional[str] = None  # Target port/handle name
+    type: Optional[str] = None  # Edge type (optional)
+    animated: Optional[bool] = None  # Animation flag (optional)
+    
+    @field_validator('source', 'target', mode='before')
+    @classmethod
+    def ensure_string_ids(cls, v):
+        """Ensure source/target are strings"""
+        if isinstance(v, int):
+            return str(v)
+        return v
+
+
+class XyflowWorkflow(BaseModel):
+    """Complete Xyflow workflow model"""
+    id: Optional[str] = None
+    name: Optional[str] = None
+    nodes: List[XyflowNode] = Field(default_factory=list)
+    edges: List[XyflowEdge] = Field(default_factory=list)
+    viewport: Optional[XyflowViewport] = None
+    
+    @field_validator('nodes', 'edges', mode='before')
+    @classmethod
+    def ensure_list(cls, v):
+        """Ensure nodes and edges are lists"""
+        if v is None:
+            return []
+        return v
+
+
+# ============================================================================
+# Parameter Binding Models
+# ============================================================================
+
+class StaticBinding(BaseModel):
+    """Static parameter binding with a direct value"""
+    kind: Literal["static"] = "static"
+    value: Any
+
+
+class DynamicBinding(BaseModel):
+    """Dynamic parameter binding referencing another node's output"""
+    kind: Literal["dynamic"] = "dynamic"
+    nodeId: str  # Source node id
+    outputName: str  # Output port name
+    
+    @field_validator('nodeId', mode='before')
+    @classmethod
+    def ensure_string_node_id(cls, v):
+        """Ensure nodeId is a string"""
+        if isinstance(v, int):
+            return str(v)
+        return v
+
+
+# ParameterBinding is a union of StaticBinding and DynamicBinding
+# Used for type hints in converters and validators
+ParameterBinding = Union[StaticBinding, DynamicBinding]

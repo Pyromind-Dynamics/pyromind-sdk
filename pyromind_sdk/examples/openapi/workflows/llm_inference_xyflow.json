@@ -1,0 +1,79 @@
+{
+  "id": "189cc5d9-cb63-4b03-9a92-9a5b43ae17cc",
+  "name": "LLM Inference Test",
+  "nodes": [
+    {
+      "id": "node-clone",
+      "type": "CloneAndCacheModel",
+      "position": {
+        "x": 100,
+        "y": 100
+      },
+      "data": {
+        "label": "CloneAndCacheModel",
+        "nodeType": "CloneAndCacheModel",
+        "config": {
+          "model": "Qwen/Qwen3-0.6B",
+          "target_path": "/workspace/models/"
+        }
+      }
+    },
+    {
+      "id": "node-inference",
+      "type": "Inference",
+      "position": {
+        "x": 400,
+        "y": 100
+      },
+      "data": {
+        "label": "Inference",
+        "nodeType": "Inference",
+        "config": {
+          "model_path": "path/to/model",
+          "port": 3000,
+          "gpu_count": 1,
+          "gpu_product": "NVIDIA-L40S"
+        }
+      }
+    },
+    {
+      "id": "node-test",
+      "type": "TestLLMNode",
+      "position": {
+        "x": 700,
+        "y": 100
+      },
+      "data": {
+        "label": "TestLLMNode",
+        "nodeType": "TestLLMNode",
+        "config": {
+          "endpoint": "http://localhost:30000",
+          "prompt": "Hello, how are you?",
+          "max_tokens": 100,
+          "temperature": 0.7
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "source": "node-clone",
+      "sourceHandle": "model_path",
+      "target": "node-inference",
+      "targetHandle": "model_path"
+    },
+    {
+      "id": "e2",
+      "source": "node-inference",
+      "sourceHandle": "endpoint",
+      "target": "node-test",
+      "targetHandle": "endpoint"
+    }
+  ],
+  "viewport": {
+    "x": 0,
+    "y": 0,
+    "zoom": 1.0
+  }
+}

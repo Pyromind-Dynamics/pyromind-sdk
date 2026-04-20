@@ -1,0 +1,44 @@
+{
+  "id": "ffa54637-358b-411c-a2b6-03fe8ddd549a",
+  "name": "Clone Model and Dataset",
+  "nodes": [
+    {
+      "id": "clone-model",
+      "type": "CloneAndCacheModel",
+      "position": {
+        "x": 789,
+        "y": 762
+      },
+      "data": {
+        "label": "Clone Model",
+        "nodeType": "CloneAndCacheModel",
+        "config": {
+          "model": "Qwen/Qwen3-0.6B",
+          "target_path": "/workspace/models/"
+        }
+      }
+    },
+    {
+      "id": "clone-dataset",
+      "type": "CloneAndCacheDataset",
+      "position": {
+        "x": 799,
+        "y": 965
+      },
+      "data": {
+        "label": "Clone Dataset",
+        "nodeType": "CloneAndCacheDataset",
+        "config": {
+          "dataset": "agibot-world/AgiBotWorld-Alpha-CtrlWorld-327",
+          "target_path": "/workspace/datasets/"
+        }
+      }
+    }
+  ],
+  "edges": [],
+  "viewport": {
+    "x": 0,
+    "y": 0,
+    "zoom": 1.0
+  }
+}

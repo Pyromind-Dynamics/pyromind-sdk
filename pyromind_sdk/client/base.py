@@ -6,6 +6,7 @@ HTTP requests, and error handling for all API clients.
 """
 
 import os
+import json
 import requests
 from typing import Optional, Dict, Any, Union
 from requests.adapters import HTTPAdapter
@@ -18,7 +19,8 @@ DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_RETRIES = 3
 ENV_API_KEY = "PYROMIND_API_KEY"
 ENV_BASE_URL = "PYROMIND_BASE_URL"
-RETRY_STATUS_CODES = [429, 500, 502, 503, 504]
+ENV_DEBUG = "PYROMIND_DEBUG"
+RETRY_STATUS_CODES = [429, 502, 503, 504]  # Note: 500 excluded to allow seeing error response
 RETRY_ALLOWED_METHODS = ["GET", "POST", "PUT", "DELETE"]
 
 
@@ -58,7 +60,8 @@ class PyroMindClient:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         timeout: int = DEFAULT_TIMEOUT,
-        max_retries: int = DEFAULT_MAX_RETRIES
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        debug: Optional[bool] = None
     ):
         # Get API key from parameter or environment variable
         if api_key is None:
@@ -85,6 +88,11 @@ class PyroMindClient:
         self.api_key = api_key
         self.base_url = base_url.rstrip('/')
         self.timeout = timeout
+        
+        # Get debug setting from parameter or environment variable
+        if debug is None:
+            debug = os.getenv(ENV_DEBUG, "").lower() in ("true", "1", "yes")
+        self.debug = debug
 
         # Create session with retry strategy
         self.session = requests.Session()
@@ -126,6 +134,87 @@ class PyroMindClient:
             return response
         return response
     
+    def _print_request_info(
+        self,
+        method: str,
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+        json_data: Optional[Dict[str, Any]] = None
+    ):
+        """
+        Print request information for debugging
+        
+        Args:
+            method: HTTP method
+            url: Request URL
+            params: Query parameters
+            json_data: JSON request body
+        """
+        print("\n" + "=" * 60)
+        print("📤 HTTP REQUEST")
+        print("=" * 60)
+        print(f"Method: {method}")
+        print(f"URL: {url}")
+        
+        # Print request headers (mask sensitive data)
+        print("\n📋 Request Headers:")
+        for key, value in self.session.headers.items():
+            if key.lower() in ("authorization", "api-key", "token"):
+                # Mask sensitive header values
+                masked_value = value[:10] + "..." if len(value) > 10 else "***"
+                print(f"  {key}: {masked_value}")
+            else:
+                print(f"  {key}: {value}")
+        
+        # Print query parameters
+        if params:
+            print("\n🔍 Query Parameters:")
+            try:
+                print("  " + json.dumps(params, indent=2, ensure_ascii=False).replace("\n", "\n  "))
+            except Exception:
+                print(f"  {params}")
+        
+        # Print request body
+        if json_data:
+            print("\n📦 Request Body:")
+            try:
+                print("  " + json.dumps(json_data, indent=2, ensure_ascii=False).replace("\n", "\n  "))
+            except Exception:
+                print(f"  {json_data}")
+        
+        print("-" * 60)
+    
+    def _print_response_info(self, response: requests.Response):
+        """
+        Print response information for debugging
+        
+        Args:
+            response: HTTP response object
+        """
+        print("\n📥 HTTP RESPONSE")
+        print("=" * 60)
+        print(f"Status Code: {response.status_code}")
+        print(f"Status: {'✅ Success' if response.ok else '❌ Failed'}")
+        
+        # Print response headers
+        print("\n📋 Response Headers:")
+        for key, value in response.headers.items():
+            print(f"  {key}: {value}")
+        
+        # Print response body
+        print("\n📦 Response Body:")
+        try:
+            response_json = response.json()
+            print("  " + json.dumps(response_json, indent=2, ensure_ascii=False).replace("\n", "\n  "))
+        except Exception:
+            # If not JSON, print raw text (truncated if too long)
+            text = response.text
+            if len(text) > 500:
+                text = text[:500] + "... (truncated)"
+            print(f"  {text}")
+        
+        print("=" * 60 + "\n")
+    
     def _request(
         self,
         method: str,
@@ -153,6 +242,10 @@ class PyroMindClient:
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
         request_context = f"{method.upper()} {url}"
         
+        # Print request information if debug mode is enabled
+        if self.debug:
+            self._print_request_info(method, url, params, json_data)
+        
         try:
             response = self.session.request(
                 method=method,
@@ -163,8 +256,21 @@ class PyroMindClient:
                 **kwargs
             )
             
+            # Print response information if debug mode is enabled
+            if self.debug:
+                self._print_response_info(response)
+            
             # Handle non-2xx responses
             if not response.ok:
+                # Always log server errors (5xx) for debugging
+                if response.status_code >= 500:
+                    print(f"\n⚠️ Server Error ({response.status_code}) for {method} {url}")
+                    try:
+                        error_json = response.json()
+                        print(f"Response: {json.dumps(error_json, indent=2, ensure_ascii=False)}")
+                    except:
+                        print(f"Response: {response.text[:1000]}")
+                
                 error_data = None
                 try:
                     error_data = response.json()
@@ -243,6 +349,9 @@ class PyroMindClient:
             return {}
 
         except requests.exceptions.RequestException as e:
+            # Log retry/connection errors
+            print(f"\n❌ Request failed: {method} {url}")
+            print(f"Error: {type(e).__name__}: {str(e)}")
             raise PyroMindAPIError(
                 message=f"{request_context} request failed: {str(e)}",
                 status_code=None

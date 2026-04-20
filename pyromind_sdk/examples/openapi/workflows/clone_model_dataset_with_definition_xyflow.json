@@ -1,0 +1,65 @@
+{
+  "id": "clone-model-dataset-with-connections",
+  "name": "Clone Model and Dataset (With Connections)",
+  "description": "Test workflow for CloneAndCacheModel and CloneAndCacheDataset with parameter name validation",
+  "nodes": [
+    {
+      "id": "node-clone-model",
+      "type": "CloneAndCacheModel",
+      "position": {
+        "x": 400,
+        "y": 100
+      },
+      "data": {
+        "label": "CloneAndCacheModel",
+        "nodeType": "CloneAndCacheModel",
+        "nodeDefinition": {
+          "input": {
+            "required": {
+              "model": [["Qwen/Qwen3-0.6B", "Qwen/Qwen3-VL-4B-Instruct"], {"default": "Qwen/Qwen3-0.6B"}],
+              "target_path": [["/workspace/models/"], {"default": "/workspace/models/"}]
+            }
+          },
+          "output": ["MODEL"],
+          "output_name": ["model_path"]
+        },
+        "config": {
+          "model": "Qwen/Qwen3-0.6B",
+          "target_path": "/workspace/models/"
+        }
+      }
+    },
+    {
+      "id": "node-clone-dataset",
+      "type": "CloneAndCacheDataset",
+      "position": {
+        "x": 400,
+        "y": 300
+      },
+      "data": {
+        "label": "CloneAndCacheDataset",
+        "nodeType": "CloneAndCacheDataset",
+        "nodeDefinition": {
+          "input": {
+            "required": {
+              "dataset": [["agibot-world/AgiBotWorld-Alpha-CtrlWorld-327", "openai/gsm8k"], {"default": "agibot-world/AgiBotWorld-Alpha-CtrlWorld-327"}],
+              "target_path": [["/workspace/datasets/"], {"default": "/workspace/datasets/"}]
+            }
+          },
+          "output": ["STRING"],
+          "output_name": ["dataset_path"]
+        },
+        "config": {
+          "dataset": "agibot-world/AgiBotWorld-Alpha-CtrlWorld-327",
+          "target_path": "/workspace/datasets/"
+        }
+      }
+    }
+  ],
+  "edges": [],
+  "viewport": {
+    "x": 0,
+    "y": 0,
+    "zoom": 1.0
+  }
+}

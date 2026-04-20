@@ -45,7 +45,7 @@ from pyromind_sdk.common.node_sdk import PodExecutionNode
 
 
 
-def test_yaml_file(yaml_path: str, verbose: bool = False, execute: bool = False, inputs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def validate_yaml_file(yaml_path: str, verbose: bool = False, execute: bool = False, inputs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Test a single YAML file"""
     yaml_path = Path(yaml_path)
     if not yaml_path.exists():
@@ -101,7 +101,7 @@ def test_yaml_file(yaml_path: str, verbose: bool = False, execute: bool = False,
         return {"success": False, "error": str(e), "file": str(yaml_path)}
 
 
-def test_directory(directory: str, verbose: bool = False, execute: bool = False) -> Dict[str, Any]:
+def validate_directory(directory: str, verbose: bool = False, execute: bool = False) -> Dict[str, Any]:
     """Test all YAML files in directory"""
     directory = Path(directory)
     if not directory.exists():
@@ -301,9 +301,9 @@ Examples:
     
     # Execute tests
     if args.directory or Path(args.yaml_path).is_dir():
-        results = test_directory(args.yaml_path, verbose=args.verbose, execute=args.execute)
+        results = validate_directory(args.yaml_path, verbose=args.verbose, execute=args.execute)
     else:
-        results = test_yaml_file(args.yaml_path, verbose=args.verbose, execute=args.execute, inputs=inputs)
+        results = validate_yaml_file(args.yaml_path, verbose=args.verbose, execute=args.execute, inputs=inputs)
     
     # Output results
     if args.json:
