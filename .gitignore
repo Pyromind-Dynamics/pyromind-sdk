@@ -26,3 +26,5 @@ htmlcov/
 # Ignore test_storage.sh in root directory only
 /test_storage.sh
 build/
+/command_setup.sh
+/pyromind_sdk/examples/openapi/workflows/deprecated/README.md

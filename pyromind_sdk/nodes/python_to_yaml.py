@@ -2,6 +2,11 @@
 Python node class to YAML configuration converter
 
 Converts Python class-defined nodes to YAML configuration files.
+Provides functionality to:
+1. Convert Python function → YAML config (python_function_to_yaml)
+2. Convert Python class → YAML config (convert_node_class_to_yaml)
+3. Convert YAML config → Python class (yaml_to_node_class)
+4. Convert YAML config → Python code (yaml_to_python_code)
 """
 
 import logging
@@ -10,21 +15,59 @@ import ast
 import inspect
 from typing import Dict, Any, List, Tuple, Optional
 from pathlib import Path
+from dataclasses import dataclass, field
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
 
-# Base class to name mapping (reverse mapping)
-CLASS_TO_NAME_MAP = {
-    "PodExecutionNode": "PodExecutionNode",
-    "GpuPodExecutionNode": "GpuPodExecutionNode",
-    "JupyterLabPodExecutionNode": "JupyterLabPodExecutionNode",
-    "PortPodExecutionNode": "PortPodExecutionNode",
-    "DaemonPodExecutionNode": "DaemonPodExecutionNode",
-    "EndpointNode": "EndpointNode",
+# ============================================================================
+# Resource Type Support# ============================================================================
+
+class ResourceType(Enum):
+    """Resource type enum for node configuration"""
+    CPU = "cpu"
+    GPU = "gpu"
+
+
+# Resource type to base classes mapping (multiple inheritance)
+RESOURCE_TYPE_TO_BASE_CLASSES: Dict[str, List[str]] = {
+    ResourceType.CPU.value: ["JupyterLabPodExecutionNode"],
+    ResourceType.GPU.value: ["JupyterLabPodExecutionNode", "GpuPodExecutionNode"],
+}
+
+# Default resource configurations
+DEFAULT_RESOURCE_CONFIGS: Dict[str, Dict[str, Any]] = {
+    ResourceType.CPU.value: {
+        "memory_limit": "1Gi",
+        "cpu_limit": 2,
+    },
+    ResourceType.GPU.value: {
+        "memory_limit": "16Gi",
+        "cpu_limit": 4,
+        "gpu_min_count": 1,
+        "gpu_max_count": 1,
+    },
 }
 
 
+def get_base_classes_by_resource_type(resource_type: str) -> List[str]:
+    """Get base class list by resource type (supports multiple inheritance)"""
+    if resource_type in RESOURCE_TYPE_TO_BASE_CLASSES:
+        return RESOURCE_TYPE_TO_BASE_CLASSES[resource_type]
+    return ["PodExecutionNode"]
+
+
+def get_resource_config(resource_type: str) -> Dict[str, Any]:
+    """Get resource configuration by resource type"""
+    if resource_type in DEFAULT_RESOURCE_CONFIGS:
+        return DEFAULT_RESOURCE_CONFIGS[resource_type].copy()
+    return DEFAULT_RESOURCE_CONFIGS[ResourceType.CPU.value].copy()
+
+
+# ============================================================================
+# Type Definitions
+# ============================================================================
 
 ALLOWED_YAML_DTYPES = {"STRING", "INT", "FLOAT", "BOOLEAN"}
 ANNOTATION_TO_DTYPE = {
@@ -33,6 +76,96 @@ ANNOTATION_TO_DTYPE = {
     "float": "FLOAT",
     "bool": "BOOLEAN",
 }
+
+
+# Type mapping: Python type annotation → pyromind-sdk dtype
+PYTHON_TYPE_TO_DTYPE = {
+    "str": "STRING",
+    "string": "STRING",
+    "String": "STRING",
+    "int": "INT",
+    "integer": "INT",
+    "float": "FLOAT",
+    "bool": "BOOLEAN",
+    "boolean": "BOOLEAN",
+    "any": "STRING",
+    "Any": "STRING",
+}
+
+
+@dataclass
+class FunctionInfo:
+    """Function information extracted from Python file"""
+    name: str
+    start_line: int
+    end_line: int
+    parameters: List[Dict[str, Any]] = field(default_factory=list)
+    return_type: Optional[str] = None
+    docstring: Optional[str] = None
+
+
+@dataclass
+class ParameterValidation:
+    """
+    Parameter validation configuration
+
+    Supported validation types:
+    - INT/FLOAT: min, max, step
+    - STRING: min_length, max_length, pattern, enum
+    - BOOLEAN: no additional validation
+    """
+    # Common attributes
+    default: Any = None
+    description: Optional[str] = None
+    display_name: Optional[str] = None
+
+    # Numeric validation (INT, FLOAT)
+    min: Optional[float] = None
+    max: Optional[float] = None
+    step: Optional[float] = None
+
+    # String validation (STRING)
+    min_length: Optional[int] = None
+    max_length: Optional[int] = None
+    pattern: Optional[str] = None  # Regex pattern
+    enum: Optional[List[str]] = None  # Enum values list
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary, only include non-null values"""
+        result = {}
+        for key, value in [
+            ("default", self.default),
+            ("description", self.description),
+            ("display_name", self.display_name),
+            ("min", self.min),
+            ("max", self.max),
+            ("step", self.step),
+            ("min_length", self.min_length),
+            ("max_length", self.max_length),
+            ("pattern", self.pattern),
+            ("enum", self.enum),
+        ]:
+            if value is not None:
+                result[key] = value
+        return result
+
+
+@dataclass
+class YamlConfig:
+    """YAML configuration data class"""
+    name: str
+    display_name: str
+    description: str
+    python_code: str
+    function_name: str
+    parameters: List[Dict[str, Any]] = field(default_factory=list)
+    base_class: str = "PodExecutionNode"
+    category: str = "custom"
+    resources: Dict[str, Any] = field(default_factory=dict)
+    python_command: str = "python3"
+    conda_env: Optional[str] = None
+    workdir: Optional[str] = None
+    environment: Optional[Dict[str, str]] = None
 
 
 def _get_name_from_annotation(annotation: Optional[ast.AST]) -> Optional[str]:
@@ -296,439 +429,244 @@ def python_function_to_yaml(
     }
 
     if output_path:
-        save_yaml_config(config, output_path)
+        _save_yaml_config(config, output_path)
     return config
 
 
-def get_base_classes(node_class: type) -> List[str]:
-    """
-    Get base class name list for node
-    
-    Args:
-        node_class: Node class
-        
-    Returns:
-        Base class name list
-    """
-    base_classes = []
-    for base in node_class.__bases__:
-        base_name = base.__name__
-        # Only include base classes we support
-        if base_name in CLASS_TO_NAME_MAP:
-            base_classes.append(base_name)
-    
-    return base_classes
-
-
-def parse_input_type_spec(input_spec: Tuple) -> Dict[str, Any]:
-    """
-    Parse input type specification
-    
-    Args:
-        input_spec: Input type tuple, e.g., ("STRING", {"default": "value"}) or ("STRING",)
-        
-    Returns:
-        Parsed configuration dictionary
-    """
-    if not input_spec:
-        return {"type": "STRING"}
-    
-    if len(input_spec) == 1:
-        # Only type, no options
-        type_spec = input_spec[0]
-        if isinstance(type_spec, str):
-            return {"type": type_spec}
-        elif isinstance(type_spec, list):
-            return {"type": type_spec}
-        else:
-            return {"type": "STRING"}
-    
-    # Has type and options
-    type_spec = input_spec[0]
-    options = input_spec[1] if len(input_spec) > 1 else {}
-    
-    config = {}
-    if isinstance(type_spec, str):
-        config["type"] = type_spec
-    elif isinstance(type_spec, list):
-        config["type"] = type_spec
-    else:
-        config["type"] = "STRING"
-    
-    # Add options
-    if isinstance(options, dict):
-        config.update(options)
-    
-    return config
-
-
-def convert_node_class_to_yaml(node_class: type, output_path: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Convert Python node class to YAML configuration dictionary
-    
-    Args:
-        node_class: Node class
-        output_path: Optional output file path
-        
-    Returns:
-        YAML configuration dictionary
-    """
-    config = {}
-    
-    # Basic information
-    config["name"] = node_class.__name__
-    
-    if hasattr(node_class, "DESCRIPTION"):
-        config["description"] = node_class.DESCRIPTION
-    if hasattr(node_class, "CATEGORY"):
-        config["category"] = node_class.CATEGORY
-    if hasattr(node_class, "DISPLAY_NAME"):
-        config["display_name"] = node_class.DISPLAY_NAME
-    
-    # Base classes
-    base_classes = get_base_classes(node_class)
-    if len(base_classes) == 1:
-        config["base_class"] = base_classes[0]
-    elif len(base_classes) > 1:
-        config["base_class"] = base_classes
-    
-    # Return types
-    if hasattr(node_class, "RETURN_TYPES") and node_class.RETURN_TYPES:
-        config["return_types"] = list(node_class.RETURN_TYPES)
-    if hasattr(node_class, "RETURN_NAMES") and node_class.RETURN_NAMES:
-        config["return_names"] = list(node_class.RETURN_NAMES)
-    if hasattr(node_class, "OUTPUT_NODE"):
-        config["output_node"] = node_class.OUTPUT_NODE
-    
-    # PodExecutionNode related attributes
-    if hasattr(node_class, "COMMAND_TEMPLATE"):
-        config["command_template"] = node_class.COMMAND_TEMPLATE
-    if hasattr(node_class, "ARGS_TEMPLATE"):
-        config["args_template"] = node_class.ARGS_TEMPLATE
-    
-    # Resource limits
-    resources = {}
-    if hasattr(node_class, "MEMORY_LIMIT") and node_class.MEMORY_LIMIT is not None:
-        resources["memory_limit"] = node_class.MEMORY_LIMIT
-    if hasattr(node_class, "CPU_LIMIT") and node_class.CPU_LIMIT is not None:
-        resources["cpu_limit"] = node_class.CPU_LIMIT
-    if hasattr(node_class, "GPU_MIN_COUNT"):
-        resources["gpu_min_count"] = node_class.GPU_MIN_COUNT
-    if hasattr(node_class, "GPU_MAX_COUNT"):
-        resources["gpu_max_count"] = node_class.GPU_MAX_COUNT
-    if resources:
-        config["resources"] = resources
-    
-    # Input types
-    if hasattr(node_class, "BASE_INPUT_TYPES"):
-        try:
-            input_types = node_class.BASE_INPUT_TYPES()
-            inputs_config = {}
-            
-            # Process required inputs
-            if "required" in input_types and input_types["required"]:
-                inputs_config["required"] = {}
-                for name, spec in input_types["required"].items():
-                    inputs_config["required"][name] = parse_input_type_spec(spec)
-            
-            # Process optional inputs
-            if "optional" in input_types and input_types["optional"]:
-                inputs_config["optional"] = {}
-                for name, spec in input_types["optional"].items():
-                    inputs_config["optional"][name] = parse_input_type_spec(spec)
-            
-            if inputs_config:
-                config["inputs"] = inputs_config
-        except Exception as e:
-            logger.warning(f"Warning: Could not parse BASE_INPUT_TYPES for {node_class.__name__}: {e}")
-    
-    # Customer inputs
-    if hasattr(node_class, "CUSTOMER_INPUTS"):
-        try:
-            customer_inputs = node_class.CUSTOMER_INPUTS()
-            if customer_inputs:
-                config["customer_inputs"] = list(customer_inputs)
-        except Exception as e:
-            logger.warning(f"Warning: Could not parse CUSTOMER_INPUTS for {node_class.__name__}: {e}")
-    
-    # If output path is specified, save to file
-    if output_path:
-        save_yaml_config(config, output_path)
-    
-    return config
-
-
-def save_yaml_config(config: Dict[str, Any], output_path: str):
-    """
-    Save configuration as YAML file
-    
-    Args:
-        config: Configuration dictionary
-        output_path: Output file path
-    """
+def _save_yaml_config(config: Dict[str, Any], output_path: str):
+    """Save configuration as YAML file"""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     with open(output_path, "w", encoding="utf-8") as f:
         yaml.dump(config, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
-    
-    logger.info(f"✓ YAML configuration saved to: {output_path}")
+
+    logger.info(f"YAML configuration saved to: {output_path}")
 
 
-def convert_module_to_yaml(module, output_dir: str = "nodes"):
+# ============================================================================
+# PythonToYamlService - Enhanced service for converting Python functions to YAML
+# ============================================================================
+
+class PythonToYamlService:
     """
-    Convert all node classes in module to YAML files
-    
-    Args:
-        module: Python module
-        output_dir: Output directory
+    Python function to YAML service
+
+    Converts Python functions to YAML configuration in pyromind-sdk format.
+    Provides advanced features like:
+    - AST parsing of Python files
+    - Resource type configuration (CPU/GPU)
+    - Parameter validation
+    - Image ID support
     """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Get all node classes in module
-    node_classes = []
-    for name, obj in inspect.getmembers(module):
-        if (inspect.isclass(obj) and 
-            obj.__module__ == module.__name__ and
-            name.endswith("Node")):
-            node_classes.append((name, obj))
-    
-    logger.info(f"Found {len(node_classes)} node classes")
-    
-    for class_name, node_class in node_classes:
+
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def parse_python_file(self, file_path: str) -> List[FunctionInfo]:
+        """Parse Python file and extract function information"""
+        functions = []
+        function_map: Dict[str, FunctionInfo] = {}
+
         try:
-            config = convert_node_class_to_yaml(node_class)
-            output_path = output_dir / f"{class_name.lower()}.yaml"
-            save_yaml_config(config, output_path)
+            with open(file_path, "r", encoding="utf-8") as f:
+                source = f.read()
+
+            tree = ast.parse(source)
+
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    parameters = []
+                    for arg in node.args.args:
+                        param_name = arg.arg
+                        if param_name == "self":
+                            continue
+
+                        param_type = None
+                        if arg.annotation:
+                            param_type = ast.unparse(arg.annotation)
+
+                        param_info = {
+                            "name": param_name,
+                            "dtype": self._convert_type(param_type),
+                            "python_type": param_type,
+                            "type": "input",
+                            "required_type": "required",
+                        }
+                        parameters.append(param_info)
+
+                    # Process default value parameters
+                    defaults = node.args.defaults
+                    if defaults:
+                        num_defaults = len(defaults)
+                        num_args = len([a for a in node.args.args if a.arg != "self"])
+                        for i, default in enumerate(defaults):
+                            arg_idx = num_args - num_defaults + i
+                            if arg_idx < len(parameters):
+                                parameters[arg_idx]["required_type"] = "optional"
+                                parameters[arg_idx]["default"] = self._get_default_value(default)
+
+                    # Extract return type
+                    return_type = None
+                    if node.returns:
+                        return_type = ast.unparse(node.returns)
+
+                    # Extract docstring
+                    docstring = ast.get_docstring(node)
+
+                    func_info = FunctionInfo(
+                        name=node.name,
+                        start_line=node.lineno,
+                        end_line=node.end_lineno or node.lineno,
+                        parameters=parameters,
+                        return_type=return_type,
+                        docstring=docstring,
+                    )
+
+                    function_map[node.name] = func_info
+
+            functions = list(function_map.values())
+
+        except SyntaxError as e:
+            logger.error(f"Syntax error in {file_path}: {e}")
         except Exception as e:
-            logger.error(f"Error converting {class_name}: {e}")
+            logger.error(f"Error parsing {file_path}: {e}")
+
+        return functions
+
+    def _convert_type(self, python_type: Optional[str]) -> str:
+        """Convert Python type to pyromind-sdk dtype"""
+        if not python_type:
+            return "STRING"
+        base_type = python_type.strip("[]").split("[")[0].strip()
+        return PYTHON_TYPE_TO_DTYPE.get(base_type, "STRING")
+
+    def _get_default_value(self, default_node) -> Any:
+        """Extract default value from AST node"""
+        if isinstance(default_node, ast.Constant):
+            return default_node.value
+        elif isinstance(default_node, ast.Num):
+            return default_node.n
+        elif isinstance(default_node, ast.Str):
+            return default_node.s
+        elif isinstance(default_node, ast.NameConstant):
+            return default_node.value
+        elif isinstance(default_node, ast.List):
+            return []
+        elif isinstance(default_node, ast.Dict):
+            return {}
+        elif isinstance(default_node, ast.Name):
+            return default_node.id
+        return None
+
+    def generate_yaml(
+        self,
+        file_path: str,
+        function_name: str,
+        node_name: Optional[str] = None,
+        display_name: Optional[str] = None,
+        description: Optional[str] = None,
+        resource_type: str = "cpu",
+        category: str = "custom",
+        conda_env: Optional[str] = None,
+        workdir: Optional[str] = None,
+        environment: Optional[Dict[str, str]] = None,
+        parameter_validations: Optional[Dict[str, ParameterValidation]] = None,
+        image_id: Optional[str] = None,
+    ) -> str:
+        """Convert Python function to YAML configuration"""
+        functions = self.parse_python_file(file_path)
+
+        target_func = None
+        for func in functions:
+            if func.name == function_name:
+                target_func = func
+                break
+
+        if target_func is None:
+            raise ValueError(f"Function '{function_name}' not found in {file_path}")
+
+        # Build parameter list
+        parameters = []
+        for param in target_func.parameters:
+            param_dict = dict(param)
+            if parameter_validations and param["name"] in parameter_validations:
+                validation = parameter_validations[param["name"]]
+                validation_dict = validation.to_dict()
+                for key, value in validation_dict.items():
+                    if key not in param_dict or param_dict.get(key) is None:
+                        param_dict[key] = value
+            parameters.append(param_dict)
+
+        # Add output parameter
+        output_dtype = self._convert_type(target_func.return_type) if target_func.return_type else "STRING"
+        parameters.append({"name": "result", "dtype": output_dtype, "type": "output"})
+
+        # Build resource config
+        resources = get_resource_config(resource_type)
+
+        # Determine base class
+        base_classes = get_base_classes_by_resource_type(resource_type)
+        base_class = base_classes[0] if len(base_classes) == 1 else base_classes
+
+        # Build YAML config
+        yaml_config = {
+            "name": node_name or function_name,
+            "display_name": display_name or function_name,
+            "description": description or target_func.docstring or f"Auto-generated from {function_name}",
+            "base_class": base_class,
+            "python_code": file_path,
+            "function_name": function_name,
+            "parameters": parameters,
+            "resources": resources,
+            "python_command": "python3",
+        }
+
+        if image_id:
+            yaml_config["image_id"] = image_id
+        if conda_env:
+            yaml_config["conda_env"] = conda_env
+        if workdir:
+            yaml_config["workdir"] = workdir
+        if environment:
+            yaml_config["environment"] = environment
+
+        return yaml.dump(yaml_config, allow_unicode=True, default_flow_style=False, sort_keys=False)
+
+    def generate_yaml_dict(self, file_path: str, function_name: str, **kwargs) -> Dict[str, Any]:
+        """Convert Python function to YAML config dictionary"""
+        yaml_content = self.generate_yaml(file_path, function_name, **kwargs)
+        return yaml.safe_load(yaml_content)
+
+    def validate_function(self, function_info: FunctionInfo) -> tuple:
+        """Validate if function can be used to generate node"""
+        import re
+        errors = []
+
+        for param in function_info.parameters:
+            param_name = param.get("name", "")
+            python_type = param.get("python_type", "")
+
+            if python_type:
+                if python_type.startswith("List[") or python_type.startswith("list["):
+                    errors.append(f"Parameter '{param_name}' type '{python_type}' not supported")
+                elif python_type.startswith("Dict[") or python_type.startswith("dict["):
+                    errors.append(f"Parameter '{param_name}' type '{python_type}' not supported")
+                elif python_type.startswith("Optional[") or python_type.startswith("optional["):
+                    errors.append(f"Parameter '{param_name}' type '{python_type}' not supported")
+                elif python_type in ("Any", "any"):
+                    errors.append(f"Parameter '{param_name}' type 'Any' not supported")
+
+        if not re.match(r"^[a-z_][a-z0-9_]*$", function_info.name):
+            errors.append(f"Function name '{function_info.name}' does not conform to naming convention")
+
+        return len(errors) == 0, errors
 
 
-def yaml_to_node_class(yaml_path: str) -> type:
-    """
-    Convert YAML configuration to Python class object (returns class directly, does not generate code file)
-    
-    Args:
-        yaml_path: YAML configuration file path
-        
-    Returns:
-        Node class object
-    """
-    from .yaml_loader import load_nodes_from_yaml
-    
-    # Use existing loader to directly load node classes
-    nodes = load_nodes_from_yaml(yaml_path)
-    
-    if not nodes:
-        raise ValueError(f"No nodes found in {yaml_path}")
-    
-    # If only one node, return directly
-    if len(nodes) == 1:
-        return list(nodes.values())[0]
-    
-    # If multiple nodes, return dictionary
-    return nodes
-
-
-def yaml_to_python_code(yaml_path: str, output_path: Optional[str] = None) -> str:
-    """
-    Convert YAML configuration to Python code string (for generating code files)
-    
-    Note: If you need to use class objects directly, use yaml_to_node_class() function
-    
-    Args:
-        yaml_path: YAML configuration file path
-        output_path: Optional output Python file path
-        
-    Returns:
-        Python code string
-    """
-    import yaml
-    
-    # Load YAML configuration
-    with open(yaml_path, "r", encoding="utf-8") as f:
-        yaml_config = yaml.safe_load(f)
-    
-    # If multi-node file, take the first one
-    if isinstance(yaml_config, dict) and "nodes" in yaml_config:
-        node_config = yaml_config["nodes"][0]
-    else:
-        node_config = yaml_config
-    
-    # Generate Python code
-    code_lines = []
-    code_lines.append(f'"""')
-    code_lines.append(f'{node_config.get("description", "Node")}')
-    code_lines.append(f'"""')
-    code_lines.append("")
-    
-    # Import statements
-    base_classes = node_config.get("base_class", [])
-    if isinstance(base_classes, str):
-        base_classes = [base_classes]
-    
-    imports = set()
-    for base in base_classes:
-        imports.add(base)
-    
-    if imports:
-        imports_str = ", ".join(sorted(imports))
-        # Use pyromind_sdk
-        code_lines.append(f"from pyromind_sdk import {imports_str}")
-        code_lines.append("")
-    
-    # Class definition
-    class_name = node_config.get("name", "Node")
-    if len(base_classes) == 1:
-        base_str = base_classes[0]
-    else:
-        base_str = ", ".join(base_classes)
-    
-    code_lines.append(f"class {class_name}({base_str}):")
-    
-    # Class attributes
-    if node_config.get("description"):
-        code_lines.append(f'    DESCRIPTION = "{node_config["description"]}"')
-    if node_config.get("category"):
-        code_lines.append(f'    CATEGORY = "{node_config["category"]}"')
-    if node_config.get("display_name"):
-        code_lines.append(f'    DISPLAY_NAME = "{node_config["display_name"]}"')
-    if node_config.get("return_types"):
-        return_types = node_config["return_types"]
-        code_lines.append(f'    RETURN_TYPES = {return_types}')
-    if node_config.get("return_names"):
-        return_names = node_config["return_names"]
-        code_lines.append(f'    RETURN_NAMES = {return_names}')
-    
-    # Resource limits
-    resources = node_config.get("resources", {})
-    if resources:
-        code_lines.append("")
-        if "memory_limit" in resources:
-            code_lines.append(f'    MEMORY_LIMIT = {resources["memory_limit"]}')
-        if "cpu_limit" in resources:
-            code_lines.append(f'    CPU_LIMIT = {resources["cpu_limit"]}')
-        if "gpu_min_count" in resources:
-            code_lines.append(f'    GPU_MIN_COUNT = {resources["gpu_min_count"]}')
-        if "gpu_max_count" in resources:
-            code_lines.append(f'    GPU_MAX_COUNT = {resources["gpu_max_count"]}')
-    
-    # Command template
-    if node_config.get("command_template"):
-        code_lines.append("")
-        code_lines.append("    COMMAND_TEMPLATE = [")
-        for cmd in node_config["command_template"]:
-            code_lines.append(f'        "{cmd}",')
-        code_lines.append("    ]")
-    
-    # BASE_INPUT_TYPES method
-    if node_config.get("inputs"):
-        code_lines.append("")
-        code_lines.append("    @classmethod")
-        code_lines.append("    def BASE_INPUT_TYPES(cls):")
-        code_lines.append("        return {")
-        
-        inputs = node_config["inputs"]
-        if inputs.get("required"):
-            code_lines.append('            "required": {')
-            for name, config in inputs["required"].items():
-                type_spec = config.get("type", "STRING")
-                options = {k: v for k, v in config.items() if k != "type"}
-                if options:
-                    code_lines.append(f'                "{name}": ({repr(type_spec)}, {options}),')
-                else:
-                    code_lines.append(f'                "{name}": ({repr(type_spec)},),')
-            code_lines.append("            },")
-        
-        if inputs.get("optional"):
-            code_lines.append('            "optional": {')
-            for name, config in inputs["optional"].items():
-                type_spec = config.get("type", "STRING")
-                options = {k: v for k, v in config.items() if k != "type"}
-                if options:
-                    code_lines.append(f'                "{name}": ({repr(type_spec)}, {options}),')
-                else:
-                    code_lines.append(f'                "{name}": ({repr(type_spec)},),')
-            code_lines.append("            },")
-        else:
-            code_lines.append('            "optional": {},')
-        
-        code_lines.append("        }")
-    
-    # CUSTOMER_INPUTS method
-    if node_config.get("customer_inputs"):
-        code_lines.append("")
-        code_lines.append("    @classmethod")
-        code_lines.append("    def CUSTOMER_INPUTS(cls) -> set:")
-        code_lines.append('        """')
-        code_lines.append("        Define which inputs are for customer use")
-        code_lines.append('        """')
-        customer_inputs = node_config["customer_inputs"]
-        code_lines.append(f"        return {set(customer_inputs)}")
-    
-    code = "\n".join(code_lines)
-    
-    # If output path is specified, save to file
-    if output_path:
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(code)
-        logger.info(f"✓ Python code saved to: {output_path}")
-    
-    return code
-
-
-if __name__ == "__main__":
-    import sys
-    from pathlib import Path
-    
-    # Add parent directory to path
-    parent_dir = Path(__file__).parent.parent
-    sys.path.insert(0, str(parent_dir))
-    
-    from custom_gui_nodes_template.training import (
-        TrainingConfigNodeV2,
-        LoggingConfigNode,
-        CtrlWorldTrainingNode,
-    )
-    
-    logger.info("=" * 60)
-    logger.info("Python to YAML Conversion Example")
-    logger.info("=" * 60)
-    
-    # Convert single node
-    logger.info("\n1. Convert TrainingConfigNodeV2:")
-    config = convert_node_class_to_yaml(TrainingConfigNodeV2)
-    logger.info(f"   Node name: {config['name']}")
-    logger.info(f"   Base class: {config.get('base_class')}")
-    logger.info(f"   Input field count: {len(config.get('inputs', {}).get('required', {}))}")
-    
-    # Save to file
-    output_dir = Path(__file__).parent / "converted_from_python"
-    output_dir.mkdir(exist_ok=True)
-    convert_node_class_to_yaml(TrainingConfigNodeV2, output_dir / "training_config_node_v2.yaml")
-    convert_node_class_to_yaml(LoggingConfigNode, output_dir / "logging_config_node.yaml")
-    convert_node_class_to_yaml(CtrlWorldTrainingNode, output_dir / "ctrl_world_training_node.yaml")
-    
-    logger.info("\n2. YAML to Python Class Object Conversion Example:")
-    yaml_path = Path(__file__).parent.parent / "tests" / "nodes" / "hello_world_node.yaml"
-    if yaml_path.exists():
-        # Directly convert to class object (recommended method)
-        node_class = yaml_to_node_class(str(yaml_path))
-        logger.info(f"   Node class: {node_class.__name__}")
-        logger.info(f"   Base classes: {[b.__name__ for b in node_class.__bases__]}")
-        logger.info(f"   Description: {node_class.DESCRIPTION}")
-        logger.info(f"   Input fields: {list(node_class.BASE_INPUT_TYPES()['required'].keys())[:3]}...")
-        
-        # If code file generation is needed, can use yaml_to_python_code
-        logger.info("\n3. YAML to Python Code File Conversion Example:")
-        python_code = yaml_to_python_code(str(yaml_path))
-        logger.info("\nGenerated Python code preview:")
-        logger.info("-" * 60)
-        logger.info("\n".join(python_code.split("\n")[:20]) + "...")
-        logger.info("-" * 60)
-    
-    logger.info("\n" + "=" * 60)
-    logger.info("Conversion complete!")
-    logger.info("=" * 60)
+# Global singleton instance
+python_to_yaml_service = PythonToYamlService()
 

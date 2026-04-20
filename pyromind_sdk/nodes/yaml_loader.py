@@ -182,45 +182,93 @@ def validate_dtype(dtype: str) -> None:
 def validate_resource_limits(resources: Dict[str, Any]) -> None:
     """
     Validate resource limit reasonableness
-    
+
+    Supports both string format (e.g., "1Gi", "2") and integer format (e.g., 1, 2)
+
     Args:
         resources: Resource limit dictionary
-        
+
     Raises:
         ValueError: If resource limits exceed reasonable range
     """
+    import re
+
+    def parse_memory(value: Any) -> float:
+        """Parse memory value to GiB float"""
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            # Match patterns like "1Gi", "512Mi", "1G", "512M", "0.5Gi"
+            match = re.match(r'^(\d+(?:\.\d+)?)\s*(Gi|Mi|G|M)?$', value, re.IGNORECASE)
+            if not match:
+                raise ValueError(f"Invalid memory format: '{value}'. Use format like '1Gi', '512Mi', or integer GiB")
+            num = float(match.group(1))
+            unit = (match.group(2) or 'G').upper()
+            if unit in ('M', 'MI'):
+                return num / 1024
+            return num
+        raise ValueError(f"memory_limit must be string or number, got {type(value)}")
+
+    def parse_cpu(value: Any) -> int:
+        """Parse CPU value to integer"""
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(float(value))
+            except ValueError:
+                raise ValueError(f"Invalid cpu_limit: '{value}'. Use integer or string number")
+        raise ValueError(f"cpu_limit must be string or int, got {type(value)}")
+
+    def parse_gpu(value: Any) -> int:
+        """Parse GPU value to integer"""
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                raise ValueError(f"Invalid gpu count: '{value}'. Use integer")
+        raise ValueError(f"gpu count must be string or int, got {type(value)}")
+
     if "memory_limit" in resources:
-        memory = resources["memory_limit"]
-        if not isinstance(memory, int):
-            raise ValueError(f"memory_limit must be an integer, got {type(memory)}")
-        if memory < MIN_MEMORY_LIMIT or memory > MAX_MEMORY_LIMIT:
-            raise ValueError(f"memory_limit must be between {MIN_MEMORY_LIMIT} and {MAX_MEMORY_LIMIT}, got {memory}")
-    
+        try:
+            memory = parse_memory(resources["memory_limit"])
+            if memory < MIN_MEMORY_LIMIT or memory > MAX_MEMORY_LIMIT:
+                raise ValueError(f"memory_limit must be between {MIN_MEMORY_LIMIT} and {MAX_MEMORY_LIMIT} GiB, got {memory}")
+        except ValueError as e:
+            raise ValueError(f"memory_limit validation error: {e}")
+
     if "cpu_limit" in resources:
-        cpu = resources["cpu_limit"]
-        if not isinstance(cpu, int):
-            raise ValueError(f"cpu_limit must be an integer, got {type(cpu)}")
-        if cpu < MIN_CPU_LIMIT or cpu > MAX_CPU_LIMIT:
-            raise ValueError(f"cpu_limit must be between {MIN_CPU_LIMIT} and {MAX_CPU_LIMIT}, got {cpu}")
-    
+        try:
+            cpu = parse_cpu(resources["cpu_limit"])
+            if cpu < MIN_CPU_LIMIT or cpu > MAX_CPU_LIMIT:
+                raise ValueError(f"cpu_limit must be between {MIN_CPU_LIMIT} and {MAX_CPU_LIMIT}, got {cpu}")
+        except ValueError as e:
+            raise ValueError(f"cpu_limit validation error: {e}")
+
     if "gpu_min_count" in resources:
-        gpu_min = resources["gpu_min_count"]
-        if not isinstance(gpu_min, int):
-            raise ValueError(f"gpu_min_count must be an integer, got {type(gpu_min)}")
-        if gpu_min < MIN_GPU_COUNT or gpu_min > MAX_GPU_COUNT:
-            raise ValueError(f"gpu_min_count must be between {MIN_GPU_COUNT} and {MAX_GPU_COUNT}, got {gpu_min}")
-    
+        try:
+            gpu_min = parse_gpu(resources["gpu_min_count"])
+            if gpu_min < MIN_GPU_COUNT or gpu_min > MAX_GPU_COUNT:
+                raise ValueError(f"gpu_min_count must be between {MIN_GPU_COUNT} and {MAX_GPU_COUNT}, got {gpu_min}")
+        except ValueError as e:
+            raise ValueError(f"gpu_min_count validation error: {e}")
+
     if "gpu_max_count" in resources:
-        gpu_max = resources["gpu_max_count"]
-        if not isinstance(gpu_max, int):
-            raise ValueError(f"gpu_max_count must be an integer, got {type(gpu_max)}")
-        if gpu_max < MIN_GPU_COUNT or gpu_max > MAX_GPU_COUNT:
-            raise ValueError(f"gpu_max_count must be between {MIN_GPU_COUNT} and {MAX_GPU_COUNT}, got {gpu_max}")
-    
+        try:
+            gpu_max = parse_gpu(resources["gpu_max_count"])
+            if gpu_max < MIN_GPU_COUNT or gpu_max > MAX_GPU_COUNT:
+                raise ValueError(f"gpu_max_count must be between {MIN_GPU_COUNT} and {MAX_GPU_COUNT}, got {gpu_max}")
+        except ValueError as e:
+            raise ValueError(f"gpu_max_count validation error: {e}")
+
     # Validate gpu_min_count <= gpu_max_count
     if "gpu_min_count" in resources and "gpu_max_count" in resources:
-        if resources["gpu_min_count"] > resources["gpu_max_count"]:
-            raise ValueError(f"gpu_min_count ({resources['gpu_min_count']}) cannot be greater than gpu_max_count ({resources['gpu_max_count']})")
+        gpu_min = parse_gpu(resources["gpu_min_count"])
+        gpu_max = parse_gpu(resources["gpu_max_count"])
+        if gpu_min > gpu_max:
+            raise ValueError(f"gpu_min_count ({gpu_min}) cannot be greater than gpu_max_count ({gpu_max})")
 
 
 def validate_file_path(file_path: str, base_path: Optional[str] = None) -> Path:
@@ -794,8 +842,19 @@ def load_all_nodes_from_directory(directory: str) -> Dict[str, type]:
 
 # Export functions
 __all__ = [
+    # Load functions
     "load_nodes_from_yaml",
     "load_all_nodes_from_directory",
     "create_node_class_from_yaml",
+    # Validation functions
+    "validate_parameter_name",
+    "validate_class_name",
+    "validate_dtype",
+    "validate_resource_limits",
+    "validate_file_path",
+    "validate_command_template",
+    # Parse functions
+    "parse_input_type",
+    "parse_parameters",
 ]
 

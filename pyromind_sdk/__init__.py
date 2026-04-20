@@ -1,10 +1,10 @@
 """
 PyroMind Node SDK
 
-A lightweight SDK stub for local development and testing of third-party nodes 
+A lightweight SDK stub for local development and testing of third-party nodes
 without the full platform codebase (without `app.models.nodes`).
 
-In the real platform runtime environment, nodes should prioritize importing 
+In the real platform runtime environment, nodes should prioritize importing
 base classes from `app.models.nodes`.
 """
 
@@ -15,9 +15,20 @@ from .nodes import (
     load_nodes_from_yaml,
     load_all_nodes_from_directory,
     create_node_class_from_yaml,
-    convert_node_class_to_yaml,
-    yaml_to_node_class,
+    # Python to YAML conversion
     python_function_to_yaml,
+    # New from PythonToYamlService
+    PythonToYamlService,
+    python_to_yaml_service,
+    FunctionInfo,
+    ParameterValidation,
+    YamlConfig,
+    ResourceType,
+    get_base_classes_by_resource_type,
+    get_resource_config,
+    # Python function executor
+    build_command_template,
+    resolve_python_file_path,
 )
 
 # Export API client functionality
@@ -65,9 +76,22 @@ __all__ = [
     "load_nodes_from_yaml",
     "load_all_nodes_from_directory",
     "create_node_class_from_yaml",
-    "convert_node_class_to_yaml",
-    "yaml_to_node_class",
+    # Python to YAML conversion
     "python_function_to_yaml",
+    # PythonToYamlService (enhanced)
+    "PythonToYamlService",
+    "python_to_yaml_service",
+    # Data classes
+    "FunctionInfo",
+    "ParameterValidation",
+    "YamlConfig",
+    # Resource type utilities
+    "ResourceType",
+    "get_base_classes_by_resource_type",
+    "get_resource_config",
+    # Python function executor
+    "build_command_template",
+    "resolve_python_file_path",
     # API client functionality
     "PyroMindClient",
     "PyroMindAPIError",
