@@ -13,6 +13,7 @@ import os
 import json
 import importlib.util
 import argparse
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
@@ -57,6 +58,24 @@ def _resolve_inputs_from_tmp_files(obj: Any) -> Any:
     return _read_tmp_file_if_exists(obj)
 
 
+@contextmanager
+def _temporary_sys_path(path: Path):
+    """Temporarily append a path to sys.path for module imports."""
+    path_str = str(path.resolve())
+    inserted = False
+    if path_str not in sys.path:
+        sys.path.append(path_str)
+        inserted = True
+    try:
+        yield
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(path_str)
+            except ValueError:
+                pass
+
+
 def load_python_module(python_file: Path):
     """
     Load Python module
@@ -80,7 +99,9 @@ def load_python_module(python_file: Path):
         raise ImportError(f"Failed to load module from: {python_file}")
     
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Ensure sibling package imports in user code work regardless of cwd.
+    with _temporary_sys_path(python_file.parent):
+        spec.loader.exec_module(module)
     return module
 
 
