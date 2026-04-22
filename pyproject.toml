@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyromind-sdk"
-version = "0.0.16"
+version = "0.0.24.rc2"
 description = "Lightweight SDK stub for local development and testing of third-party nodes without the full platform codebase"
 readme = "README.md"
 requires-python = ">=3.8"

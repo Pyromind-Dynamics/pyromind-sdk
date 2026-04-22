@@ -10,12 +10,15 @@ Regression tests for tmp heredoc indirection:
 
 from __future__ import annotations
 
+import os
+import sys
+import importlib.util
 from pathlib import Path
 
 import pytest
 
 from pyromind_sdk.nodes.command_executor import prepare_command_template
-from pyromind_sdk.nodes.function_call_wrapper import function_call_wrapper
+from pyromind_sdk.nodes.function_call_wrapper import function_call_wrapper, load_python_module
 from pyromind_sdk.nodes.python_function_executor import build_command_template
 
 
@@ -83,4 +86,54 @@ def test_function_call_wrapper_reads_tmp_files(tmp_path: Path) -> None:
 
     assert out_file.exists()
     assert out_file.read_text(encoding="utf-8") == content
+
+
+def test_load_python_module_imports_sibling_package_and_restores_sys_path(tmp_path: Path) -> None:
+    """
+    Ensure module loading works outside module cwd and does not leak sys.path entries.
+    """
+    package_name = "tmp_unique_pkg_for_wrapper_test"
+    package_dir = tmp_path / package_name
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "call.py").write_text(
+        "def call() -> str:\n"
+        "    return 'ok'\n",
+        encoding="utf-8",
+    )
+    module_file = tmp_path / "node_functions.py"
+    module_file.write_text(
+        f"from {package_name}.call import call\n"
+        "def run() -> str:\n"
+        "    return call()\n",
+        encoding="utf-8",
+    )
+
+    original_cwd = Path.cwd()
+    before_sys_path = list(sys.path)
+    try:
+        other_dir = tmp_path / "other_cwd"
+        other_dir.mkdir(parents=True, exist_ok=True)
+        os.chdir(other_dir)
+
+        wrapper_file = (
+            Path(__file__).resolve().parents[2]
+            / "nodes"
+            / "function_call_wrapper.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "function_call_wrapper_under_test",
+            wrapper_file,
+        )
+        assert spec is not None and spec.loader is not None
+        wrapper_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wrapper_module)
+
+        module = wrapper_module.load_python_module(module_file)
+        assert module.run() == "ok"
+        assert str(tmp_path.resolve()) not in sys.path
+    finally:
+        os.chdir(original_cwd)
+
+    assert sys.path == before_sys_path
 

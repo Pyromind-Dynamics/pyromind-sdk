@@ -72,9 +72,12 @@ def test_yaml_file(yaml_path: str, verbose: bool = False, execute: bool = False,
                     if hasattr(node_class, "BASE_INPUT_TYPES"):
                         input_types = node_class.BASE_INPUT_TYPES()
                     
-                    # Use default values if inputs not provided
-                    if inputs is None:
-                        inputs = get_default_inputs(input_types)
+                    # Always start from defaults, then override with user inputs.
+                    # This prevents unresolved placeholders like {{optional_param}}
+                    # when users provide only a partial --inputs JSON.
+                    merged_inputs = get_default_inputs(input_types)
+                    if inputs is not None:
+                        merged_inputs.update(inputs)
                     
                     # Get output names
                     return_names = list(getattr(node_class, "RETURN_NAMES", ()))
@@ -82,7 +85,7 @@ def test_yaml_file(yaml_path: str, verbose: bool = False, execute: bool = False,
                     # Execute command template
                     execution_result = execute_command_template(
                         command_template,
-                        inputs=inputs,
+                        inputs=merged_inputs,
                         output_names=return_names if return_names else None
                     )
             
