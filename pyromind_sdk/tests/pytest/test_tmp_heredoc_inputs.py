@@ -22,6 +22,16 @@ from pyromind_sdk.nodes.function_call_wrapper import function_call_wrapper, load
 from pyromind_sdk.nodes.python_function_executor import build_command_template
 
 
+def _load_nodes_module(module_filename: str):
+    """Load a nodes module directly from source file path."""
+    module_file = Path(__file__).resolve().parents[2] / "nodes" / module_filename
+    spec = importlib.util.spec_from_file_location(f"nodes_{module_filename}", module_file)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_build_command_template_uses_tmp_heredoc_for_string_inputs(tmp_path: Path) -> None:
     """
     Ensure command_template preserves heredoc syntax and passes `/tmp/<input>` paths.
@@ -136,4 +146,177 @@ def test_load_python_module_imports_sibling_package_and_restores_sys_path(tmp_pa
         os.chdir(original_cwd)
 
     assert sys.path == before_sys_path
+
+
+def test_build_command_template_accelerate_mode_uses_accelerate_config_input(tmp_path: Path) -> None:
+    """ACCELERATE_CONFIG input should be written to tmp config file and passed by --config_file."""
+    python_executor_module = _load_nodes_module("python_function_executor.py")
+    build_template = python_executor_module.build_command_template
+
+    dummy_py = tmp_path / "dummy_accelerate_module.py"
+    dummy_py.write_text(
+        "def f(system_prompt: str) -> dict:\n"
+        "    return {'out': system_prompt}\n",
+        encoding="utf-8",
+    )
+
+    command_template = build_template(
+        python_code=str(dummy_py),
+        function_name="f",
+        input_types={
+            "required": {
+                "system_prompt": ("STRING", {}),
+                "accelerate_config": ("ACCELERATE_CONFIG", {}),
+            },
+            "optional": {},
+        },
+        output_names=["out"],
+        return_types=["STRING"],
+        python_command="accelerate",
+    )
+
+    script = command_template[2]
+    assert "accelerate launch --config_file /tmp/accelerate_config" in script
+    assert "cat > /tmp/accelerate_config" in script
+    assert "{{accelerate_config}}" in script
+    assert "--inputs '{\"system_prompt\": \"/tmp/system_prompt\"}'" in script
+    assert "\"accelerate_config\": \"/tmp/accelerate_config\"" not in script
+    assert "pyromind_sdk.nodes.function_call_wrapper" in script
+
+
+def test_build_command_template_accelerate_mode_without_declared_config_input(tmp_path: Path) -> None:
+    """accelerate mode should use auto-injected accelerate_config placeholder."""
+    python_executor_module = _load_nodes_module("python_function_executor.py")
+    build_template = python_executor_module.build_command_template
+
+    dummy_py = tmp_path / "dummy_accelerate_missing_cfg_module.py"
+    dummy_py.write_text(
+        "def f(system_prompt: str) -> dict:\n"
+        "    return {'out': system_prompt}\n",
+        encoding="utf-8",
+    )
+
+    command_template = build_template(
+        python_code=str(dummy_py),
+        function_name="f",
+        input_types={"required": {"system_prompt": ("STRING", {})}, "optional": {}},
+        output_names=["out"],
+        return_types=["STRING"],
+        python_command="accelerate",
+    )
+    script = command_template[2]
+    assert "{{accelerate_config}}" in script
+    assert "accelerate launch --config_file /tmp/accelerate_config" in script
+
+
+def test_build_command_template_accelerate_prefix_not_special_mode(tmp_path: Path) -> None:
+    python_executor_module = _load_nodes_module("python_function_executor.py")
+    build_template = python_executor_module.build_command_template
+
+    """
+    Only exact `python_command='accelerate'` is special mode.
+
+    Prefix values (e.g. `accelerate launch ...`) are treated as plain command strings.
+    """
+    dummy_py = tmp_path / "dummy_accelerate_prefix_module.py"
+    dummy_py.write_text(
+        "def f(system_prompt: str) -> dict:\n"
+        "    return {'out': system_prompt}\n",
+        encoding="utf-8",
+    )
+
+    command_template = build_template(
+        python_code=str(dummy_py),
+        function_name="f",
+        input_types={"required": {"system_prompt": ("STRING", {})}, "optional": {}},
+        output_names=["out"],
+        return_types=["STRING"],
+        python_command="accelerate launch --num_processes 4",
+    )
+
+    script = command_template[2]
+    assert "accelerate launch --num_processes 4 -m pyromind_sdk.nodes.function_call_wrapper" in script
+    assert "--config_file /tmp/accelerate_config_" not in script
+
+
+def test_yaml_loader_rejects_accelerate_without_gpu_base_class(tmp_path: Path) -> None:
+    """YAML loader should fail early when accelerate mode is used without GpuPodExecutionNode."""
+    yaml_loader_module = _load_nodes_module("yaml_loader.py")
+    create_node_class_from_yaml = yaml_loader_module.create_node_class_from_yaml
+
+    python_file = tmp_path / "node_func.py"
+    python_file.write_text(
+        "def run(text: str) -> dict:\n"
+        "    return {'out': text}\n",
+        encoding="utf-8",
+    )
+
+    yaml_config = {
+        "name": "InvalidAccelerateNode",
+        "description": "Invalid accelerate example",
+        "category": "Tests",
+        "base_class": "PodExecutionNode",
+        "python_code": str(python_file),
+        "function_name": "run",
+        "python_command": "accelerate",
+        "parameters": [
+            {
+                "name": "text",
+                "type": "input",
+                "dtype": "STRING",
+                "required_type": "required",
+            },
+            {
+                "name": "out",
+                "type": "output",
+                "dtype": "STRING",
+            },
+        ],
+    }
+
+    with pytest.raises(ValueError, match="GpuPodExecutionNode"):
+        create_node_class_from_yaml(yaml_config, class_name="InvalidAccelerateNode")
+
+
+def test_yaml_loader_accepts_accelerate_without_config_input_decl(tmp_path: Path) -> None:
+    """accelerate mode should not require manual ACCELERATE_CONFIG declaration."""
+    yaml_loader_module = _load_nodes_module("yaml_loader.py")
+    yaml_loader_module.resolve_python_file_path = lambda python_code, yaml_file_path=None: python_code
+    yaml_loader_module.build_command_template = lambda *args, **kwargs: ["bash", "-c", "echo ok"]
+    create_node_class_from_yaml = yaml_loader_module.create_node_class_from_yaml
+
+    python_file = tmp_path / "node_func_missing_cfg.py"
+    python_file.write_text(
+        "def run(text: str) -> dict:\n"
+        "    return {'out': text}\n",
+        encoding="utf-8",
+    )
+
+    yaml_config = {
+        "name": "MissingAccelerateConfigNode",
+        "description": "Missing config",
+        "category": "Tests",
+        "base_class": "GpuPodExecutionNode",
+        "python_code": str(python_file),
+        "function_name": "run",
+        "python_command": "accelerate",
+        "parameters": [
+            {
+                "name": "text",
+                "type": "input",
+                "dtype": "STRING",
+                "required_type": "required",
+            },
+            {
+                "name": "out",
+                "type": "output",
+                "dtype": "STRING",
+            },
+        ],
+    }
+
+    node_class = create_node_class_from_yaml(yaml_config, class_name="MissingAccelerateConfigNode")
+    assert hasattr(node_class, "COMMAND_TEMPLATE")
+    base_inputs = node_class.BASE_INPUT_TYPES()
+    assert "accelerate_config" in base_inputs.get("required", {})
 

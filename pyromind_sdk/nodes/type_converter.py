@@ -21,6 +21,9 @@ def convert_string_to_python_type(value: str, type_spec: Any) -> Any:
     """
     if type_spec == "STRING":
         return str(value)
+    elif type_spec == "ACCELERATE_CONFIG":
+        # Keep accelerate config as raw text content.
+        return str(value)
     elif type_spec == "INT":
         return int(value)
     elif type_spec == "FLOAT":

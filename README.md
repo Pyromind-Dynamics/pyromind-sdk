@@ -179,6 +179,13 @@ python -m pyromind_sdk.cli python-to-yaml \
 - Conda environment activation is handled automatically (default: `base` environment)
 - The command execution uses `bash -c` with conda activation, so shell operators like `&&` are preserved
 
+**Note on accelerate mode:**
+- Accelerate mode is enabled only when `python_command: "accelerate"` (exact match after trimming spaces).
+- Values that only start with `accelerate` (for example `accelerate launch --num_processes 2`) are treated as normal command strings.
+- In accelerate mode, the node must inherit `GpuPodExecutionNode`.
+- In accelerate mode, the SDK reads the input parameter with dtype `ACCELERATE_CONFIG`, writes it into `/tmp/accelerate_config_<uuid>.yaml`, and starts with `accelerate launch --config_file <tmp_file> ...`.
+- `ACCELERATE_CONFIG` is injected by runtime automatically, so YAML does not need to declare it in `parameters`.
+
 ## Advanced Features
 
 ### Resource Configuration
@@ -333,6 +340,7 @@ Check the `examples/` directory for more examples:
 - `echo_node.yaml`: Simple command execution
 - `python_calculator_node.yaml`: Python function node with multiple inputs/outputs
 - `jupyter_gpu_node.yaml`: Jupyter GPU execution example
+- `accelerate_gpu_node.yaml`: Accelerate launch example for GPU Python nodes
 - `multiline_text_node.yaml`: Multiline text processing
 - `customer_inputs_node.yaml`: Customer inputs example
 

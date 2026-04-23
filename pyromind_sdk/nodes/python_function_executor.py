@@ -13,6 +13,62 @@ from typing import Dict, Any, List, Optional
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+AUTO_ACCELERATE_CONFIG_INPUT_NAME = "accelerate_config"
+
+
+def _ensure_accelerate_config_required_input(input_types: Dict[str, Any]) -> str:
+    """
+    Ensure accelerate config is present in required inputs.
+
+    If YAML explicitly declares one ACCELERATE_CONFIG input, use that name.
+    Otherwise inject auto input name into required inputs with no default.
+    """
+    required_inputs = input_types.setdefault("required", {})
+    optional_inputs = input_types.setdefault("optional", {})
+    all_inputs = {**required_inputs, **optional_inputs}
+    matched: List[str] = []
+    for input_name, input_spec in all_inputs.items():
+        if isinstance(input_spec, (tuple, list)) and len(input_spec) > 0:
+            type_spec = input_spec[0]
+            if type_spec == "ACCELERATE_CONFIG":
+                matched.append(input_name)
+    if not matched:
+        required_inputs[AUTO_ACCELERATE_CONFIG_INPUT_NAME] = ("ACCELERATE_CONFIG", {})
+        return AUTO_ACCELERATE_CONFIG_INPUT_NAME
+    if len(matched) > 1:
+        raise ValueError(
+            "accelerate mode supports exactly one ACCELERATE_CONFIG input parameter, "
+            f"got: {matched}"
+        )
+    return matched[0]
+
+
+def _build_wrapper_command(
+    python_command: str,
+    wrapper_module: str,
+    accelerate_config_file: Optional[str] = None,
+) -> str:
+    """
+    Build wrapper invocation command.
+
+    Only when python_command is exactly 'accelerate' (after strip) will it use
+    accelerate-specific launch logic.
+    """
+    python_command_stripped = (python_command or "").strip()
+    if not python_command_stripped:
+        python_command_stripped = "python3"
+
+    if python_command_stripped == "accelerate":
+        if not accelerate_config_file:
+            raise ValueError(
+                "accelerate mode requires a config file path. "
+                "Please provide an ACCELERATE_CONFIG input parameter."
+            )
+        cfg_escaped = shlex.quote(accelerate_config_file)
+        # `accelerate launch` already chooses the Python executable. Passing an
+        # extra `python` token makes it treated as a script path and fails.
+        return f"accelerate launch --config_file {cfg_escaped} -m {wrapper_module}"
+    return f"{python_command_stripped} -m {wrapper_module}"
 
 
 def build_command_template(
@@ -24,7 +80,7 @@ def build_command_template(
     python_command: str = "python3",
     conda_env: Optional[str] = None,
     workdir: Optional[str] = None,
-    environment: Optional[Dict[str, str]] = None
+    environment: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     """
     Build complete COMMAND_TEMPLATE
@@ -49,29 +105,53 @@ def build_command_template(
     python_code_escaped = shlex.quote(str(python_code))
     function_name_escaped = shlex.quote(str(function_name))
     
-    # Build input type definition JSON string (needs escaping)
-    input_types_json = json.dumps(input_types, ensure_ascii=False)
-    input_types_escaped = shlex.quote(input_types_json)
+    # Build function_call_wrapper invocation command
+    # Use -m to import module, or directly specify module path
+    wrapper_module = "pyromind_sdk.nodes.function_call_wrapper"
+    accelerate_config_path: Optional[str] = None
+    accelerate_input_name: Optional[str] = None
+    if (python_command or "").strip() == "accelerate":
+        accelerate_input_name = _ensure_accelerate_config_required_input(input_types)
+        # Reuse generic /tmp/<input_name> heredoc path to avoid duplicate config writes.
+        accelerate_config_path = f"/tmp/{accelerate_input_name}"
+
+    wrapper_cmd = _build_wrapper_command(
+        python_command=python_command,
+        wrapper_module=wrapper_module,
+        accelerate_config_file=accelerate_config_path,
+    )
     
     # Build output path dictionary (using placeholders)
     output_paths_dict = {name: f"{{{{{name}}}}}" for name in output_names}
     output_paths_json = json.dumps(output_paths_dict, ensure_ascii=False)
     output_paths_escaped = shlex.quote(output_paths_json)
-    
-    # Build function_call_wrapper invocation command
-    # Use -m to import module, or directly specify module path
-    wrapper_module = "pyromind_sdk.nodes.function_call_wrapper"
-    wrapper_cmd = f"{python_command} -m {wrapper_module}"
-    
-    # Collect all input placeholders, build input parameter JSON
+
+    # Collect all input placeholders.
     all_inputs = {**input_types.get("required", {}), **input_types.get("optional", {})}
-    input_names = list(all_inputs.keys())
-    
-    # Build input parameter JSON dictionary.
+    input_names_for_heredoc = list(all_inputs.keys())
+    wrapper_input_names = [name for name in input_names_for_heredoc if name != accelerate_input_name]
+
+    # Build wrapper input type definition JSON (exclude internal accelerate config input).
+    wrapper_input_types = {
+        "required": {
+            name: config
+            for name, config in input_types.get("required", {}).items()
+            if name != accelerate_input_name
+        },
+        "optional": {
+            name: config
+            for name, config in input_types.get("optional", {}).items()
+            if name != accelerate_input_name
+        },
+    }
+    input_types_json = json.dumps(wrapper_input_types, ensure_ascii=False)
+    input_types_escaped = shlex.quote(input_types_json)
+
+    # Build wrapper input parameter JSON dictionary.
     #
     # Important: We intentionally pass /tmp/<input_name> paths here and put the real values
     # into those files via heredoc blocks, to avoid shell/JSON escaping issues with large prompts.
-    inputs_dict = {name: f"/tmp/{name}" for name in input_names}
+    inputs_dict = {name: f"/tmp/{name}" for name in wrapper_input_names}
     inputs_json = json.dumps(inputs_dict, ensure_ascii=False)
     inputs_escaped = shlex.quote(inputs_json)
     
@@ -153,7 +233,7 @@ def build_command_template(
     # 2.1 Write each input into /tmp/<input_name> using heredoc.
     # The platform replaces {{<input_name>}} placeholders at runtime before executing bash -c.
     heredoc_commands: List[str] = []
-    for input_name in input_names:
+    for input_name in input_names_for_heredoc:
         tmp_path = f"/tmp/{input_name}"
         tmp_path_escaped = shlex.quote(tmp_path)
         delim = f"PYROMIND_{uuid.uuid4().hex}"

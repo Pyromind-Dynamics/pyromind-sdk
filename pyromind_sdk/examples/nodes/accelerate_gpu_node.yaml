@@ -1,0 +1,36 @@
+name: AccelerateGpuNode
+description: "GPU node example using accelerate launch mode"
+category: "Examples"
+display_name: "Accelerate GPU Node"
+base_class:
+  - GpuPodExecutionNode
+  - JupyterLabPodExecutionNode
+
+python_code: "utils/jupyter_gpu_executor.py"
+function_name: "execute_jupyter_gpu_code"
+
+# Accelerate mode is enabled only when python_command is exactly "accelerate"
+python_command: "accelerate"
+
+parameters:
+  - name: message
+    dtype: "STRING"
+    default: "Accelerate GPU Node executed successfully"
+    type: "input"
+    required_type: "required"
+  - name: gpu_info
+    dtype: "STRING"
+    type: "output"
+  - name: execution_result
+    dtype: "STRING"
+    type: "output"
+  - name: execution_output
+    dtype: "STRING"
+    type: "output"
+  - name: message_output
+    dtype: "STRING"
+    type: "output"
+
+resources:
+  gpu_min_count: 1
+  gpu_max_count: 1

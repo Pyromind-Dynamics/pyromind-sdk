@@ -55,7 +55,8 @@ ALLOWED_DTYPES = {
     "FLOAT",
     "BOOLEAN",
     "MODEL",
-    "ENV"
+    "ENV",
+    "ACCELERATE_CONFIG",
 }
 
 # ============================================================================

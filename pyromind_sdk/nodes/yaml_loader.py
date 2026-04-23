@@ -557,6 +557,32 @@ def create_node_class_from_yaml(yaml_config: Dict[str, Any], class_name: str, ya
     return_types = parsed["return_types"]
     return_names = parsed["return_names"]
     customer_use_from_parameters = parsed.get("customer_use", [])
+
+    # Accelerate pre-checks for Python function nodes.
+    python_code_config = yaml_config.get("python_code")
+    function_name_config = yaml_config.get("function_name")
+    python_command_config = yaml_config.get("python_command", "python3")
+    is_accelerate_mode = str(python_command_config).strip() == "accelerate"
+    if python_code_config and function_name_config and is_accelerate_mode:
+        if "GpuPodExecutionNode" not in base_class_names:
+            raise ValueError(
+                f"Node '{class_name}' uses python_command='accelerate' and must inherit "
+                f"'GpuPodExecutionNode' in base_class."
+            )
+        required_inputs = inputs_config.setdefault("required", {})
+        optional_inputs = inputs_config.setdefault("optional", {})
+        all_inputs = {**required_inputs, **optional_inputs}
+        accelerate_config_inputs = []
+        for name, config in all_inputs.items():
+            if isinstance(config, dict) and config.get("type") == "ACCELERATE_CONFIG":
+                accelerate_config_inputs.append(name)
+        if len(accelerate_config_inputs) > 1:
+            raise ValueError(
+                f"Node '{class_name}' uses python_command='accelerate' and supports at most one "
+                f"input parameter with dtype 'ACCELERATE_CONFIG'."
+            )
+        if len(accelerate_config_inputs) == 0:
+            required_inputs["accelerate_config"] = {"type": "ACCELERATE_CONFIG"}
     
     # Create class dictionary
     class_dict = {
@@ -641,7 +667,7 @@ def create_node_class_from_yaml(yaml_config: Dict[str, Any], class_name: str, ya
             conda_env = yaml_config.get("conda_env")
             workdir = yaml_config.get("workdir")
             environment = yaml_config.get("environment")
-            
+
             # Build command template
             command_template = build_command_template(
                 python_code=resolved_python_code,
@@ -652,7 +678,7 @@ def create_node_class_from_yaml(yaml_config: Dict[str, Any], class_name: str, ya
                 python_command=python_command,
                 conda_env=conda_env,
                 workdir=workdir,
-                environment=environment
+                environment=environment,
             )
             class_dict["COMMAND_TEMPLATE"] = command_template
         else:
