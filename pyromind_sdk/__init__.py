@@ -15,6 +15,11 @@ from .nodes import (
     load_nodes_from_yaml,
     load_all_nodes_from_directory,
     create_node_class_from_yaml,
+    # Validation functions
+    validate_parameter_name,
+    validate_class_name,
+    validate_dtype,
+    validate_resource_limits,
     # Python to YAML conversion
     python_function_to_yaml,
     # New from PythonToYamlService
@@ -105,6 +110,11 @@ __all__ = [
     "load_nodes_from_yaml",
     "load_all_nodes_from_directory",
     "create_node_class_from_yaml",
+    # Validation functions
+    "validate_parameter_name",
+    "validate_class_name",
+    "validate_dtype",
+    "validate_resource_limits",
     # Python to YAML conversion
     "python_function_to_yaml",
     # PythonToYamlService (enhanced)
