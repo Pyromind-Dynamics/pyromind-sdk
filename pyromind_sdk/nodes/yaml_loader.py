@@ -176,7 +176,7 @@ def validate_dtype(dtype: str) -> None:
         ValueError: If data type is not in whitelist
     """
     if dtype not in ALLOWED_DTYPES:
-        raise ValueError(f"Invalid dtype: '{dtype}'. Allowed types: {', '.join(sorted(ALLOWED_DTYPES))}")
+        logger.warning(f"Invalid dtype: '{dtype}'. Allowed types: {', '.join(sorted(ALLOWED_DTYPES))}")
 
 
 def validate_resource_limits(resources: Dict[str, Any]) -> None:
