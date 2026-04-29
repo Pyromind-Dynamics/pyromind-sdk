@@ -59,7 +59,7 @@ with PyroMindAPIClient(api_key="your-api-key") as client:
     pass
 ```
 
-## 沙箱（Sandbox）
+## 沙箱（Sandbox）⚠️已废弃不能创建
 
 ### 列出所有沙箱
 

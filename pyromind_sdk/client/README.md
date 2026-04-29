@@ -59,7 +59,7 @@ with PyroMindAPIClient(api_key="your-api-key") as client:
     pass
 ```
 
-## Sandboxes
+## Sandboxes（⚠️desperate can not create）
 
 ### List all sandboxes
 
