@@ -72,6 +72,7 @@ for sandbox in sandboxes:
 ### Create a sandbox
 
 ```python
+import time
 from pyromind_sdk.client.models import (
     SandboxRequest,
     SandboxConfiguration,
@@ -82,13 +83,19 @@ from pyromind_sdk.client.models import (
 
 sandbox = client.sandboxes.create(
     SandboxRequest(
-        name="my-sandbox",
+        name=f"example-sandbox-{int(time.time())}",
         sandbox_type=SandboxType.WINDOWS,
-        resources=ResourceConfig(cpu="2", memory="16Gi"),
-        configuration=SandboxConfiguration(
-            screen_resolution=ScreenResolution(width=1920, height=1080),
-            auto_destroy=True,
+        resources=ResourceConfig(
+            cpu="4",
+            memory="8Gi",
+            gpu=0
         ),
+        configuration=SandboxConfiguration(
+            screen_resolution=ScreenResolution(
+                width=1920,
+                height=1080
+            )
+        )
     )
 )
 print(f"Created sandbox: {sandbox.id}")
@@ -99,6 +106,39 @@ print(f"Created sandbox: {sandbox.id}")
 ```python
 sandbox = client.sandboxes.get_sandbox(sandbox_id="sandbox-id")
 print(f"Sandbox status: {sandbox.status}")
+```
+
+### Update a sandbox
+
+```python
+updated_sandbox = client.sandboxes.update(
+    sandbox_id="sandbox-id",
+    request=SandboxRequest(
+        name=f"updated-sandbox-{int(time.time())}",
+        resources=ResourceConfig(
+            cpu="5",
+            memory="10Gi",
+            gpu=0
+        ),
+        configuration=SandboxConfiguration(
+            screen_resolution=ScreenResolution(
+                width=2560,
+                height=1440
+            )
+        ),
+        sandbox_type=SandboxType.WINDOWS
+    )
+)
+```
+
+### Pause/Resume a sandbox
+
+```python
+# Pause
+client.sandboxes.pause(sandbox_id="sandbox-id")
+
+# Resume
+client.sandboxes.resume(sandbox_id="sandbox-id")
 ```
 
 ### Execute an action in a sandbox
@@ -173,13 +213,18 @@ for instance in instances:
 ### Create a Jupyter instance
 
 ```python
+import time
+from pyromind_sdk.client.models import JupyterRequest, ResourceConfig
+
 instance = client.instance.create(
     JupyterRequest(
-        name="my-jupyter",
-        image="jupyter/scipy-notebook:latest",
-        resources=ResourceConfig(cpu="2", memory="4Gi", gpu=1),
-        auto_pause=True,
-        auto_pause_timeout=3600
+        name=f"example-jupyter-{int(time.time())}",
+        resources=ResourceConfig(
+            cpu="2",
+            memory="18Gi",
+            gpu=0
+        ),
+        timeout=3600  # Timeout in seconds (1 hour)
     )
 )
 print(f"Created instance: {instance.id}")
@@ -191,6 +236,7 @@ print(f"Jupyter URL: {instance.url}")
 ```python
 instance = client.instance.get_instance(jupyter_id="jupyter-id")
 print(f"Instance status: {instance.status}")
+print(f"Instance password: {instance.password}")
 ```
 
 ### Update a Jupyter instance
@@ -200,8 +246,12 @@ updated = client.instance.update(
     jupyter_id="jupyter-id",
     request=JupyterRequest(
         name="updated-jupyter",
-        image="jupyter/tensorflow-notebook:latest",
-        resources=ResourceConfig(cpu="4", memory="8Gi")
+        resources=ResourceConfig(
+            cpu=4,      # CPU as int 4 (int format)
+            memory=32,  # Memory as 32Gi (int)
+            gpu=1,      # GPU count: 1
+            gpu_card="L40S"
+        )
     )
 )
 ```
@@ -212,8 +262,16 @@ updated = client.instance.update(
 # Pause
 client.instance.pause(jupyter_id="jupyter-id")
 
-# Resume
-client.instance.resume(jupyter_id="jupyter-id")
+# Resume (with retry logic, as database status may need time to sync after pause)
+for attempt in range(10):
+    try:
+        client.instance.resume(jupyter_id="jupyter-id")
+        break
+    except PyroMindAPIError as e:
+        if e.status_code == 400 and "status" in e.message.lower():
+            time.sleep(3)
+            continue
+        raise
 ```
 
 ### Delete a Jupyter instance
@@ -235,16 +293,36 @@ for job in jobs:
 ### Create an inference job
 
 ```python
-job = client.inference.create(
-    InferenceJobCreateRequest(
-        name="my-inference",
-        model_path="/models/my-model",
-        image="pytorch/pytorch:latest",
-        resources=ResourceConfig(cpu="4", memory="8Gi", gpu=1),
-        endpoint_url="https://api.example.com/inference"
+import time
+from pyromind_sdk.client.models import InferenceJobRequest, ResourceConfig
+
+# First, get available inference frameworks and images
+frameworks = client.inference.get_framework()
+selected_framework = frameworks[0]  # Use the first available framework
+
+images = client.inference.get_inf_image(selected_framework)
+selected_image = images[0]  # Use the first available image
+
+job_id = client.inference.create(
+    InferenceJobRequest(
+        model_path="/workspace/models/Qwen/Qwen3-0.6B/",
+        model_name="glm-5",
+        inference_framework=selected_framework,
+        inf_image=selected_image,
+        timeout=7200,
+        resources=ResourceConfig(
+            cpu="4",
+            memory="32Gi",
+            gpu=1,
+            gpu_card="L40S"
+        ),
+        name=f"example-inference-{int(time.time())}",
+        environment_variables={
+            "MODEL_PATH": "/workspace/models/Qwen/Qwen3-0.6B/",
+        }
     )
 )
-print(f"Created inference job: {job.id}")
+print(f"Created inference job: {job_id}")
 ```
 
 ### Get an inference job
@@ -253,6 +331,38 @@ print(f"Created inference job: {job.id}")
 job = client.inference.get_job(job_id="job-id")
 print(f"Job status: {job.status}")
 print(f"Endpoint URL: {job.endpoint_url}")
+```
+
+### Update an inference job
+
+```python
+# First, get available inference frameworks and images
+frameworks = client.inference.get_framework()
+selected_framework = frameworks[0]
+
+images = client.inference.get_inf_image(selected_framework)
+selected_image = images[0]
+
+updated_job = client.inference.update(
+    job_id="job-id",
+    request=InferenceJobRequest(
+        model_path="/workspace/models/Qwen/Qwen3-0.6B/",
+        model_name="glm-5",
+        inference_framework=selected_framework,
+        inf_image=selected_image,
+        timeout=7200,
+        resources=ResourceConfig(
+            cpu="4",
+            memory="32Gi",
+            gpu=1,
+            gpu_card="L40S"
+        ),
+        name=f"updated-inference-{int(time.time())}",
+        environment_variables={
+            "MODEL_PATH": "/workspace/models/Qwen/Qwen3-0.6B/",
+        }
+    )
+)
 ```
 
 ### Delete an inference job
@@ -266,51 +376,47 @@ client.inference.delete(job_id="job-id")
 ### List all training tasks
 
 ```python
-jobs = client.training.list()
-for job in jobs:
-    print(f"Task: {job.name} - Status: {job.status}")
+tasks = client.training.list()
+for task in tasks:
+    print(f"Task: {task.name} - Status: {task.status}")
 ```
 
 ### Create a training task
 
 ```python
-job = client.training.create(
-    TrainingTaskCreateRequest(
-        name="my-training",
-        framework=TrainingFramework.verl,
-        environment_config={
-            "env_type": "gym",
-            "env_name": "CartPole-v1"
-        },
-        model_configuration={
-            "model_type": "ppo",
-            "hidden_size": 256
-        },
-        training_config={
-            "learning_rate": 0.001,
-            "batch_size": 32,
-            "epochs": 100
-        },
-        resources=ResourceConfig(cpu="8", memory="16Gi", gpu=2),
-        checkpoint_interval=300,
-        data_source={
-            "type": "local",
-            "path": "/data/training"
-        },
-        output_config={
-            "type": "local",
-            "path": "/output/models"
-        }
-    )
+from pyromind_sdk import PyroMindAPIClient
+from pyromind_sdk.client.models import TrainingTaskCreateRequest
+from pyromind_sdk.client import validate_workflow
+
+client = PyroMindAPIClient()
+
+# Load workflow file
+import json
+with open("workflow.json", "r") as f:
+    workflow = json.load(f)
+
+# Validate workflow
+is_valid, errors = validate_workflow(workflow, client)
+if not is_valid:
+    print("Workflow validation failed:")
+    for error in errors:
+        print(f"  - {error}")
+    raise ValidationError(f"Workflow validation failed")
+
+# Create training task
+task = client.training.create(
+    TrainingTaskCreateRequest(name="example-training", workflow=workflow)
 )
-print(f"Created training task: {job.task_id}")
+print(f"Created training task: {task.task_id}")
 ```
 
 ### Get a training task
 
 ```python
-job = client.training.get_job(task_id="task-id")
-print(f"Task status: {job.status}")
+task = client.training.get_task(task_id="task-id")
+print(f"Task status: {task.status}")
+print(f"Started At: {task.started_at}")
+print(f"Completed At: {task.completed_at}")
 ```
 
 ### Stop a training task
@@ -535,25 +641,29 @@ for job in jobs:
 ### Create an EchoMind instance
 
 ```python
-from pyromind_sdk.client.models import EchoMindJobRequest, ApiMode
+import time
+from pyromind_sdk.client.models import EchoMindJobRequest, ResourceConfig
 
-job = client.echomind.create(
+job_id = client.echomind.create(
     EchoMindJobRequest(
-        name="my-echomind",
-        api_url="https://api.openai.com/v1",
-        api_mode=ApiMode.OPENAI,
-        origin_model="gpt-4",
+        name=f"my-echomind-training-{int(time.time())}",
+        api_url="https://generativelanguage.googleapis.com",
+        api_mode="gemini",
+        origin_model="gemini-1.5-flash",
         access_key="your-access-key",
-        training_model="gpt-3.5-turbo",
-        training_batch_size=10,
-        trajectory_buffer_size=100,
+        training_model="my-training-model",
+        training_batch_size=32,
+        trajectory_buffer_size=1000,
         time_per_round=60.0,
-        training_round=5,
-        training_save_path="/models/echomind",
-        resources=ResourceConfig(cpu="4", memory="8Gi", gpu=1)
+        training_round=100,
+        training_save_path="/data/training/echomind",
+        resources=ResourceConfig(
+            cpu="4",
+            memory="16Gi",
+        )
     )
 )
-print(f"Created EchoMind job: {job}")
+print(f"Created EchoMind job: {job_id}")
 ```
 
 ### Get an EchoMind instance
@@ -561,6 +671,11 @@ print(f"Created EchoMind job: {job}")
 ```python
 job = client.echomind.get_job(job_id="job-id")
 print(f"Job status: {job.status}")
+print(f"API Mode: {job.api_mode}")
+print(f"Origin Model: {job.origin_model}")
+print(f"Training Model: {job.training_model}")
+if job.secret_key:
+    print(f"Secret Key: {job.secret_key[:8]}...")
 ```
 
 ### Update an EchoMind instance
@@ -569,17 +684,21 @@ print(f"Job status: {job.status}")
 updated = client.echomind.update(
     job_id="job-id",
     request=EchoMindJobRequest(
-        name="updated-echomind",
-        api_url="https://api.openai.com/v1",
-        api_mode=ApiMode.OPENAI,
-        origin_model="gpt-4",
+        name=f"updated-echomind-training-{int(time.time())}",
+        api_url="https://generativelanguage.googleapis.com",
+        api_mode="gemini",
+        origin_model="gemini-1.5-flash",
         access_key="your-access-key",
-        training_model="gpt-3.5-turbo",
-        training_batch_size=20,
-        trajectory_buffer_size=200,
-        time_per_round=60.0,
-        training_round=10,
-        training_save_path="/models/echomind"
+        training_model="updated-training-model",
+        training_batch_size=64,
+        trajectory_buffer_size=2000,
+        time_per_round=120.0,
+        training_round=200,
+        training_save_path="/data/training/echomind-updated",
+        resources=ResourceConfig(
+            cpu="8",
+            memory="32Gi",
+        )
     )
 )
 ```
@@ -876,3 +995,46 @@ For detailed API documentation, see [PyroMind API v1 Docs](https://pyromind.ai/a
 - `ProfileStorageInfoResponse`: Storage info response
 - `UserPubKey`: SSH public key
 - `UserPubKeyRequest`: SSH public key request
+
+## Complete Examples
+
+The following example files demonstrate the complete usage of each module:
+
+### Sync Client Examples
+
+| Module | Example File | Description |
+|--------|--------------|-------------|
+| EchoMind | `echomind_example.py` | EchoMind instance create, list, get, update, pause, resume, delete |
+| Inference | `inference_example.py` | Inference job create, list, get, update, delete |
+| Sandbox | `sandbox_example.py` | Sandbox create, update, pause, resume, list, get, execute action, get VNC, delete |
+| Training | `training_example.py` | Training task create, list, get, stop, delete, get node output, get node info, workflow visualization |
+| Jupyter | `jupyter_instance_example.py` | Jupyter instance create, list, get, update, pause, resume, delete, wait for status, check URL |
+| Storage | `storage_example.py` | File list, check existence, upload, download |
+
+### Async Client Examples
+
+| Module | Example File | Description |
+|--------|--------------|-------------|
+| EchoMind | `async_echomind_example.py` | Async EchoMind instance management |
+| Inference | `async_inference_example.py` | Async inference job management |
+| Sandbox | `async_sandbox_example.py` | Async sandbox management |
+| Training | `async_training_example.py` | Async training task management |
+| Jupyter | `async_jupyter_instance_example.py` | Async Jupyter instance management |
+
+### Running Examples
+
+```bash
+# Go to examples directory
+cd pyromind_sdk/examples/openapi
+
+# Run EchoMind example
+python echomind_example.py
+
+# Run inference example
+python inference_example.py
+
+# Run async example
+python async_echomind_example.py
+```
+
+Example files are located in the `pyromind_sdk/examples/openapi/` directory.
