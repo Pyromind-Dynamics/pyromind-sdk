@@ -42,6 +42,12 @@ from .type_converter import (
     convert_output_to_string,
     validate_output_type,
 )
+from .command_executor import (
+    execute_command_template,
+    get_default_inputs,
+    extract_placeholders,
+    print_node_info,
+)
 
 __all__ = [
     "__version__",
@@ -79,5 +85,9 @@ __all__ = [
     "convert_inputs",
     "convert_output_to_string",
     "validate_output_type",
+    # Command executor
+    "execute_command_template",
+    "get_default_inputs",
+    "extract_placeholders",
+    "print_node_info",
 ]
-

@@ -571,7 +571,6 @@ class PythonToYamlService:
         display_name: Optional[str] = None,
         description: Optional[str] = None,
         resource_type: str = "cpu",
-        category: str = "custom",
         conda_env: Optional[str] = None,
         workdir: Optional[str] = None,
         environment: Optional[Dict[str, str]] = None,

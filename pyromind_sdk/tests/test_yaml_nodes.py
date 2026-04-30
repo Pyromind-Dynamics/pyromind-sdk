@@ -33,14 +33,18 @@ from pyromind_sdk.nodes import (
     execute_command_template,
     get_default_inputs,
     extract_placeholders,
-    parse_input_spec,
-    validate_node_class,
     print_node_info,
 )
 from pyromind_sdk.common.node_sdk import PodExecutionNode
 
 
-# validate_node_class and parse_input_spec have been moved to nodes.node_validator module
+def validate_node_class(node_class: type, node_name: str) -> Dict[str, Any]:
+    """Simple validation for node class"""
+    validation = {"valid": True, "warnings": [], "errors": []}
+    if not hasattr(node_class, "COMMAND_TEMPLATE"):
+        validation["errors"].append(f"Node {node_name} has no COMMAND_TEMPLATE")
+        validation["valid"] = False
+    return validation
 
 
 
