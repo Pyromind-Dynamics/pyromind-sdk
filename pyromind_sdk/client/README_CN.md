@@ -59,7 +59,7 @@ with PyroMindAPIClient(api_key="your-api-key") as client:
     pass
 ```
 
-## 沙箱（Sandbox）
+## 沙箱（Sandbox）⚠️已废弃不能创建
 
 ### 列出所有沙箱
 
@@ -72,6 +72,7 @@ for sandbox in sandboxes:
 ### 创建沙箱
 
 ```python
+import time
 from pyromind_sdk.client.models import (
     SandboxRequest,
     SandboxConfiguration,
@@ -82,13 +83,19 @@ from pyromind_sdk.client.models import (
 
 sandbox = client.sandboxes.create(
     SandboxRequest(
-        name="my-sandbox",
+        name=f"example-sandbox-{int(time.time())}",
         sandbox_type=SandboxType.WINDOWS,
-        resources=ResourceConfig(cpu="2", memory="16Gi"),
-        configuration=SandboxConfiguration(
-            screen_resolution=ScreenResolution(width=1920, height=1080),
-            auto_destroy=True,
+        resources=ResourceConfig(
+            cpu="4",
+            memory="8Gi",
+            gpu=0
         ),
+        configuration=SandboxConfiguration(
+            screen_resolution=ScreenResolution(
+                width=1920,
+                height=1080
+            )
+        )
     )
 )
 print(f"Created sandbox: {sandbox.id}")
@@ -99,6 +106,39 @@ print(f"Created sandbox: {sandbox.id}")
 ```python
 sandbox = client.sandboxes.get_sandbox(sandbox_id="sandbox-id")
 print(f"Sandbox status: {sandbox.status}")
+```
+
+### 更新沙箱
+
+```python
+updated_sandbox = client.sandboxes.update(
+    sandbox_id="sandbox-id",
+    request=SandboxRequest(
+        name=f"updated-sandbox-{int(time.time())}",
+        resources=ResourceConfig(
+            cpu="5",
+            memory="10Gi",
+            gpu=0
+        ),
+        configuration=SandboxConfiguration(
+            screen_resolution=ScreenResolution(
+                width=2560,
+                height=1440
+            )
+        ),
+        sandbox_type=SandboxType.WINDOWS
+    )
+)
+```
+
+### 暂停/恢复沙箱
+
+```python
+# 暂停
+client.sandboxes.pause(sandbox_id="sandbox-id")
+
+# 恢复
+client.sandboxes.resume(sandbox_id="sandbox-id")
 ```
 
 ### 在沙箱中执行操作
@@ -173,13 +213,18 @@ for instance in instances:
 ### 创建 Jupyter 实例
 
 ```python
+import time
+from pyromind_sdk.client.models import JupyterRequest, ResourceConfig
+
 instance = client.instance.create(
     JupyterRequest(
-        name="my-jupyter",
-        image="jupyter/scipy-notebook:latest",
-        resources=ResourceConfig(cpu="2", memory="4Gi", gpu=1),
-        auto_pause=True,
-        auto_pause_timeout=3600
+        name=f"example-jupyter-{int(time.time())}",
+        resources=ResourceConfig(
+            cpu="2",
+            memory="18Gi",
+            gpu=0
+        ),
+        timeout=3600  # Timeout in seconds (1 hour)
     )
 )
 print(f"Created instance: {instance.id}")
@@ -191,6 +236,7 @@ print(f"Jupyter URL: {instance.url}")
 ```python
 instance = client.instance.get_instance(jupyter_id="jupyter-id")
 print(f"Instance status: {instance.status}")
+print(f"Instance password: {instance.password}")
 ```
 
 ### 更新 Jupyter 实例
@@ -200,8 +246,12 @@ updated = client.instance.update(
     jupyter_id="jupyter-id",
     request=JupyterRequest(
         name="updated-jupyter",
-        image="jupyter/tensorflow-notebook:latest",
-        resources=ResourceConfig(cpu="4", memory="8Gi")
+        resources=ResourceConfig(
+            cpu=4,      # CPU as int 4 (int format)
+            memory=32,  # Memory as 32Gi (int)
+            gpu=1,      # GPU count: 1
+            gpu_card="L40S"
+        )
     )
 )
 ```
@@ -212,8 +262,16 @@ updated = client.instance.update(
 # 暂停
 client.instance.pause(jupyter_id="jupyter-id")
 
-# 恢复
-client.instance.resume(jupyter_id="jupyter-id")
+# 恢复（带重试逻辑，因为暂停后数据库状态可能需要时间同步）
+for attempt in range(10):
+    try:
+        client.instance.resume(jupyter_id="jupyter-id")
+        break
+    except PyroMindAPIError as e:
+        if e.status_code == 400 and "status" in e.message.lower():
+            time.sleep(3)
+            continue
+        raise
 ```
 
 ### 删除 Jupyter 实例
@@ -235,16 +293,36 @@ for job in jobs:
 ### 创建推理任务
 
 ```python
-job = client.inference.create(
+import time
+from pyromind_sdk.client.models import InferenceJobRequest, ResourceConfig
+
+# 首先获取可用的推理框架和镜像
+frameworks = client.inference.get_framework()
+selected_framework = frameworks[0]  # 使用一个可用框架
+
+images = client.inference.get_inf_image(selected_framework)
+selected_image = images[0]  # 使用一个可用镜像
+
+job_id = client.inference.create(
     InferenceJobRequest(
-        name="my-inference",
-        model_path="/models/my-model",
-        image="pytorch/pytorch:latest",
-        resources=ResourceConfig(cpu="4", memory="8Gi", gpu=1),
-        endpoint_url="https://api.example.com/inference"
+        model_path="/workspace/models/Qwen/Qwen3-0.6B/",
+        model_name="glm-5",
+        inference_framework=selected_framework,
+        inf_image=selected_image,
+        timeout=7200,
+        resources=ResourceConfig(
+            cpu="4",
+            memory="32Gi",
+            gpu=1,
+            gpu_card="L40S"
+        ),
+        name=f"example-inference-{int(time.time())}",
+        environment_variables={
+            "MODEL_PATH": "/workspace/models/Qwen/Qwen3-0.6B/",
+        }
     )
 )
-print(f"Created inference job: {job.id}")
+print(f"Created inference job: {job_id}")
 ```
 
 ### 获取推理任务
@@ -253,6 +331,38 @@ print(f"Created inference job: {job.id}")
 job = client.inference.get_job(job_id="job-id")
 print(f"Job status: {job.status}")
 print(f"Endpoint URL: {job.endpoint_url}")
+```
+
+### 更新推理任务
+
+```python
+# 首先获取可用的推理框架和镜像
+frameworks = client.inference.get_framework()
+selected_framework = frameworks[0]
+
+images = client.inference.get_inf_image(selected_framework)
+selected_image = images[0]
+
+updated_job = client.inference.update(
+    job_id="job-id",
+    request=InferenceJobRequest(
+        model_path="/workspace/models/Qwen/Qwen3-0.6B/",
+        model_name="glm-5",
+        inference_framework=selected_framework,
+        inf_image=selected_image,
+        timeout=7200,
+        resources=ResourceConfig(
+            cpu="4",
+            memory="32Gi",
+            gpu=1,
+            gpu_card="L40S"
+        ),
+        name=f"updated-inference-{int(time.time())}",
+        environment_variables={
+            "MODEL_PATH": "/workspace/models/Qwen/Qwen3-0.6B/",
+        }
+    )
+)
 ```
 
 ### 删除推理任务
@@ -266,51 +376,47 @@ client.inference.delete(job_id="job-id")
 ### 列出所有训练任务
 
 ```python
-jobs = client.training.list()
-for job in jobs:
-    print(f"Task: {job.name} - Status: {job.status}")
+tasks = client.training.list()
+for task in tasks:
+    print(f"Task: {task.name} - Status: {task.status}")
 ```
 
 ### 创建训练任务
 
 ```python
-job = client.training.create(
-    TrainingTaskCreateRequest(
-        name="my-training",
-        framework=TrainingFramework.verl,
-        environment_config={
-            "env_type": "gym",
-            "env_name": "CartPole-v1"
-        },
-        model_configuration={
-            "model_type": "ppo",
-            "hidden_size": 256
-        },
-        training_config={
-            "learning_rate": 0.001,
-            "batch_size": 32,
-            "epochs": 100
-        },
-        resources=ResourceConfig(cpu="8", memory="16Gi", gpu=2),
-        checkpoint_interval=300,
-        data_source={
-            "type": "local",
-            "path": "/data/training"
-        },
-        output_config={
-            "type": "local",
-            "path": "/output/models"
-        }
-    )
+from pyromind_sdk import PyroMindAPIClient
+from pyromind_sdk.client.models import TrainingTaskCreateRequest
+from pyromind_sdk.client import validate_workflow
+
+client = PyroMindAPIClient()
+
+# 加载工作流文件
+import json
+with open("workflow.json", "r") as f:
+    workflow = json.load(f)
+
+# 验证工作流
+is_valid, errors = validate_workflow(workflow, client)
+if not is_valid:
+    print("Workflow validation failed:")
+    for error in errors:
+        print(f"  - {error}")
+    raise ValidationError(f"Workflow validation failed")
+
+# 创建训练任务
+task = client.training.create(
+    TrainingTaskCreateRequest(name="example-training", workflow=workflow)
 )
-print(f"Created training task: {job.task_id}")
+print(f"Created training task: {task.task_id}")
 ```
 
 ### 获取训练任务
 
 ```python
-job = client.training.get_job(task_id="task-id")
-print(f"Task status: {job.status}")
+task = client.training.get_task(task_id="task-id")
+print(f"Task status: {task.status}")
+print(f"Started At: {task.started_at}")
+print(f"Completed At: {task.completed_at}")
 ```
 
 ### 停止训练任务
@@ -401,25 +507,29 @@ for job in jobs:
 ### 创建 EchoMind 实例
 
 ```python
-from pyromind_sdk.client.models import EchoMindJobRequest, ApiMode
+import time
+from pyromind_sdk.client.models import EchoMindJobRequest, ResourceConfig
 
-job = client.echomind.create(
+job_id = client.echomind.create(
     EchoMindJobRequest(
-        name="my-echomind",
-        api_url="https://api.openai.com/v1",
-        api_mode=ApiMode.OPENAI,
-        origin_model="gpt-4",
+        name=f"my-echomind-training-{int(time.time())}",
+        api_url="https://generativelanguage.googleapis.com",
+        api_mode="gemini",
+        origin_model="gemini-1.5-flash",
         access_key="your-access-key",
-        training_model="gpt-3.5-turbo",
-        training_batch_size=10,
-        trajectory_buffer_size=100,
+        training_model="my-training-model",
+        training_batch_size=32,
+        trajectory_buffer_size=1000,
         time_per_round=60.0,
-        training_round=5,
-        training_save_path="/models/echomind",
-        resources=ResourceConfig(cpu="4", memory="8Gi", gpu=1)
+        training_round=100,
+        training_save_path="/data/training/echomind",
+        resources=ResourceConfig(
+            cpu="4",
+            memory="16Gi",
+        )
     )
 )
-print(f"Created EchoMind job: {job}")
+print(f"Created EchoMind job: {job_id}")
 ```
 
 ### 获取 EchoMind 实例
@@ -427,6 +537,11 @@ print(f"Created EchoMind job: {job}")
 ```python
 job = client.echomind.get_job(job_id="job-id")
 print(f"Job status: {job.status}")
+print(f"API Mode: {job.api_mode}")
+print(f"Origin Model: {job.origin_model}")
+print(f"Training Model: {job.training_model}")
+if job.secret_key:
+    print(f"Secret Key: {job.secret_key[:8]}...")
 ```
 
 ### 更新 EchoMind 实例
@@ -435,17 +550,21 @@ print(f"Job status: {job.status}")
 updated = client.echomind.update(
     job_id="job-id",
     request=EchoMindJobRequest(
-        name="updated-echomind",
-        api_url="https://api.openai.com/v1",
-        api_mode=ApiMode.OPENAI,
-        origin_model="gpt-4",
+        name=f"updated-echomind-training-{int(time.time())}",
+        api_url="https://generativelanguage.googleapis.com",
+        api_mode="gemini",
+        origin_model="gemini-1.5-flash",
         access_key="your-access-key",
-        training_model="gpt-3.5-turbo",
-        training_batch_size=20,
-        trajectory_buffer_size=200,
-        time_per_round=60.0,
-        training_round=10,
-        training_save_path="/models/echomind"
+        training_model="updated-training-model",
+        training_batch_size=64,
+        trajectory_buffer_size=2000,
+        time_per_round=120.0,
+        training_round=200,
+        training_save_path="/data/training/echomind-updated",
+        resources=ResourceConfig(
+            cpu="8",
+            memory="32Gi",
+        )
     )
 )
 ```
@@ -876,3 +995,46 @@ client = PyroMindAPIClient(
 - `ProfileStorageInfoResponse`：存储信息响应
 - `UserPubKey`：SSH 公钥
 - `UserPubKeyRequest`：SSH 公钥请求
+
+## 完整示例
+
+以下示例文件展示了各模块的完整使用方式：
+
+### 同步客户端示例
+
+| 模块 | 示例文件 | 说明 |
+|------|----------|------|
+| EchoMind | `echomind_example.py` | EchoMind 实例的创建、列表、获取、更新、暂停、恢复、删除 |
+| Inference | `inference_example.py` | 推理任务的创建、列表、获取、更新、删除 |
+| Sandbox | `sandbox_example.py` | 沙箱的创建、更新、暂停、恢复、列表、获取、执行操作、获取VNC、删除 |
+| Training | `training_example.py` | 训练任务的创建、列表、获取、停止、删除、获取节点输出、获取节点信息、工作流可视化 |
+| Jupyter | `jupyter_instance_example.py` | Jupyter 实例的创建、列表、获取、更新、暂停、恢复、删除、状态等待、URL检查 |
+| Storage | `storage_example.py` | 文件的列表、检查存在、上传、下载 |
+
+### 异步客户端示例
+
+| 模块 | 示例文件 | 说明 |
+|------|----------|------|
+| EchoMind | `async_echomind_example.py` | 异步版 EchoMind 实例管理 |
+| Inference | `async_inference_example.py` | 异步版推理任务管理 |
+| Sandbox | `async_sandbox_example.py` | 异步版沙箱管理 |
+| Training | `async_training_example.py` | 异步版训练任务管理 |
+| Jupyter | `async_jupyter_instance_example.py` | 异步版 Jupyter 实例管理 |
+
+### 运行示例
+
+```bash
+# 切换到示例目录
+cd pyromind_sdk/examples/openapi
+
+# 运行 EchoMind 示例
+python echomind_example.py
+
+# 运行推理示例
+python inference_example.py
+
+# 运行异步示例
+python async_echomind_example.py
+```
+
+示例文件位于 `pyromind_sdk/examples/openapi/` 目录下。
