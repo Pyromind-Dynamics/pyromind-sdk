@@ -698,7 +698,7 @@ def main():
         if task:
             workflow = _load_workflow(workflow_path)
             draw_workflow_graph(workflow)
-            # delete_training_task_example(task_id)
+            delete_training_task_example(task_id)
 
 
 if __name__ == "__main__":
