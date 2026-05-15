@@ -28,6 +28,22 @@ from pyromind_sdk.client.models import (
     ResourceConfig,
 )
 
+
+def skip_if_insufficient_resources(error: Exception) -> None:
+    """
+    Check if error contains INSUFFICIENT_RESOURCES and skip test if so.
+    
+    Args:
+        error: The exception to check
+        
+    Raises:
+        pytest.skip: If error contains INSUFFICIENT_RESOURCES
+    """
+    error_str = str(error).upper()
+    if "INSUFFICIENT_RESOURCES" in error_str:
+        pytest.skip(f"Skipping test due to INSUFFICIENT_RESOURCES: {error}")
+
+
 # From pyromind_sdk/tests/pytest/ to pyromind_sdk/examples/openapi/
 EXAMPLES_DIR = Path(__file__).parent.parent.parent / "examples" / "openapi"
 if str(EXAMPLES_DIR) not in sys.path:
@@ -52,6 +68,29 @@ list_inference_jobs_example = inference_example.list_inference_jobs_example
 get_inference_job_example = inference_example.get_inference_job_example
 update_inference_job_example = inference_example.update_inference_job_example
 delete_inference_job_example = inference_example.delete_inference_job_example
+
+
+def get_available_framework_and_image(client: PyroMindAPIClient) -> tuple:
+    """
+    Get available inference framework and image from the API.
+    
+    Returns:
+        Tuple of (framework, image) or (None, None) if not available
+    """
+    try:
+        frameworks = client.inference.get_framework()
+        if not frameworks:
+            return None, None
+        
+        framework = frameworks[0]
+        images = client.inference.get_inf_image(framework)
+        if not images:
+            return None, None
+        
+        return framework, images[0]
+    except Exception as e:
+        print(f"[WARNING] Failed to get framework and image: {e}")
+        return None, None
 
 
 @pytest.fixture(scope="module")
@@ -263,13 +302,21 @@ def test_job_id(client, job_tracker):
     job_id = None
     
     try:
+        # Get available framework and image
+        framework, image = get_available_framework_and_image(client)
+        if not framework or not image:
+            pytest.skip("No available inference frameworks or images")
+        
         # Create a test job
         print(f"[TEST] Creating test job for fixture...")
+        print(f"[TEST] Using framework: {framework}, image: {image}")
         job_id = client.inference.create(
             InferenceJobRequest(
                 name=f"test-inference-{int(time.time())}",
                 model_path="/workspace/models/Qwen/Qwen3-0.6B/",
-                inference_framework="sglang",
+                model_name="glm-5",
+                inference_framework=framework,
+                inf_image=image,
                 timeout=3600,
                 resources=ResourceConfig(
                     cpu="4",
@@ -289,6 +336,7 @@ def test_job_id(client, job_tracker):
         
     except Exception as e:
         print(f"[ERROR] Failed to create test job in fixture: {type(e).__name__}: {str(e)}")
+        skip_if_insufficient_resources(e)
         raise
     finally:
         # Clean up: delete the test job
@@ -325,6 +373,7 @@ class TestListInferenceJobs:
             print(f"[TEST] Retrieved {len(jobs)} job(s)")
         except Exception as e:
             print(f"[ERROR] Failed to list jobs: {type(e).__name__}: {str(e)}")
+            skip_if_insufficient_resources(e)
             raise
         
         # Should return a list (may be empty)
@@ -355,13 +404,21 @@ class TestCreateInferenceJob:
     
     def test_create_inference_job(self, client, job_tracker):
         """Test creating an inference job"""
+        # Get available framework and image
+        framework, image = get_available_framework_and_image(client)
+        if not framework or not image:
+            pytest.skip("No available inference frameworks or images")
+        
         print(f"[TEST] Creating inference job...")
+        print(f"[TEST] Using framework: {framework}, image: {image}")
         name = f"test-inference-{int(time.time())}"
         try:
             job_id = client.inference.create(
                 InferenceJobRequest(
                     model_path="/workspace/models/Qwen/Qwen3-0.6B/",
-                    inference_framework="sglang",
+                    model_name="glm-5",
+                    inference_framework=framework,
+                    inf_image=image,
                     timeout=7200,
                     resources=ResourceConfig(
                         cpu="4",
@@ -382,9 +439,11 @@ class TestCreateInferenceJob:
             print(f"[ERROR] Failed to create job: {e.message} (status_code: {e.status_code})")
             if e.response:
                 print(f"[ERROR] Error response: {e.response}")
+            skip_if_insufficient_resources(e)
             raise
         except Exception as e:
             print(f"[ERROR] Unexpected error creating job: {type(e).__name__}: {str(e)}")
+            skip_if_insufficient_resources(e)
             raise
         
         # Verify job was created
@@ -427,9 +486,11 @@ class TestGetInferenceJob:
             print(f"[ERROR] Failed to get job: {e.message} (status_code: {e.status_code})")
             if e.response:
                 print(f"[ERROR] Error response: {e.response}")
+            skip_if_insufficient_resources(e)
             raise
         except Exception as e:
             print(f"[ERROR] Unexpected error getting job: {type(e).__name__}: {str(e)}")
+            skip_if_insufficient_resources(e)
             raise
         
         # Verify job details
@@ -449,6 +510,7 @@ class TestGetInferenceJob:
             print(f"[TEST] Function returned job: id={job.id if job else None}, name={job.name if job else None}, status={job.status if job else None}")
         except Exception as e:
             print(f"[ERROR] Function failed: {type(e).__name__}: {str(e)}")
+            skip_if_insufficient_resources(e)
             raise
         
         # Verify job details
@@ -476,18 +538,25 @@ class TestUpdateInferenceJob:
     """Test cases for updating inference jobs"""
     
     def test_update_inference_job_failed(self, client, job_tracker):
+        # Get available framework and image
+        framework, image = get_available_framework_and_image(client)
+        if not framework or not image:
+            pytest.skip("No available inference frameworks or images")
 
         # Wait for job to be in a modifiable state (Running or Stopped)
         print(f"[TEST] Waiting for job to be in modifiable state...")
+        print(f"[TEST] Using framework: {framework}, image: {image}")
         pending_id = client.inference.create(request= InferenceJobRequest(
                     model_path="/workspace/models/Qwen/Qwen3-0.6B/",
-                    inference_framework="sglang",
+                    model_name="glm-5",
+                    inference_framework=framework,
+                    inf_image=image,
                     timeout=7200,
                     resources=ResourceConfig(
                         cpu="4",
                         memory="64Gi",
-                        gpu=9,
-                        gpu_card="H100"
+                        gpu=1,
+                        gpu_card="L40S"
                     ),
                     name=f"pending-inference-example-{int(time.time())}",
                     environment_variables={
@@ -501,7 +570,9 @@ class TestUpdateInferenceJob:
                 job_id=pending_id,
                 request= InferenceJobRequest(
                     model_path="/workspace/models/Qwen/Qwen3-0.6B/",
-                    inference_framework="sglang",
+                    model_name="glm-5",
+                    inference_framework=framework,
+                    image=image,
                     timeout=7200,
                     resources=ResourceConfig(
                         cpu="4",
@@ -522,6 +593,7 @@ class TestUpdateInferenceJob:
             assert "instance`s status is pending, can not modify!" in e.message, f"Unexpected error message: {e.message}"
         except Exception as e:
             print(f"[ERROR] Unexpected error updating job: {type(e).__name__}: {str(e)}")
+            skip_if_insufficient_resources(e)
             raise
     
     def test_update_inference_job_example_function(self, job_tracker):
@@ -545,6 +617,7 @@ class TestUpdateInferenceJob:
             print(f"[TEST] Function returned updated job: id={updated_job.id if updated_job else None}, name={updated_job.name if updated_job else None}")
         except Exception as e:
             print(f"[ERROR] Function failed: {type(e).__name__}: {str(e)}")
+            skip_if_insufficient_resources(e)
             raise
         
         # Verify job was updated (may return None if update fails)
@@ -558,11 +631,20 @@ class TestDeleteInferenceJob:
     
     def test_delete_inference_job(self, client, job_tracker):
         """Test deleting an inference job"""
+        # Get available framework and image
+        framework, image = get_available_framework_and_image(client)
+        if not framework or not image:
+            pytest.skip("No available inference frameworks or images")
+        
+        print(f"[TEST] Using framework: {framework}, image: {image}")
+        
         # Create a temporary job to delete
         job_id = client.inference.create(
             InferenceJobRequest(
                 model_path="/workspace/models/Qwen/Qwen3-0.6B/",
-                inference_framework="sglang",
+                model_name="glm-5",
+                inference_framework=framework,
+                inf_image=image,
                 timeout=3600,
                 resources=ResourceConfig(
                     cpu="4",
@@ -676,6 +758,13 @@ class TestCompleteWorkflow:
     
     def test_complete_workflow(self, client, job_tracker):
         """Test a complete workflow of inference job management"""
+        # Get available framework and image
+        framework, image = get_available_framework_and_image(client)
+        if not framework or not image:
+            pytest.skip("No available inference frameworks or images")
+        
+        print(f"[TEST] Using framework: {framework}, image: {image}")
+        
         job_id = None
         
         try:
@@ -683,7 +772,9 @@ class TestCompleteWorkflow:
             job_id = client.inference.create(
                 InferenceJobRequest(
                     model_path="/workspace/models/Qwen/Qwen3-0.6B/",
-                    inference_framework="sglang",
+                    model_name="glm-5",
+                    inference_framework=framework,
+                    inf_image=image,
                     timeout=3600,
                     resources=ResourceConfig(
                         cpu="4",
@@ -752,6 +843,82 @@ class TestCompleteWorkflow:
                 except Exception:
                     pass
             raise
+
+
+class TestGetFrameworkAndImages:
+    """Test cases for getting inference frameworks and images"""
+    
+    def test_get_framework(self, client):
+        """Test getting the list of inference frameworks"""
+        print("[TEST] Testing get_framework...")
+        try:
+            frameworks = client.inference.get_framework()
+            print(f"[TEST] Retrieved {len(frameworks)} framework(s): {frameworks}")
+        except Exception as e:
+            print(f"[ERROR] Failed to get frameworks: {type(e).__name__}: {str(e)}")
+            skip_if_insufficient_resources(e)
+            raise
+        
+        # Should return a list (may be empty)
+        assert isinstance(frameworks, list), f"Expected list, got {type(frameworks).__name__}"
+        
+        # If frameworks exist, verify they are strings
+        for idx, framework in enumerate(frameworks):
+            assert isinstance(framework, str), f"Framework at index {idx} is not a string, got {type(framework).__name__}"
+            print(f"[TEST] Framework {idx + 1}: {framework}")
+    
+    def test_get_inf_image(self, client):
+        """Test getting the list of inference images for a specific framework"""
+        # First get the list of frameworks
+        print("[TEST] Testing get_inf_image...")
+        try:
+            frameworks = client.inference.get_framework()
+            print(f"[TEST] Retrieved {len(frameworks)} framework(s): {frameworks}")
+        except Exception as e:
+            print(f"[ERROR] Failed to get frameworks: {type(e).__name__}: {str(e)}")
+            skip_if_insufficient_resources(e)
+            raise
+        
+        # If no frameworks available, skip this test
+        if not frameworks:
+            pytest.skip("No frameworks available to test get_inf_image")
+        
+        # Test with the first framework
+        framework = frameworks[0]
+        print(f"[TEST] Testing get_inf_image with framework: {framework}")
+        
+        try:
+            images = client.inference.get_inf_image(framework)
+            print(f"[TEST] Retrieved {len(images)} image(s) for framework '{framework}': {images}")
+        except Exception as e:
+            print(f"[ERROR] Failed to get images for framework '{framework}': {type(e).__name__}: {str(e)}")
+            skip_if_insufficient_resources(e)
+            raise
+        
+        # Should return a list (may be empty)
+        assert isinstance(images, list), f"Expected list, got {type(images).__name__}"
+        
+        # If images exist, verify they are strings
+        for idx, image in enumerate(images):
+            assert isinstance(image, str), f"Image at index {idx} is not a string, got {type(image).__name__}"
+            print(f"[TEST] Image {idx + 1}: {image}")
+    
+    def test_get_inf_image_with_invalid_framework(self, client):
+        """Test getting images with an invalid framework"""
+        invalid_framework = "invalid_framework_12345"
+        print(f"[TEST] Testing get_inf_image with invalid framework: {invalid_framework}")
+        
+        try:
+            images = client.inference.get_inf_image(invalid_framework)
+            print(f"[TEST] Retrieved {len(images)} image(s) for invalid framework: {images}")
+        except Exception as e:
+            print(f"[ERROR] Failed to get images for invalid framework: {type(e).__name__}: {str(e)}")
+            skip_if_insufficient_resources(e)
+            raise
+        
+        # Should return an empty list for invalid framework
+        assert isinstance(images, list), f"Expected list, got {type(images).__name__}"
+        assert len(images) == 0, f"Expected empty list for invalid framework, got {images}"
 
 
 if __name__ == "__main__":

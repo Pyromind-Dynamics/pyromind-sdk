@@ -7,10 +7,12 @@ This module provides the main client class that integrates all resource clients.
 import os
 from typing import Optional
 from .base import PyroMindClient
-from .sandboxes import SandboxesClient
+from .sandbox import SandboxClient
 from .instance import InstanceClient
 from .inference import InferenceClient
 from .training import TrainingClient
+from .echomind import EchoMindClient
+from .profile import ProfileClient
 
 
 class PyroMindAPIClient:
@@ -96,7 +98,7 @@ class PyroMindAPIClient:
         )
         
         # Initialize resource clients
-        self.sandboxes = SandboxesClient(
+        self.sandboxes = SandboxClient(
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
@@ -120,6 +122,18 @@ class PyroMindAPIClient:
             timeout=timeout,
             max_retries=max_retries
         )
+        self.echomind = EchoMindClient(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=max_retries
+        )
+        self.profile = ProfileClient(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=max_retries
+        )
     
     def close(self):
         """Close all client sessions"""
@@ -128,6 +142,8 @@ class PyroMindAPIClient:
         self.instance.close()
         self.inference.close()
         self.training.close()
+        self.echomind.close()
+        self.profile.close()
     
     def __enter__(self):
         """Context manager entry"""

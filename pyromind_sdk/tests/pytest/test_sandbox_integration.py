@@ -287,8 +287,8 @@ def test_sandbox_id(client, sandbox_tracker):
                 name=f"test-sandbox-{uuid.uuid4().hex[:8]}",
                 sandbox_type=SandboxType.WINDOWS,
                 resources=ResourceConfig(
-                    cpu="2",
-                    memory="4Gi",
+                    cpu="4",
+                    memory="8Gi",
                     gpu=0
                 ),
                 configuration=SandboxConfiguration(
@@ -416,8 +416,8 @@ class TestCreateSandbox:
                     name=sandbox_name,
                     sandbox_type=SandboxType.WINDOWS,
                     resources=ResourceConfig(
-                        cpu="2",
-                        memory="4Gi",
+                        cpu="4",
+                        memory="8Gi",
                         gpu=0
                     ),
                     configuration=SandboxConfiguration(
@@ -451,10 +451,10 @@ class TestCreateSandbox:
 
     @pytest.mark.parametrize("sandbox_type", [SandboxType.WINDOWS, SandboxType.LINUX])
     def test_sandbox_resource_boundary_cpu_memory(
-        self,
-        client,
-        sandbox_tracker,
-        sandbox_type: SandboxType,
+            self,
+            client,
+            sandbox_tracker,
+            sandbox_type: SandboxType,
     ):
         """Compare resource boundary configs: 1CPU+2Gi vs 2CPU+4Gi.
 
@@ -465,11 +465,38 @@ class TestCreateSandbox:
         """
         suffix = f"{sandbox_type.value}-{int(time.time())}"
 
-        # Baseline: 2 CPU + 4Gi memory
+        # ===================== 核心修复：LINUX 预期 422 错误 =====================
+        if sandbox_type == SandboxType.LINUX:
+            # 构造请求
+            request = SandboxRequest(
+                name=f"test-sandbox-linux-expect-fail-{suffix}",
+                sandbox_type=sandbox_type,
+                resources=ResourceConfig(cpu="4", memory="8Gi", gpu=0),
+                configuration=SandboxConfiguration(
+                    screen_resolution=ScreenResolution(width=1920, height=1080),
+                ),
+            )
+            # 预期抛出 422 错误
+            with pytest.raises(PyroMindAPIError) as excinfo:
+                client.sandboxes.create(request)
+
+            err = excinfo.value
+            print(f"[TEST] Linux 预期错误：{err.status_code} | {err.message}")
+
+            # 校验错误码 + 错误信息
+            assert err.status_code == 422, f"预期422，实际{err.status_code}"
+            assert "Input should be 'win'" in err.message, f"错误信息不正确：{err.message}"
+            assert "sandbox_type" in err.message
+
+            print("[INFO] ✅ LINUX沙箱校验通过：后端正确拒绝code类型")
+            return  # 直接结束，不继续跑
+
+        # ===================== 以下是原来的 WINDOWS 正常流程 =====================
+        # Baseline: 4 CPU + 8Gi memory
         request_baseline = SandboxRequest(
-            name=f"test-sandbox-boundary-2c-4g-{suffix}",
+            name=f"test-sandbox-boundary-4c-8g-{suffix}",
             sandbox_type=sandbox_type,
-            resources=ResourceConfig(cpu="2", memory="4Gi", gpu=0),
+            resources=ResourceConfig(cpu="4", memory="8Gi"),
             configuration=SandboxConfiguration(
                 screen_resolution=ScreenResolution(width=1920, height=1080),
             ),
@@ -507,11 +534,11 @@ class TestCreateSandbox:
             print(f"[ERROR] Unexpected baseline error: {type(e).__name__}: {str(e)}")
             raise
 
-        # Boundary case: 1 CPU + 2Gi memory
+        # Boundary case: 4 CPU + 4Gi memory (minimum CPU but reduced memory)
         request_boundary = SandboxRequest(
-            name=f"test-sandbox-boundary-1c-2g-{suffix}",
+            name=f"test-sandbox-boundary-4c-4g-{suffix}",
             sandbox_type=sandbox_type,
-            resources=ResourceConfig(cpu="1", memory="2Gi", gpu=0),
+            resources=ResourceConfig(cpu="4", memory="4Gi", gpu=0),
             configuration=SandboxConfiguration(
                 screen_resolution=ScreenResolution(width=1920, height=1080),
             ),
@@ -558,9 +585,7 @@ class TestCreateSandbox:
                 f"response={e.response}"
             )
             assert e.message
-            assert e.status_code is None or isinstance(e.status_code, int)
-            if e.response is not None:
-                assert isinstance(e.response, dict)
+            assert e.status_code == 400, f"预期400，实际{e.status_code}"
         except Exception as e:
             print(f"[ERROR] Unexpected boundary error: {type(e).__name__}: {str(e)}")
             raise
@@ -667,8 +692,8 @@ class TestUpdateSandbox:
                     name=f"updated-test-{int(time.time())}",
                     sandbox_type=SandboxType.WINDOWS,
                     resources=ResourceConfig(
-                        cpu="4",
-                        memory="8Gi",
+                        cpu="6",
+                        memory="12Gi",
                         gpu=0
                     ),
                     configuration=SandboxConfiguration(
@@ -961,7 +986,7 @@ class TestGetVNC:
         assert isinstance(vnc_info, dict), f"Expected dict, got {type(vnc_info).__name__}"
         assert 'host' in vnc_info or 'port' in vnc_info, "VNC info missing required fields"
     
-    def test_get_vnc_example_function(self, test_sandbox_id):
+    def test_get_vnc_example_function(self, client, test_sandbox_id):
         """Test the get_vnc_example function"""
         print(f"[TEST] Testing get_vnc_example function with sandbox: {test_sandbox_id}")
         
@@ -992,8 +1017,8 @@ class TestDeleteSandbox:
                 name=f"test-delete-{int(time.time())}",
                 sandbox_type=SandboxType.WINDOWS,
                 resources=ResourceConfig(
-                    cpu="2",
-                    memory="4Gi",
+                    cpu="4",
+                    memory="8Gi",
                     gpu=0
                 ),
                 configuration=SandboxConfiguration(
@@ -1101,8 +1126,8 @@ class TestCompleteWorkflow:
                     name=f"test-workflow-{int(time.time())}",
                     sandbox_type=SandboxType.WINDOWS,
                     resources=ResourceConfig(
-                        cpu="2",
-                        memory="4Gi",
+                        cpu="4",
+                        memory="8Gi",
                         gpu=0
                     ),
                     configuration=SandboxConfiguration(

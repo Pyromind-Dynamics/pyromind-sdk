@@ -164,24 +164,25 @@ def main():
     
     # Example 1: List files
     print("\n1. Listing files...")
-    list_files_example(folder_path="")
+    list_files_example(folder_path="dist")
     
     # Example 2: Check file existence
     print("\n2. Checking file existence...")
-    check_file_exists_example("example.txt")
+    check_file_exists_example("dist/index.html")
     
     # Example 3: Upload a file (uncomment to test)
     # print("\n3. Uploading a file...")
     # upload_file_example(
-    #     local_file="/path/to/local/file.txt",
-    #     object_name="documents/file.txt"
+    #     local_file="/Users/demo/Downloads/Doubao_universal.dmg",
+    #     object_name="/dist/tes00000011111.dmg"
     # )
     
     # Example 4: Upload a folder (uncomment to test)
     # print("\n4. Uploading a folder...")
     # upload_folder_example(
-    #     local_folder="/path/to/local/folder",
-    #     object_prefix="backups/2024/"
+    #     local_folder="/Users/demo/Downloads/",
+    #     object_prefix="/dist",
+    #
     # )
     
     # Example 5: Download a file (uncomment to test)

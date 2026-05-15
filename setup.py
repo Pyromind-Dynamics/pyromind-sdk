@@ -21,6 +21,10 @@ setup(
     python_requires=">=3.8",
     install_requires=[
         "pyyaml>=6.0",
+        "requests>=2.28.0",
+        "pydantic>=2.0.0",
+        "urllib3>=1.26.0",
+        "aiohttp>=3.8.0",
     ],
     classifiers=[
         "Development Status :: 4 - Beta",
