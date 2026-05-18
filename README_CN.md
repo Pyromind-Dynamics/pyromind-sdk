@@ -372,6 +372,30 @@ pyromind_sdk/
 └── README.md
 ```
 
+### 发布到 PyPI
+
+发版前请先更新 `pyproject.toml` 中的 `version`，并安装构建工具：`pip install build twine`。
+
+**1. 打包**
+
+```bash
+rm -rf dist/ build/ *.egg-info && python -m build
+```
+
+**2. 上传到 TestPyPI**
+
+```bash
+twine upload --repository testpypi dist/*
+```
+
+**3. 上传到 PyPI**
+
+```bash
+twine upload dist/*
+```
+
+使用 API token 时，用户名填 `__token__`，密码填对应平台的 token。TestPyPI 与正式 PyPI 的账号和 token 相互独立，需在 [test.pypi.org](https://test.pypi.org) 与 [pypi.org](https://pypi.org) 分别创建。
+
 ### 贡献
 
 欢迎贡献！请确保：
