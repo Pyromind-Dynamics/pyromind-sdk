@@ -329,6 +329,30 @@ base_class: PortPodExecutionNode
 - `convert_inputs(inputs: Dict, input_types: Dict) -> Dict`: Convert input values according to type definitions
 - `validate_output_type(value: Any, type_spec: str) -> bool`: Validate output value type (supports STRING, PATH, MODEL, ENV, INT, FLOAT, BOOLEAN)
 
+### Workflow Functions
+
+- `WorkflowLiteConverter`: Workflow lite format converter
+- `LayoutGenerator`: Auto layout generator
+- `to_workflow_lite(workflow: Dict) -> Dict`: Convert standard workflow to lite format
+- `to_workflow_standard(workflow: Dict) -> Dict`: Convert lite workflow to standard format
+- `validate_workflow(workflow: Dict, format: str = 'lite') -> ValidationResult`: Validate workflow format
+
+### Workflow Validation
+
+- `validate_lite_format(workflow: Dict) -> ValidationResult`: Validate lite format workflow
+- `validate_standard_format(workflow: Dict) -> ValidationResult`: Validate standard format workflow
+- `validate_workflow_lite(workflow: Dict) -> ValidationResult`: Validate lite workflow
+- `validate_workflow_standard(workflow: Dict) -> ValidationResult`: Validate standard workflow
+- `validate_workflow_legacy(workflow: Dict) -> ValidationResult`: Validate legacy format workflow
+
+### Exception Classes
+
+- `PyroMindAPIError`: API error exception
+- `ValidationError`: Workflow validation error
+- `SchemaValidationError`: Workflow schema validation error
+- `LinkValidationError`: Workflow link validation error
+- `TypeValidationError`: Workflow type validation error
+
 ## Testing
 
 Test your YAML node configurations:
@@ -374,6 +398,8 @@ Check the `examples/` directory for more examples:
 - ✅ **Resource Management**: Configure CPU, memory, and GPU resources
 - ✅ **Customer Inputs**: Mark inputs/outputs for customer-specific use
 - ✅ **Security**: Built-in validation and security checks
+- ✅ **Workflow Conversion**: Support conversion between standard and lite formats
+- ✅ **Workflow Validation**: Comprehensive workflow validation
 
 ## Requirements
 

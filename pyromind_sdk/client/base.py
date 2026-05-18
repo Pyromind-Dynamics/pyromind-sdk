@@ -6,6 +6,7 @@ HTTP requests, and error handling for all API clients.
 """
 
 import os
+import logging
 import requests
 from typing import Optional, Dict, Any, Union
 from requests.adapters import HTTPAdapter
@@ -18,8 +19,25 @@ DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_RETRIES = 3
 ENV_API_KEY = "PYROMIND_API_KEY"
 ENV_BASE_URL = "PYROMIND_BASE_URL"
-RETRY_STATUS_CODES = []
+ENV_LOG_FORMAT = "PYROMIND_LOG_FORMAT"
+RETRY_STATUS_CODES = [500, 502, 503, 504]
 RETRY_ALLOWED_METHODS = ["GET", "POST", "PUT", "DELETE"]
+
+ERROR_MESSAGE_MAX_LENGTH = 500
+
+# Default log format
+DEFAULT_LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+
+# Configure logger (always enabled)
+logger = logging.getLogger("pyromind_sdk")
+logger.setLevel(logging.INFO)
+
+# Configure handler with format from environment variable or default
+_log_format = os.getenv(ENV_LOG_FORMAT, DEFAULT_LOG_FORMAT)
+_handler = logging.StreamHandler()
+_handler.setLevel(logging.INFO)
+_handler.setFormatter(logging.Formatter(_log_format))
+logger.addHandler(_handler)
 
 
 class PyroMindAPIError(Exception):
@@ -127,6 +145,182 @@ class PyroMindClient:
             return response
         return response
     
+    # ========== URL and Request Building ==========
+    
+    def _build_url(self, endpoint: str) -> str:
+        """Build full URL from endpoint"""
+        return f"{self.base_url}/{endpoint.lstrip('/')}"
+    
+    def _build_request_context(self, method: str, url: str) -> str:
+        """Build request context string for error messages"""
+        return f"{method.upper()} {url}"
+    
+    # ========== Error Data Extraction ==========
+    
+    def _extract_error_data(self, response) -> Dict[str, Any]:
+        """Extract error data from response, handling JSON parse failures"""
+        try:
+            return response.json()
+        except Exception:
+            return {"message": response.text}
+    
+    def _truncate_error_message(self, error_data: Dict[str, Any], max_length: int = 500) -> Dict[str, Any]:
+        """Truncate error message to avoid flooding logs"""
+        if isinstance(error_data, dict) and isinstance(error_data.get("message"), str):
+            msg = error_data["message"]
+            if len(msg) > max_length:
+                error_data["message"] = msg[:max_length] + "..."
+        return error_data
+    
+    # ========== Error Message Formatting ==========
+    
+    def _format_400_error(self, response, error_data: Dict[str, Any]) -> str:
+        """Format error message for 400 Bad Request"""
+        base_message = (
+            "Bad Request (400). The request was invalid or malformed. "
+            "This usually means there's an issue with the request parameters, "
+            "request body format, or missing required fields."
+        )
+        response_text = response.text[:ERROR_MESSAGE_MAX_LENGTH]
+        suffix = "..." if len(response.text) > ERROR_MESSAGE_MAX_LENGTH else ""
+        return f"{base_message}\nResponse: {response_text}{suffix}"
+    
+    def _format_401_error(self, error_data: Dict[str, Any]) -> str:
+        """Format error message for 401 Unauthorized"""
+        error_message = (
+            "Authentication failed (401). Please check your API key. "
+            "The API key may be invalid, expired, or incorrectly formatted."
+        )
+        if error_data.get("message"):
+            error_message += f" Server message: {error_data.get('message')}"
+        return error_message
+    
+    def _format_404_error(self, error_data: Dict[str, Any]) -> str:
+        """Format error message for 404 Not Found"""
+        # Check for nested error structure (APIResponse format)
+        if not isinstance(error_data, dict):
+            return "Resource not found (404). The requested resource does not exist."
+        
+        # Check "error" field
+        if "error" in error_data:
+            error_obj = error_data.get("error", {})
+            if isinstance(error_obj, dict):
+                error_code = error_obj.get("code", "")
+                error_msg = error_obj.get("message", "")
+                if error_code:
+                    return f"{error_code}: {error_msg}"
+                if error_msg:
+                    return error_msg
+        
+        # Check "detail" field
+        if "detail" in error_data:
+            detail = error_data.get("detail")
+            if isinstance(detail, dict) and "error" in detail:
+                error_obj = detail.get("error", {})
+                if isinstance(error_obj, dict):
+                    error_code = error_obj.get("code", "")
+                    error_msg = error_obj.get("message", "")
+                    if error_code:
+                        return f"{error_code}: {error_msg}"
+                    if error_msg:
+                        return error_msg
+            elif isinstance(detail, str):
+                return detail
+        
+        # Default message
+        error_message = "Resource not found (404). The requested resource does not exist."
+        if error_data.get("message"):
+            error_message += f" Details: {error_data.get('message')}"
+        return error_message
+    
+    def _format_422_error(self, error_data: Dict[str, Any]) -> str:
+        """Format error message for 422 Unprocessable Entity"""
+        error_message = "Unprocessable Entity (422). The request was well-formed but contains semantic errors."
+        if error_data.get("message"):
+            error_message += f" Details: {error_data.get('message')}"
+        if error_data.get("detail"):
+            error_message += f"\nValidation details: {error_data.get('detail')}"
+        return error_message
+    
+    def _format_generic_error(self, response, error_data: Dict[str, Any]) -> str:
+        """Format error message for other status codes"""
+        error_code = ""
+        payload_message = ""
+        
+        if isinstance(error_data, dict):
+            # Try common error code locations
+            error_obj = error_data.get("error")
+            if isinstance(error_obj, dict):
+                if isinstance(error_obj.get("message"), str):
+                    payload_message = error_obj.get("message", "")
+                error_code = (
+                    error_obj.get("code")
+                    or error_obj.get("error_code")
+                    or ""
+                )
+            
+            # Check nested detail structure
+            detail = error_data.get("detail")
+            if not error_code and isinstance(detail, dict):
+                nested_error = detail.get("error")
+                if isinstance(nested_error, dict):
+                    if isinstance(nested_error.get("message"), str):
+                        payload_message = nested_error.get("message", "")
+                    error_code = (
+                        nested_error.get("code")
+                        or nested_error.get("error_code")
+                        or ""
+                    )
+        
+        # Build error message
+        error_message = payload_message or error_data.get("message", "")
+        if not error_message:
+            error_message = f"API request failed with status {response.status_code}"
+        
+        if error_code:
+            error_message = f"{error_code}: {error_message}"
+        
+        if error_data.get("detail"):
+            error_message += f"\nDetails: {error_data.get('detail')}"
+        
+        return error_message
+    
+    def _format_error_message(self, response, error_data: Dict[str, Any]) -> str:
+        """Format error message based on status code"""
+        status_code = response.status_code
+        
+        if status_code == 400:
+            return self._format_400_error(response, error_data)
+        elif status_code == 401:
+            return self._format_401_error(error_data)
+        elif status_code == 404:
+            return self._format_404_error(error_data)
+        elif status_code == 422:
+            return self._format_422_error(error_data)
+        else:
+            return self._format_generic_error(response, error_data)
+    
+    # ========== Error Response Handling ==========
+    
+    def _handle_error_response(self, response, request_context: str) -> None:
+        """Handle HTTP error response and raise appropriate exception"""
+        error_data = self._extract_error_data(response)
+        error_data = self._truncate_error_message(error_data)
+        error_message = self._format_error_message(response, error_data)
+        
+        # Log error (single line)
+        safe_error_data = self._mask_sensitive_data(error_data)
+        logger.error(f"[ERROR] {request_context} - Status: {response.status_code} | message: {error_message} | response: {safe_error_data}")
+        
+        raise PyroMindAPIError(
+            message=f"{request_context} failed: {error_message}",
+            status_code=response.status_code,
+            response=error_data,
+            headers=dict(response.headers)
+        )
+    
+    # ========== Main Request Method ==========
+    
     def _request(
         self,
         method: str,
@@ -151,8 +345,19 @@ class PyroMindClient:
         Raises:
             PyroMindAPIError: If the request fails
         """
-        url = f"{self.base_url}/{endpoint.lstrip('/')}"
-        request_context = f"{method.upper()} {url}"
+        url = self._build_url(endpoint)
+        request_context = self._build_request_context(method, url)
+        
+        # Log request (single line with all info)
+        safe_headers = {k: '***' if k.lower() == 'authorization' else v for k, v in self.session.headers.items()}
+        safe_json = self._mask_sensitive_data(json_data) if json_data else None
+        log_parts = [f"[REQUEST] {request_context}"]
+        if params:
+            log_parts.append(f"params={params}")
+        log_parts.append(f"headers={safe_headers}")
+        if safe_json:
+            log_parts.append(f"body={safe_json}")
+        logger.info(" | ".join(log_parts))
         
         try:
             response = self.session.request(
@@ -163,124 +368,64 @@ class PyroMindClient:
                 timeout=self.timeout,
                 **kwargs
             )
+            
+            # Log response (single line)
+            resp_log = f"[RESPONSE] {request_context} - Status: {response.status_code}"
+            try:
+                if response.content:
+                    resp_json = response.json()
+                    safe_resp = self._mask_sensitive_data(resp_json)
+                    resp_log += f" | body={safe_resp}"
+            except Exception:
+                pass
+            logger.info(resp_log)
+            
             # Handle non-2xx responses
             if not response.ok:
-                error_data = None
-                try:
-                    error_data = response.json()
-                except:
-                    error_data = {"message": response.text}
-                
-                # Avoid flooding logs with very large payloads.
-                if isinstance(error_data, dict) and isinstance(error_data.get("message"), str):
-                    msg = error_data["message"]
-                    if len(msg) > 500:
-                        error_data["message"] = msg[:500] + "..."
-                
-                # Provide more detailed error messages for specific status codes
-                if response.status_code == 400:
-                    error_message = (
-                        "Bad Request (400). The request was invalid or malformed. "
-                        "This usually means there's an issue with the request parameters, "
-                        "request body format, or missing required fields."
-                    ) + f"\nResponse: {response.text[:500]}{'...' if len(response.text) > 500 else ''}"
-                elif response.status_code == 401:
-                    error_message = (
-                        "Authentication failed (401). Please check your API key. "
-                        "The API key may be invalid, expired, or incorrectly formatted."
-                    )
-                    if error_data.get("message"):
-                        error_message += f" Server message: {error_data.get('message')}"
-                elif response.status_code == 404:
-                    error_message = "Resource not found (404). The requested resource does not exist."
-                    # Try to extract detailed error information from the response
-                    if isinstance(error_data, dict):
-                        # Check for nested error structure (APIResponse format)
-                        if "error" in error_data:
-                            error_obj = error_data.get("error", {})
-                            if isinstance(error_obj, dict):
-                                error_code = error_obj.get("code", "")
-                                error_msg = error_obj.get("message", "")
-                                if error_code:
-                                    error_message = f"{error_code}: {error_msg}"
-                                elif error_msg:
-                                    error_message = error_msg
-                        elif "detail" in error_data:
-                            detail = error_data.get("detail")
-                            if isinstance(detail, dict) and "error" in detail:
-                                error_obj = detail.get("error", {})
-                                if isinstance(error_obj, dict):
-                                    error_code = error_obj.get("code", "")
-                                    error_msg = error_obj.get("message", "")
-                                    if error_code:
-                                        error_message = f"{error_code}: {error_msg}"
-                                    elif error_msg:
-                                        error_message = error_msg
-                            elif isinstance(detail, str):
-                                error_message = detail
-                        elif error_data.get("message"):
-                            error_message += f" Details: {error_data.get('message')}"
-                elif response.status_code == 422:
-                    error_message = "Unprocessable Entity (422). The request was well-formed but contains semantic errors."
-                    if error_data.get("message"):
-                        error_message += f" Details: {error_data.get('message')}"
-                    if error_data.get("detail"):
-                        error_message += f"\nValidation details: {error_data.get('detail')}"
-                else:
-                    error_code = ""
-                    payload_message: str = ""
-                    if isinstance(error_data, dict):
-                        # Try common error code locations.
-                        error_obj = error_data.get("error")
-                        if isinstance(error_obj, dict):
-                            if isinstance(error_obj.get("message"), str):
-                                payload_message = error_obj.get("message", "")
-                            error_code = (
-                                error_obj.get("code")
-                                or error_obj.get("error_code")
-                                or ""
-                            )
-                        detail = error_data.get("detail")
-                        if not error_code and isinstance(detail, dict):
-                            nested_error = detail.get("error")
-                            if isinstance(nested_error, dict):
-                                if isinstance(nested_error.get("message"), str):
-                                    payload_message = nested_error.get("message", "")
-                                error_code = (
-                                    nested_error.get("code")
-                                    or nested_error.get("error_code")
-                                    or ""
-                                )
+                self._handle_error_response(response, request_context)
 
-                    error_message = payload_message or error_data.get(
-                        "message",
-                        "",
-                    )
-                    if not error_message:
-                        error_message = f"API request failed with status {response.status_code}"
-                    if error_code:
-                        error_message = f"{error_code}: {error_message}"
-                    if error_data.get("detail"):
-                        error_message += f"\nDetails: {error_data.get('detail')}"
-                
-                raise PyroMindAPIError(
-                    message=f"{request_context} failed: {error_message}",
-                    status_code=response.status_code,
-                    response=error_data,
-                    headers=dict(response.headers)
-                )
-            
             # Return JSON response
             if response.content:
                 return response.json()
             return {}
 
         except requests.exceptions.RequestException as e:
+            # Log exception
+            logger.error(f"[ERROR] {request_context} - {type(e).__name__}: {str(e)}")
             raise PyroMindAPIError(
                 message=f"{request_context} request failed: {type(e).__name__}: {str(e)}",
                 status_code=None
             )
     
+    def _mask_sensitive_data(self, data: Any, mask: str = "***") -> Any:
+        """
+        Mask sensitive data in logs
+        
+        Args:
+            data: Data to mask
+            mask: Mask string to use
+            
+        Returns:
+            Data with sensitive fields masked
+        """
+        sensitive_keys = {'password', 'api_key', 'apikey', 'token', 'secret', 'authorization'}
+        
+        if isinstance(data, dict):
+            masked = {}
+            for key, value in data.items():
+                if key.lower() in sensitive_keys:
+                    masked[key] = mask
+                elif isinstance(value, (dict, list)):
+                    masked[key] = self._mask_sensitive_data(value, mask)
+                else:
+                    masked[key] = value
+            return masked
+        elif isinstance(data, list):
+            return [self._mask_sensitive_data(item, mask) for item in data]
+        return data
+
+
+
     def get(self, endpoint: str, params: Optional[Dict[str, Any]] = None, **kwargs) -> Dict[str, Any]:
         """Make a GET request"""
         return self._request("GET", endpoint, params=params, **kwargs)

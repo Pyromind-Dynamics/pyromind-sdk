@@ -385,6 +385,10 @@ class TestCreateJupyterInstance:
             print(f"[ERROR] Failed to create instance: {e.message} (status_code: {e.status_code})")
             if e.response:
                 print(f"[ERROR] Error response: {e.response}")
+            ## 如果异常信息中包含"already exists" 跳过
+            if "already exists" in e.message:
+                print(f"[WARNING] Instance {instance_name} already exists. Skipping creation.")
+                return
             raise
         except Exception as e:
             print(f"[ERROR] Unexpected error creating instance: {type(e).__name__}: {str(e)}")

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyromind-sdk"
-version = "0.0.24.rc10"
+version = "0.0.25.rc1"
 description = "Lightweight SDK stub for local development and testing of third-party nodes without the full platform codebase"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -30,6 +30,7 @@ dependencies = [
     "pydantic>=2.0.0",
     "urllib3>=1.26.0",
     "minio>=7.0.0",
+    "aiohttp>=3.8.0",
 ]
 
 [project.optional-dependencies]
@@ -59,4 +60,7 @@ norecursedirs = []
 testpaths = ["pyromind_sdk/tests"]
 # Exclude test_yaml_nodes.py specifically
 python_functions = ["test_*"]
+# Asyncio configuration for async tests (use STRICT mode to avoid auto-detection)
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
 

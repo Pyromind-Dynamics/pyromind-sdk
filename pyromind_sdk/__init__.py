@@ -8,7 +8,7 @@ In the real platform runtime environment, nodes should prioritize importing
 base classes from `app.models.nodes`.
 """
 
-__version__ = "0.0.24.rc0"
+__version__ = "0.0.25.rc1"
 
 # Export YAML nodes functionality
 from .nodes import (
@@ -52,12 +52,31 @@ from .nodes import (
 from .client import (
     PyroMindClient,
     PyroMindAPIError,
-    SandboxesClient,
+    SandboxClient,
     InstanceClient,
     InferenceClient,
     TrainingClient,
     StorageClient,
     PyroMindAPIClient,
+    EchoMindClient,
+    ProfileClient,
+    # Async clients
+    PyroMindAsyncClient,
+    PyroMindAsyncAPIError,
+    AsyncSandboxClient,
+    AsyncInstanceClient,
+    AsyncInferenceClient,
+    AsyncTrainingClient,
+    AsyncEchoMindClient,
+    PyroMindAsyncAPIClient,
+)
+
+# Export models
+from .client.models import (
+    ApiMode,
+    EchoMindJobRequest,
+    EchoMindJobResponse,
+    ResourceConfig,
 )
 
 # Export workflow functionality
@@ -114,12 +133,28 @@ __all__ = [
     # API client functionality
     "PyroMindClient",
     "PyroMindAPIError",
-    "SandboxesClient",
+    "SandboxClient",
     "InstanceClient",
     "InferenceClient",
     "TrainingClient",
     "StorageClient",
     "PyroMindAPIClient",
+    "EchoMindClient",
+    "ProfileClient",
+    # Async clients
+    "PyroMindAsyncClient",
+    "PyroMindAsyncAPIError",
+    "AsyncSandboxClient",
+    "AsyncInstanceClient",
+    "AsyncInferenceClient",
+    "AsyncTrainingClient",
+    "AsyncEchoMindClient",
+    "PyroMindAsyncAPIClient",
+    # Models
+    "ApiMode",
+    "EchoMindJobRequest",
+    "EchoMindJobResponse",
+    "ResourceConfig",
     # Workflow functionality
     "WorkflowLiteConverter",
     "LayoutGenerator",
