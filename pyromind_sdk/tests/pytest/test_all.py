@@ -39,7 +39,8 @@ TEST_MODULES = [
     "test_python_function_to_yaml_cli_pytest.py",
     "test_workflow_converter.py",
     # Integration tests (slower)
-    "test_sandbox_integration.py",
+    # 线上已移除sanbox@jwc
+    # "test_sandbox_integration.py",
     "test_jupyter_instance_integration.py",
     "test_inference_integration.py",
     "test_training_example.py",

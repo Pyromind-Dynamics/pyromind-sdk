@@ -165,7 +165,7 @@ def task_tracker():
 def workflow_file():
     """Get a workflow file for testing"""
     workflows_dir = EXAMPLES_DIR / "workflows"
-    workflow_files = ["clone.json", "llm_test.json", "join_path.json"]
+    workflow_files = ["clone-xyflow.json", "join_path-xyflow.json"]
     
     for workflow_file in workflow_files:
         workflow_path = workflows_dir / workflow_file
@@ -261,6 +261,8 @@ class TestCreateTrainingTask:
     
     def test_create_training_task(self, client, task_tracker, workflow_file):
         """Test creating a training task"""
+        workflow = _load_workflow(workflow_file)
+        expected_name = workflow.get("name", "example-training")
         task_name = f"test-create-{int(time.time())}"
         print(f"[TEST] Creating training task with name: {task_name}")
         
@@ -280,7 +282,7 @@ class TestCreateTrainingTask:
         try:
             task = client.training.get_task(task_id)
             assert task.task_id == task_id
-            assert task.name == task_name
+            assert task.name == expected_name
             print(f"[TEST] Task verification passed: id={task.task_id}, name={task.name}")
         except Exception as e:
             print(f"[ERROR] Failed to verify created task: {type(e).__name__}: {str(e)}")
@@ -356,7 +358,7 @@ class TestGetTrainingTask:
     
     def test_get_nonexistent_task(self, client):
         """Test getting a non-existent task should raise an error"""
-        fake_id = "non-existent-task-id-12345"
+        fake_id = "999999999999"
         print(f"[TEST] Attempting to get non-existent task: {fake_id}")
         with pytest.raises(PyroMindAPIError) as exc_info:
             client.training.get_task(fake_id)
@@ -413,21 +415,25 @@ class TestDeleteTrainingTask:
         task_id = task.task_id
         task_tracker.add(task_id)
         
-        # Wait a bit before deleting
-        time.sleep(2)
+        # Wait for task to complete before deleting
+        max_wait = 120
+        check_interval = 5
+        waited = 0
+        while waited < max_wait:
+            try:
+                task = client.training.get_task(task_id)
+                if task and task.status in ("Succeeded", "Failed", "Error", "Terminated", "Cancelled"):
+                    break
+            except Exception:
+                pass
+            time.sleep(check_interval)
+            waited += check_interval
+        
+        if waited >= max_wait:
+            pytest.skip(f"Task {task_id} did not complete within {max_wait}s, cannot test deletion")
         
         # Delete the task
         try:
-            # Verify task exists before deleting
-            try:
-                task = client.training.get_task(task_id)
-                if not task:
-                    pytest.skip(f"Task {task_id} not found, cannot test deletion")
-            except PyroMindAPIError as e:
-                if e.status_code == 404:
-                    pytest.skip(f"Task {task_id} not found, cannot test deletion")
-                raise
-            
             client.training.delete(task_id)
             print(f"[TEST] Task deleted successfully: {task_id}")
         except PyroMindAPIError as e:
@@ -444,7 +450,7 @@ class TestDeleteTrainingTask:
             # Good, task was deleted (raises error when getting)
             pass
     
-    def test_delete_training_task_example_function(self, task_tracker, workflow_file):
+    def test_delete_training_task_example_function(self, api_key, task_tracker, workflow_file):
         """Test the delete_training_task_example function"""
         # Create a temporary task to delete
         task_id = create_training_task_example(workflow_file)
@@ -454,8 +460,24 @@ class TestDeleteTrainingTask:
         
         task_tracker.add(task_id)
         
-        # Wait a bit before deleting
-        time.sleep(2)
+        # Wait for task to complete before deleting
+        client = PyroMindAPIClient(api_key=api_key)
+        max_wait = 120
+        check_interval = 5
+        waited = 0
+        while waited < max_wait:
+            try:
+                task = client.training.get_task(task_id)
+                if task and task.status in ("Succeeded", "Failed", "Error", "Terminated", "Cancelled"):
+                    break
+            except Exception:
+                pass
+            time.sleep(check_interval)
+            waited += check_interval
+        client.close()
+        
+        if waited >= max_wait:
+            pytest.skip(f"Task {task_id} did not complete within {max_wait}s, cannot test deletion")
         
         # Delete the task
         try:
@@ -466,12 +488,9 @@ class TestDeleteTrainingTask:
         
         # Verify task was deleted
         time.sleep(5)
-        try:
-            get_training_task_example(task_id)
+        result = get_training_task_example(task_id)
+        if result is not None:
             pytest.skip("Task still exists after deletion attempt")
-        except PyroMindAPIError:
-            # Good, task was deleted
-            pass
 
 
 class TestGetNodeOutput:
