@@ -9,7 +9,7 @@ long_description = readme_file.read_text(encoding="utf-8") if readme_file.exists
 
 setup(
     name="pyromind-sdk",
-    version = "0.0.25.rc1",
+    version = "0.0.25",
     description="Lightweight SDK stub for local development and testing of third-party nodes without the full platform codebase",
     long_description=long_description,
     long_description_content_type="text/markdown",

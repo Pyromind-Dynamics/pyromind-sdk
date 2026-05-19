@@ -317,6 +317,7 @@ class InferenceJobResponse(BaseModel):
     updated_at: Optional[datetime] = None
     model_name: Optional[str] = None
     model_length: Optional[int] = None
+    inf_image: Optional[str] = None
 
 
 class InferenceJobListAPIResponse(BaseModel):
