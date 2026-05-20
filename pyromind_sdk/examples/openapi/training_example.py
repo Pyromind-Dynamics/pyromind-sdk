@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Optional, Dict, List, Set, Tuple
 
 from pyromind_sdk import PyroMindAPIClient, PyroMindAPIError
-from pyromind_sdk.client.models import TrainingTaskCreateRequest
+from pyromind_sdk.client.models import TrainingTaskCreateRequest, WorkflowRunRequest
 from pyromind_sdk.client import validate_workflow, ValidationError
 
 
@@ -222,6 +222,38 @@ def stop_training_task_example(task_id: str) -> Optional[object]:
         client.close()
 
 
+def run_workflow_with_params_example(
+    workflow_name: str,
+    primitive_node_map: dict,
+) -> Optional[str]:
+    """
+    Example: Run a stored workflow with injected primitive node values.
+
+    Args:
+        workflow_name: Name of the stored workflow (corresponds to {name}.json in storage)
+        primitive_node_map: {workflow_node_id: value} mapping for PrimitiveNode nodes
+
+    Returns:
+        Task ID if successful, None otherwise
+    """
+    client = PyroMindAPIClient()
+
+    try:
+        print(f"Running workflow '{workflow_name}' with injected values...")
+        request = WorkflowRunRequest(
+            workflow_name=workflow_name,
+            primitive_node_map=primitive_node_map,
+        )
+        task = client.training.run_with_params(request)
+        print(f"✓ Workflow started: {task.task_id} - {task.status}")
+        return task.task_id
+    except PyroMindAPIError as e:
+        print(f"✗ Failed to run workflow: {e.message}")
+        return None
+    finally:
+        client.close()
+
+
 def delete_training_task_example(task_id: str) -> None:
     """Delete a training task."""
     client = PyroMindAPIClient()
@@ -360,8 +392,6 @@ def get_node_info_example() -> Optional[Dict]:
     client = PyroMindAPIClient()
     
     try:
-        print("Reloading node definitions...")
-        client.training.reload_nodes()
         print("Getting node information...")
         node_info = client.training.get_node_info()
         
@@ -674,31 +704,40 @@ def main():
     print("Getting Node Information")
     print("=" * 60)
     get_node_info_example()
-    
+
     # Then process workflow files
     workflow_files = ["clone-xyflow.json","join-path-xyflow.json"]
     workflows_dir = Path(__file__).parent / "workflows"
-    
+
     for workflow_file in workflow_files:
         workflow_path = workflows_dir / workflow_file
-        
+
         if not workflow_path.exists():
             print(f"⚠ Skipping {workflow_file}: file not found")
             continue
-        
+
         print(f"\n{'=' * 60}")
         print(f"Processing workflow: {workflow_file}")
         print(f"{'=' * 60}")
-        
+
         task_id = create_training_task_example(workflow_path, task_name=f"training-{workflow_file}")
         if not task_id:
             continue
-        
+
         task = wait_for_task_completion(task_id, target_status="Succeeded")
         if task:
             workflow = _load_workflow(workflow_path)
             draw_workflow_graph(workflow)
             delete_training_task_example(task_id)
+    # TODO run_workflow_with_params_example
+    # # Run workflow with params example
+    # print(f"\n{'=' * 60}")
+    # print("Running Workflow with Params")
+    # print(f"{'=' * 60}")
+    # run_workflow_with_params_example(
+    #     workflow_name="test",
+    #     primitive_node_map={"1": "Qwen/Qwen3-8B","5":99},
+    # )
 
 
 if __name__ == "__main__":

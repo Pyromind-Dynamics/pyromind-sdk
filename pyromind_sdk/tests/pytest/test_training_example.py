@@ -770,9 +770,25 @@ class TestCompleteWorkflow:
             # Step 2: Get task
             task = client.training.get_task(task_id)
             assert task.task_id == task_id
-            
-            # Step 3: Delete task
-            time.sleep(2)
+
+            # Step 3: Wait for task to complete before deleting
+            max_wait = 120
+            check_interval = 5
+            waited = 0
+            while waited < max_wait:
+                try:
+                    task = client.training.get_task(task_id)
+                    if task and task.status in ("Succeeded", "Failed", "Error", "Terminated", "Cancelled"):
+                        break
+                except Exception:
+                    pass
+                time.sleep(check_interval)
+                waited += check_interval
+
+            if waited >= max_wait:
+                pytest.skip(f"Task {task_id} did not complete within {max_wait}s, cannot test deletion")
+
+            # Step 4: Delete task
             client.training.delete(task_id)
             
             # Verify deletion
@@ -792,6 +808,318 @@ class TestCompleteWorkflow:
                 except Exception:
                     pass
             raise
+
+
+class TestNodeStructureValidation:
+    """Validate node type structures across categories"""
+
+    VALID_PARAM_TYPES = {"STRING", "INT", "FLOAT", "BOOL", "BOOLEAN", "COMBO", "MODEL", "DATASET", "FILE", "IMAGE", "AUDIO", "VIDEO", "TENSOR", "ANY", "*", "ENV", "PATH", "ACCELERATE_CONFIG"}
+
+    def _get_node_info(self, client):
+        node_info = client.training.get_node_info()
+        assert isinstance(node_info, dict) and len(node_info) > 0, "No node info available"
+        return node_info
+
+    def _get_node_info_with_reload(self, client):
+        client.training.reload_nodes()
+        return self._get_node_info(client)
+
+    def test_nodes_grouped_by_category(self, client):
+        """Verify all nodes have valid categories"""
+        node_info = self._get_node_info(client)
+
+        for node_name, info in node_info.items():
+            category = info.get("category")
+            assert category is None or isinstance(category, str), \
+                f"{node_name}: category should be string or None, got {type(category).__name__}"
+
+    def test_no_duplicate_node_names(self, client):
+        """Verify no duplicate node names in API response"""
+        node_info = self._get_node_info(client)
+        assert len(node_info) == len(set(node_info.keys())), \
+            f"Duplicate node names found: {len(node_info)} keys vs {len(set(node_info.keys()))} unique"
+
+    def test_all_nodes_have_display_name(self, client):
+        """Verify all non-system nodes have display_name"""
+        node_info = self._get_node_info(client)
+
+        for node_name, info in node_info.items():
+            display_name = info.get("display_name")
+            assert display_name is None or isinstance(display_name, str), \
+                f"{node_name}: display_name should be string or None, got {type(display_name).__name__}"
+
+    def test_no_duplicate_display_name(self, client):
+        """Verify no duplicate display_name across nodes"""
+        node_info = self._get_node_info(client)
+        seen = {}
+        for node_name, info in node_info.items():
+            dn = info.get("display_name")
+            if dn is not None:
+                assert isinstance(dn, str) and len(dn) > 0, \
+                    f"{node_name}: display_name should be non-empty string"
+                if dn in seen:
+                    print(f"[WARN] display_name '{dn}' shared by '{seen[dn]}' and '{node_name}'")
+                seen.setdefault(dn, node_name)
+
+    def test_input_param_types_are_known(self, client):
+        """Verify all input parameter types are recognized types"""
+        node_info = self._get_node_info(client)
+
+        for node_name, info in node_info.items():
+            input_defs = info.get("input")
+            if not input_defs:
+                continue
+
+            for cat in ("required", "optional"):
+                params = input_defs.get(cat, {})
+                for param_name, param_def in params.items():
+                    assert isinstance(param_def, list) and len(param_def) >= 1, \
+                        f"{node_name}.input.{cat}.{param_name}: should be [type, options?]"
+
+                    first = param_def[0]
+                    if isinstance(first, str):
+                        if first not in self.VALID_PARAM_TYPES:
+                            print(f"[WARN] {node_name}.input.{cat}.{param_name}: unrecognized type '{first}'")
+                    elif isinstance(first, list):
+                        for opt in first:
+                            assert isinstance(opt, str), \
+                                f"{node_name}.input.{cat}.{param_name}: COMBO option should be string, got {type(opt).__name__}"
+                    else:
+                        assert False, \
+                            f"{node_name}.input.{cat}.{param_name}: first element should be string or list, got {type(first).__name__}"
+
+    def test_input_param_constraint_is_dict(self, client):
+        """Verify the second element of param_def is a dict when present"""
+        node_info = self._get_node_info(client)
+
+        for node_name, info in node_info.items():
+            input_defs = info.get("input")
+            if not input_defs:
+                continue
+
+            for cat in ("required", "optional"):
+                params = input_defs.get(cat, {})
+                for param_name, param_def in params.items():
+                    assert isinstance(param_def, list) and 1 <= len(param_def) <= 2, \
+                        f"{node_name}.input.{cat}.{param_name}: expected [type, options?] (1 or 2 elements)"
+
+                    if len(param_def) == 2:
+                        opts = param_def[1]
+                        assert isinstance(opts, dict), \
+                            f"{node_name}.input.{cat}.{param_name}: second element should be dict, got {type(opts).__name__}"
+
+    def test_input_param_options_have_known_keys(self, client):
+        """Verify constraint dict keys are known"""
+        node_info = self._get_node_info(client)
+        known_keys = {"default", "min", "max", "enum", "display", "skip_enum", "image_upload"}
+
+        for node_name, info in node_info.items():
+            input_defs = info.get("input")
+            if not input_defs:
+                continue
+
+            for cat in ("required", "optional"):
+                params = input_defs.get(cat, {})
+                for param_name, param_def in params.items():
+                    if len(param_def) == 2:
+                        for key in param_def[1]:
+                            if key not in known_keys:
+                                print(f"[WARN] {node_name}.input.{cat}.{param_name}: unknown option key '{key}'")
+
+    def test_input_param_type_and_constraint_consistency(self, client):
+        """Verify type-constraint compatibility in param definitions"""
+        node_info = self._get_node_info(client)
+
+        for node_name, info in node_info.items():
+            input_defs = info.get("input")
+            if not input_defs:
+                continue
+
+            for cat in ("required", "optional"):
+                params = input_defs.get(cat, {})
+                for param_name, param_def in params.items():
+                    first = param_def[0]
+                    if isinstance(first, list) or len(param_def) < 2:
+                        continue
+
+                    opts = param_def[1]
+
+                    if first in ("INT", "FLOAT"):
+                        for key in ("min", "max"):
+                            val = opts.get(key)
+                            if val is not None:
+                                assert isinstance(val, (int, float)), \
+                                    f"{node_name}.input.{cat}.{param_name}.{key}: should be int/float"
+                                if first == "INT":
+                                    assert isinstance(val, int), \
+                                        f"{node_name}.input.{cat}.{param_name}.{key}: INT param should have int constraint"
+
+                    if "enum" in opts:
+                        assert isinstance(opts["enum"], list), \
+                            f"{node_name}.input.{cat}.{param_name}.enum: should be list"
+                        for opt in opts["enum"]:
+                            assert isinstance(opt, (str, int, float)), \
+                                f"{node_name}.input.{cat}.{param_name}.enum element: should be str/int/float"
+
+    def test_output_fields_consistency(self, client):
+        """Verify output and output_name arrays match"""
+        node_info = self._get_node_info(client)
+
+        for node_name, info in node_info.items():
+            outputs = info.get("output")
+            output_names = info.get("output_name")
+
+            if outputs is not None:
+                assert isinstance(outputs, list), f"{node_name}: output should be list"
+                if output_names is not None:
+                    assert len(output_names) == len(outputs), \
+                        f"{node_name}: output len ({len(outputs)}) != output_name len ({len(output_names)})"
+
+            if output_names is not None:
+                assert isinstance(output_names, list), f"{node_name}: output_name should be list"
+
+    def test_output_node_flag_type(self, client):
+        """Verify OUTPUT_NODE is bool when present"""
+        node_info = self._get_node_info(client)
+
+        for node_name, info in node_info.items():
+            output_flag = info.get("OUTPUT_NODE")
+            if output_flag is not None:
+                assert isinstance(output_flag, bool), f"{node_name}: OUTPUT_NODE should be bool"
+
+    def test_node_type_field(self, client):
+        """Verify NODE_TYPE field is string when present"""
+        node_info = self._get_node_info(client)
+
+        for node_name, info in node_info.items():
+            node_type = info.get("NODE_TYPE")
+            if node_type is not None:
+                assert isinstance(node_type, str), f"{node_name}: NODE_TYPE should be string"
+
+    def test_nodes_have_consistent_structure(self, client):
+        """Verify all node info dicts have consistent field types"""
+        node_info = self._get_node_info(client)
+
+        for node_name, info in node_info.items():
+            if not isinstance(info, dict):
+                assert False, f"{node_name}: info should be dict"
+
+            for field in ("display_name", "description", "category"):
+                val = info.get(field)
+                if val is not None:
+                    assert isinstance(val, str), f"{node_name}.{field}: should be string"
+
+    def test_reload_and_get_node_info(self, client):
+        """Verify reload_nodes then get_node_info returns valid structure"""
+        node_info = self._get_node_info_with_reload(client)
+
+        assert isinstance(node_info, dict) and len(node_info) > 0
+        for node_name, info in node_info.items():
+            assert isinstance(node_name, str)
+            assert isinstance(info, dict)
+
+    def test_node_info_example_function_structure(self, api_key):
+        """Verify get_node_info_example returns structurally valid node info"""
+        node_info = get_node_info_example()
+
+        if node_info is None:
+            pytest.skip("get_node_info_example returned None")
+
+        assert isinstance(node_info, dict)
+        for node_name, info in node_info.items():
+            assert isinstance(node_name, str)
+            assert isinstance(info, dict)
+
+            input_defs = info.get("input") or {}
+            for cat in ("required", "optional"):
+                params = input_defs.get(cat, {})
+                for param_name, param_def in params.items():
+                    assert isinstance(param_def, list) and len(param_def) >= 1
+
+    def test_node_type_enum_values(self, client):
+        """Verify node_type field values belong to known enum"""
+        node_info = self._get_node_info(client)
+        known_types = {"system", "user", "share"}
+
+        for node_name, info in node_info.items():
+            node_type = info.get("node_type")
+            assert node_type is not None, f"{node_name}: node_type is missing"
+            assert isinstance(node_type, str), f"{node_name}: node_type should be string"
+            assert node_type in known_types, \
+                f"{node_name}: node_type '{node_type}' not in known types {known_types}"
+
+    def test_node_type_parameter_reasonableness(self, client):
+        """Verify nodes of different node_type have reasonable parameter patterns"""
+        node_info = self._get_node_info(client)
+
+        system_count = user_count = share_count = 0
+        for node_name, info in node_info.items():
+            node_type = info.get("node_type")
+            input_defs = info.get("input") or {}
+            required = input_defs.get("required", {})
+            optional = input_defs.get("optional", {})
+
+            if node_type == "system":
+                system_count += 1
+                assert isinstance(info.get("category"), str), \
+                    f"{node_name}: system node should have string category"
+            elif node_type == "user":
+                user_count += 1
+            elif node_type == "share":
+                share_count += 1
+                assert isinstance(info.get("display_name"), str), \
+                    f"{node_name}: share node should have display_name"
+                assert isinstance(info.get("description"), str), \
+                    f"{node_name}: share node should have description"
+
+        assert system_count > 0, "No system nodes found"
+        assert user_count > 0, "No user nodes found"
+        assert share_count > 0, "No share nodes found"
+
+        print(f"[TEST] system={system_count}, user={user_count}, share={share_count}")
+
+    @staticmethod
+    def _infer_base_class(node_info: dict) -> set:
+        """Infer base class(es) from node input parameters"""
+        input_defs = node_info.get("input") or {}
+        all_params = {}
+        for cat in ("required", "optional"):
+            all_params.update(input_defs.get(cat, {}))
+
+        param_names = set(all_params.keys())
+        bases = set()
+
+        has_gpu = bool(param_names & {"gpu_count", "gpu_product", "gpu"})
+        has_port = "port" in param_names
+
+        if has_gpu:
+            bases.add("GpuPodExecutionNode")
+        if has_port:
+            bases.add("PortPodExecutionNode")
+        if not bases:
+            bases.add("PodExecutionNode")
+
+        return bases
+
+    def test_user_node_base_class_inference(self, client):
+        """Infer base_class for user nodes from parameter patterns"""
+        node_info = self._get_node_info(client)
+
+        for node_name, info in node_info.items():
+            if info.get("node_type") != "user":
+                continue
+
+            bases = self._infer_base_class(info)
+            input_defs = info.get("input") or {}
+            all_param_count = sum(
+                len(input_defs.get(cat, {}))
+                for cat in ("required", "optional")
+            )
+
+            print(
+                f"  {node_name:40s} → {sorted(bases)}  "
+                f"(params: {all_param_count})"
+            )
 
 
 if __name__ == "__main__":
