@@ -474,9 +474,16 @@ def parse_parameters(parameters: List[Dict[str, Any]]) -> Dict[str, Any]:
             type: input
             required_type: required
             default: 0.0               # top-level
-            limit:
+            config:
               min: -10.0               # constraint
               max: 100.0
+          - name: input1
+            dtype: STRING
+            type: input
+            required_type: optional
+            config:
+              input_components:
+                type: file_select      # or image_select, folder_select
           - name: input2
             dtype: [STRING, PATH]      # list for union type
             type: input
@@ -529,20 +536,20 @@ def parse_parameters(parameters: List[Dict[str, Any]]) -> Dict[str, Any]:
                     f"got {sorted(dtypes)}"
                 )
 
-        # Read limit block (constraints)
-        limit = param.get("limit", {})
-        if limit is not None and not isinstance(limit, dict):
+        # Read config block (constraints)
+        config = param.get("config", {})
+        if config is not None and not isinstance(config, dict):
             raise ValueError(
-                f"Parameter '{name}': 'limit' must be a dict, got {type(limit).__name__}"
+                f"Parameter '{name}': 'config' must be a dict, got {type(config).__name__}"
             )
-        limit = limit or {}
-        # 校验 limit 中是否存在未知 key
-        allowed_limit_keys = {"min", "max", "step", "enum", "input_object"}
-        unknown_keys = set(limit.keys()) - allowed_limit_keys
+        config = config or {}
+        # 校验 config 中是否存在未知 key
+        allowed_config_keys = {"min", "max", "step", "enum", "input_components"}
+        unknown_keys = set(config.keys()) - allowed_config_keys
         if unknown_keys:
             raise ValueError(
-                f"Parameter '{name}': unknown key(s) in limit: {', '.join(sorted(unknown_keys))}. "
-                f"Allowed keys: {', '.join(sorted(allowed_limit_keys))}"
+                f"Parameter '{name}': unknown key(s) in config: {', '.join(sorted(unknown_keys))}. "
+                f"Allowed keys: {', '.join(sorted(allowed_config_keys))}"
             )
 
         # Read default from top-level (with backward compat)
@@ -571,29 +578,29 @@ def parse_parameters(parameters: List[Dict[str, Any]]) -> Dict[str, Any]:
         if default is not None:
             input_config["default"] = default
 
-        # Process constraints from limit block
-        limit_keys = {"min", "max", "step", "enum", "input_object"}
-        for key in limit_keys:
-            if key == "input_object":
-                if key not in limit:
+        # Process constraints from config block
+        config_keys = {"min", "max", "step", "enum", "input_components"}
+        for key in config_keys:
+            if key == "input_components":
+                if key not in config:
                     continue
-                value = limit[key]
+                value = config[key]
                 if not isinstance(value, dict):
                     raise ValueError(
-                        f"Parameter '{name}': 'input_object' must be a dict, got {type(value).__name__}"
+                        f"Parameter '{name}': 'input_components' must be a dict, got {type(value).__name__}"
                     )
                 obj_type = value.get("type")
-                if obj_type not in ("file_select", "image_select"):
+                if obj_type not in ("file_select", "image_select", "folder_select"):
                     raise ValueError(
-                        f"Parameter '{name}': input_object.type must be 'file_select' or 'image_select', "
-                        f"got '{obj_type}'"
+                        f"Parameter '{name}': input_components.type must be 'file_select', 'image_select' "
+                        f"or 'folder_select', got '{obj_type}'"
                     )
                 input_config[key] = value
                 continue
 
-            # Read from limit block first, then fall back to top-level param for backward compat
-            if key in limit:
-                value = limit[key]
+            # Read from config block first, then fall back to top-level param for backward compat
+            if key in config:
+                value = config[key]
             elif key in param:
                 value = param[key]
             else:
@@ -604,14 +611,14 @@ def parse_parameters(parameters: List[Dict[str, Any]]) -> Dict[str, Any]:
 
             # Specific validation rules
             if key in ("min", "max", "step"):
-                if key == "min" and "max" in (limit if "max" in limit else param):
-                    max_val = limit.get("max", param.get("max"))
+                if key == "min" and "max" in (config if "max" in config else param):
+                    max_val = config.get("max", param.get("max"))
                     if value > max_val:
                         raise ValueError(
                             f"min ({value}) cannot be greater than max ({max_val}) for parameter '{name}'"
                         )
-                elif key == "max" and "min" in (limit if "min" in limit else param):
-                    min_val = limit.get("min", param.get("min"))
+                elif key == "max" and "min" in (config if "min" in config else param):
+                    min_val = config.get("min", param.get("min"))
                     if value < min_val:
                         raise ValueError(
                             f"max ({value}) cannot be less than min ({min_val}) for parameter '{name}'"

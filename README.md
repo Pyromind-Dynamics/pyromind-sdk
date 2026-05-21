@@ -47,7 +47,7 @@ parameters:
     type: input
     required_type: required
     dtype: STRING
-    limit:
+    config:
       enum: ["train", "eval"]     # dropdown choices
     default: "train"
   - name: output
@@ -57,7 +57,9 @@ parameters:
 
 Available `dtype` values: `STRING`, `INT`, `FLOAT`, `BOOLEAN`, `PATH`, `MODEL`, `ENV`, `ACCELERATE_CONFIG`, `*` (any), `ANY`.
 
-Union types use a list: `[STRING, PATH]`. Constraints (`min`, `max`, `step`, `enum`) go in the `limit` block and are validated against dtype compatibility.
+Union types use a list: `[STRING, PATH]`. Constraints (`min`, `max`, `step`, `enum`, `input_components`) go in the `config` block and are validated against dtype compatibility.
+
+`input_components` accepts `{"type": "file_select"}`, `{"type": "image_select"}`, or `{"type": "folder_select"}`.
 
 #### Example YAML Node Configuration
 
@@ -92,7 +94,7 @@ parameters:
     dtype: STRING
     type: input
     required_type: required
-    limit:
+    config:
       enum: ["train", "eval", "predict"]
     default: "train"
   - name: output
