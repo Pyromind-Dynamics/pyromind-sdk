@@ -62,7 +62,8 @@ class PyroMindAPIClient:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         timeout: int = 30,
-        max_retries: int = 3
+        max_retries: int = 3,
+        log_level: Optional[str] = "INFO",
     ):
         """
         Initialize the PyroMind API Client
@@ -94,7 +95,8 @@ class PyroMindAPIClient:
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
-            max_retries=max_retries
+            max_retries=max_retries,
+            log_level=log_level,
         )
         
         # Initialize resource clients
@@ -102,37 +104,43 @@ class PyroMindAPIClient:
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
-            max_retries=max_retries
+            max_retries=max_retries,
+            log_level=log_level,
         )
         self.instance = InstanceClient(
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
-            max_retries=max_retries
+            max_retries=max_retries,
+            log_level=log_level,
         )
         self.inference = InferenceClient(
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
-            max_retries=max_retries
+            max_retries=max_retries,
+            log_level=log_level,
         )
         self.training = TrainingClient(
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
-            max_retries=max_retries
+            max_retries=max_retries,
+            log_level=log_level,
         )
         self.echomind = EchoMindClient(
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
-            max_retries=max_retries
+            max_retries=max_retries,
+            log_level=log_level,
         )
         self.profile = ProfileClient(
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
-            max_retries=max_retries
+            max_retries=max_retries,
+            log_level=log_level,
         )
     
     def close(self):

@@ -9,7 +9,7 @@ cd_to_project_root() {
   cd "${PROJECT_ROOT}"
 }
 
-# 从 pyproject.toml 读取版本，规范化为与 python -m build 产物一致的 PEP 440 形式（如 0.0.25rc2）
+# 从 pyproject.toml 读取版本，规范化为与 python -m build 产物一致的 PEP 440 形式（如 0.0.26.rc1）
 read_project_version() {
   python - <<'PY'
 import re

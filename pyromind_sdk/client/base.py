@@ -23,6 +23,7 @@ ENV_LOG_FORMAT = "PYROMIND_LOG_FORMAT"
 RETRY_STATUS_CODES = [500, 502, 503, 504]
 RETRY_ALLOWED_METHODS = ["GET", "POST", "PUT", "DELETE"]
 
+
 ERROR_MESSAGE_MAX_LENGTH = 500
 
 # Default log format
@@ -77,7 +78,8 @@ class PyroMindClient:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         timeout: int = DEFAULT_TIMEOUT,
-        max_retries: int = DEFAULT_MAX_RETRIES
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        log_level: Optional[str] = "INFO",
     ):
         # Get API key from parameter or environment variable
         if api_key is None:
@@ -104,6 +106,10 @@ class PyroMindClient:
         self.api_key = api_key
         self.base_url = base_url.rstrip('/')
         self.timeout = timeout
+        self.log_level = log_level
+
+        logger.setLevel(self._get_log_level(log_level))
+        _handler.setLevel(self._get_log_level(log_level))
 
         # Create session with retry strategy
         self.session = requests.Session()
@@ -331,7 +337,7 @@ class PyroMindClient:
     ) -> Dict[str, Any]:
         """
         Make an HTTP request to the API
-        
+
         Args:
             method: HTTP method (GET, POST, PUT, DELETE)
             endpoint: API endpoint (relative to base_url)
@@ -351,13 +357,15 @@ class PyroMindClient:
         # Log request (single line with all info)
         safe_headers = {k: '***' if k.lower() == 'authorization' else v for k, v in self.session.headers.items()}
         safe_json = self._mask_sensitive_data(json_data) if json_data else None
+
         log_parts = [f"[REQUEST] {request_context}"]
+        logger.info(" | ".join(log_parts))
         if params:
             log_parts.append(f"params={params}")
         log_parts.append(f"headers={safe_headers}")
         if safe_json:
             log_parts.append(f"body={safe_json}")
-        logger.info(" | ".join(log_parts))
+        logger.debug(" | ".join(log_parts))
         
         try:
             response = self.session.request(
@@ -378,7 +386,7 @@ class PyroMindClient:
                     resp_log += f" | body={safe_resp}"
             except Exception:
                 pass
-            logger.info(resp_log)
+            logger.debug(resp_log)
             
             # Handle non-2xx responses
             if not response.ok:
@@ -453,3 +461,22 @@ class PyroMindClient:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit"""
         self.close()
+
+    def _get_log_level(self, log_level:str) -> int:
+        if log_level == "FATAL":
+            return logging.FATAL
+        if log_level == "CRITICAL":
+            return logging.CRITICAL
+        if log_level == "ERROR":
+            return logging.ERROR
+        if log_level == "WARNING":
+            return logging.WARNING
+        if log_level == "WARN":
+            return logging.WARN
+        if log_level == "INFO":
+            return logging.INFO
+        if log_level == "DEBUG":
+            return logging.DEBUG
+        if log_level == "NOTSET":
+            return logging.NOTSET
+        return logging.INFO

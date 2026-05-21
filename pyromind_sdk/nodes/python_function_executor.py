@@ -254,7 +254,7 @@ def build_command_template(
     if python_exec != "accelerate":
         bash_commands.append(
             f"{python_exec} -c \"import pyromind_sdk\" 2>/dev/null || "
-            f"{python_exec} -m pip install pyromind-sdk==0.0.25rc1 -q"
+            f"{python_exec} -m pip install pyromind-sdk==0.0.26rc1 -q"
         )
 
     # 5. Execute wrapper command
