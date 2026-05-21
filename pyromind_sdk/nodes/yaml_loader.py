@@ -537,7 +537,7 @@ def parse_parameters(parameters: List[Dict[str, Any]]) -> Dict[str, Any]:
             )
         limit = limit or {}
         # 校验 limit 中是否存在未知 key
-        allowed_limit_keys = {"min", "max", "step", "enum"}
+        allowed_limit_keys = {"min", "max", "step", "enum", "input_object"}
         unknown_keys = set(limit.keys()) - allowed_limit_keys
         if unknown_keys:
             raise ValueError(
@@ -572,8 +572,25 @@ def parse_parameters(parameters: List[Dict[str, Any]]) -> Dict[str, Any]:
             input_config["default"] = default
 
         # Process constraints from limit block
-        limit_keys = {"min", "max", "step", "enum"}
+        limit_keys = {"min", "max", "step", "enum", "input_object"}
         for key in limit_keys:
+            if key == "input_object":
+                if key not in limit:
+                    continue
+                value = limit[key]
+                if not isinstance(value, dict):
+                    raise ValueError(
+                        f"Parameter '{name}': 'input_object' must be a dict, got {type(value).__name__}"
+                    )
+                obj_type = value.get("type")
+                if obj_type not in ("file_select", "image_select"):
+                    raise ValueError(
+                        f"Parameter '{name}': input_object.type must be 'file_select' or 'image_select', "
+                        f"got '{obj_type}'"
+                    )
+                input_config[key] = value
+                continue
+
             # Read from limit block first, then fall back to top-level param for backward compat
             if key in limit:
                 value = limit[key]
