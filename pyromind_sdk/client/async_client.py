@@ -34,6 +34,9 @@ class PyroMindAsyncAPIClient:
         base_url: Base URL for the API. If not provided, will try to read from
                  PYROMIND_BASE_URL environment variable. Defaults to
                  https://api.pyromind.ai/api/v1
+        cluster: Target cluster identifier. Will be sent as X-Cluster header
+                on every request. If not provided, will try to read from
+                PYROMIND_CLUSTER environment variable. Defaults to "default".
         timeout: Request timeout in seconds (default: 30)
         max_retries: Maximum number of retries for failed requests (default: 3)
 
@@ -46,6 +49,7 @@ class PyroMindAsyncAPIClient:
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
+        cluster: Optional[str] = None,
         timeout: int = 30,
         max_retries: int = 3
     ):
@@ -53,6 +57,7 @@ class PyroMindAsyncAPIClient:
         self._base_client = _PyroMindAsyncClientBase(
             api_key=api_key,
             base_url=base_url,
+            cluster=cluster,
             timeout=timeout,
             max_retries=max_retries
         )
@@ -61,30 +66,35 @@ class PyroMindAsyncAPIClient:
         self.echomind = AsyncEchoMindClient(
             api_key=api_key,
             base_url=base_url,
+            cluster=cluster,
             timeout=timeout,
             max_retries=max_retries
         )
         self.inference = AsyncInferenceClient(
             api_key=api_key,
             base_url=base_url,
+            cluster=cluster,
             timeout=timeout,
             max_retries=max_retries
         )
         self.instances = AsyncInstanceClient(
             api_key=api_key,
             base_url=base_url,
+            cluster=cluster,
             timeout=timeout,
             max_retries=max_retries
         )
         self.sandboxes = AsyncSandboxClient(
             api_key=api_key,
             base_url=base_url,
+            cluster=cluster,
             timeout=timeout,
             max_retries=max_retries
         )
         self.training = AsyncTrainingClient(
             api_key=api_key,
             base_url=base_url,
+            cluster=cluster,
             timeout=timeout,
             max_retries=max_retries
         )

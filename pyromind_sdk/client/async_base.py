@@ -12,11 +12,13 @@ from typing import Optional, Dict, Any
 
 
 # Constants
-DEFAULT_API_BASE_URL = "https://api.pyromind.ai/api/v1"
+DEFAULT_API_BASE_URL = "https://api-portal.pyromind.ai/api/v1"
+DEFAULT_CLUSTER = "us-west-2"
 DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_RETRIES = 3
 ENV_API_KEY = "PYROMIND_API_KEY"
 ENV_BASE_URL = "PYROMIND_BASE_URL"
+ENV_CLUSTER = "PYROMIND_CLUSTER"
 ENV_LOG_FORMAT = "PYROMIND_LOG_FORMAT"
 RETRY_STATUS_CODES = [500, 502, 503, 504]
 
@@ -60,6 +62,9 @@ class PyroMindAsyncClient:
         base_url: Base URL for the API. If not provided, will try to read from
                  PYROMIND_BASE_URL environment variable. If neither is provided,
                  defaults to https://api.pyromind.ai/api/v1
+        cluster: Target cluster identifier. Will be sent as X-Cluster header
+                on every request. If not provided, will try to read from
+                PYROMIND_CLUSTER environment variable. Defaults to "default".
         timeout: Request timeout in seconds (default: 30)
         max_retries: Maximum number of retries for failed requests (default: 3)
 
@@ -72,6 +77,7 @@ class PyroMindAsyncClient:
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
+        cluster: Optional[str] = None,
         timeout: int = DEFAULT_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES
     ):
@@ -99,6 +105,12 @@ class PyroMindAsyncClient:
             )
         self.api_key = api_key
         self.base_url = base_url.rstrip('/')
+
+        # Get cluster from parameter, environment variable, or use default
+        if cluster is None:
+            cluster = os.getenv(ENV_CLUSTER, DEFAULT_CLUSTER)
+        self.cluster = cluster
+
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.max_retries = max_retries
 
@@ -113,7 +125,8 @@ class PyroMindAsyncClient:
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
-                    "Accept": "application/json"
+                    "Accept": "application/json",
+                    "X-Cluster": self.cluster,
                 }
             )
         return self._session
