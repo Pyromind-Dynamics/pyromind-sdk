@@ -729,15 +729,6 @@ def main():
             workflow = _load_workflow(workflow_path)
             draw_workflow_graph(workflow)
             delete_training_task_example(task_id)
-    # TODO run_workflow_with_params_example
-    # # Run workflow with params example
-    # print(f"\n{'=' * 60}")
-    # print("Running Workflow with Params")
-    # print(f"{'=' * 60}")
-    # run_workflow_with_params_example(
-    #     workflow_name="test",
-    #     primitive_node_map={"1": "Qwen/Qwen3-8B","5":99},
-    # )
 
 
 if __name__ == "__main__":
