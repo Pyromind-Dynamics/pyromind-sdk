@@ -135,36 +135,41 @@ def check_environment():
     return api_key is not None
 
 
-def run_tests(modules=None, verbose=True, extra_args=None):
-    """Run pytest on specified test modules"""
+def run_tests(modules=None, verbose=True, extra_args=None, exit_first=False):
+    """Run pytest on specified test modules sequentially"""
     test_dir = Path(__file__).parent
 
     if modules is None:
         modules = TEST_MODULES
 
-    pytest_args = [sys.executable, "-m", "pytest"]
-    if verbose:
-        pytest_args.append("-v")
-    pytest_args.append("-s")
-
-    if extra_args:
-        pytest_args.extend(extra_args)
-
-    for module in modules:
-        test_file = test_dir / module
-        if test_file.exists():
-            pytest_args.append(str(test_file))
-        else:
-            print(f"Warning: Test file not found: {test_file}")
-
-    print(f"\nRunning tests: {', '.join(modules)}")
-    print("-" * 60)
-
     env = os.environ.copy()
     env["PYTHONPATH"] = str(project_root)
 
-    result = subprocess.run(pytest_args, env=env)
-    return result.returncode
+    for i, module in enumerate(modules, 1):
+        test_file = test_dir / module
+        if not test_file.exists():
+            print(f"Warning: Test file not found: {test_file}")
+            continue
+
+        print(f"\n{'='*60}")
+        print(f"[{i}/{len(modules)}] Running: {module}")
+        print('='*60)
+
+        pytest_args = [sys.executable, "-m", "pytest", str(test_file)]
+        if verbose:
+            pytest_args.append("-v")
+        pytest_args.append("-s")
+
+        if extra_args:
+            pytest_args.extend(extra_args)
+
+        result = subprocess.run(pytest_args, env=env)
+        if result.returncode != 0:
+            print(f"\nFailed: {module}")
+            if exit_first:
+                return result.returncode
+
+    return 0
 
 
 def main():
@@ -237,7 +242,7 @@ Examples:
     if args.tb:
         extra_args.extend(["--tb", args.tb])
 
-    exit_code = run_tests(modules=modules, extra_args=extra_args)
+    exit_code = run_tests(modules=modules, extra_args=extra_args, exit_first=args.exitfirst)
 
     print("\n" + "=" * 60)
     if exit_code == 0:

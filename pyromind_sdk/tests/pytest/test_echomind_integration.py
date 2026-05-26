@@ -7,7 +7,7 @@ using real API calls (no mocks).
 
 Environment variables required:
 - PYROMIND_API_KEY: API key for authentication
-- PYROMIND_BASE_URL: Base URL for the API (optional, defaults to https://pyromind.ai/api/v1)
+- PYROMIND_BASE_URL: Base URL for the API (optional, defaults to https://api.pyromind.ai/api/v1)
 
 These tests will create, manage, and delete actual EchoMind instances.
 """
@@ -71,7 +71,7 @@ def api_key():
 @pytest.fixture(scope="module")
 def base_url():
     """Get base URL from environment variable or use default"""
-    url = os.getenv("PYROMIND_BASE_URL", "https://pyromind.ai/api/v1")
+    url = os.getenv("PYROMIND_BASE_URL", "https://api.pyromind.ai/api/v1")
     print(f"[INFO] Using base URL: {url}")
     return url
 
@@ -86,7 +86,7 @@ def client(api_key, base_url):
 def session_client():
     """Create a session-scoped PyroMind API client for cleanup"""
     api_key = os.getenv("PYROMIND_API_KEY")
-    base_url = os.getenv("PYROMIND_BASE_URL", "https://pyromind.ai/api/v1")
+    base_url = os.getenv("PYROMIND_BASE_URL", "https://api.pyromind.ai/api/v1")
     if not api_key:
         return None
     return PyroMindAPIClient(api_key=api_key, base_url=base_url)
