@@ -8,7 +8,7 @@ In the real platform runtime environment, nodes should prioritize importing
 base classes from `app.models.nodes`.
 """
 
-__version__ = "0.0.25"
+__version__ = "0.0.26"
 
 # Export YAML nodes functionality
 from .nodes import (
@@ -25,7 +25,6 @@ from .nodes import (
     ParameterValidation,
     validate_parameter_name,
     validate_class_name,
-    validate_dtype,
     validate_resource_limits,
     validate_file_path,
     validate_command_template,
@@ -111,7 +110,6 @@ __all__ = [
     "ParameterValidation",
     "validate_parameter_name",
     "validate_class_name",
-    "validate_dtype",
     "validate_resource_limits",
     "validate_file_path",
     "validate_command_template",

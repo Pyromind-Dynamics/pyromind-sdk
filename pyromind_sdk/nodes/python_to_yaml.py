@@ -26,12 +26,14 @@ CLASS_TO_NAME_MAP = {
 }
 
 
-ALLOWED_YAML_DTYPES = {"STRING", "INT", "FLOAT", "BOOLEAN"}
+# Inference mapping from Python type annotations to dtype strings.
+# This is an inference map, not a restriction — any dtype string is valid in YAML.
 ANNOTATION_TO_DTYPE = {
     "str": "STRING",
     "int": "INT",
     "float": "FLOAT",
     "bool": "BOOLEAN",
+    "Path": "PATH",
 }
 
 
@@ -49,11 +51,12 @@ def _get_name_from_annotation(annotation: Optional[ast.AST]) -> Optional[str]:
 
 
 def _annotation_to_dtype(annotation: Optional[ast.AST]) -> str:
-    """Convert a Python type annotation AST node to YAML dtype."""
+    """Convert a Python type annotation AST node to dtype string."""
     ann_name = _get_name_from_annotation(annotation)
     if ann_name is None:
         return "STRING"
-    return ANNOTATION_TO_DTYPE.get(ann_name, "STRING")
+    # Return inferred dtype if known, otherwise use the annotation name as dtype
+    return ANNOTATION_TO_DTYPE.get(ann_name, ann_name)
 
 
 def _is_float_expr(node: ast.AST, input_types: Dict[str, str]) -> bool:
@@ -193,8 +196,6 @@ def _build_output_parameters(
             raise ValueError("Return dict keys must be string literals")
         output_name = key_node.value
         output_dtype = _infer_dtype_from_expr(value_node, input_types, local_types)
-        if output_dtype not in ALLOWED_YAML_DTYPES:
-            output_dtype = "STRING"
         outputs.append(
             {
                 "name": output_name,
@@ -218,8 +219,6 @@ def _build_output_parameters_from_return(
     if isinstance(return_node, ast.Tuple):
         for i, elt in enumerate(return_node.elts):
             output_dtype = _infer_dtype_from_expr(elt, input_types, local_types)
-            if output_dtype not in ALLOWED_YAML_DTYPES:
-                output_dtype = "STRING"
             outputs.append({
                 "name": f"output_{i}",
                 "dtype": output_dtype,
@@ -227,8 +226,6 @@ def _build_output_parameters_from_return(
             })
     else:
         output_dtype = _infer_dtype_from_expr(return_node, input_types, local_types)
-        if output_dtype not in ALLOWED_YAML_DTYPES:
-            output_dtype = "STRING"
         outputs.append({
             "name": "output",
             "dtype": output_dtype,
@@ -768,10 +765,10 @@ class ParameterValidation:
 
 
 RESOURCE_TYPE_TO_BASE_CLASS = {
-    "cpu": "PodExecutionNode",
-    "gpu": ["GpuPodExecutionNode", "PodExecutionNode"],
-    # "tpu": "PodExecutionNode",
-    # "npu": "PodExecutionNode",
+    "cpu": "JupyterLabPodExecutionNode",
+    "gpu": ["JupyterLabPodExecutionNode", "GpuPodExecutionNode"],
+    # "tpu": "JupyterLabPodExecutionNode",
+    # "npu": "JupyterLabPodExecutionNode",
     # "jupyter": "JupyterLabPodExecutionNode",
     # "jupyterlab": "JupyterLabPodExecutionNode",
     # "port": "PortPodExecutionNode",

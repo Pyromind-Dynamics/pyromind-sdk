@@ -26,7 +26,6 @@ try:
         MAX_DESCRIPTION_LENGTH,
         MAX_CATEGORY_LENGTH,
         MAX_COMMAND_TEMPLATE_PARTS,
-        ALLOWED_DTYPES,
         MIN_MEMORY_LIMIT,
         MAX_MEMORY_LIMIT,
         MIN_CPU_LIMIT,
@@ -48,7 +47,6 @@ except ImportError:
         MAX_DESCRIPTION_LENGTH,
         MAX_CATEGORY_LENGTH,
         MAX_COMMAND_TEMPLATE_PARTS,
-        ALLOWED_DTYPES,
         MIN_MEMORY_LIMIT,
         MAX_MEMORY_LIMIT,
         MIN_CPU_LIMIT,
@@ -177,22 +175,6 @@ def validate_class_name(class_name: str) -> None:
     if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', class_name):
         raise ValueError(
             f"Invalid class name format: '{class_name}'. Must be a valid Python identifier."
-        )
-
-
-def validate_dtype(dtype: str) -> None:
-    """
-    Validate if data type is in whitelist
-
-    Args:
-        dtype: Data type
-
-    Raises:
-        ValueError: If data type is not in whitelist
-    """
-    if dtype not in ALLOWED_DTYPES:
-        logger.warning(
-            f"Invalid dtype: '{dtype}'. Allowed types: {', '.join(sorted(ALLOWED_DTYPES))}"
         )
 
 
@@ -388,21 +370,126 @@ def parse_input_type(input_config: Any) -> Tuple[Any, Dict[str, Any]]:
         return "STRING", {}
 
 
+def _get_dtype_set(dtype: Any) -> set:
+    """Normalize dtype to a set of type strings (handles string, list union, pipe-separated)."""
+    if isinstance(dtype, str):
+        if "|" in dtype:
+            parts = [t.strip() for t in dtype.split("|") if t.strip()]
+            if not parts:
+                raise ValueError(f"Empty dtype after splitting pipe-separated value: '{dtype}'")
+            return set(parts)
+        return {dtype}
+    elif isinstance(dtype, list):
+        if not all(isinstance(t, str) for t in dtype):
+            raise ValueError(f"dtype list must contain only strings, got {dtype}")
+        return set(dtype)
+    else:
+        raise ValueError(f"dtype must be a string or list of strings, got {type(dtype)}")
+
+
+def _validate_constraint_for_dtype(
+    name: str, key: str, value: Any, dtypes: set
+) -> None:
+    """Validate that a constraint key is compatible with the given dtype(s)."""
+    numeric_types = {"INT", "FLOAT"}
+
+    if key == "step":
+        if not dtypes.issubset(numeric_types):
+            raise ValueError(
+                f"'step' for parameter '{name}' is only valid for INT/FLOAT types, "
+                f"got dtype(s): {', '.join(sorted(dtypes))}"
+            )
+        if not isinstance(value, (int, float)):
+            raise ValueError(
+                f"step for parameter '{name}' must be a number, got {type(value)}"
+            )
+    elif key in ("min", "max"):
+        if dtypes == {"BOOLEAN"}:
+            raise ValueError(
+                f"'{key}' for parameter '{name}' is not valid for BOOLEAN type"
+            )
+        if dtypes.issubset({"INT", "FLOAT"}):
+            if not isinstance(value, (int, float)):
+                raise ValueError(
+                    f"{key} for parameter '{name}' must be a number, got {type(value)}"
+                )
+        elif dtypes.issubset({"STRING", "PATH"}):
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"{key} for STRING/PATH parameter '{name}' must be a string, got {type(value)}"
+                )
+
+    elif key == "enum":
+        if not isinstance(value, list):
+            raise ValueError(f"enum for parameter '{name}' must be a list, got {type(value)}")
+        # Validate each enum element type matches at least one dtype in the union.
+        # STRING/PATH accepts any value; only check when no string type is in the union.
+        if "STRING" in dtypes or "PATH" in dtypes:
+            pass  # string types accept any value
+        else:
+            for elem in value:
+                if "INT" in dtypes and isinstance(elem, int):
+                    continue
+                if "FLOAT" in dtypes and isinstance(elem, (int, float)):
+                    continue
+                if "BOOLEAN" in dtypes and isinstance(elem, bool):
+                    continue
+                raise ValueError(
+                    f"enum element '{elem}' for parameter '{name}' (dtypes: "
+                    f"{', '.join(sorted(dtypes))}) does not match any declared type"
+                )
+
+
+def _validate_default_for_dtype(
+    name: str, default: Any, dtypes: set
+) -> None:
+    """Validate that default value is compatible with dtype(s)."""
+    if default is None:
+        return
+    if "STRING" in dtypes or "PATH" in dtypes:
+        if isinstance(default, str):
+            validate_string_length(default, f"Default value for parameter '{name}'", MAX_STRING_DEFAULT_LENGTH)
+    elif "INT" in dtypes and not isinstance(default, int):
+        raise ValueError(
+            f"Default value for INT parameter '{name}' must be an integer, got {type(default)}"
+        )
+    elif "FLOAT" in dtypes and not isinstance(default, (int, float)):
+        raise ValueError(
+            f"Default value for FLOAT parameter '{name}' must be a number, got {type(default)}"
+        )
+    elif "BOOLEAN" in dtypes and not isinstance(default, bool):
+        raise ValueError(
+            f"Default value for BOOLEAN parameter '{name}' must be a boolean, got {type(default)}"
+        )
+
+
 def parse_parameters(parameters: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Parse unified parameters format
+    Parse unified parameters format.
 
-    Args:
-        parameters: Parameter list, each parameter contains name, dtype, type, required_type, default, etc.
-        - name: Parameter name
-        - dtype: Data type (STRING, INT, FLOAT, BOOLEAN, etc.)
-        - type: "input" or "output"
-        - required_type: "required" or "optional" (only for input)
-        - default: Default value (optional)
-        - customer_use: Boolean, marks whether this parameter is for customer use (can be used for input or output)
+    Format:
+        parameters:
+          - name: input0
+            dtype: FLOAT              # string for single type
+            type: input
+            required_type: required
+            default: 0.0               # top-level
+            config:
+              min: -10.0               # constraint
+              max: 100.0
+          - name: input1
+            dtype: STRING
+            type: input
+            required_type: optional
+            config:
+              input_components:
+                type: file_select      # or image_select, folder_select
+          - name: input2
+            dtype: [STRING, PATH]      # list for union type
+            type: input
+            required_type: required
 
-    Returns:
-        Dictionary containing inputs, outputs, and customer_use
+    Backward compatible with old flat format (default/constraints at top level).
     """
     if not isinstance(parameters, list):
         raise ValueError("parameters must be a list")
@@ -417,7 +504,7 @@ def parse_parameters(parameters: List[Dict[str, Any]]) -> Dict[str, Any]:
     return_types = []
     return_names = []
     customer_use = []
-    seen_names = set()  # Check for duplicate parameter names
+    seen_names = set()
 
     for param in parameters:
         if not isinstance(param, dict):
@@ -427,98 +514,134 @@ def parse_parameters(parameters: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not name:
             raise ValueError("Parameter must have a 'name' field")
 
-        # Validate parameter name
         validate_parameter_name(name)
 
-        # Check for duplicate parameter names
         if name in seen_names:
             raise ValueError(f"Duplicate parameter name: '{name}'")
         seen_names.add(name)
 
-        # Get parameter type (input or output)
         param_type = param.get("type", "input")
-        if param_type not in ["input", "output"]:
+        if param_type not in ("input", "output"):
             raise ValueError(f"Invalid type: {param_type}. Must be 'input' or 'output'")
 
-        # Get data type and validate
-        dtype = param.get("dtype", "STRING")
-        if not isinstance(dtype, str):
-            raise ValueError(f"dtype must be a string, got {type(dtype)}")
-        validate_dtype(dtype)
+        # Read dtype (supports string or list for union)
+        dtype_raw = param.get("dtype", "STRING")
+        dtypes = _get_dtype_set(dtype_raw)
+        # Validate union: only STRING/PATH can be in unions, others must be single types
+        if len(dtypes) > 1:
+            solo_types = {"INT", "FLOAT", "BOOLEAN"}
+            if dtypes & solo_types:
+                raise ValueError(
+                    f"Parameter '{name}': INT/FLOAT/BOOLEAN cannot be in a union, "
+                    f"got {sorted(dtypes)}"
+                )
 
+        # Read config block (constraints)
+        config = param.get("config", {})
+        if config is not None and not isinstance(config, dict):
+            raise ValueError(
+                f"Parameter '{name}': 'config' must be a dict, got {type(config).__name__}"
+            )
+        config = config or {}
+        # 校验 config 中是否存在未知 key
+        allowed_config_keys = {"min", "max", "step", "enum", "input_components"}
+        unknown_keys = set(config.keys()) - allowed_config_keys
+        if unknown_keys:
+            raise ValueError(
+                f"Parameter '{name}': unknown key(s) in config: {', '.join(sorted(unknown_keys))}. "
+                f"Allowed keys: {', '.join(sorted(allowed_config_keys))}"
+            )
+
+        # Read default from top-level (with backward compat)
         default = param.get("default")
 
-        # Validate default value type and length
-        if default is not None:
-            if dtype == "STRING" and isinstance(default, str):
-                validate_string_length(default, f"Default value for parameter '{name}'", MAX_STRING_DEFAULT_LENGTH)
-            elif dtype == "INT" and not isinstance(default, int):
-                raise ValueError(
-                    f"Default value for INT parameter '{name}' must be an integer, got {type(default)}"
-                )
-            elif dtype == "FLOAT" and not isinstance(default, (int, float)):
-                raise ValueError(
-                    f"Default value for FLOAT parameter '{name}' must be a number, got {type(default)}"
-                )
-            elif dtype == "BOOLEAN" and not isinstance(default, bool):
-                raise ValueError(
-                    f"Default value for BOOLEAN parameter '{name}' must be a boolean, got {type(default)}"
-                )
+        # Validate default against dtype
+        _validate_default_for_dtype(name, default, dtypes)
 
-        # Check if it is customer use (supports both input and output)
         is_customer_use = param.get("customer_use", False)
         if is_customer_use:
             customer_use.append(name)
 
         if param_type == "output":
-            # Output parameter
             return_names.append(name)
-            return_types.append(dtype)
-        elif param_type == "input":
-            # Input parameter
-            required_type = param.get("required_type", "required")
-            if required_type not in ["required", "optional"]:
-                raise ValueError(
-                    f"Invalid required_type: {required_type}. Must be 'required' or 'optional'"
-                )
+            return_types.append(dtype_raw if isinstance(dtype_raw, str) else "|".join(sorted(dtypes)))
+            continue
 
-            # Build input configuration
-            input_config = {"type": dtype}
-            if default is not None:
-                input_config["default"] = default
-            # Add other options (such as min, max, step, etc.)
-            for key in ["min", "max", "step"]:
-                if key in param:
-                    value = param[key]
-                    # Validate numeric range options
-                    if key in ["min", "max", "step"]:
-                        if not isinstance(value, (int, float)):
-                            raise ValueError(
-                                f"{key} for parameter '{name}' must be a number, got {type(value)}"
-                            )
-                        # Validate min <= max (if both exist)
-                        if key == "min" and "max" in param:
-                            if value > param["max"]:
-                                raise ValueError(
-                                    f"min ({value}) cannot be greater than max ({param['max']}) for parameter '{name}'"
-                                )
-                        elif key == "max" and "min" in param:
-                            if value < param["min"]:
-                                raise ValueError(
-                                    f"max ({value}) cannot be less than min ({param['min']}) for parameter '{name}'"
-                                )
-                    input_config[key] = value
+        # --- Input parameter ---
+        required_type = param.get("required_type", "required")
+        if required_type not in ("required", "optional"):
+            raise ValueError(
+                f"Invalid required_type: {required_type}. Must be 'required' or 'optional'"
+            )
 
-            if required_type == "required":
-                inputs_required[name] = input_config
-            else:  # optional
-                inputs_optional[name] = input_config
+        input_config = {"type": "|".join(sorted(dtypes)) if isinstance(dtype_raw, list) else dtype_raw}
+        if default is not None:
+            input_config["default"] = default
+
+        # Process constraints from config block
+        config_keys = {"min", "max", "step", "enum", "input_components"}
+        for key in config_keys:
+            if key == "input_components":
+                if key not in config:
+                    continue
+                value = config[key]
+                if not isinstance(value, dict):
+                    raise ValueError(
+                        f"Parameter '{name}': 'input_components' must be a dict, got {type(value).__name__}"
+                    )
+                obj_type = value.get("type")
+                if obj_type not in ("file_select", "image_select", "folder_select"):
+                    raise ValueError(
+                        f"Parameter '{name}': input_components.type must be 'file_select', 'image_select' "
+                        f"or 'folder_select', got '{obj_type}'"
+                    )
+                input_config[key] = value
+                continue
+
+            # Read from config block first, then fall back to top-level param for backward compat
+            if key in config:
+                value = config[key]
+            elif key in param:
+                value = param[key]
+            else:
+                continue
+
+            # Validate constraint against dtype
+            _validate_constraint_for_dtype(name, key, value, dtypes)
+
+            # Specific validation rules
+            if key in ("min", "max", "step"):
+                if key == "min" and "max" in (config if "max" in config else param):
+                    max_val = config.get("max", param.get("max"))
+                    if value > max_val:
+                        raise ValueError(
+                            f"min ({value}) cannot be greater than max ({max_val}) for parameter '{name}'"
+                        )
+                elif key == "max" and "min" in (config if "min" in config else param):
+                    min_val = config.get("min", param.get("min"))
+                    if value < min_val:
+                        raise ValueError(
+                            f"max ({value}) cannot be less than min ({min_val}) for parameter '{name}'"
+                        )
+
+            elif key == "enum" and default is not None:
+                if default not in value:
+                    raise ValueError(
+                        f"default '{default}' for parameter '{name}' is not in enum values: {value}"
+                    )
+
+            input_config[key] = value
+
+        if required_type == "required":
+            inputs_required[name] = input_config
+        else:
+            inputs_optional[name] = input_config
 
     return {
         "inputs": {"required": inputs_required, "optional": inputs_optional},
         "return_types": return_types,
         "return_names": return_names,
-        "customer_use": customer_use
+        "customer_use": customer_use,
     }
 
 
@@ -719,6 +842,14 @@ def create_node_class_from_yaml(
                 environment=environment,
             )
             class_dict["COMMAND_TEMPLATE"] = command_template
+
+            # Python function 节点：通过 base_class 获取 IMAGE_ID
+            # 检查是否有基类提供了非 alpine 的 IMAGE_ID（如 JupyterLabPodExecutionNode）
+            if not any(
+                "IMAGE_ID" in base.__dict__ and "alpine" not in base.__dict__["IMAGE_ID"]
+                for base in base_classes
+            ):
+                class_dict["IMAGE_ID"] = "python:3.10"
         else:
             # Traditional node: use command_template from configuration
             command_template = yaml_config.get("command_template", [])
@@ -771,12 +902,24 @@ def create_node_class_from_yaml(
         # Process required inputs
         for name, config in inputs_config.get("required", {}).items():
             type_spec, options = parse_input_type(config)
-            required[name] = (type_spec, options) if options else (type_spec,)
+            if isinstance(type_spec, list):
+                # Old format: list as first element = dropdown/enum
+                # New: ("STRING", {"enum": list, **options})
+                new_options = dict(options) if options else {}
+                new_options["enum"] = list(type_spec)
+                required[name] = ("STRING", new_options)
+            else:
+                required[name] = (type_spec, options) if options else (type_spec,)
 
         # Process optional inputs
         for name, config in inputs_config.get("optional", {}).items():
             type_spec, options = parse_input_type(config)
-            optional[name] = (type_spec, options) if options else (type_spec,)
+            if isinstance(type_spec, list):
+                new_options = dict(options) if options else {}
+                new_options["enum"] = list(type_spec)
+                optional[name] = ("STRING", new_options)
+            else:
+                optional[name] = (type_spec, options) if options else (type_spec,)
 
         return {"required": required, "optional": optional}
 

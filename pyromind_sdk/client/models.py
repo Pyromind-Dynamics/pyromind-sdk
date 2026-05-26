@@ -352,6 +352,12 @@ class TrainingTaskCreateRequest(BaseModel):
     workflow: Dict[str, Any]  # Workflow JSON structure similar to convert_workflow_to_prompt's workflow field
 
 
+class WorkflowRunRequest(BaseModel):
+    """Request model for running a workflow with injected primitive node values"""
+    workflow_name: str
+    primitive_node_map: Dict[str, Any] = {}
+
+
 class TrainingTaskNodeInfo(BaseModel):
     """Training task node information"""
     node_id: int

@@ -4,7 +4,7 @@ YAML node configuration system
 Provides functionality for loading nodes from YAML configuration files.
 """
 
-__version__ = "0.0.25"
+__version__ = "0.0.26"
 
 from .yaml_loader import (
     load_nodes_from_yaml,
@@ -12,7 +12,6 @@ from .yaml_loader import (
     create_node_class_from_yaml,
     validate_parameter_name,
     validate_class_name,
-    validate_dtype,
     validate_resource_limits,
     validate_file_path,
     validate_command_template,
@@ -60,7 +59,6 @@ __all__ = [
     "create_node_class_from_yaml",
     "validate_parameter_name",
     "validate_class_name",
-    "validate_dtype",
     "validate_resource_limits",
     "validate_file_path",
     "validate_command_template",
