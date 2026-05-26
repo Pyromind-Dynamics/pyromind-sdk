@@ -14,10 +14,7 @@ pip install pyromind-sdk
 
 ### YAML-based Node Configuration
 
-Define nodes using YAML files with the unified `parameters` format. All inputs and outputs are defined in the `parameters` list:
-
-- **Input parameters**: Use `type: "input"` with `required_type: "required"` or `"optional"`
-- **Output parameters**: Use `type: "output"` (outputs are automatically extracted to create `RETURN_TYPES` and `RETURN_NAMES`)
+Define nodes using YAML files with the `parameters` format:
 
 ```python
 from pyromind_sdk import load_nodes_from_yaml
@@ -31,9 +28,40 @@ print(MyNode.DESCRIPTION)
 print(MyNode.BASE_INPUT_TYPES())
 ```
 
-#### Example YAML Node Configuration
+#### Parameter Format
 
-Create `my_node.yaml`:
+```yaml
+parameters:
+  - name: input0
+    type: input
+    required_type: required
+    dtype: INT
+    default: 1
+    min: 1
+    max: 8
+  - name: input1
+    type: input
+    required_type: optional
+    dtype: [STRING, PATH]          # list for union type
+  - name: input2
+    type: input
+    required_type: required
+    dtype: STRING
+    config:
+      enum: ["train", "eval"]     # dropdown choices
+    default: "train"
+  - name: output
+    type: output
+    dtype: STRING
+```
+
+Available `dtype` values: `STRING`, `INT`, `FLOAT`, `BOOLEAN`, `PATH`, `MODEL`, `ENV`, `ACCELERATE_CONFIG`, `*` (any), `ANY`.
+
+Union types use a list: `[STRING, PATH]`. Constraints (`min`, `max`, `step`, `enum`, `input_components`) go in the `config` block and are validated against dtype compatibility.
+
+`input_components` accepts `{"type": "file_select"}`, `{"type": "image_select"}`, or `{"type": "folder_select"}`.
+
+#### Example YAML Node Configuration
 
 ```yaml
 name: MyNode
@@ -47,13 +75,31 @@ command_template:
 
 parameters:
   - name: name
-    dtype: "STRING"
+    dtype: STRING
     default: "World"
-    type: "input"
-    required_type: "required"
+    type: input
+    required_type: required
+  - name: score
+    dtype: FLOAT
+    type: input
+    required_type: required
+    default: 0.5
+    min: 0.0
+    max: 1.0
+  - name: path_or_model
+    dtype: [STRING, PATH]          # union — accepts STRING and non-basic types
+    type: input
+    required_type: optional
+  - name: mode
+    dtype: STRING
+    type: input
+    required_type: required
+    config:
+      enum: ["train", "eval", "predict"]
+    default: "train"
   - name: output
-    dtype: "STRING"
-    type: "output"
+    dtype: STRING
+    type: output
 ```
 
 ## Main Classes
@@ -86,7 +132,7 @@ You can also create nodes that execute Python functions directly:
 ```yaml
 name: CalculatorNode
 description: "A calculator node using Python function"
-base_class: PodExecutionNode
+base_class: JupyterLabPodExecutionNode
 
 # Python function configuration
 python_code: "utils/calculator.py"      # Python file path (relative to YAML file or absolute path)
@@ -147,11 +193,11 @@ config = python_function_to_yaml(
 
 Auto-generate rules:
 - Inputs are generated from function parameters in order
-- Input `dtype` is inferred from annotations (`str/int/float/bool`)
+- Input `dtype` is inferred from annotations: `str` → `STRING`, `int` → `INT`, `float` → `FLOAT`, `bool` → `BOOLEAN`, `Path` → `PATH`
 - Inputs are generated as `required_type: optional` with no default
 - Outputs are generated only from `return { ... }` dict literals
 - Return dict keys must be string literals
-- Unknown types fall back to `STRING`
+- Unknown annotations are passed through as the annotation name (no fallback to STRING)
 - Generated YAML `python_code` is emitted as an absolute path
 
 CLI 用法（写入到 YAML 文件）:
@@ -223,7 +269,7 @@ base_class:
 
 **When to use each base class:**
 
-- **`PodExecutionNode`**: Basic Pod execution node (default). Use this for standard command execution without special requirements.
+- **`PodExecutionNode`**: Basic Pod execution node. Use this for standard command execution without special requirements.
 
 - **`GpuPodExecutionNode`**: **Required** if your node needs GPU resources. This base class provides GPU configuration options (`gpu_count`, `gpu_product`) and ensures GPU resources are allocated. If you specify GPU resources in the `resources` section or need GPU access, you must inherit from this class.
 
@@ -281,9 +327,9 @@ base_class: PortPodExecutionNode
 
 ### Type Conversion
 
-- `convert_string_to_python_type(value: str, type_spec: Any) -> Any`: Convert string value to Python type
+- `convert_string_to_python_type(value: str, type_spec: Any) -> Any`: Convert string value to Python type (supports INT → int, FLOAT → float, BOOLEAN → bool; PATH/MODEL/ENV → str)
 - `convert_inputs(inputs: Dict, input_types: Dict) -> Dict`: Convert input values according to type definitions
-- `validate_output_type(value: Any, type_spec: str) -> bool`: Validate output value type
+- `validate_output_type(value: Any, type_spec: str) -> bool`: Validate output value type (supports STRING, PATH, MODEL, ENV, INT, FLOAT, BOOLEAN)
 
 ### Workflow Functions
 
@@ -349,7 +395,8 @@ Check the `examples/` directory for more examples:
 - ✅ **Dynamic Loading**: Load nodes at runtime without code changes
 - ✅ **Multiple Inheritance**: Support for multiple base classes in YAML
 - ✅ **Python Function Nodes**: Execute Python functions directly in nodes via YAML configuration
-- ✅ **Type Validation**: Automatic type conversion and validation
+- ✅ **Type Conversion**: Automatic type conversion and validation (INT, FLOAT, BOOLEAN, STRING, PATH, MODEL, ENV)
+- ✅ **Dtype Constraints**: Input constraints (min, max, step, enum) validated against dtype compatibility
 - ✅ **Resource Management**: Configure CPU, memory, and GPU resources
 - ✅ **Customer Inputs**: Mark inputs/outputs for customer-specific use
 - ✅ **Security**: Built-in validation and security checks

@@ -12,6 +12,7 @@ from .models import (
     TrainingTaskCreateRequest,
     TrainingTaskCreateResponse,
     TrainingTaskResponse,
+    WorkflowRunRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -230,3 +231,21 @@ class TrainingClient(PyroMindClient):
             ```
         """
         return self.post("/nodes/reload")
+
+    def run_with_params(
+        self, request: WorkflowRunRequest
+    ) -> TrainingTaskCreateResponse:
+        """
+        Run a stored workflow with injected primitive node values.
+
+        Args:
+            request: WorkflowRunRequest with workflow_name and primitive_node_map
+
+        Returns:
+            TrainingTaskCreateResponse object
+        """
+        response = self.post(
+            "/training/tasks/run-custom-param", json_data=request.model_dump()
+        )
+        data = self._extract_data(response)
+        return TrainingTaskCreateResponse(**data)

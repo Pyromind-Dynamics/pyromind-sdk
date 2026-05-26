@@ -32,13 +32,16 @@ def convert_string_to_python_type(value: str, type_spec: Any) -> Any:
         if isinstance(value, str):
             return value.lower() in ("true", "1", "yes", "on")
         return bool(value)
+    elif type_spec in ("PATH", "MODEL", "ENV"):
+        # PATH/MODEL/ENV are represented as strings at runtime.
+        return str(value)
     elif isinstance(type_spec, list):
         # Choice type, value must be one in the list
         if value not in type_spec:
             raise ValueError(f"Value '{value}' not in allowed choices: {type_spec}")
         return value
     else:
-        # Default return string
+        # Unknown type: safe fallthrough
         return str(value)
 
 
@@ -89,6 +92,8 @@ def validate_output_type(value: Any, type_spec: str) -> bool:
         Whether it matches the type requirement
     """
     if type_spec == "STRING":
+        return isinstance(value, str)
+    elif type_spec in ("PATH", "MODEL", "ENV"):
         return isinstance(value, str)
     elif type_spec == "INT":
         return isinstance(value, int)
