@@ -29,6 +29,9 @@ class PyroMindAPIClient:
         base_url: Base URL for the API. If not provided, will try to read from
                  PYROMIND_BASE_URL environment variable. If neither is provided,
                  defaults to https://api.pyromind.ai/api/v1
+        cluster: Target cluster identifier. Will be sent as X-Cluster header
+                on every request. If not provided, will try to read from
+                PYROMIND_CLUSTER environment variable. Defaults to "default".
         timeout: Request timeout in seconds (default: 30)
         max_retries: Maximum number of retries for failed requests (default: 3)
     
@@ -61,6 +64,7 @@ class PyroMindAPIClient:
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
+        cluster: Optional[str] = None,
         timeout: int = 30,
         max_retries: int = 3
     ):
@@ -73,6 +77,8 @@ class PyroMindAPIClient:
             base_url: Base URL for the API. If not provided, will try to read from
                      PYROMIND_BASE_URL environment variable. If neither is provided,
                      defaults to https://api.pyromind.ai/api/v1
+            cluster: Target cluster identifier. Will be sent as X-Cluster header
+                    on every request. Defaults to "default".
             timeout: Request timeout in seconds
             max_retries: Maximum number of retries for failed requests
         """
@@ -88,11 +94,12 @@ class PyroMindAPIClient:
         
         # Get base URL from parameter, environment variable, or use default
         if base_url is None:
-            base_url = os.getenv("PYROMIND_BASE_URL", "https://api.pyromind.ai/api/v1")
+            base_url = os.getenv("PYROMIND_BASE_URL", "https://api-portal.pyromind.ai/api/v1")
         
         self._base_client = PyroMindClient(
             api_key=api_key,
             base_url=base_url,
+            cluster=cluster,
             timeout=timeout,
             max_retries=max_retries
         )
@@ -101,36 +108,42 @@ class PyroMindAPIClient:
         self.sandboxes = SandboxClient(
             api_key=api_key,
             base_url=base_url,
+            cluster=cluster,
             timeout=timeout,
             max_retries=max_retries
         )
         self.instance = InstanceClient(
             api_key=api_key,
             base_url=base_url,
+            cluster=cluster,
             timeout=timeout,
             max_retries=max_retries
         )
         self.inference = InferenceClient(
             api_key=api_key,
             base_url=base_url,
+            cluster=cluster,
             timeout=timeout,
             max_retries=max_retries
         )
         self.training = TrainingClient(
             api_key=api_key,
             base_url=base_url,
+            cluster=cluster,
             timeout=timeout,
             max_retries=max_retries
         )
         self.echomind = EchoMindClient(
             api_key=api_key,
             base_url=base_url,
+            cluster=cluster,
             timeout=timeout,
             max_retries=max_retries
         )
         self.profile = ProfileClient(
             api_key=api_key,
             base_url=base_url,
+            cluster=cluster,
             timeout=timeout,
             max_retries=max_retries
         )
