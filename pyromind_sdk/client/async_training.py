@@ -11,6 +11,7 @@ from .models import (
     TrainingTaskCreateRequest,
     TrainingTaskCreateResponse,
     TrainingTaskResponse,
+    WorkflowRunRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -134,14 +135,120 @@ class AsyncTrainingClient(PyroMindAsyncClient):
 
         return data if isinstance(data, dict) else None
 
-    async def get_node_info(self) -> Dict[str, Any]:
+    async def get_node_info(self, names: Optional[str] = None) -> Dict[str, Any]:
         """
         Get node information dictionary for the current user (async).
+
+        Args:
+            names: Optional comma-separated node names to filter by
 
         Returns:
             Dictionary mapping node names to their information dictionaries.
         """
-        response = await self.get("/training/node_info")
+        params = {"names": names} if names else {}
+        response = await self.get("/training/nodes", params=params)
         data = self._extract_data(response)
 
+        # Normalize: convert {nodes: [...], total: N} -> {node_name: node_info}
+        if isinstance(data, dict) and "nodes" in data:
+            nodes = data["nodes"]
+            if isinstance(nodes, list):
+                return {node["name"]: node for node in nodes if isinstance(node, dict) and "name" in node}
+
         return data if isinstance(data, dict) else {}
+
+    async def reload_nodes(self, node_name: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Reload/refresh node definitions from the server (async).
+
+        Args:
+            node_name: Optional specific node name to reload. If omitted, scans all YAML files.
+
+        Returns:
+            API response dictionary.
+        """
+        params = {"node_name": node_name} if node_name else {}
+        return await self.post("/training/nodes/reload", params=params)
+
+    async def run_with_params(
+        self, request: WorkflowRunRequest
+    ) -> TrainingTaskCreateResponse:
+        """
+        Run a stored workflow with injected primitive node values (async).
+
+        Args:
+            request: WorkflowRunRequest with workflow_name and primitive_node_map
+
+        Returns:
+            TrainingTaskCreateResponse object
+        """
+        response = await self.post(
+            "/training/tasks/custom/param", json_data=request.model_dump()
+        )
+        data = self._extract_data(response)
+        return TrainingTaskCreateResponse(**data)
+
+    async def create_node(
+        self,
+        yaml_path: Optional[str] = None,
+        yaml_content: Optional[str] = None,
+        source_file_path: Optional[str] = None,
+        function_name: Optional[str] = None,
+        category: str = "",
+        cover: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Create a custom training node (async).
+
+        Args:
+            yaml_path: Path to YAML file (mutually exclusive with yaml_content)
+            yaml_content: YAML config content string
+            source_file_path: Source Python file path
+            function_name: Function name in source file
+            category: Node category
+            cover: Overwrite existing node if name conflicts
+
+        Returns:
+            API response dictionary.
+        """
+        json_data = {
+            "category": category,
+            "cover": cover,
+        }
+        if yaml_path:
+            json_data["yaml_path"] = yaml_path
+        if yaml_content:
+            json_data["yaml_content"] = yaml_content
+        if source_file_path:
+            json_data["source_file_path"] = source_file_path
+        if function_name:
+            json_data["function_name"] = function_name
+        return await self.post("/training/nodes", json_data=json_data)
+
+    async def delete_node_by_name(self, node_name: str) -> Dict[str, Any]:
+        """
+        Delete a custom node by name (async).
+
+        Args:
+            node_name: Name of the node to delete
+
+        Returns:
+            API response dictionary.
+        """
+        return await self.delete(f"/training/nodes/{node_name}")
+
+    async def move_node(self, node_name: str, source_file_path: str) -> Dict[str, Any]:
+        """
+        Move a node to a new source file path (async).
+
+        Args:
+            node_name: Name of the node to move
+            source_file_path: New source file path
+
+        Returns:
+            API response dictionary.
+        """
+        return await self.put(
+            "/training/nodes/move",
+            json_data={"node_name": node_name, "source_file_path": source_file_path},
+        )

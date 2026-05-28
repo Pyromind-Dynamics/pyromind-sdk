@@ -171,7 +171,7 @@ class TrainingClient(PyroMindClient):
         
         return data if isinstance(data, dict) else None
     
-    def get_node_info(self) -> Dict[str, Any]:
+    def get_node_info(self, names: Optional[str] = None) -> Dict[str, Any]:
         """
         Get node information dictionary for the current user.
         
@@ -179,6 +179,9 @@ class TrainingClient(PyroMindClient):
         input/output definitions, display names, descriptions, and other metadata.
         The result is cached per user to improve performance.
         
+        Args:
+            names: Optional comma-separated node names to filter by
+            
         Returns:
             Dictionary mapping node names to their information dictionaries.
             Each node info dictionary contains:
@@ -199,7 +202,8 @@ class TrainingClient(PyroMindClient):
                 logger.info(f"  Outputs: {info.get('output', [])}")
             ```
         """
-        response = self.get("/training/node_info")
+        params = {"names": names} if names else {}
+        response = self.get("/training/nodes", params=params)
         # API returns {success: True, data: {nodes: [...], total: N}} format
         data = self._extract_data(response)
         
@@ -212,25 +216,97 @@ class TrainingClient(PyroMindClient):
         # Backend returns node info dictionary directly in the data field
         return data if isinstance(data, dict) else {}
 
-    def reload_nodes(self) -> Dict[str, Any]:
+    def reload_nodes(self, node_name: Optional[str] = None) -> Dict[str, Any]:
         """
-        Reload/refresh all node definitions from the server.
+        Reload/refresh node definitions from the server.
 
-        This forces the server to re-scan and reload all node YAML definitions,
+        This forces the server to re-scan and reload node YAML definitions,
         including newly added custom nodes. Call this after uploading or modifying
         custom node YAML files.
+
+        Args:
+            node_name: Optional specific node name to reload. If omitted, scans all YAML files.
 
         Returns:
             API response dictionary indicating success or failure.
 
         Example:
             ```python
+            # Reload a specific node
+            result = client.training.reload_nodes(node_name="my_node")
+            # Reload all nodes
             result = client.training.reload_nodes()
             if result.get("success"):
                 logger.info("Nodes reloaded successfully")
             ```
         """
-        return self.post("/nodes/reload")
+        params = {"node_name": node_name} if node_name else {}
+        return self.post("/training/nodes/reload", params=params)
+
+    def create_node(
+        self,
+        yaml_path: Optional[str] = None,
+        yaml_content: Optional[str] = None,
+        source_file_path: Optional[str] = None,
+        function_name: Optional[str] = None,
+        category: str = "",
+        cover: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Create a custom training node.
+
+        Args:
+            yaml_path: Path to YAML file (mutually exclusive with yaml_content)
+            yaml_content: YAML config content string (mutually exclusive with yaml_path)
+            source_file_path: Source Python file path (required for direct mode via yaml_content)
+            function_name: Function name in source file (required for direct mode via yaml_content)
+            category: Node category
+            cover: Overwrite existing node if name conflicts
+
+        Returns:
+            API response dictionary with node_id, message, yaml_config.
+        """
+        json_data = {
+            "category": category,
+            "cover": cover,
+        }
+        if yaml_path:
+            json_data["yaml_path"] = yaml_path
+        if yaml_content:
+            json_data["yaml_content"] = yaml_content
+        if source_file_path:
+            json_data["source_file_path"] = source_file_path
+        if function_name:
+            json_data["function_name"] = function_name
+        return self.post("/training/nodes", json_data=json_data)
+
+    def delete_node_by_name(self, node_name: str) -> Dict[str, Any]:
+        """
+        Delete a custom node by name.
+
+        Args:
+            node_name: Name of the node to delete
+
+        Returns:
+            API response dictionary.
+        """
+        return self.delete(f"/training/nodes/{node_name}")
+
+    def move_node(self, node_name: str, source_file_path: str) -> Dict[str, Any]:
+        """
+        Move a node to a new source file path.
+
+        Args:
+            node_name: Name of the node to move
+            source_file_path: New source file path
+
+        Returns:
+            API response dictionary.
+        """
+        return self.put(
+            "/training/nodes/move",
+            json_data={"node_name": node_name, "source_file_path": source_file_path},
+        )
 
     def run_with_params(
         self, request: WorkflowRunRequest
@@ -245,7 +321,7 @@ class TrainingClient(PyroMindClient):
             TrainingTaskCreateResponse object
         """
         response = self.post(
-            "/training/tasks/run-custom-param", json_data=request.model_dump()
+            "/training/tasks/custom/param", json_data=request.model_dump()
         )
         data = self._extract_data(response)
         return TrainingTaskCreateResponse(**data)
