@@ -15,6 +15,7 @@ from pyromind_sdk import PyroMindAPIClient, PyroMindAPIError
 from pyromind_sdk.client.models import (
     InferenceJobRequest,
     ResourceConfig,
+    get_default_gpu_card,
 )
 import time
 
@@ -61,7 +62,7 @@ def create_inference_job_example():
                     cpu="4",
                     memory="32Gi",
                     gpu=1,
-                    gpu_card="L40S"
+                    gpu_card=get_default_gpu_card()
                 ),
                 name=f"example-inference-{int(time.time())}",
                 environment_variables={
@@ -195,7 +196,7 @@ def update_inference_job_example(job_id: str):
                     cpu="4",
                     memory="32Gi",
                     gpu=1,
-                    gpu_card="L40S"
+                    gpu_card=get_default_gpu_card()
                 ),
                 name=f"updated-inference-{int(time.time())}",
                 environment_variables={

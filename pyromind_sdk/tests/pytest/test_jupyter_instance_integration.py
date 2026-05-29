@@ -86,13 +86,16 @@ def client(api_key, base_url):
 
 def _create_instance(client: PyroMindAPIClient, name_prefix: str = "test") -> JupyterResponse:
     """Create a Jupyter instance and return the response."""
-    instance = client.jupyter.create(
-        JupyterRequest(
-            name=f"{name_prefix}-{int(time.time())}",
-            resources=ResourceConfig(cpu="1", memory="8Gi", gpu=0),
-            timeout=3600
+    try:
+        instance = client.jupyter.create(
+            JupyterRequest(
+                name=f"{name_prefix}-{int(time.time())}",
+                resources=ResourceConfig(cpu="1", memory="8Gi", gpu=0)
+            )
         )
-    )
+    except PyroMindAPIError as e:
+        skip_if_insufficient_resources(e)
+        raise
     print(f"[CREATE] Instance created: id={instance.id}, name={instance.name}, status={instance.status}")
     return instance
 
@@ -236,13 +239,16 @@ class TestCreateJupyterInstance:
         instance_name = f"test-create-{int(time.time())}"
         print(f"[TEST] Creating Jupyter instance with name: {instance_name}")
 
-        instance = client.jupyter.create(
-            JupyterRequest(
-                name=instance_name,
-                resources=ResourceConfig(cpu="1", memory="8Gi", gpu=0),
-                timeout=3600
+        try:
+            instance = client.jupyter.create(
+                JupyterRequest(
+                    name=instance_name,
+                    resources=ResourceConfig(cpu="1", memory="8Gi", gpu=0)
+                )
             )
-        )
+        except PyroMindAPIError as e:
+            skip_if_insufficient_resources(e)
+            raise
         try:
             print(f"[TEST] Instance created: id={instance.id}, name={instance.name}, status={instance.status}")
 

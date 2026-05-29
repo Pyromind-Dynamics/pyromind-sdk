@@ -18,6 +18,7 @@ from pyromind_sdk import PyroMindAPIClient, PyroMindAPIError
 from pyromind_sdk.client.models import (
     JupyterRequest,
     ResourceConfig,
+    get_default_gpu_card,
 )
 
 
@@ -122,7 +123,7 @@ def update_jupyter_example(jupyter_id: str):
                     cpu=4,      # CPU as int 4 (int format)
                     memory=32,  # Memory as 32Gi (int)
                     gpu=1,         # GPU count: 1
-                    gpu_card="L40S"
+                    gpu_card=get_default_gpu_card()
                 )
             )
         )

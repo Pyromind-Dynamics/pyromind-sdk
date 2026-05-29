@@ -19,6 +19,7 @@ from pyromind_sdk import PyroMindAsyncAPIClient, PyroMindAPIError
 from pyromind_sdk.client.models import (
     JupyterRequest,
     ResourceConfig,
+    get_default_gpu_card,
 )
 
 
@@ -34,10 +35,9 @@ async def create_jupyter_example():
                 name=f"example-jupyter-{int(time.time())}",
                 resources=ResourceConfig(
                     cpu="2",
-                    memory="18Gi",
+                    memory="16Gi",
                     gpu=0
-                ),
-                timeout=3600  # Timeout in seconds (1 hour)
+                )
             )
         )
         print(f"✓ Jupyter instance created successfully!")
@@ -124,7 +124,7 @@ async def update_jupyter_example(jupyter_id: str):
                     cpu=4,      # CPU as int 4 (int format)
                     memory=32,  # Memory as 32Gi (int)
                     gpu=1,         # GPU count: 1
-                    gpu_card="L40S"
+                    gpu_card=get_default_gpu_card()
                 )
             )
         )
