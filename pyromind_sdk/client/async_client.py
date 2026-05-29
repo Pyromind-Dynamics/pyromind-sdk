@@ -10,7 +10,7 @@ from .async_echomind import AsyncEchoMindClient
 from .async_inference import AsyncInferenceClient
 from .async_instance import AsyncInstanceClient
 from .async_sandbox import AsyncSandboxClient
-from .async_training import AsyncTrainingClient
+from .async_studio import AsyncStudioClient
 
 
 class PyroMindAsyncAPIClient:
@@ -91,7 +91,7 @@ class PyroMindAsyncAPIClient:
             timeout=timeout,
             max_retries=max_retries
         )
-        self.training = AsyncTrainingClient(
+        self.studio = AsyncStudioClient(
             api_key=api_key,
             base_url=base_url,
             cluster=cluster,
@@ -106,7 +106,7 @@ class PyroMindAsyncAPIClient:
         await self.inference.close()
         await self.instances.close()
         await self.sandboxes.close()
-        await self.training.close()
+        await self.studio.close()
 
     async def __aenter__(self):
         """Async context manager entry"""

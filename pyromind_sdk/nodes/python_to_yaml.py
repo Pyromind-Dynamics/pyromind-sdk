@@ -9,7 +9,7 @@ import yaml
 import ast
 import inspect
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Union
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -256,7 +256,7 @@ def python_function_to_yaml(
     *,
     description: str = "",
     display_name: Optional[str] = None,
-    base_class: str = "PodExecutionNode",
+    base_class: Union[str, List[str]] = "JupyterLabPodExecutionNode",
     python_command: str = "python3",
     python_code: Optional[str] = None,
 ) -> Dict[str, Any]:

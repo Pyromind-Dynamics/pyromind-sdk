@@ -10,7 +10,7 @@ from .base import PyroMindClient
 from .sandbox import SandboxClient
 from .instance import InstanceClient
 from .inference import InferenceClient
-from .training import TrainingClient
+from .studio import StudioClient
 from .echomind import EchoMindClient
 from .profile import ProfileClient
 
@@ -20,7 +20,7 @@ class PyroMindAPIClient:
     Main PyroMind API Client
     
     This class provides a unified interface to all PyroMind API resources.
-    It integrates all resource-specific clients (Sandboxes, Instance, Inference, Training).
+    It integrates all resource-specific clients (Sandboxes, Instance, Inference, Studio).
     
     Args:
         api_key: Bearer token for API authentication. If not provided, will try to
@@ -126,7 +126,7 @@ class PyroMindAPIClient:
             timeout=timeout,
             max_retries=max_retries
         )
-        self.training = TrainingClient(
+        self.studio = StudioClient(
             api_key=api_key,
             base_url=base_url,
             cluster=cluster,
@@ -154,7 +154,7 @@ class PyroMindAPIClient:
         self.sandboxes.close()
         self.instance.close()
         self.inference.close()
-        self.training.close()
+        self.studio.close()
         self.echomind.close()
         self.profile.close()
     

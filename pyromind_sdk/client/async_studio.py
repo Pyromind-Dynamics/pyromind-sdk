@@ -1,7 +1,7 @@
 """
-Async Training API Client
+Async Studio API Client
 
-This module provides an async client for managing training tasks via the PyroMind API.
+This module provides an async client for managing studio tasks via the PyroMind API.
 """
 
 import logging
@@ -17,22 +17,22 @@ from .models import (
 logger = logging.getLogger(__name__)
 
 
-class AsyncTrainingClient(PyroMindAsyncClient):
+class AsyncStudioClient(PyroMindAsyncClient):
     """
-    Async client for managing training tasks
+    Async client for managing studio tasks
 
     Provides async methods for creating, listing, getting, deleting,
-    and stopping training tasks.
+    and stopping studio tasks.
     """
 
     async def list(self) -> List[TrainingTaskResponse]:
         """
-        List all training tasks (async)
+        List all studio tasks (async)
 
         Returns:
             List of TrainingTaskResponse objects
         """
-        response = await self.get("/training/tasks")
+        response = await self.get("/studio/tasks")
         data = self._extract_data(response)
 
         if isinstance(data, dict) and "tasks" in data:
@@ -48,7 +48,7 @@ class AsyncTrainingClient(PyroMindAsyncClient):
 
     async def create(self, request: TrainingTaskCreateRequest) -> TrainingTaskCreateResponse:
         """
-        Create a new training task (async)
+        Create a new studio task (async)
 
         Args:
             request: TrainingTaskCreateRequest with task configuration
@@ -56,32 +56,32 @@ class AsyncTrainingClient(PyroMindAsyncClient):
         Returns:
             TrainingTaskCreateResponse object
         """
-        response = await self.post("/training/tasks", json_data=request.model_dump())
+        response = await self.post("/studio/tasks", json_data=request.model_dump())
         data = self._extract_data(response)
 
         return TrainingTaskCreateResponse(**data)
 
     async def get_job(self, task_id: str) -> TrainingTaskResponse:
         """
-        Get a specific training task by ID (async)
+        Get a specific studio task by ID (async)
 
         Args:
-            task_id: ID of the training task to retrieve (can be int or str)
+            task_id: ID of the studio task to retrieve (can be int or str)
 
         Returns:
             TrainingTaskResponse object
         """
-        response = await self.get(f"/training/tasks/{task_id}")
+        response = await self.get(f"/studio/tasks/{task_id}")
         data = self._extract_data(response)
 
         return TrainingTaskResponse(**data)
 
     async def get_task(self, task_id: str) -> TrainingTaskResponse:
         """
-        Get a specific training task by ID (async) (alias for get_job)
+        Get a specific studio task by ID (async) (alias for get_job)
 
         Args:
-            task_id: ID of the training task to retrieve (can be int or str)
+            task_id: ID of the studio task to retrieve (can be int or str)
 
         Returns:
             TrainingTaskResponse object
@@ -90,26 +90,26 @@ class AsyncTrainingClient(PyroMindAsyncClient):
 
     async def delete(self, task_id: str, force: bool = False) -> None:
         """
-        Delete a training task (async)
+        Delete a studio task (async)
 
         Args:
-            task_id: ID of the training task to delete (can be int or str)
+            task_id: ID of the studio task to delete (can be int or str)
             force: If True, force delete even if task is running
         """
         params = {"force": force} if force else {}
-        await self._request("DELETE", f"/training/tasks/{task_id}", params=params)
+        await self._request("DELETE", f"/studio/tasks/{task_id}", params=params)
 
     async def stop(self, task_id: str) -> TrainingTaskResponse:
         """
-        Stop a running or paused training task (async)
+        Stop a running or paused studio task (async)
 
         Args:
-            task_id: ID of the training task to stop (can be int or str)
+            task_id: ID of the studio task to stop (can be int or str)
 
         Returns:
             TrainingTaskResponse object
         """
-        response = await self.post(f"/training/tasks/{task_id}/stop")
+        response = await self.post(f"/studio/tasks/{task_id}/stop")
         data = self._extract_data(response)
 
         if isinstance(data, dict) and "task_id" in data:
@@ -118,16 +118,16 @@ class AsyncTrainingClient(PyroMindAsyncClient):
 
     async def get_node_output(self, task_id: str, node_id: str) -> Optional[Dict[str, Any]]:
         """
-        Get output results for a specific node in a training task (async)
+        Get output results for a specific node in a studio task (async)
 
         Args:
-            task_id: ID of the training task (can be int or str)
+            task_id: ID of the studio task (can be int or str)
             node_id: ID of the node (can be int or str)
 
         Returns:
             Dictionary containing node outputs, or None if not found.
         """
-        response = await self.get(f"/training/tasks/{task_id}/nodes/{node_id}/output")
+        response = await self.get(f"/studio/tasks/{task_id}/nodes/{node_id}/output")
         data = self._extract_data(response)
 
         if not data:
@@ -146,7 +146,7 @@ class AsyncTrainingClient(PyroMindAsyncClient):
             Dictionary mapping node names to their information dictionaries.
         """
         params = {"names": names} if names else {}
-        response = await self.get("/training/nodes", params=params)
+        response = await self.get("/nodes", params=params)
         data = self._extract_data(response)
 
         # Normalize: convert {nodes: [...], total: N} -> {node_name: node_info}
@@ -168,7 +168,7 @@ class AsyncTrainingClient(PyroMindAsyncClient):
             API response dictionary.
         """
         params = {"node_name": node_name} if node_name else {}
-        return await self.post("/training/nodes/reload", params=params)
+        return await self.post("/nodes/reload", params=params)
 
     async def run_with_params(
         self, request: WorkflowRunRequest
@@ -183,7 +183,7 @@ class AsyncTrainingClient(PyroMindAsyncClient):
             TrainingTaskCreateResponse object
         """
         response = await self.post(
-            "/training/tasks/custom/param", json_data=request.model_dump()
+            "/studio/tasks/custom/param", json_data=request.model_dump()
         )
         data = self._extract_data(response)
         return TrainingTaskCreateResponse(**data)
@@ -198,7 +198,7 @@ class AsyncTrainingClient(PyroMindAsyncClient):
         cover: bool = False,
     ) -> Dict[str, Any]:
         """
-        Create a custom training node (async).
+        Create a custom studio node (async).
 
         Args:
             yaml_path: Path to YAML file (mutually exclusive with yaml_content)
@@ -223,7 +223,7 @@ class AsyncTrainingClient(PyroMindAsyncClient):
             json_data["source_file_path"] = source_file_path
         if function_name:
             json_data["function_name"] = function_name
-        return await self.post("/training/nodes", json_data=json_data)
+        return await self.post("/nodes", json_data=json_data)
 
     async def delete_node_by_name(self, node_name: str) -> Dict[str, Any]:
         """
@@ -235,7 +235,7 @@ class AsyncTrainingClient(PyroMindAsyncClient):
         Returns:
             API response dictionary.
         """
-        return await self.delete(f"/training/nodes/{node_name}")
+        return await self.delete(f"/nodes/{node_name}")
 
     async def move_node(self, node_name: str, source_file_path: str) -> Dict[str, Any]:
         """
@@ -249,6 +249,6 @@ class AsyncTrainingClient(PyroMindAsyncClient):
             API response dictionary.
         """
         return await self.put(
-            "/training/nodes/move",
+            "/nodes/move",
             json_data={"node_name": node_name, "source_file_path": source_file_path},
         )

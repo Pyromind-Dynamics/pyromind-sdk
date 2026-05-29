@@ -1,7 +1,7 @@
 """
-Training API Client
+Studio API Client
 
-This module provides a client for managing training tasks via the PyroMind API.
+This module provides a client for managing studio tasks via the PyroMind API.
 """
 
 import logging
@@ -18,22 +18,22 @@ from .models import (
 logger = logging.getLogger(__name__)
 
 
-class TrainingClient(PyroMindClient):
+class StudioClient(PyroMindClient):
     """
-    Client for managing training tasks
+    Client for managing studio tasks
     
     Provides methods for creating, listing, getting, deleting,
-    and stopping training tasks.
+    and stopping studio tasks.
     """
     
     def list(self) -> List[TrainingTaskResponse]:
         """
-        List all training tasks
+        List all studio tasks
         
         Returns:
             List of TrainingTaskResponse objects
         """
-        response = self.get("/training/tasks")
+        response = self.get("/studio/tasks")
         # API returns {success: True, data: {...}} format
         data = self._extract_data(response)
         
@@ -53,7 +53,7 @@ class TrainingClient(PyroMindClient):
     
     def create(self, request: TrainingTaskCreateRequest) -> TrainingTaskCreateResponse:
         """
-        Create a new training task
+        Create a new studio task
         
         Args:
             request: TrainingTaskCreateRequest with task configuration
@@ -61,7 +61,7 @@ class TrainingClient(PyroMindClient):
         Returns:
             TrainingTaskCreateResponse object
         """
-        response = self.post("/training/tasks", json_data=request.model_dump())
+        response = self.post("/studio/tasks", json_data=request.model_dump())
         # API returns {success: True, data: {...}} format
         data = self._extract_data(response)
         
@@ -70,15 +70,15 @@ class TrainingClient(PyroMindClient):
     
     def get_job(self, task_id: str) -> TrainingTaskResponse:
         """
-        Get a specific training task by ID
+        Get a specific studio task by ID
         
         Args:
-            task_id: ID of the training task to retrieve (can be int or str)
+            task_id: ID of the studio task to retrieve (can be int or str)
             
         Returns:
             TrainingTaskResponse object
         """
-        response = self.get(f"/training/tasks/{task_id}")
+        response = self.get(f"/studio/tasks/{task_id}")
         # API returns {success: True, data: {...}} format
         data = self._extract_data(response)
         
@@ -87,10 +87,10 @@ class TrainingClient(PyroMindClient):
     
     def get_task(self, task_id: str) -> TrainingTaskResponse:
         """
-        Get a specific training task by ID (alias for get_job)
+        Get a specific studio task by ID (alias for get_job)
         
         Args:
-            task_id: ID of the training task to retrieve (can be int or str)
+            task_id: ID of the studio task to retrieve (can be int or str)
             
         Returns:
             TrainingTaskResponse object
@@ -99,26 +99,26 @@ class TrainingClient(PyroMindClient):
     
     def delete(self, task_id: str, force: bool = False) -> None:
         """
-        Delete a training task
+        Delete a studio task
         
         Args:
-            task_id: ID of the training task to delete (can be int or str)
+            task_id: ID of the studio task to delete (can be int or str)
             force: If True, force delete even if task is running
         """
         params = {"force": force} if force else {}
-        self._request("DELETE", f"/training/tasks/{task_id}", params=params)
+        self._request("DELETE", f"/studio/tasks/{task_id}", params=params)
     
     def stop(self, task_id: str) -> TrainingTaskResponse:
         """
-        Stop a running or paused training task
+        Stop a running or paused studio task
         
         Args:
-            task_id: ID of the training task to stop (can be int or str)
+            task_id: ID of the studio task to stop (can be int or str)
             
         Returns:
             TrainingTaskResponse object
         """
-        response = self.post(f"/training/tasks/{task_id}/stop")
+        response = self.post(f"/studio/tasks/{task_id}/stop")
         # API returns {success: True, data: {...}} format
         data = self._extract_data(response)
         
@@ -131,10 +131,10 @@ class TrainingClient(PyroMindClient):
     
     def get_node_output(self, task_id: str, node_id: str) -> Optional[Dict[str, Any]]:
         """
-        Get output results for a specific node in a training task
+        Get output results for a specific node in a studio task
         
         Args:
-            task_id: ID of the training task (can be int or str)
+            task_id: ID of the studio task (can be int or str)
             node_id: ID of the node (can be int or str)
             
         Returns:
@@ -153,14 +153,14 @@ class TrainingClient(PyroMindClient):
             
         Example:
             ```python
-            outputs = client.training.get_node_output(task_id="123", node_id="5")
+            outputs = client.studio.get_node_output(task_id="123", node_id="5")
             if outputs:
                 logger.info(f"Exit code: {outputs.get('exit_code')}")
                 for param in outputs.get('parameters', []):
                     logger.info(f"{param['name']}: {param['value']}")
             ```
         """
-        response = self.get(f"/training/tasks/{task_id}/nodes/{node_id}/output")
+        response = self.get(f"/studio/tasks/{task_id}/nodes/{node_id}/output")
         # API returns {success: True, data: {...}} format
         data = self._extract_data(response)
         
@@ -194,7 +194,7 @@ class TrainingClient(PyroMindClient):
             
         Example:
             ```python
-            node_info = client.training.get_node_info()
+            node_info = client.studio.get_node_info()
             for node_name, info in node_info.items():
                 logger.info(f"Node: {info['display_name']}")
                 logger.info(f"  Category: {info.get('category', 'N/A')}")
@@ -203,7 +203,7 @@ class TrainingClient(PyroMindClient):
             ```
         """
         params = {"names": names} if names else {}
-        response = self.get("/training/nodes", params=params)
+        response = self.get("/nodes", params=params)
         # API returns {success: True, data: {nodes: [...], total: N}} format
         data = self._extract_data(response)
         
@@ -233,15 +233,15 @@ class TrainingClient(PyroMindClient):
         Example:
             ```python
             # Reload a specific node
-            result = client.training.reload_nodes(node_name="my_node")
+            result = client.studio.reload_nodes(node_name="my_node")
             # Reload all nodes
-            result = client.training.reload_nodes()
+            result = client.studio.reload_nodes()
             if result.get("success"):
                 logger.info("Nodes reloaded successfully")
             ```
         """
         params = {"node_name": node_name} if node_name else {}
-        return self.post("/training/nodes/reload", params=params)
+        return self.post("/nodes/reload", params=params)
 
     def create_node(
         self,
@@ -253,7 +253,7 @@ class TrainingClient(PyroMindClient):
         cover: bool = False,
     ) -> Dict[str, Any]:
         """
-        Create a custom training node.
+        Create a custom studio node.
 
         Args:
             yaml_path: Path to YAML file (mutually exclusive with yaml_content)
@@ -278,7 +278,7 @@ class TrainingClient(PyroMindClient):
             json_data["source_file_path"] = source_file_path
         if function_name:
             json_data["function_name"] = function_name
-        return self.post("/training/nodes", json_data=json_data)
+        return self.post("/nodes", json_data=json_data)
 
     def delete_node_by_name(self, node_name: str) -> Dict[str, Any]:
         """
@@ -290,7 +290,7 @@ class TrainingClient(PyroMindClient):
         Returns:
             API response dictionary.
         """
-        return self.delete(f"/training/nodes/{node_name}")
+        return self._request("DELETE", f"/nodes/{node_name}")
 
     def move_node(self, node_name: str, source_file_path: str) -> Dict[str, Any]:
         """
@@ -304,7 +304,7 @@ class TrainingClient(PyroMindClient):
             API response dictionary.
         """
         return self.put(
-            "/training/nodes/move",
+            "/nodes/move",
             json_data={"node_name": node_name, "source_file_path": source_file_path},
         )
 
@@ -321,7 +321,7 @@ class TrainingClient(PyroMindClient):
             TrainingTaskCreateResponse object
         """
         response = self.post(
-            "/training/tasks/custom/param", json_data=request.model_dump()
+            "/studio/tasks/custom/param", json_data=request.model_dump()
         )
         data = self._extract_data(response)
         return TrainingTaskCreateResponse(**data)
