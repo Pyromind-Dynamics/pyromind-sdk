@@ -8,7 +8,7 @@ from typing import Optional
 from .async_base import PyroMindAsyncClient as _PyroMindAsyncClientBase
 from .async_echomind import AsyncEchoMindClient
 from .async_inference import AsyncInferenceClient
-from .async_instance import AsyncInstanceClient
+from .async_jupyterlab import AsyncJupyterLabClient
 from .async_sandbox import AsyncSandboxClient
 from .async_studio import AsyncStudioClient
 
@@ -77,7 +77,7 @@ class PyroMindAsyncAPIClient:
             timeout=timeout,
             max_retries=max_retries
         )
-        self.instances = AsyncInstanceClient(
+        self.instances = AsyncJupyterLabClient(
             api_key=api_key,
             base_url=base_url,
             cluster=cluster,

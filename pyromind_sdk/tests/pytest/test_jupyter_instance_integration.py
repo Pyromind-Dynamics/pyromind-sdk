@@ -120,14 +120,14 @@ def _cleanup_all_instances(client: Optional[PyroMindAPIClient]):
             # First, try to pause the instance
             try:
                 print(f"[FINAL_CLEANUP] Attempting to pause instance {instance_id}...")
-                client.instance.pause(instance_id)
+                client.jupyter.pause(instance_id)
                 # Wait for pause to complete
                 max_wait = 30
                 check_interval = 2
                 waited = 0
                 while waited < max_wait:
                     try:
-                        instance = client.instance.get_instance(instance_id)
+                        instance = client.jupyter.get_instance(instance_id)
                         current_status = instance.status.lower()
                         if current_status in ['stopped', 'failed']:
                             print(f"[FINAL_CLEANUP] Instance {instance_id} is in deletable state: {current_status}")
@@ -140,7 +140,7 @@ def _cleanup_all_instances(client: Optional[PyroMindAPIClient]):
                 # If pause fails, check if already in deletable state
                 print(f"[FINAL_CLEANUP] Pause failed: {e.message} (status_code: {e.status_code})")
                 try:
-                    instance = client.instance.get_instance(instance_id)
+                    instance = client.jupyter.get_instance(instance_id)
                     current_status = instance.status.lower()
                     if current_status not in ['stopped', 'failed']:
                         print(f"[FINAL_CLEANUP] Cannot pause instance {instance_id} for deletion. Status: {current_status}. Skipping deletion.")
@@ -151,7 +151,7 @@ def _cleanup_all_instances(client: Optional[PyroMindAPIClient]):
             
             # Now try to delete
             print(f"[FINAL_CLEANUP] Attempting to delete instance {instance_id}...")
-            client.instance.delete(instance_id)
+            client.jupyter.delete(instance_id)
             print(f"[FINAL_CLEANUP] Successfully deleted instance {instance_id}")
         except PyroMindAPIError as e:
             print(f"[FINAL_CLEANUP] Failed to delete instance {instance_id}: {e.message} (status_code: {e.status_code})")
@@ -247,7 +247,7 @@ def test_instance_id(client, instance_tracker):
     try:
         # Create a test instance
         print(f"[TEST] Creating test instance for fixture...")
-        instance = client.instance.create(
+        instance = client.jupyter.create(
             JupyterRequest(
                 name=f"test-instance-{int(time.time())}",
                 resources=ResourceConfig(
@@ -275,14 +275,14 @@ def test_instance_id(client, instance_tracker):
                 # First, try to pause the instance (required for deletion)
                 try:
                     print(f"[CLEANUP] Attempting to pause instance {instance_id}...")
-                    client.instance.pause(instance_id)
+                    client.jupyter.pause(instance_id)
                     # Wait for pause to complete
                     max_wait = 30
                     check_interval = 2
                     waited = 0
                     while waited < max_wait:
                         try:
-                            instance = client.instance.get_instance(instance_id)
+                            instance = client.jupyter.get_instance(instance_id)
                             current_status = instance.status.lower()
                             print(f"[CLEANUP] Instance {instance_id} status: {current_status} (waited {waited}s)")
                             if current_status in ['stopped', 'failed']:
@@ -299,7 +299,7 @@ def test_instance_id(client, instance_tracker):
                     # If pause fails, check if already in deletable state
                     print(f"[CLEANUP] Pause failed: {e.message} (status_code: {e.status_code})")
                     try:
-                        instance = client.instance.get_instance(instance_id)
+                        instance = client.jupyter.get_instance(instance_id)
                         current_status = instance.status.lower()
                         print(f"[CLEANUP] Current instance status: {current_status}")
                         if current_status not in ['stopped', 'failed']:
@@ -312,7 +312,7 @@ def test_instance_id(client, instance_tracker):
                 
                 # Now try to delete
                 print(f"[CLEANUP] Attempting to delete instance {instance_id}...")
-                client.instance.delete(instance_id)
+                client.jupyter.delete(instance_id)
                 print(f"[CLEANUP] Successfully deleted instance {instance_id}")
             except PyroMindAPIError as e:
                 # Log but don't fail the test if cleanup fails
@@ -331,7 +331,7 @@ class TestListJupyterInstances:
         """Test listing all Jupyter instances"""
         print("[TEST] Testing list_jupyter_instances...")
         try:
-            instances = client.instance.list()
+            instances = client.jupyter.list()
             print(f"[TEST] Retrieved {len(instances)} instance(s)")
         except Exception as e:
             print(f"[ERROR] Failed to list instances: {type(e).__name__}: {str(e)}")
@@ -367,7 +367,7 @@ class TestCreateJupyterInstance:
         print(f"[TEST] Creating Jupyter instance with name: {instance_name}")
         
         try:
-            instance = client.instance.create(
+            instance = client.jupyter.create(
                 JupyterRequest(
                     name=instance_name,
                     resources=ResourceConfig(
@@ -413,7 +413,7 @@ class TestCreateJupyterInstance:
             # Try to pause the instance first
             try:
                 print(f"[CLEANUP] Attempting to pause instance {instance.id}...")
-                client.instance.pause(instance.id)
+                client.jupyter.pause(instance.id)
                 print(f"[CLEANUP] Pause request sent, waiting 10 seconds for completion...")
                 time.sleep(10)
             except PyroMindAPIError as e:
@@ -423,7 +423,7 @@ class TestCreateJupyterInstance:
                 print(f"[CLEANUP] Unexpected error during pause: {type(e).__name__}: {str(e)}")
             
             print(f"[CLEANUP] Attempting to delete instance {instance.id}...")
-            client.instance.delete(instance.id)
+            client.jupyter.delete(instance.id)
             print(f"[CLEANUP] Successfully deleted instance {instance.id}")
         except PyroMindAPIError as e:
             print(f"[WARNING] Failed to delete instance {instance.id}: {e.message} (status_code: {e.status_code})")
@@ -451,7 +451,7 @@ class TestGetJupyterInstance:
         """Test getting a specific Jupyter instance"""
         print(f"[TEST] Getting Jupyter instance: {test_instance_id}")
         try:
-            instance = client.instance.get_instance(test_instance_id)
+            instance = client.jupyter.get_instance(test_instance_id)
             print(f"[TEST] Retrieved instance: id={instance.id}, name={instance.name}, status={instance.status}")
         except PyroMindAPIError as e:
             print(f"[ERROR] Failed to get instance: {e.message} (status_code: {e.status_code})")
@@ -489,7 +489,7 @@ class TestGetJupyterInstance:
         fake_id = "non-existent-id-12345"
         print(f"[TEST] Attempting to get non-existent instance: {fake_id}")
         with pytest.raises(PyroMindAPIError) as exc_info:
-            client.instance.get_instance(fake_id)
+            client.jupyter.get_instance(fake_id)
         
         error = exc_info.value
         print(f"[TEST] Correctly raised PyroMindAPIError: {error.message} (status_code: {error.status_code})")
@@ -506,7 +506,7 @@ class TestUpdateJupyterInstance:
         test_instance_id = None
         for instance_id in instance_tracker:
             try:
-                instance = client.instance.get_instance(instance_id)
+                instance = client.jupyter.get_instance(instance_id)
             except PyroMindAPIError as e:
                 print(f"[WARNING] Error getting instance {instance_id}: {e.message} (status_code: {e.status_code})")
                 if e.status_code == 404:
@@ -521,7 +521,7 @@ class TestUpdateJupyterInstance:
             print("[WARNING] No running instances found. Skipping test.")
             return
         
-        updated_instance = client.instance.update(
+        updated_instance = client.jupyter.update(
             jupyter_id=test_instance_id,
             request=JupyterRequest(
                 name=f"updated-test-{int(time.time())}",
@@ -543,7 +543,7 @@ class TestUpdateJupyterInstance:
         test_instance_id = None
         for instance_id in instance_tracker:
             try:
-                instance = client.instance.get_instance(instance_id)
+                instance = client.jupyter.get_instance(instance_id)
             except PyroMindAPIError as e:
                 print(f"[WARNING] Error getting instance {instance_id}: {e.message} (status_code: {e.status_code})")
                 if e.status_code == 404:
@@ -574,7 +574,7 @@ class TestPauseJupyterInstance:
         test_instance_id = None
         for instance_id in instance_tracker:
             try:
-                instance = client.instance.get_instance(instance_id)
+                instance = client.jupyter.get_instance(instance_id)
             except PyroMindAPIError as e:
                 print(f"[WARNING] Error getting instance {instance_id}: {e.message} (status_code: {e.status_code})")
                 if e.status_code == 404:
@@ -590,7 +590,7 @@ class TestPauseJupyterInstance:
             return
         
         # Pause the instance
-        paused_instance = client.instance.pause(test_instance_id)
+        paused_instance = client.jupyter.pause(test_instance_id)
         
         # Verify instance was paused
         assert paused_instance is not None
@@ -602,7 +602,7 @@ class TestPauseJupyterInstance:
         test_instance_id = None
         for instance_id in instance_tracker:
             try:
-                instance = client.instance.get_instance(instance_id)
+                instance = client.jupyter.get_instance(instance_id)
             except PyroMindAPIError as e:
                 print(f"[WARNING] Error getting instance {instance_id}: {e.message} (status_code: {e.status_code})")
                 if e.status_code == 404:
@@ -633,7 +633,7 @@ class TestResumeJupyterInstance:
         test_instance_id = None
         for instance_id in instance_tracker:
             try:
-                instance = client.instance.get_instance(instance_id)
+                instance = client.jupyter.get_instance(instance_id)
             except PyroMindAPIError as e:
                 print(f"[WARNING] Error getting instance {instance_id}: {e.message} (status_code: {e.status_code})")
                 if e.status_code == 404:
@@ -649,7 +649,7 @@ class TestResumeJupyterInstance:
             return
         
         # Resume the instance
-        resumed_instance = client.instance.resume(test_instance_id)
+        resumed_instance = client.jupyter.resume(test_instance_id)
         
         # Verify instance was resumed
         assert resumed_instance is not None
@@ -661,7 +661,7 @@ class TestResumeJupyterInstance:
         test_instance_id = None
         for instance_id in instance_tracker:
             try:
-                instance = client.instance.get_instance(instance_id)
+                instance = client.jupyter.get_instance(instance_id)
             except PyroMindAPIError as e:
                 print(f"[WARNING] Error getting instance {instance_id}: {e.message} (status_code: {e.status_code})")
                 if e.status_code == 404:
@@ -695,15 +695,14 @@ class TestDeleteJupyterInstance:
     def test_delete_jupyter_instance(self, client, instance_tracker):
         """Test deleting a Jupyter instance"""
         # Create a temporary instance to delete
-        instance = client.instance.create(
+        instance = client.jupyter.create(
             JupyterRequest(
                 name=f"test-delete-{int(time.time())}",
                 resources=ResourceConfig(
                     cpu="2",
                     memory="18Gi",
                     gpu=0
-                ),
-                timeout=3600
+                )
             )
         )
         
@@ -716,14 +715,14 @@ class TestDeleteJupyterInstance:
         
         # Pause the instance first (required for deletion)
         try:
-            client.instance.pause(instance_id)
+            client.jupyter.pause(instance_id)
             # Wait for pause to complete (status should be STOPPED)
             max_wait = 60
             check_interval = 3
             waited = 0
             while waited < max_wait:
                 try:
-                    instance = client.instance.get_instance(instance_id)
+                    instance = client.jupyter.get_instance(instance_id)
                     if instance.status.lower() in ['stopped', 'failed']:
                         break
                 except Exception:
@@ -733,7 +732,7 @@ class TestDeleteJupyterInstance:
         except PyroMindAPIError as e:
             # If pause fails, check if instance is already in deletable state
             try:
-                instance = client.instance.get_instance(instance_id)
+                instance = client.jupyter.get_instance(instance_id)
                 if instance.status.lower() not in ['stopped', 'failed']:
                     pytest.skip(f"Cannot pause instance for deletion: {e.message}")
             except Exception:
@@ -741,7 +740,7 @@ class TestDeleteJupyterInstance:
         
         # Delete the instance
         try:
-            client.instance.delete(instance_id)
+            client.jupyter.delete(instance_id)
         except PyroMindAPIError as e:
             # If delete fails, check the error message
             if "not in a deletable state" in str(e.message).lower():
@@ -753,14 +752,14 @@ class TestDeleteJupyterInstance:
         # Note: Deletion may be asynchronous, so we check status or wait for error
         time.sleep(5)
         try:
-            instance = client.instance.get_instance(instance_id)
+            instance = client.jupyter.get_instance(instance_id)
             # If instance still exists, check if it's being deleted
             # Some APIs may mark it as "deleting" status
             if instance.status.lower() not in ['deleting', 'deleted']:
                 # Wait a bit more and try again
                 time.sleep(10)
                 try:
-                    client.instance.get_instance(instance_id)
+                    client.jupyter.get_instance(instance_id)
                     # If we can still get it, deletion may have failed
                     pytest.skip("Instance still exists after deletion attempt")
                 except PyroMindAPIError:
@@ -837,15 +836,14 @@ class TestCompleteWorkflow:
         
         try:
             # Step 1: Create instance
-            instance = client.instance.create(
+            instance = client.jupyter.create(
                 JupyterRequest(
                     name=f"test-workflow-{int(time.time())}",
                     resources=ResourceConfig(
                         cpu="1",
                         memory="8Gi",
                         gpu=0
-                    ),
-                    timeout=3600
+                    )
                 )
             )
             instance_id = instance.id
@@ -854,12 +852,12 @@ class TestCompleteWorkflow:
             assert instance_id is not None
             
             # Step 2: Get instance
-            instance = client.instance.get_instance(instance_id)
+            instance = client.jupyter.get_instance(instance_id)
             assert instance.id == instance_id
             
             # Step 3: Update instance
             wait_for_instance_status(client, instance_id, "running")
-            updated = client.instance.update(
+            updated = client.jupyter.update(
                 jupyter_id=instance_id,
                 request=JupyterRequest(
                     name=f"updated-workflow-{int(time.time())}",
@@ -875,12 +873,12 @@ class TestCompleteWorkflow:
             # Step 4: Pause instance (if supported)
             try:
                 wait_for_instance_status(client, instance_id, "running")
-                paused = client.instance.pause(instance_id)
+                paused = client.jupyter.pause(instance_id)
                 assert paused.id == instance_id
                 
                 # Step 5: Resume instance (if pause succeeded)
                 wait_for_instance_status(client, instance_id, "running")
-                resumed = client.instance.resume(instance_id)
+                resumed = client.jupyter.resume(instance_id)
                 assert resumed.id == instance_id
             except PyroMindAPIError as e:
                 # If pause/resume is not supported, skip these steps
@@ -889,14 +887,14 @@ class TestCompleteWorkflow:
             # Step 6: Pause instance before deletion (required)
             try:
                 wait_for_instance_status(client, instance_id, "running")
-                client.instance.pause(instance_id)
+                client.jupyter.pause(instance_id)
                 # Wait for pause to complete
                 max_wait = 60
                 check_interval = 3
                 waited = 0
                 while waited < max_wait:
                     try:
-                        instance = client.instance.get_instance(instance_id)
+                        instance = client.jupyter.get_instance(instance_id)
                         if instance.status.lower() in ['stopped', 'failed']:
                             break
                     except Exception:
@@ -906,7 +904,7 @@ class TestCompleteWorkflow:
             except PyroMindAPIError as e:
                 # If pause fails, check if instance is already in deletable state
                 try:
-                    instance = client.instance.get_instance(instance_id)
+                    instance = client.jupyter.get_instance(instance_id)
                     if instance.status.lower() not in ['stopped', 'failed']:
                         print(f"Warning: Cannot pause instance for deletion: {e.message}")
                 except Exception:
@@ -914,7 +912,7 @@ class TestCompleteWorkflow:
             
             # Step 7: Delete instance
             try:
-                client.instance.delete(instance_id)
+                client.jupyter.delete(instance_id)
             except PyroMindAPIError as e:
                 if "not in a deletable state" in str(e.message).lower():
                     print(f"Warning: Cannot delete instance: {e.message}")
@@ -927,12 +925,12 @@ class TestCompleteWorkflow:
             # Note: Deletion may be asynchronous
             time.sleep(5)
             try:
-                instance = client.instance.get_instance(instance_id)
+                instance = client.jupyter.get_instance(instance_id)
                 # If instance still exists, wait a bit more
                 if instance:
                     time.sleep(10)
                     try:
-                        client.instance.get_instance(instance_id)
+                        client.jupyter.get_instance(instance_id)
                         # If we can still get it, deletion may have failed
                         print(f"Warning: Instance {instance_id} still exists after deletion attempt")
                     except PyroMindAPIError:
@@ -946,7 +944,7 @@ class TestCompleteWorkflow:
             # Clean up on error
             if instance_id:
                 try:
-                    client.instance.delete(instance_id)
+                    client.jupyter.delete(instance_id)
                 except Exception:
                     pass
             raise

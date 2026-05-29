@@ -6,7 +6,7 @@ This module provides a Python client SDK for interacting with the PyroMind API v
 
 from .base import PyroMindClient, PyroMindAPIError
 from .sandbox import SandboxClient
-from .instance import InstanceClient
+from .jupyterLab import JupyterLabClient
 from .inference import InferenceClient
 from .studio import StudioClient
 from .storage import StorageClient
@@ -21,7 +21,7 @@ from .workflow import (
 # Async clients
 from .async_base import PyroMindAsyncAPIError
 from .async_sandbox import AsyncSandboxClient
-from .async_instance import AsyncInstanceClient
+from .async_jupyterlab import AsyncJupyterLabClient
 from .async_inference import AsyncInferenceClient
 from .async_studio import AsyncStudioClient
 from .async_echomind import AsyncEchoMindClient
@@ -32,7 +32,7 @@ __all__ = [
     "PyroMindClient",
     "PyroMindAPIError",
     "SandboxClient",
-    "InstanceClient",
+    "JupyterLabClient",
     "InferenceClient",
     "StudioClient",
     "StorageClient",
@@ -45,7 +45,7 @@ __all__ = [
     "PyroMindAsyncClient",
     "PyroMindAsyncAPIError",
     "AsyncSandboxClient",
-    "AsyncInstanceClient",
+    "AsyncJupyterLabClient",
     "AsyncInferenceClient",
     "AsyncStudioClient",
     "AsyncEchoMindClient",

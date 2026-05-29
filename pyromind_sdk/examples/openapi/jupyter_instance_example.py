@@ -28,7 +28,7 @@ def create_jupyter_example():
     
     try:
         print("Creating a new Jupyter instance...")
-        instance = client.instance.create(
+        instance = client.jupyter.create(
             JupyterRequest(
                 name=f"example-jupyter-{int(time.time())}",
                 resources=ResourceConfig(
@@ -61,7 +61,7 @@ def list_jupyter_example():
     
     try:
         print("Listing all Jupyter instances...")
-        instances = client.instance.list()
+        instances = client.jupyter.list()
         print(f"Found {len(instances)} Jupyter instance(s):")
         
         for instance in instances:
@@ -87,7 +87,7 @@ def get_jupyter_example(jupyter_id: str):
     
     try:
         print(f"Getting Jupyter instance {jupyter_id}...")
-        instance = client.instance.get_instance(jupyter_id)
+        instance = client.jupyter.get_instance(jupyter_id)
         print(f"✓ Jupyter instance details:")
         print(f"  Name: {instance.name}")
         print(f"  Status: {instance.status}")
@@ -115,7 +115,7 @@ def update_jupyter_example(jupyter_id: str):
     
     try:
         print(f"Updating Jupyter instance {jupyter_id}...")
-        updated = client.instance.update(
+        updated = client.jupyter.update(
             jupyter_id=jupyter_id,
             request=JupyterRequest(
                 name="updated-jupyter",
@@ -152,7 +152,7 @@ def pause_jupyter_example(jupyter_id: str):
     
     try:
         print(f"Pausing Jupyter instance {jupyter_id}...")
-        instance = client.instance.pause(jupyter_id)
+        instance = client.jupyter.pause(jupyter_id)
         print(f"✓ Jupyter instance paused!")
         print(f"  Status: {instance.status}")
         return instance
@@ -182,7 +182,7 @@ def resume_jupyter_example(jupyter_id: str, max_retries: int = 10, retry_interva
         # and needs to be updated to 'Stopped' by a background job
         for attempt in range(max_retries):
             try:
-                instance = client.instance.resume(jupyter_id)
+                instance = client.jupyter.resume(jupyter_id)
                 print(f"✓ Jupyter instance resumed!")
                 print(f"  Status: {instance.status}")
                 return instance
@@ -218,7 +218,7 @@ def delete_jupyter_example(jupyter_id: str):
     
     try:
         print(f"Deleting Jupyter instance {jupyter_id}...")
-        client.instance.delete(jupyter_id)
+        client.jupyter.delete(jupyter_id)
         print(f"✓ Jupyter instance deleted successfully!")
         
     except PyroMindAPIError as e:
@@ -252,7 +252,7 @@ def wait_for_status(
         start_time = time.time()
         
         while time.time() - start_time < max_wait_time:
-            instance = client.instance.get_instance(jupyter_id)
+            instance = client.jupyter.get_instance(jupyter_id)
             current_status = instance.status.lower()
             target_status_lower = target_status.lower()
             

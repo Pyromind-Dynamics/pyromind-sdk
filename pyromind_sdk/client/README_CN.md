@@ -205,7 +205,7 @@ client.sandboxes.delete(sandbox_id="sandbox-id")
 ### 列出所有 Jupyter 实例
 
 ```python
-instances = client.instance.list()
+instances = client.jupyter.list()
 for instance in instances:
     print(f"Instance: {instance.name} - Status: {instance.status}")
 ```
@@ -216,7 +216,7 @@ for instance in instances:
 import time
 from pyromind_sdk.client.models import JupyterRequest, ResourceConfig
 
-instance = client.instance.create(
+instance = client.jupyter.create(
     JupyterRequest(
         name=f"example-jupyter-{int(time.time())}",
         resources=ResourceConfig(
@@ -234,7 +234,7 @@ print(f"Jupyter URL: {instance.url}")
 ### 获取 Jupyter 实例
 
 ```python
-instance = client.instance.get_instance(jupyter_id="jupyter-id")
+instance = client.jupyter.get_instance(jupyter_id="jupyter-id")
 print(f"Instance status: {instance.status}")
 print(f"Instance password: {instance.password}")
 ```
@@ -242,7 +242,7 @@ print(f"Instance password: {instance.password}")
 ### 更新 Jupyter 实例
 
 ```python
-updated = client.instance.update(
+updated = client.jupyter.update(
     jupyter_id="jupyter-id",
     request=JupyterRequest(
         name="updated-jupyter",
@@ -260,12 +260,12 @@ updated = client.instance.update(
 
 ```python
 # 暂停
-client.instance.pause(jupyter_id="jupyter-id")
+client.jupyter.pause(jupyter_id="jupyter-id")
 
 # 恢复（带重试逻辑，因为暂停后数据库状态可能需要时间同步）
 for attempt in range(10):
     try:
-        client.instance.resume(jupyter_id="jupyter-id")
+        client.jupyter.resume(jupyter_id="jupyter-id")
         break
     except PyroMindAPIError as e:
         if e.status_code == 400 and "status" in e.message.lower():
@@ -277,7 +277,7 @@ for attempt in range(10):
 ### 删除 Jupyter 实例
 
 ```python
-client.instance.delete(jupyter_id="jupyter-id")
+client.jupyter.delete(jupyter_id="jupyter-id")
 ```
 
 ## 推理（Inference）
@@ -883,7 +883,7 @@ async def main():
         )
         
         # 获取 Jupyter 实例
-        instance = await client.instance.get_instance(jupyter_id="jupyter-id")
+        instance = await client.jupyter.get_instance(jupyter_id="jupyter-id")
         
         # 创建训练任务
         job = await client.training.create(
@@ -902,7 +902,7 @@ asyncio.run(main())
 - `PyroMindAsyncAPIClient`：异步主客户端
 - `PyroMindAsyncClient`：异步基础客户端
 - `AsyncSandboxClient`：异步沙箱客户端
-- `AsyncInstanceClient`：异步实例客户端
+- `AsyncJupyterLabClient`：异步 JupyterLab 客户端
 - `AsyncInferenceClient`：异步推理客户端
 - `AsyncTrainingClient`：异步训练客户端
 - `AsyncEchoMindClient`：异步 EchoMind 客户端

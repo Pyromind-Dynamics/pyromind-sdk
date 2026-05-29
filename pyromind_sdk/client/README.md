@@ -205,7 +205,7 @@ client.sandboxes.delete(sandbox_id="sandbox-id")
 ### List all Jupyter instances
 
 ```python
-instances = client.instance.list()
+instances = client.jupyter.list()
 for instance in instances:
     print(f"Instance: {instance.name} - Status: {instance.status}")
 ```
@@ -216,7 +216,7 @@ for instance in instances:
 import time
 from pyromind_sdk.client.models import JupyterRequest, ResourceConfig
 
-instance = client.instance.create(
+instance = client.jupyter.create(
     JupyterRequest(
         name=f"example-jupyter-{int(time.time())}",
         resources=ResourceConfig(
@@ -234,7 +234,7 @@ print(f"Jupyter URL: {instance.url}")
 ### Get a Jupyter instance
 
 ```python
-instance = client.instance.get_instance(jupyter_id="jupyter-id")
+instance = client.jupyter.get_instance(jupyter_id="jupyter-id")
 print(f"Instance status: {instance.status}")
 print(f"Instance password: {instance.password}")
 ```
@@ -242,7 +242,7 @@ print(f"Instance password: {instance.password}")
 ### Update a Jupyter instance
 
 ```python
-updated = client.instance.update(
+updated = client.jupyter.update(
     jupyter_id="jupyter-id",
     request=JupyterRequest(
         name="updated-jupyter",
@@ -260,12 +260,12 @@ updated = client.instance.update(
 
 ```python
 # Pause
-client.instance.pause(jupyter_id="jupyter-id")
+client.jupyter.pause(jupyter_id="jupyter-id")
 
 # Resume (with retry logic, as database status may need time to sync after pause)
 for attempt in range(10):
     try:
-        client.instance.resume(jupyter_id="jupyter-id")
+        client.jupyter.resume(jupyter_id="jupyter-id")
         break
     except PyroMindAPIError as e:
         if e.status_code == 400 and "status" in e.message.lower():
@@ -277,7 +277,7 @@ for attempt in range(10):
 ### Delete a Jupyter instance
 
 ```python
-client.instance.delete(jupyter_id="jupyter-id")
+client.jupyter.delete(jupyter_id="jupyter-id")
 ```
 
 ## Inference
@@ -915,7 +915,7 @@ async def main():
         )
         
         # Get Jupyter instance
-        instance = await client.instance.get_instance(jupyter_id="jupyter-id")
+        instance = await client.jupyter.get_instance(jupyter_id="jupyter-id")
         
         # Create training task
         job = await client.training.create(
@@ -934,7 +934,7 @@ asyncio.run(main())
 - `PyroMindAsyncAPIClient`: Async main client
 - `PyroMindAsyncClient`: Async base client
 - `AsyncSandboxClient`: Async sandbox client
-- `AsyncInstanceClient`: Async instance client
+- `AsyncJupyterLabClient`: Async JupyterLab client
 - `AsyncInferenceClient`: Async inference client
 - `AsyncTrainingClient`: Async training client
 - `AsyncEchoMindClient`: Async EchoMind client

@@ -8,7 +8,7 @@ import os
 from typing import Optional
 from .base import PyroMindClient
 from .sandbox import SandboxClient
-from .instance import InstanceClient
+from .jupyterLab import JupyterLabClient
 from .inference import InferenceClient
 from .studio import StudioClient
 from .echomind import EchoMindClient
@@ -50,7 +50,7 @@ class PyroMindAPIClient:
         
         # Create a Jupyter instance
         from pyromind_sdk.client.models import JupyterRequest, ResourceConfig
-        jupyter = client.instance.create(
+        jupyter = client.jupyter.create(
             JupyterRequest(
                 name="my-jupyter",
                 image="jupyter/scipy-notebook:latest",
@@ -112,7 +112,7 @@ class PyroMindAPIClient:
             timeout=timeout,
             max_retries=max_retries
         )
-        self.instance = InstanceClient(
+        self.jupyter = JupyterLabClient(
             api_key=api_key,
             base_url=base_url,
             cluster=cluster,
@@ -152,7 +152,7 @@ class PyroMindAPIClient:
         """Close all client sessions"""
         self._base_client.close()
         self.sandboxes.close()
-        self.instance.close()
+        self.jupyter.close()
         self.inference.close()
         self.studio.close()
         self.echomind.close()

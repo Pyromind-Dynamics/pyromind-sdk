@@ -39,7 +39,7 @@ def main():
         
         # Example 2: List all Jupyter instances
         print("\n=== Listing all Jupyter instances ===")
-        instances = client.instance.list()
+        instances = client.jupyter.list()
         print(f"Found {len(instances)} Jupyter instance(s)")
         for instance in instances:
             print(f"  - {instance.name} (ID: {instance.id}, Status: {instance.status})")

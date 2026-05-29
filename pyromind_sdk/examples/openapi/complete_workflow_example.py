@@ -61,7 +61,7 @@ def complete_workflow():
         # Step 2: Create a Jupyter instance for experimentation
         print("\n[Step 2] Creating Jupyter instance for experimentation...")
         try:
-            jupyter = client.instance.create(
+            jupyter = client.jupyter.create(
                 JupyterRequest(
                     name="experiment-jupyter",
                     image="jupyter/scipy-notebook:latest",
@@ -143,7 +143,7 @@ def complete_workflow():
             print(f"    - {sb.name} ({sb.id}): {sb.status}")
         
         print("\n  Jupyter Instances:")
-        instances = client.instance.list()
+        instances = client.jupyter.list()
         for inst in instances:
             print(f"    - {inst.name} ({inst.id}): {inst.status}")
         

@@ -35,7 +35,7 @@ from pyromind_sdk import PyroMindAPIClient
 from pyromind_sdk.client.models import ResourceConfig, JupyterRequest
 
 client = PyroMindAPIClient(api_key="YOUR_API_KEY")
-jupyter = client.instance.create(
+jupyter = client.jupyter.create(
     JupyterRequest(name="my-jupyter", resources=ResourceConfig(cpu=2, memory=8))
 )
 print(jupyter.id, jupyter.url)
