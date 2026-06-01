@@ -79,7 +79,7 @@ def complete_workflow():
         # Step 3: Create a training task
         print("\n[Step 3] Creating training task...")
         try:
-            training_job = client.training.create(
+            training_job = client.studio.create(
                 TrainingTaskCreateRequest(
                     name="ml-training-task",
                     framework=TrainingFramework.verl,
@@ -148,7 +148,7 @@ def complete_workflow():
             print(f"    - {inst.name} ({inst.id}): {inst.status}")
         
         print("\n  Training Jobs:")
-        training_jobs = client.training.list()
+        training_jobs = client.studio.list()
         for job in training_jobs:
             print(f"    - {job.name} ({job.id}): {job.status}")
         
