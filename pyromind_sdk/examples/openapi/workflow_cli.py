@@ -56,7 +56,7 @@ def fetch_node_info() -> Dict[str, Any]:
     try:
         print("Fetching node info from API...")
         client = PyroMindAPIClient()
-        node_info = client.training.get_node_info()
+        node_info = client.studio.get_node_info()
         print(f"✓ Loaded {len(node_info)} node definitions")
         client.close()
         return node_info

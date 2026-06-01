@@ -115,7 +115,7 @@ async def cleanup_all_tasks_async(client: Optional[PyroMindAsyncAPIClient]):
         try:
             # First check if task still exists
             try:
-                await client.training.get_task(task_id)
+                await client.studio.get_task(task_id)
             except PyroMindAPIError as e:
                 if e.status_code == 404:
                     print(f"[FINAL_CLEANUP] Task {task_id} already deleted, skipping")
@@ -123,7 +123,7 @@ async def cleanup_all_tasks_async(client: Optional[PyroMindAsyncAPIClient]):
                 raise
             
             # Task exists, try to delete
-            await client.training.delete(task_id)
+            await client.studio.delete(task_id)
             print(f"[FINAL_CLEANUP] Successfully deleted task {task_id}")
         except PyroMindAPIError as e:
             if e.status_code == 404:
@@ -185,7 +185,7 @@ async def test_task_id(client, task_tracker, workflow_file):
         print(f"[TEST] Creating test task with name: {task_name}")
         
         workflow = _load_workflow(workflow_file)
-        task = await client.training.create(
+        task = await client.studio.create(
             TrainingTaskCreateRequest(name=task_name, workflow=workflow)
         )
         task_id = task.task_id
@@ -202,7 +202,7 @@ async def test_task_id(client, task_tracker, workflow_file):
             try:
                 # First check if task still exists
                 try:
-                    await client.training.get_task(task_id)
+                    await client.studio.get_task(task_id)
                 except PyroMindAPIError as e:
                     if e.status_code == 404:
                         print(f"[CLEANUP] Task {task_id} already deleted, skipping")
@@ -210,7 +210,7 @@ async def test_task_id(client, task_tracker, workflow_file):
                     raise
                 
                 # Task exists, try to delete
-                await client.training.delete(task_id)
+                await client.studio.delete(task_id)
                 print(f"[CLEANUP] Successfully deleted test task {task_id}")
             except PyroMindAPIError as e:
                 if e.status_code == 404:
@@ -229,7 +229,7 @@ class TestListTrainingTasks:
         """Test listing all training tasks"""
         print("[TEST] Testing list_training_tasks...")
         try:
-            tasks = await client.training.list()
+            tasks = await client.studio.list()
             print(f"[TEST] Retrieved {len(tasks)} task(s)")
         except Exception as e:
             print(f"[ERROR] Failed to list tasks: {type(e).__name__}: {str(e)}")
@@ -273,7 +273,7 @@ class TestCreateTrainingTask:
         
         # Verify task was created by getting it
         try:
-            task = await client.training.get_task(task_id)
+            task = await client.studio.get_task(task_id)
             assert task.task_id == task_id
             assert task.name == task_name
             print(f"[TEST] Task verification passed: id={task.task_id}, name={task.name}")
@@ -284,7 +284,7 @@ class TestCreateTrainingTask:
         # Clean up
         print(f"[CLEANUP] Starting cleanup for task: {task_id}")
         try:
-            await client.training.delete(task_id)
+            await client.studio.delete(task_id)
             print(f"[CLEANUP] Successfully deleted task {task_id}")
         except PyroMindAPIError as e:
             if e.status_code == 404:
@@ -313,7 +313,7 @@ class TestGetTrainingTask:
         """Test getting a specific training task"""
         print(f"[TEST] Getting training task: {test_task_id}")
         try:
-            task = await client.training.get_task(test_task_id)
+            task = await client.studio.get_task(test_task_id)
             print(f"[TEST] Retrieved task: id={task.task_id}, name={task.name}, status={task.status}")
         except PyroMindAPIError as e:
             print(f"[ERROR] Failed to get task: {e.message} (status_code: {e.status_code})")
@@ -349,7 +349,7 @@ class TestGetTrainingTask:
         fake_id = "non-existent-task-id-12345"
         print(f"[TEST] Attempting to get non-existent task: {fake_id}")
         with pytest.raises(PyroMindAPIError) as exc_info:
-            await client.training.get_task(fake_id)
+            await client.studio.get_task(fake_id)
         
         error = exc_info.value
         print(f"[TEST] Correctly raised PyroMindAPIError: {error.message} (status_code: {error.status_code})")
@@ -366,7 +366,7 @@ class TestStopTrainingTask:
         await asyncio.sleep(5)
         
         try:
-            stopped_task = await client.training.stop(test_task_id)
+            stopped_task = await client.studio.stop(test_task_id)
             print(f"[TEST] Task stopped: {stopped_task.task_id}, status: {stopped_task.status}")
         except PyroMindAPIError as e:
             if "cannot be stopped" in str(e.message).lower() or "already" in str(e.message).lower():
@@ -398,7 +398,7 @@ class TestDeleteTrainingTask:
         # Create a temporary task to delete
         task_name = f"test-delete-{int(time.time())}"
         workflow = _load_workflow(workflow_file)
-        task = await client.training.create(
+        task = await client.studio.create(
             TrainingTaskCreateRequest(name=task_name, workflow=workflow)
         )
         
@@ -410,7 +410,7 @@ class TestDeleteTrainingTask:
         
         # Delete the task
         try:
-            await client.training.delete(task_id)
+            await client.studio.delete(task_id)
             print(f"[TEST] Task deleted successfully: {task_id}")
         except PyroMindAPIError as e:
             print(f"[ERROR] Failed to delete task: {e.message} (status_code: {e.status_code})")
@@ -419,7 +419,7 @@ class TestDeleteTrainingTask:
         # Verify task was deleted
         await asyncio.sleep(5)
         try:
-            await client.training.get_task(task_id)
+            await client.studio.get_task(task_id)
             pytest.skip("Task still exists after deletion attempt")
         except PyroMindAPIError:
             # Good, task was deleted
@@ -470,7 +470,7 @@ class TestGetNodeOutput:
         task = None
         while waited < max_wait:
             try:
-                task = await client.training.get_task(test_task_id)
+                task = await client.studio.get_task(test_task_id)
                 if task.nodes and len(task.nodes) > 0:
                     break
             except Exception:
@@ -487,7 +487,7 @@ class TestGetNodeOutput:
             pytest.skip("Node has no node_id, skipping node output test")
         
         try:
-            outputs = await client.training.get_node_output(test_task_id, str(node.node_id))
+            outputs = await client.studio.get_node_output(test_task_id, str(node.node_id))
             print(f"[TEST] Retrieved node output for node {node.node_id}")
             
             if outputs:
@@ -543,7 +543,7 @@ class TestGetNodeInfo:
         """Test getting all available node information"""
         print("[TEST] Testing get_node_info...")
         try:
-            node_info = await client.training.get_node_info()
+            node_info = await client.studio.get_node_info()
             print(f"[TEST] Retrieved information for {len(node_info) if node_info else 0} node(s)")
         except Exception as e:
             print(f"[ERROR] Failed to get node info: {type(e).__name__}: {str(e)}")
@@ -646,7 +646,7 @@ class TestCompleteWorkflow:
             # Step 1: Create task
             task_name = f"test-workflow-{int(time.time())}"
             workflow = _load_workflow(workflow_file)
-            task = await client.training.create(
+            task = await client.studio.create(
                 TrainingTaskCreateRequest(name=task_name, workflow=workflow)
             )
             task_id = task.task_id
@@ -654,17 +654,17 @@ class TestCompleteWorkflow:
             assert task_id is not None
             
             # Step 2: Get task
-            task = await client.training.get_task(task_id)
+            task = await client.studio.get_task(task_id)
             assert task.task_id == task_id
             
             # Step 3: Delete task
             await asyncio.sleep(2)
-            await client.training.delete(task_id)
+            await client.studio.delete(task_id)
             
             # Verify deletion
             await asyncio.sleep(5)
             try:
-                await client.training.get_task(task_id)
+                await client.studio.get_task(task_id)
                 pytest.skip("Task still exists after deletion attempt")
             except PyroMindAPIError:
                 # Good, task was deleted
@@ -674,7 +674,7 @@ class TestCompleteWorkflow:
             # Clean up on error
             if task_id:
                 try:
-                    await client.training.delete(task_id)
+                    await client.studio.delete(task_id)
                 except Exception:
                     pass
             raise

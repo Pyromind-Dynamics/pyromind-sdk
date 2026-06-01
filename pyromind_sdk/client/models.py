@@ -358,6 +358,22 @@ class WorkflowRunRequest(BaseModel):
     primitive_node_map: Dict[str, Any] = {}
 
 
+class CreateTrainingNodeRequest(BaseModel):
+    """Request model for creating a custom training node"""
+    yaml_path: Optional[str] = Field(None, description="Path to YAML file (mutually exclusive with yaml_content)")
+    yaml_content: Optional[str] = Field(None, description="YAML config content (mutually exclusive with yaml_path)")
+    source_file_path: Optional[str] = Field(None, description="Source Python file path (required for direct mode)")
+    function_name: Optional[str] = Field(None, description="Function name in source file (required for direct mode)")
+    category: str = Field(default="", description="Node category")
+    cover: bool = Field(default=False, description="Overwrite existing node if name conflicts")
+
+
+class MoveNodeRequest(BaseModel):
+    """Request model for moving a node to a new source file path"""
+    node_name: str = Field(..., description="Node name to move")
+    source_file_path: str = Field(..., description="New source file path")
+
+
 class TrainingTaskNodeInfo(BaseModel):
     """Training task node information"""
     node_id: int

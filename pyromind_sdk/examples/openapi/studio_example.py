@@ -84,7 +84,7 @@ def create_training_task_example(workflow_path: Path, task_name: str = "example-
                 print(f"⚠ Warning: Failed to get node info for validation: {e.message}")
                 print("  Continuing without validation...")
         
-        task = client.training.create(
+        task = client.studio.create(
             TrainingTaskCreateRequest(name=task_name, workflow=workflow)
         )
         print(f"✓ Training task created: {task.task_id} ({task.name}) - {task.status}")
@@ -109,7 +109,7 @@ def list_training_tasks_example() -> list:
     
     try:
         print("Listing all training tasks...")
-        tasks = client.training.list()
+        tasks = client.studio.list()
         print(f"Found {len(tasks)} training task(s):")
         
         for task in tasks:
@@ -140,7 +140,7 @@ def get_training_task_example(task_id: str) -> Optional[object]:
     
     try:
         print(f"Getting training task {task_id}...")
-        task = client.training.get_task(task_id)
+        task = client.studio.get_task(task_id)
         
         print(f"✓ Training task details:")
         print(f"  Name: {task.name}")
@@ -210,7 +210,7 @@ def stop_training_task_example(task_id: str) -> Optional[object]:
     
     try:
         print(f"Stopping training task {task_id}...")
-        task = client.training.stop(task_id)
+        task = client.studio.stop(task_id)
         print(f"✓ Training task stopped!")
         print(f"  Status: {task.status}")
         return task
@@ -244,7 +244,7 @@ def run_workflow_with_params_example(
             workflow_name=workflow_name,
             primitive_node_map=primitive_node_map,
         )
-        task = client.training.run_with_params(request)
+        task = client.studio.run_with_params(request)
         print(f"✓ Workflow started: {task.task_id} - {task.status}")
         return task.task_id
     except PyroMindAPIError as e:
@@ -258,7 +258,7 @@ def delete_training_task_example(task_id: str) -> None:
     """Delete a training task."""
     client = PyroMindAPIClient()
     try:
-        client.training.delete(task_id)
+        client.studio.delete(task_id)
         print(f"✓ Training task {task_id} deleted")
     except PyroMindAPIError as e:
         print(f"✗ Failed to delete task: {e.message}")
@@ -280,7 +280,7 @@ def get_node_output_example(task_id: str, node_id: str) -> Optional[Dict]:
     client = PyroMindAPIClient()
     
     try:
-        outputs = client.training.get_node_output(task_id, node_id)
+        outputs = client.studio.get_node_output(task_id, node_id)
         if outputs:
             for param in outputs.get('parameters', []):
                 print(f"    - {param.get('name', 'unnamed')}: {param.get('value', 'N/A')}")
@@ -393,7 +393,7 @@ def get_node_info_example() -> Optional[Dict]:
     
     try:
         print("Getting node information...")
-        node_info = client.training.get_node_info()
+        node_info = client.studio.get_node_info()
         
         if node_info:
             print(f"✓ Retrieved information for {len(node_info)} node(s):")
