@@ -4,7 +4,7 @@ YAML node configuration system
 Provides functionality for loading nodes from YAML configuration files.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from .yaml_loader import (
     load_nodes_from_yaml,

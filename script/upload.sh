@@ -13,7 +13,7 @@ echo "Version: ${VERSION} (from pyproject.toml)"
 python -m pip install -q twine packaging
 assert_dist_artifacts "${VERSION}"
 
-twine upload dist/*
+twine upload --verbose dist/*
 
 echo ""
 echo "Uploaded to PyPI. Verify install:"
