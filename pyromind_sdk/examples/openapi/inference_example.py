@@ -15,7 +15,6 @@ from pyromind_sdk import PyroMindAPIClient, PyroMindAPIError
 from pyromind_sdk.client.models import (
     InferenceJobRequest,
     ResourceConfig,
-    get_default_gpu_card,
 )
 import time
 
@@ -57,17 +56,13 @@ def create_inference_job_example():
                 model_name="glm-5",
                 inference_framework=selected_framework,
                 inf_image=selected_image,
-                timeout=7200,
                 resources=ResourceConfig(
                     cpu="4",
                     memory="32Gi",
                     gpu=1,
-                    gpu_card=get_default_gpu_card()
+                    gpu_card="L40S"
                 ),
-                name=f"example-inference-{int(time.time())}",
-                environment_variables={
-                    "MODEL_PATH": "/workspace/models/Qwen/Qwen3-0.6B/",
-                }
+                name=f"example-inference-{int(time.time())}"
             )
         )
         print(f"✓ Inference job created successfully!")
@@ -191,17 +186,13 @@ def update_inference_job_example(job_id: str):
                 model_name="glm-5",
                 inference_framework=selected_framework,
                 inf_image=selected_image,
-                timeout=7200,
                 resources=ResourceConfig(
                     cpu="4",
                     memory="32Gi",
                     gpu=1,
-                    gpu_card=get_default_gpu_card()
+                    gpu_card="L40S"
                 ),
                 name=f"updated-inference-{int(time.time())}",
-                environment_variables={
-                    "MODEL_PATH": "/workspace/models/Qwen/Qwen3-0.6B/",
-                }
             )
         )
         print(f"✓ Inference job updated successfully!")

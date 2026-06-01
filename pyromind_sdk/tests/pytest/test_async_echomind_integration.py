@@ -7,7 +7,7 @@ using real API calls (no mocks).
 
 Environment variables required:
 - PYROMIND_API_KEY: API key for authentication
-- PYROMIND_BASE_URL: Base URL for the API (optional, defaults to https://api.pyromind.ai/api/v1)
+- PYROMIND_BASE_URL: Base URL for the API (optional, defaults to https://api-portal.pyromind.ai/api/v1)
 
 These tests will create, manage, and delete actual EchoMind instances.
 Each test case creates its own instance, waits for the required status,
@@ -82,7 +82,7 @@ def api_key():
 @pytest.fixture(scope="module")
 def base_url():
     """Get base URL from environment variable or use default"""
-    url = os.getenv("PYROMIND_BASE_URL", "https://api.pyromind.ai/api/v1")
+    url = os.getenv("PYROMIND_BASE_URL", "https://api-portal.pyromind.ai/api/v1")
     print(f"[INFO] Using base URL: {url}")
     return url
 
@@ -274,8 +274,8 @@ class TestCreateEchoMindInstance:
             assert instance.job_id == instance_id
             print(f"[TEST] Instance verification passed: job_id={instance_id}, status={instance.status}")
         except Exception:
-            await _pause_and_delete(client, instance_id)
             raise
+        await _pause_and_delete(client, instance_id)
 
     @pytest.mark.asyncio
     async def test_create_echomind_instance_example_function(self, client):
@@ -543,7 +543,6 @@ class TestDeleteEchoMindInstance:
                     else:
                         print(f"[TEST] Unexpected error when deleting instance: {e.message}")
             except Exception:
-                await _pause_and_delete(client, instance_id)
                 raise
             finally:
                 await client.close()

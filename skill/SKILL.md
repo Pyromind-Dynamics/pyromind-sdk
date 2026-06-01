@@ -13,7 +13,7 @@ Lightweight SDK for defining nodes from YAML and converting or validating PyroMi
 pip install pyromind-sdk
 ```
 
-API docs: https://api.pyromind.ai/api/v1/docs
+API docs: https://api-portal.pyromind.ai/api/v1/docs
 
 Optional: clone repo for examples and CLI:
 

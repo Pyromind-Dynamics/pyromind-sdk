@@ -7,7 +7,7 @@ using real API calls (no mocks).
 
 Environment variables required:
 - PYROMIND_API_KEY: API key for authentication
-- PYROMIND_BASE_URL: Base URL for the API (optional, defaults to https://api.pyromind.ai/api/v1)
+- PYROMIND_BASE_URL: Base URL for the API (optional, defaults to https://api-portal.pyromind.ai/api/v1)
 
 These tests will create, manage, and delete actual inference jobs.
 Each test case creates its own job, waits for the required status,
@@ -27,7 +27,6 @@ from pyromind_sdk import PyroMindAsyncAPIClient, PyroMindAsyncAPIError
 from pyromind_sdk.client.models import (
     InferenceJobRequest,
     ResourceConfig,
-    get_default_gpu_card,
 )
 
 
@@ -100,7 +99,7 @@ def api_key():
 @pytest.fixture(scope="module")
 def base_url():
     """Get base URL from environment variable or use default"""
-    url = os.getenv("PYROMIND_BASE_URL", "https://api.pyromind.ai/api/v1")
+    url = os.getenv("PYROMIND_BASE_URL", "https://api-portal.pyromind.ai/api/v1")
     print(f"[INFO] Using base URL: {url}")
     return url
 
@@ -127,7 +126,7 @@ async def _create_job(client: PyroMindAsyncAPIClient, name_prefix: str = "test")
                 model_name="glm-5",
                 inference_framework=framework,
                 inf_image=image,
-                resources=ResourceConfig(cpu="4", memory="32Gi", gpu=1, gpu_card=get_default_gpu_card())
+                resources=ResourceConfig(cpu="4", memory="32Gi", gpu=1, gpu_card="L40S")
             )
         )
     except PyroMindAsyncAPIError as e:
@@ -276,8 +275,9 @@ class TestCreateInferenceJob:
             else:
                 raise PyroMindAsyncAPIError(f"inference {job_id} create failed")
         except Exception:
-            await _pause_and_delete(client, job_id)
             raise
+        finally:
+            await _pause_and_delete(client, job_id)
 
     @pytest.mark.asyncio
     async def test_create_inference_job_example_function(self, client):
@@ -366,7 +366,7 @@ class TestUpdateInferenceJob:
                     model_name="glm-5",
                     inference_framework=framework,
                     inf_image=image,
-                    resources=ResourceConfig(cpu="4", memory="64Gi", gpu=1, gpu_card=get_default_gpu_card()),
+                    resources=ResourceConfig(cpu="4", memory="64Gi", gpu=1, gpu_card="L40S"),
                     name=f"pending-inference-example-{int(time.time())}"
                 )
             )

@@ -33,7 +33,7 @@ class PyroMindAsyncAPIClient:
                 read from PYROMIND_API_KEY environment variable.
         base_url: Base URL for the API. If not provided, will try to read from
                  PYROMIND_BASE_URL environment variable. Defaults to
-                 https://api.pyromind.ai/api/v1
+                 https://api-portal.pyromind.ai/api/v1
         cluster: Target cluster identifier. Will be sent as X-Cluster header
                 on every request. If not provided, will try to read from
                 PYROMIND_CLUSTER environment variable. Defaults to "default".

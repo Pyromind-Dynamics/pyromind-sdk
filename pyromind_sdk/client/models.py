@@ -71,28 +71,6 @@ class ResourceConfig(BaseModel):
         raise ValueError(f"gpu must be an integer or string, got {type(v).__name__}")
 
 
-def get_default_gpu_card() -> str:
-    """Get the default GPU card type based on the PYROMIND_CLUSTER environment variable.
-
-    Cluster mapping:
-        - west-1 -> L40S
-        - west-2 -> H200
-        - pre2 -> H200
-
-    Returns:
-        GPU card type string, defaults to "L40S" if cluster is not recognized.
-    """
-    import os
-    cluster = os.getenv("PYROMIND_CLUSTER", "west-1")
-    if "#" in cluster:
-        cluster = cluster.split("#")[0]
-    gpu_card_map = {
-        "us-west-1": "L40S",
-        "us-west-2": "H200",
-    }
-    return gpu_card_map.get(cluster, "L40S")
-
-
 # Sandbox Models
 class SandboxType(str, Enum):
     """Sandbox type enumeration"""

@@ -17,20 +17,20 @@ The API key and base URL can be provided in two ways:
 1. **Environment variables (recommended):**
 ```bash
 export PYROMIND_API_KEY="your-api-key"
-export PYROMIND_BASE_URL="https://api.pyromind.ai/api/v1"  # Optional, defaults to https://api.pyromind.ai/api/v1
+export PYROMIND_BASE_URL="https://api-portal.pyromind.ai/api/v1"  # Optional, defaults to https://api-portal.pyromind.ai/api/v1
 ```
 
 2. **As parameters:**
 ```python
 client = PyroMindAPIClient(
     api_key="your-api-key",
-    base_url="https://api.pyromind.ai/api/v1"  # Optional
+    base_url="https://api-portal.pyromind.ai/api/v1"  # Optional
 )
 ```
 
 **Note:** 
 - API key is required. If neither parameter nor `PYROMIND_API_KEY` environment variable is provided, the client will raise a `ValueError`.
-- Base URL is optional. If not provided, it will try to read from `PYROMIND_BASE_URL` environment variable, or default to `https://api.pyromind.ai/api/v1`.
+- Base URL is optional. If not provided, it will try to read from `PYROMIND_BASE_URL` environment variable, or default to `https://api-portal.pyromind.ai/api/v1`.
 
 ### Basic Usage
 

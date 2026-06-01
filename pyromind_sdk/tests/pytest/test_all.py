@@ -120,7 +120,7 @@ class TestIntegration:
 def check_environment():
     """Check if required environment variables are set"""
     api_key = os.getenv("PYROMIND_API_KEY")
-    base_url = os.getenv("PYROMIND_BASE_URL", "https://api.pyromind.ai/api/v1")
+    base_url = os.getenv("PYROMIND_BASE_URL", "https://api-portal.pyromind.ai/api/v1")
 
     print("=" * 60)
     print("PyroMind SDK Integration Tests")

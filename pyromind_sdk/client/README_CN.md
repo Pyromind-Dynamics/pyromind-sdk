@@ -17,20 +17,20 @@ pip install pyromind-sdk
 1. **环境变量（推荐）：**
 ```bash
 export PYROMIND_API_KEY="your-api-key"
-export PYROMIND_BASE_URL="https://api.pyromind.ai/api/v1"  # 可选，默认为 https://api.pyromind.ai/api/v1
+export PYROMIND_BASE_URL="https://api-portal.pyromind.ai/api/v1"  # 可选，默认为 https://api-portal.pyromind.ai/api/v1
 ```
 
 2. **作为参数：**
 ```python
 client = PyroMindAPIClient(
     api_key="your-api-key",
-    base_url="https://api.pyromind.ai/api/v1"  # 可选
+    base_url="https://api-portal.pyromind.ai/api/v1"  # 可选
 )
 ```
 
 **注意：**
 - API 密钥是必需的。如果未提供参数且未设置 `PYROMIND_API_KEY` 环境变量，客户端将抛出 `ValueError`。
-- 基础 URL 是可选的。如果未提供，将尝试从 `PYROMIND_BASE_URL` 环境变量读取，或默认为 `https://api.pyromind.ai/api/v1`。
+- 基础 URL 是可选的。如果未提供，将尝试从 `PYROMIND_BASE_URL` 环境变量读取，或默认为 `https://api-portal.pyromind.ai/api/v1`。
 
 ### 基本用法
 
