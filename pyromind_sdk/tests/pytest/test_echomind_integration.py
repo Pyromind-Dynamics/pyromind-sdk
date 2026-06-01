@@ -151,6 +151,29 @@ def _wait_for_status(
     return False
 
 
+def _resume_with_retry(
+    client: PyroMindAPIClient,
+    instance_id: str,
+    timeout: int = 60,
+    check_interval: int = 3
+):
+    """Resume an instance with retry logic to handle server-side Pending state transition."""
+    waited = 0
+    while waited < timeout:
+        try:
+            resumed_instance = client.echomind.resume(instance_id)
+            print(f"[RESUME] Instance {instance_id} resumed successfully, status: {resumed_instance.status}")
+            return resumed_instance
+        except PyroMindAPIError as e:
+            if "pending" in e.message.lower() or "can not resume" in e.message.lower():
+                print(f"[RESUME] Instance {instance_id} still in Pending state, retrying in {check_interval}s...")
+                time.sleep(check_interval)
+                waited += check_interval
+            else:
+                raise
+    raise PyroMindAPIError(f"Timeout waiting for instance {instance_id} to be resumable after {timeout}s")
+
+
 def _pause_and_delete(client: PyroMindAPIClient, instance_id: str) -> None:
     """Pause (if running) then delete an instance. Best-effort cleanup."""
     print(f"[CLEANUP] Starting cleanup for instance: {instance_id}")
@@ -367,7 +390,7 @@ class TestPauseResumeEchoMindInstance:
             _wait_for_status(client, instance_id, "stopped")
 
             print(f"[TEST] Resuming EchoMind instance: {instance_id}")
-            resumed_instance = client.echomind.resume(instance_id)
+            resumed_instance = _resume_with_retry(client, instance_id)
 
             assert resumed_instance is not None
             assert resumed_instance.job_id == instance_id
@@ -550,7 +573,7 @@ class TestCompleteWorkflow:
                     print(f"[TEST] Instance {instance_id} is stopped")
 
                     # Step 5: Resume instance
-                    resumed = client.echomind.resume(instance_id)
+                    resumed = _resume_with_retry(client, instance_id)
                     print(f"[TEST] Instance resumed, status: {resumed.status}")
 
             # Step 6: Clean up - pause and delete
