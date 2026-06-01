@@ -81,7 +81,7 @@ def push_task(workflow_path: Path, task_name: Optional[str] = None) -> Optional[
             task_name = f"task-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         
         workflow = _load_workflow(workflow_path)
-        task = client.training.create(
+        task = client.studio.create(
             TrainingTaskCreateRequest(name=task_name, workflow=workflow)
         )
         print(f"✓ Task created: {task.task_id} ({task.name})")
@@ -106,7 +106,7 @@ def get_task_status(task_id: str) -> Optional[object]:
     client = PyroMindAPIClient()
     
     try:
-        return client.training.get_task(task_id)
+        return client.studio.get_task(task_id)
     except PyroMindAPIError as e:
         return None
     finally:
@@ -127,7 +127,7 @@ def get_node_output(task_id: str, node_id: str) -> Optional[Dict]:
     client = PyroMindAPIClient()
     
     try:
-        return client.training.get_node_output(task_id, node_id)
+        return client.studio.get_node_output(task_id, node_id)
     except PyroMindAPIError:
         return None
     finally:

@@ -9,7 +9,7 @@ import yaml
 import ast
 import inspect
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Union
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -256,7 +256,7 @@ def python_function_to_yaml(
     *,
     description: str = "",
     display_name: Optional[str] = None,
-    base_class: str = "PodExecutionNode",
+    base_class: Union[str, List[str]] = "JupyterLabPodExecutionNode",
     python_command: str = "python3",
     python_code: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -849,7 +849,7 @@ class PythonToYamlService:
         description: str = "",
     ) -> Dict[str, Any]:
         """生成 YAML 节点配置"""
-        base_class = RESOURCE_TYPE_TO_BASE_CLASS.get(resource_type, "PodExecutionNode")
+        base_class = RESOURCE_TYPE_TO_BASE_CLASS.get(resource_type, "JupyterLabPodExecutionNode")
         _node_name = node_name or f"user_{function_name}"
         return python_function_to_yaml(
             python_file_path=file_path,

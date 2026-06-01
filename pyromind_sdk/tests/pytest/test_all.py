@@ -44,6 +44,8 @@ TEST_MODULES = [
     "test_inference_integration.py",
     "test_training_example.py",
     "test_echomind_integration.py",
+    "test_training_nodes_flow.py",
+    "test_training_nodes_integration.py",
 ]
 
 UNIT_TESTS = [

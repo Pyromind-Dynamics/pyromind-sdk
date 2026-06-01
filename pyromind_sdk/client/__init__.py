@@ -8,7 +8,7 @@ from .base import PyroMindClient, PyroMindAPIError
 from .sandbox import SandboxClient
 from .instance import InstanceClient
 from .inference import InferenceClient
-from .training import TrainingClient
+from .studio import StudioClient
 from .storage import StorageClient
 from .echomind import EchoMindClient
 from .profile import ProfileClient
@@ -23,7 +23,7 @@ from .async_base import PyroMindAsyncAPIError
 from .async_sandbox import AsyncSandboxClient
 from .async_instance import AsyncInstanceClient
 from .async_inference import AsyncInferenceClient
-from .async_training import AsyncTrainingClient
+from .async_studio import AsyncStudioClient
 from .async_echomind import AsyncEchoMindClient
 from .async_client import PyroMindAsyncAPIClient, PyroMindAsyncClient
 
@@ -34,7 +34,7 @@ __all__ = [
     "SandboxClient",
     "InstanceClient",
     "InferenceClient",
-    "TrainingClient",
+    "StudioClient",
     "StorageClient",
     "EchoMindClient",
     "ProfileClient",
@@ -47,7 +47,7 @@ __all__ = [
     "AsyncSandboxClient",
     "AsyncInstanceClient",
     "AsyncInferenceClient",
-    "AsyncTrainingClient",
+    "AsyncStudioClient",
     "AsyncEchoMindClient",
     "PyroMindAsyncAPIClient",
 ]
