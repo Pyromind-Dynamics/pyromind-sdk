@@ -849,7 +849,7 @@ class PythonToYamlService:
         description: str = "",
     ) -> Dict[str, Any]:
         """生成 YAML 节点配置"""
-        base_class = RESOURCE_TYPE_TO_BASE_CLASS.get(resource_type, "PodExecutionNode")
+        base_class = RESOURCE_TYPE_TO_BASE_CLASS.get(resource_type, "JupyterLabPodExecutionNode")
         _node_name = node_name or f"user_{function_name}"
         return python_function_to_yaml(
             python_file_path=file_path,
