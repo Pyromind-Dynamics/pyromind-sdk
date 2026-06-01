@@ -3,8 +3,8 @@ YAML node configuration system
 
 Provides functionality for loading nodes from YAML configuration files.
 """
-
-__version__ = "0.1.1"
+## todo update_version
+__version__ = "0.1.2"
 
 from .yaml_loader import (
     load_nodes_from_yaml,
