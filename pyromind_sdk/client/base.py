@@ -385,6 +385,11 @@ class PyroMindClient:
             # Log response (single line)
             resp_log = f"[RESPONSE] {request_context} - Status: {response.status_code}"
             try:
+                safe_resp_headers = {k: '***' if k.lower() == 'authorization' else v for k, v in response.headers.items()}
+                resp_log += f" | headers={safe_resp_headers}"
+            except Exception:
+                pass
+            try:
                 if response.content:
                     resp_json = response.json()
                     safe_resp = self._mask_sensitive_data(resp_json)

@@ -62,7 +62,7 @@ class JupyterLabClient(PyroMindClient):
         Returns:
             List of JupyterResponse objects
         """
-        response = self.get("/instance")
+        response = self.get("/jupyterlab")
         # API returns {success: True, data: {...}} format
         data = self._extract_data(response)
         
@@ -102,7 +102,7 @@ class JupyterLabClient(PyroMindClient):
         # Convert request to dict and ensure gpu is string if present
         request_dict = request.model_dump(exclude_none=True)
         
-        response = self.post("/instance", json_data=request_dict)
+        response = self.post("/jupyterlab", json_data=request_dict)
         # API returns {success: True, data: {...}} format
         data = self._extract_data(response)
         
@@ -127,7 +127,7 @@ class JupyterLabClient(PyroMindClient):
         Returns:
             JupyterResponse object
         """
-        response = self.get(f"/instance/{jupyter_id}")
+        response = self.get(f"/jupyterlab/{jupyter_id}")
         # API returns {success: True, data: {...}} format
         data = self._extract_data(response)
         
@@ -156,7 +156,7 @@ class JupyterLabClient(PyroMindClient):
         # Convert request to dict and ensure gpu is string if present
         request_dict = request.model_dump(exclude_none=True)
         
-        response = self.put(f"/instance/{jupyter_id}", json_data=request_dict)
+        response = self.put(f"/jupyterlab/{jupyter_id}", json_data=request_dict)
         # API returns {success: True, data: {...}} format
         data = self._extract_data(response)
         
@@ -178,7 +178,7 @@ class JupyterLabClient(PyroMindClient):
         Args:
             jupyter_id: ID of the Jupyter instance to delete
         """
-        self._request("DELETE", f"/instance/{jupyter_id}")
+        self._request("DELETE", f"/jupyterlab/{jupyter_id}")
     
     def pause(self, jupyter_id: str) -> JupyterResponse:
         """
@@ -190,7 +190,7 @@ class JupyterLabClient(PyroMindClient):
         Returns:
             JupyterResponse object
         """
-        response = self.post(f"/instance/{jupyter_id}/pause")
+        response = self.post(f"/jupyterlab/{jupyter_id}/pause")
         # API returns {success: True, data: {...}} format
         data = self._extract_data(response)
         
@@ -215,7 +215,7 @@ class JupyterLabClient(PyroMindClient):
         Returns:
             JupyterResponse object
         """
-        response = self.post(f"/instance/{jupyter_id}/resume")
+        response = self.post(f"/jupyterlab/{jupyter_id}/resume")
         # API returns {success: True, data: {...}} format
         data = self._extract_data(response)
         

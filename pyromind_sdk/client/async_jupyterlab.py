@@ -58,7 +58,7 @@ class AsyncJupyterLabClient(PyroMindAsyncClient):
         Returns:
             List of JupyterResponse objects
         """
-        response = await self.get("/instance")
+        response = await self.get("/jupyterlab")
         data = self._extract_data(response)
 
         if isinstance(data, dict):
@@ -93,7 +93,7 @@ class AsyncJupyterLabClient(PyroMindAsyncClient):
         """
         request_dict = request.model_dump(exclude_none=True)
 
-        response = await self.post("/instance", json_data=request_dict)
+        response = await self.post("/jupyterlab", json_data=request_dict)
         data = self._extract_data(response)
 
         if isinstance(data, dict) and "instance" in data:
@@ -116,7 +116,7 @@ class AsyncJupyterLabClient(PyroMindAsyncClient):
         Returns:
             JupyterResponse object
         """
-        response = await self.get(f"/instance/{jupyter_id}")
+        response = await self.get(f"/jupyterlab/{jupyter_id}")
         data = self._extract_data(response)
 
         if isinstance(data, dict) and "instance" in data:
@@ -142,7 +142,7 @@ class AsyncJupyterLabClient(PyroMindAsyncClient):
         """
         request_dict = request.model_dump(exclude_none=True)
 
-        response = await self.put(f"/instance/{jupyter_id}", json_data=request_dict)
+        response = await self.put(f"/jupyterlab/{jupyter_id}", json_data=request_dict)
         data = self._extract_data(response)
 
         if isinstance(data, dict) and "instance" in data:
@@ -162,7 +162,7 @@ class AsyncJupyterLabClient(PyroMindAsyncClient):
         Args:
             jupyter_id: ID of the Jupyter instance to delete
         """
-        await self._request("DELETE", f"/instance/{jupyter_id}")
+        await self._request("DELETE", f"/jupyterlab/{jupyter_id}")
 
     async def pause(self, jupyter_id: str) -> JupyterResponse:
         """
@@ -174,7 +174,7 @@ class AsyncJupyterLabClient(PyroMindAsyncClient):
         Returns:
             JupyterResponse object
         """
-        response = await self.post(f"/instance/{jupyter_id}/pause")
+        response = await self.post(f"/jupyterlab/{jupyter_id}/pause")
         data = self._extract_data(response)
 
         if isinstance(data, dict) and "instance" in data:
@@ -197,7 +197,7 @@ class AsyncJupyterLabClient(PyroMindAsyncClient):
         Returns:
             JupyterResponse object
         """
-        response = await self.post(f"/instance/{jupyter_id}/resume")
+        response = await self.post(f"/jupyterlab/{jupyter_id}/resume")
         data = self._extract_data(response)
 
         if isinstance(data, dict) and "instance" in data:

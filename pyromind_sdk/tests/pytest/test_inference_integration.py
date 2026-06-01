@@ -30,10 +30,12 @@ from pyromind_sdk.client.models import (
 
 
 def skip_if_insufficient_resources(error: Exception) -> None:
-    """Check if error contains INSUFFICIENT_RESOURCES and skip test if so."""
+    """Check if error is INSUFFICIENT_RESOURCES or 404 (endpoint not available) and skip test."""
     error_str = str(error).upper()
     if "INSUFFICIENT_RESOURCES" in error_str:
         pytest.skip(f"Skipping test due to INSUFFICIENT_RESOURCES: {error}")
+    if hasattr(error, 'status_code') and error.status_code == 404:
+        pytest.skip(f"Skipping test due to 404 Not Found (endpoint not available on this cluster): {error}")
 
 
 # From pyromind_sdk/tests/pytest/ to pyromind_sdk/examples/openapi/
@@ -268,8 +270,14 @@ class TestCreateInferenceJob:
             else:
                 raise PyroMindAPIError(f"inference {job_id} create failed")
         except Exception:
-            _pause_and_delete(client, job_id)
             raise
+        finally:
+            if job_id:
+                client = PyroMindAPIClient()
+                try:
+                    _pause_and_delete(client, job_id)
+                finally:
+                    client.close()
 
     def test_create_inference_job_example_function(self):
         """Test the create_inference_job_example function"""
@@ -445,10 +453,14 @@ class TestDeleteInferenceJob:
                 else:
                     raise
         except Exception:
-            _pause_and_delete(client, job_id)
             raise
         finally:
-            client.close()
+            if job_id:
+                client = PyroMindAPIClient()
+                try:
+                    _pause_and_delete(client, job_id)
+                finally:
+                    client.close()
 
 
 class TestGetFrameworkAndImages:

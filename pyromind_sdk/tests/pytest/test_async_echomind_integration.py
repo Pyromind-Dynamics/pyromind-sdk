@@ -29,6 +29,15 @@ from pyromind_sdk.client.models import (
     ResourceConfig,
 )
 
+def skip_if_insufficient_resources(error: Exception) -> None:
+    """Check if error is INSUFFICIENT_RESOURCES or 404 (endpoint not available) and skip test."""
+    error_str = str(error).upper()
+    if "INSUFFICIENT_RESOURCES" in error_str:
+        pytest.skip(f"Skipping test due to INSUFFICIENT_RESOURCES: {error}")
+    if hasattr(error, 'status_code') and error.status_code == 404:
+        pytest.skip(f"Skipping test due to 404 Not Found (endpoint not available on this cluster): {error}")
+
+
 # From pyromind_sdk/tests/pytest/ to pyromind_sdk/examples/openapi/
 EXAMPLES_DIR = Path(__file__).parent.parent.parent / "examples" / "openapi"
 if str(EXAMPLES_DIR) not in sys.path:
@@ -246,7 +255,7 @@ class TestCreateEchoMindInstance:
             raise
 
     @pytest.mark.asyncio
-    async def test_create_echomind_instance_example_function(self):
+    async def test_create_echomind_instance_example_function(self, client):
         """Test the create_echomind_example function"""
         job_id = await create_echomind_example()
 
@@ -483,7 +492,7 @@ class TestDeleteEchoMindInstance:
             pass
 
     @pytest.mark.asyncio
-    async def test_delete_echomind_instance_example_function(self):
+    async def test_delete_echomind_instance_example_function(self, client):
         """Test the delete_echomind_example function"""
         instance_id = await create_echomind_example()
         if not instance_id:

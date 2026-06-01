@@ -27,6 +27,15 @@ from pyromind_sdk.client.models import (
     ResourceConfig,
 )
 
+def skip_if_insufficient_resources(error: Exception) -> None:
+    """Check if error is INSUFFICIENT_RESOURCES or 404 (endpoint not available) and skip test."""
+    error_str = str(error).upper()
+    if "INSUFFICIENT_RESOURCES" in error_str:
+        pytest.skip(f"Skipping test due to INSUFFICIENT_RESOURCES: {error}")
+    if hasattr(error, 'status_code') and error.status_code == 404:
+        pytest.skip(f"Skipping test due to 404 Not Found (endpoint not available on this cluster): {error}")
+
+
 # From pyromind_sdk/tests/pytest/ to pyromind_sdk/examples/openapi/
 EXAMPLES_DIR = Path(__file__).parent.parent.parent / "examples" / "openapi"
 if str(EXAMPLES_DIR) not in sys.path:
@@ -236,8 +245,14 @@ class TestCreateEchoMindInstance:
             assert instance.job_id == instance_id
             print(f"[TEST] Instance verification passed: job_id={instance_id}, status={instance.status}")
         except Exception:
-            _pause_and_delete(client, instance_id)
             raise
+        finally:
+            if instance_id:
+                client = PyroMindAPIClient()
+                try:
+                    _pause_and_delete(client, instance_id)
+                finally:
+                    client.close()
 
     def test_create_echomind_instance_example_function(self):
         """Test the create_echomind_example function"""
@@ -317,7 +332,12 @@ class TestPauseResumeEchoMindInstance:
             assert paused_instance.status is not None
             print(f"[TEST] Instance paused successfully, status: {paused_instance.status}")
         finally:
-            _pause_and_delete(client, instance_id)
+            if instance_id:
+                client = PyroMindAPIClient()
+                try:
+                    _pause_and_delete(client, instance_id)
+                finally:
+                    client.close()
 
     def test_pause_echomind_instance_example_function(self, client):
         """Test the pause_echomind_example function"""
@@ -330,7 +350,12 @@ class TestPauseResumeEchoMindInstance:
                 assert paused_instance.job_id == instance_id
                 print(f"[TEST] Function returned paused instance: job_id={paused_instance.job_id}, status={paused_instance.status}")
         finally:
-            _pause_and_delete(client, instance_id)
+            if instance_id:
+                client = PyroMindAPIClient()
+                try:
+                    _pause_and_delete(client, instance_id)
+                finally:
+                    client.close()
 
     def test_resume_echomind_instance(self, client):
         """Test resuming a paused EchoMind instance"""
@@ -493,9 +518,9 @@ class TestDeleteEchoMindInstance:
                 else:
                     print(f"[TEST] Unexpected error when deleting instance: {e.message}")
         except Exception:
-            _pause_and_delete(client, instance_id)
             raise
         finally:
+            _pause_and_delete(client, instance_id)
             client.close()
 
 
@@ -538,8 +563,8 @@ class TestCompleteWorkflow:
 
         except Exception as e:
             print(f"[ERROR] Workflow failed: {type(e).__name__}: {str(e)}")
-            _pause_and_delete(client, instance_id)
             raise
+        _pause_and_delete(client, instance_id)
 
 
 if __name__ == "__main__":

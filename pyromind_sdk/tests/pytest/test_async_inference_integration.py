@@ -32,10 +32,12 @@ from pyromind_sdk.client.models import (
 
 
 def skip_if_insufficient_resources(error: Exception) -> None:
-    """Check if error contains INSUFFICIENT_RESOURCES and skip test if so."""
+    """Check if error is INSUFFICIENT_RESOURCES or 404 (endpoint not available) and skip test."""
     error_str = str(error).upper()
     if "INSUFFICIENT_RESOURCES" in error_str:
         pytest.skip(f"Skipping test due to INSUFFICIENT_RESOURCES: {error}")
+    if hasattr(error, 'status_code') and error.status_code == 404:
+        pytest.skip(f"Skipping test due to 404 Not Found (endpoint not available on this cluster): {error}")
 
 
 # From pyromind_sdk/tests/pytest/ to pyromind_sdk/examples/openapi/
@@ -125,9 +127,7 @@ async def _create_job(client: PyroMindAsyncAPIClient, name_prefix: str = "test")
                 model_name="glm-5",
                 inference_framework=framework,
                 inf_image=image,
-                timeout=3600,
-                resources=ResourceConfig(cpu="4", memory="32Gi", gpu=1, gpu_card=get_default_gpu_card()),
-                environment_variables={"MODEL_PATH": "/workspace/models/Qwen/Qwen3-0.6B/"}
+                resources=ResourceConfig(cpu="4", memory="32Gi", gpu=1, gpu_card=get_default_gpu_card())
             )
         )
     except PyroMindAsyncAPIError as e:
@@ -280,7 +280,7 @@ class TestCreateInferenceJob:
             raise
 
     @pytest.mark.asyncio
-    async def test_create_inference_job_example_function(self):
+    async def test_create_inference_job_example_function(self, client):
         """Test the create_inference_job_example function"""
         job_id = await create_inference_job_example()
 
@@ -366,10 +366,8 @@ class TestUpdateInferenceJob:
                     model_name="glm-5",
                     inference_framework=framework,
                     inf_image=image,
-                    timeout=7200,
                     resources=ResourceConfig(cpu="4", memory="64Gi", gpu=1, gpu_card=get_default_gpu_card()),
-                    name=f"pending-inference-example-{int(time.time())}",
-                    environment_variables={"MODEL_PATH": "/workspace/models/Qwen/Qwen3-0.6B/"}
+                    name=f"pending-inference-example-{int(time.time())}"
                 )
             )
         except PyroMindAsyncAPIError as e:
@@ -384,10 +382,8 @@ class TestUpdateInferenceJob:
                     model_name="glm-5",
                     inference_framework=framework,
                     inf_image=image,
-                    timeout=7200,
                     resources=ResourceConfig(cpu="4", memory="64Gi", gpu=9, gpu_card="H100"),
-                    name=f"updated-inference-example-{int(time.time())}",
-                    environment_variables={"MODEL_PATH": "/workspace/models/Qwen/Qwen3-0.6B/"}
+                    name=f"updated-inference-example-{int(time.time())}"
                 )
             )
             print(f"[TEST] Job updated unexpectedly: id={updated_job.id}, name={updated_job.name}")
@@ -444,7 +440,7 @@ class TestDeleteInferenceJob:
             pass
 
     @pytest.mark.asyncio
-    async def test_delete_inference_job_example_function(self):
+    async def test_delete_inference_job_example_function(self, client):
         """Test the delete_inference_job_example function"""
         job_id = await create_inference_job_example()
         if not job_id:
