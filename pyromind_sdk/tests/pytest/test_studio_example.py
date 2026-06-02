@@ -31,7 +31,7 @@ if str(EXAMPLES_DIR) not in sys.path:
     sys.path.insert(0, str(EXAMPLES_DIR))
 
 # Import using importlib to handle module loading
-training_example_path = EXAMPLES_DIR / "training_example.py"
+training_example_path = EXAMPLES_DIR / "studio_example.py"
 if not training_example_path.exists():
     raise FileNotFoundError(f"Example file not found: {training_example_path}")
 
