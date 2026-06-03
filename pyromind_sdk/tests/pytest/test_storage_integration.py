@@ -93,7 +93,7 @@ class TestGetStorageInfo:
             if "API key is required" in e.__str__():
                 print("[TEST] Passed: get_storage_info raised ValueError when API key is missing")
             else:
-                print(f"[ERROR] Failed: get_storage_info did not raise ValueError when API key is missing: {e.message}")
+                print(f"[ERROR] Failed: get_storage_info did not raise ValueError when API key is missing: {str(e)}")
                 raise e
         finally:
             # Restore API key
