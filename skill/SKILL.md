@@ -13,7 +13,7 @@ Lightweight SDK for defining nodes from YAML and converting or validating PyroMi
 pip install pyromind-sdk
 ```
 
-API docs: https://api.pyromind.ai/api/v1/docs
+API docs: https://api-portal.pyromind.ai/api/v1/docs
 
 Optional: clone repo for examples and CLI:
 
@@ -169,7 +169,7 @@ from pyromind_sdk.client.models import (
 client = PyroMindAPIClient(api_key="YOUR_API_KEY")
 
 # --- Jupyter instance ---
-jupyter = client.instance.create(
+jupyter = client.jupyter.create(
     JupyterRequest(
         name="demo-jupyter",
         resources=ResourceConfig(cpu="2", memory="8Gi"),
@@ -234,50 +234,50 @@ Deleting a Running instance returns `400 Bad Request`. Always pause first:
 import time
 
 # Step 1: pause the instance
-client.instance.pause("jp-xxx")
+client.jupyter.pause("jp-xxx")
 
 # Step 2: wait for the pause to complete
 time.sleep(10)
 
 # Step 3: delete
-client.instance.delete("jp-xxx")
+client.jupyter.delete("jp-xxx")
 ```
 
 #### 2. Bulk cleanup (keep a specific instance)
 
-`client.instance.list()` returns `List[JupyterResponse]` — access fields via attributes (`.id`, `.name`, `.status`), not dict keys.
+`client.jupyter.list()` returns `List[JupyterResponse]` — access fields via attributes (`.id`, `.name`, `.status`), not dict keys.
 
 ```python
 import time
 
-instances = client.instance.list()  # List[JupyterResponse]
+instances = client.jupyter.list()  # List[JupyterResponse]
 
 keep_id = "jp-0b8e936dc9d7"
 to_delete = [inst.id for inst in instances if inst.id != keep_id]
 
 for inst_id in to_delete:
-    client.instance.pause(inst_id)
+    client.jupyter.pause(inst_id)
 
 time.sleep(10)
 
 for inst_id in to_delete:
-    client.instance.delete(inst_id)
+    client.jupyter.delete(inst_id)
 ```
 
-#### 3. InstanceClient methods
+#### 3. JupyterLabClient methods
 
 ```python
-instances = client.instance.list()           # List[JupyterResponse]
-detail    = client.instance.get_instance("jp-xxx")  # JupyterResponse
-client.instance.pause("jp-xxx")             # Running → Paused
-client.instance.resume("jp-xxx")            # Paused  → Running
-client.instance.delete("jp-xxx")            # must be Paused first
+instances = client.jupyter.list()           # List[JupyterResponse]
+detail    = client.jupyter.get_instance("jp-xxx")  # JupyterResponse
+client.jupyter.pause("jp-xxx")             # Running → Paused
+client.jupyter.resume("jp-xxx")            # Paused  → Running
+client.jupyter.delete("jp-xxx")            # must be Paused first
 ```
 
 #### 4. Status check
 
 ```python
-instances = client.instance.list()  # List[JupyterResponse]
+instances = client.jupyter.list()  # List[JupyterResponse]
 for inst in instances:
     print(f"{inst.id}: {inst.status}")  # Running, Paused, Stopped, etc.
 ```

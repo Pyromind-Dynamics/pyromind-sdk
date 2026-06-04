@@ -8,7 +8,7 @@ import os
 from typing import Optional
 from .base import PyroMindClient
 from .sandbox import SandboxClient
-from .instance import InstanceClient
+from .jupyterLab import JupyterLabClient
 from .inference import InferenceClient
 from .studio import StudioClient
 from .echomind import EchoMindClient
@@ -28,7 +28,7 @@ class PyroMindAPIClient:
                 provided, will raise ValueError.
         base_url: Base URL for the API. If not provided, will try to read from
                  PYROMIND_BASE_URL environment variable. If neither is provided,
-                 defaults to https://api.pyromind.ai/api/v1
+                 defaults to https://api-portal.pyromind.ai/api/v1
         cluster: Target cluster identifier. Will be sent as X-Cluster header
                 on every request. If not provided, will try to read from
                 PYROMIND_CLUSTER environment variable. Defaults to "default".
@@ -50,7 +50,7 @@ class PyroMindAPIClient:
         
         # Create a Jupyter instance
         from pyromind_sdk.client.models import JupyterRequest, ResourceConfig
-        jupyter = client.instance.create(
+        jupyter = client.jupyter.create(
             JupyterRequest(
                 name="my-jupyter",
                 image="jupyter/scipy-notebook:latest",
@@ -76,7 +76,7 @@ class PyroMindAPIClient:
                     read from PYROMIND_API_KEY environment variable.
             base_url: Base URL for the API. If not provided, will try to read from
                      PYROMIND_BASE_URL environment variable. If neither is provided,
-                     defaults to https://api.pyromind.ai/api/v1
+                     defaults to https://api-portal.pyromind.ai/api/v1
             cluster: Target cluster identifier. Will be sent as X-Cluster header
                     on every request. Defaults to "default".
             timeout: Request timeout in seconds
@@ -112,7 +112,7 @@ class PyroMindAPIClient:
             timeout=timeout,
             max_retries=max_retries
         )
-        self.instance = InstanceClient(
+        self.jupyter = JupyterLabClient(
             api_key=api_key,
             base_url=base_url,
             cluster=cluster,
@@ -152,7 +152,7 @@ class PyroMindAPIClient:
         """Close all client sessions"""
         self._base_client.close()
         self.sandboxes.close()
-        self.instance.close()
+        self.jupyter.close()
         self.inference.close()
         self.studio.close()
         self.echomind.close()

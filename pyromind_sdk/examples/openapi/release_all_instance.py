@@ -41,7 +41,7 @@ def release_all_instances(
     try:
         # List all instances
         print("Fetching all Jupyter instances...")
-        instances = client.instance.list()
+        instances = client.jupyter.list()
         print(f"Found {len(instances)} instance(s)")
 
         if not instances:
@@ -94,7 +94,7 @@ def release_all_instances(
             for instance in running_instances:
                 try:
                     print(f"  Pausing {instance.name} (ID: {instance.id})...")
-                    client.instance.pause(instance.id)
+                    client.jupyter.pause(instance.id)
                     results["paused"] += 1
                     print(f"    ✓ Paused")
                 except PyroMindAPIError as e:
@@ -114,7 +114,7 @@ def release_all_instances(
         for instance in instances_to_delete:
             try:
                 print(f"  Deleting {instance.name} (ID: {instance.id})...")
-                client.instance.delete(instance.id)
+                client.jupyter.delete(instance.id)
                 results["deleted"] += 1
                 print(f"    ✓ Deleted")
             except PyroMindAPIError as e:

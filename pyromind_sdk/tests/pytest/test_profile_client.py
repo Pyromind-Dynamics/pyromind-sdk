@@ -24,7 +24,7 @@ def api_key():
 
 @pytest.fixture(scope="module")
 def base_url():
-    url = os.getenv("PYROMIND_BASE_URL", "https://api.pyromind.ai/api/v1")
+    url = os.getenv("PYROMIND_BASE_URL", "https://api-portal.pyromind.ai/api/v1")
     print(f"[INFO] Using base URL: {url}")
     return url
 

@@ -18,7 +18,7 @@ from pyromind_sdk.client.workflow import (
 - Repository: https://github.com/PyroMind-Dynamics/pyromind-sdk
 - Package: `pip install pyromind-sdk`
 - Examples: `pyromind_sdk/examples/` (after install or clone)
-- API docs: https://api.pyromind.ai/api/v1/docs
+- API docs: https://api-portal.pyromind.ai/api/v1/docs
 
 ## Script entrypoints
 
@@ -35,7 +35,7 @@ from pyromind_sdk import PyroMindAPIClient
 from pyromind_sdk.client.models import ResourceConfig, JupyterRequest
 
 client = PyroMindAPIClient(api_key="YOUR_API_KEY")
-jupyter = client.instance.create(
+jupyter = client.jupyter.create(
     JupyterRequest(name="my-jupyter", resources=ResourceConfig(cpu=2, memory=8))
 )
 print(jupyter.id, jupyter.url)

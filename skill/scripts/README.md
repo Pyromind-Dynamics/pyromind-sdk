@@ -6,7 +6,7 @@ These scripts are customer-facing helpers for common local tasks.
 
 - Python 3.8+
 - `pyromind-sdk` installed
-- API docs: https://api.pyromind.ai/api/v1/docs
+- API docs: https://api-portal.pyromind.ai/api/v1/docs
 
 ```bash
 pip install pyromind-sdk
