@@ -8,7 +8,7 @@ from typing import Optional
 from .async_base import PyroMindAsyncClient as _PyroMindAsyncClientBase
 from .async_echomind import AsyncEchoMindClient
 from .async_inference import AsyncInferenceClient
-from .async_instance import AsyncInstanceClient
+from .async_jupyterlab import AsyncJupyterLabClient
 from .async_sandbox import AsyncSandboxClient
 from .async_studio import AsyncStudioClient
 
@@ -33,7 +33,7 @@ class PyroMindAsyncAPIClient:
                 read from PYROMIND_API_KEY environment variable.
         base_url: Base URL for the API. If not provided, will try to read from
                  PYROMIND_BASE_URL environment variable. Defaults to
-                 https://api.pyromind.ai/api/v1
+                 https://api-portal.pyromind.ai/api/v1
         cluster: Target cluster identifier. Will be sent as X-Cluster header
                 on every request. If not provided, will try to read from
                 PYROMIND_CLUSTER environment variable. Defaults to "default".
@@ -77,7 +77,7 @@ class PyroMindAsyncAPIClient:
             timeout=timeout,
             max_retries=max_retries
         )
-        self.instances = AsyncInstanceClient(
+        self.instances = AsyncJupyterLabClient(
             api_key=api_key,
             base_url=base_url,
             cluster=cluster,

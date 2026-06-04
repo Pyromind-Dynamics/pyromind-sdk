@@ -34,10 +34,9 @@ async def create_jupyter_example():
                 name=f"example-jupyter-{int(time.time())}",
                 resources=ResourceConfig(
                     cpu="2",
-                    memory="18Gi",
+                    memory="16Gi",
                     gpu=0
-                ),
-                timeout=3600  # Timeout in seconds (1 hour)
+                )
             )
         )
         print(f"✓ Jupyter instance created successfully!")
