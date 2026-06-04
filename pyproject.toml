@@ -34,9 +34,6 @@ dependencies = [
     "aiohttp>=3.8.0",
 ]
 
-[project.scripts]
-pyromind = "pyromind_sdk.cli:main"
-
 [project.optional-dependencies]
 dev = [
     "build",
