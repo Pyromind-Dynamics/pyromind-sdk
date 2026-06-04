@@ -27,7 +27,7 @@ def _build_client(api_key: Optional[str], base_url: Optional[str]) -> PyroMindAP
 
 def _ensure_no_duplicate(mode: str, client: PyroMindAPIClient, name: str) -> None:
     if mode == "jupyter":
-        duplicates = [x for x in client.instance.list() if x.name == name]
+        duplicates = [x for x in client.jupyter.list() if x.name == name]
     elif mode == "inference":
         duplicates = [x for x in client.inference.list() if x.name == name]
     else:
@@ -51,32 +51,32 @@ def jupyter_crud(
     updated_memory: Union[int, str],
     keep: bool,
 ) -> None:
-    created = client.instance.create(
+    created = client.jupyter.create(
         JupyterRequest(
             name=name,
             resources=ResourceConfig(cpu=cpu, memory=memory),
         )
     )
-    created_verified = client.instance.get_instance(created.id)
+    created_verified = client.jupyter.get_instance(created.id)
     print(f"[create] jupyter id={created_verified.id} status={created_verified.status} url={created_verified.url}")
     print("[check] jupyter creation verified by get_instance")
 
-    updated = client.instance.update(
+    updated = client.jupyter.update(
         created.id,
         JupyterRequest(
             name=updated_name,
             resources=ResourceConfig(cpu=updated_cpu, memory=updated_memory),
         ),
     )
-    updated_verified = client.instance.get_instance(updated.id)
+    updated_verified = client.jupyter.get_instance(updated.id)
     print(f"[update] jupyter id={updated_verified.id} name={updated_verified.name} status={updated_verified.status}")
     print("[check] jupyter update verified by get_instance")
 
     if not keep:
-        client.instance.pause(created.id)
+        client.jupyter.pause(created.id)
         print(f"[pause]  jupyter id={created.id} (waiting for pause)")
         time.sleep(10)
-        client.instance.delete(created.id)
+        client.jupyter.delete(created.id)
         print(f"[delete] jupyter id={created.id}")
 
 

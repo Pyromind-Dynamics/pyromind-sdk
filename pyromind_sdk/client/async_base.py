@@ -20,7 +20,7 @@ ENV_API_KEY = "PYROMIND_API_KEY"
 ENV_BASE_URL = "PYROMIND_BASE_URL"
 ENV_CLUSTER = "PYROMIND_CLUSTER"
 ENV_LOG_FORMAT = "PYROMIND_LOG_FORMAT"
-RETRY_STATUS_CODES = [500, 502, 503, 504]
+RETRY_STATUS_CODES = [502, 503, 504]
 
 ERROR_MESSAGE_MAX_LENGTH = 500
 
@@ -61,7 +61,7 @@ class PyroMindAsyncClient:
                 provided, will raise ValueError.
         base_url: Base URL for the API. If not provided, will try to read from
                  PYROMIND_BASE_URL environment variable. If neither is provided,
-                 defaults to https://api.pyromind.ai/api/v1
+                 defaults to https://api-portal.pyromind.ai/api/v1
         cluster: Target cluster identifier. Will be sent as X-Cluster header
                 on every request. If not provided, will try to read from
                 PYROMIND_CLUSTER environment variable. Defaults to "default".

@@ -6,6 +6,7 @@ This module provides a client for managing file storage operations via MinIO/S3-
 
 import os
 import mimetypes
+import requests
 from pathlib import Path
 from typing import List, Dict, Any, Optional, BinaryIO, Union
 from collections import deque
@@ -21,13 +22,14 @@ except ImportError:
         "Please install it with: pip install minio"
     )
 
+from pyromind_sdk.client.base import PyroMindAPIError, DEFAULT_API_BASE_URL, DEFAULT_CLUSTER, ENV_API_KEY, ENV_BASE_URL, ENV_CLUSTER
+
 
 # Constants
 DEFAULT_STORAGE_ENDPOINT = "https://storage.pyromind.ai"
 DEFAULT_REGION = "us-east-1"
 DEFAULT_CONTENT_TYPE = "application/octet-stream"
 ENV_STORAGE_ENDPOINT = "PYROMIND_STORAGE_ENDPOINT"
-ENV_API_KEY = "PYROMIND_API_KEY"
 ENV_STORAGE_SECRET_KEY = "PYROMIND_STORAGE_SECRET_KEY"
 ENV_STORAGE_BUCKET = "PYROMIND_STORAGE_BUCKET"
 
@@ -725,3 +727,76 @@ class StorageClient:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit"""
         self.close()
+
+
+def get_storage_info() -> Dict[str, Any]:
+    """
+    Get storage information from the API.
+
+    Calls the /storage_info endpoint to retrieve storage credentials and usage information.
+    Uses environment variables for configuration:
+    - PYROMIND_API_KEY: API key for authentication
+    - PYROMIND_BASE_URL: Base URL for the API (optional)
+    - PYROMIND_CLUSTER: Target cluster identifier (optional)
+
+    Returns:
+        Dictionary containing storage information:
+        - access_key: Storage access key
+        - secret_key: Storage secret key
+        - url: Storage endpoint URL
+        - bucket_name: User's bucket name
+        - used_size: Used storage in bytes with unit (e.g., "2655304097792byte")
+        - human_used_size: Human-readable used size (e.g., "2.41TB")
+        - total_size: Total storage quota in bytes with unit (e.g., "7696581394432byte")
+        - human_total_size: Human-readable total size (e.g., "7.00TB")
+
+    Raises:
+        PyroMindAPIError: If the API request fails
+        ValueError: If API key is not available
+    """
+    api_key = os.getenv(ENV_API_KEY)
+    if not api_key:
+        raise ValueError(
+            f"API key is required. Please set the {ENV_API_KEY} environment variable."
+        )
+
+    base_url = os.getenv(ENV_BASE_URL, DEFAULT_API_BASE_URL)
+    cluster = os.getenv(ENV_CLUSTER, DEFAULT_CLUSTER)
+
+    base_url = base_url.rstrip('/')
+    url = f"{base_url}/storage_info"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-Cluster": cluster,
+    }
+
+    try:
+        response = requests.post(url, headers=headers, timeout=30)
+        response.raise_for_status()
+
+        result = response.json()
+        if isinstance(result, dict) and "data" in result:
+            return result["data"]
+        return result
+
+    except requests.exceptions.HTTPError as e:
+        error_data = {}
+        try:
+            error_data = e.response.json()
+        except Exception:
+            error_data = {"message": e.response.text if e.response else str(e)}
+
+        error_message = error_data.get("message", str(e))
+        raise PyroMindAPIError(
+            message=f"Failed to get storage info: {error_message}",
+            status_code=e.response.status_code if e.response else None,
+            response=error_data
+        )
+    except requests.exceptions.RequestException as e:
+        raise PyroMindAPIError(
+            message=f"Failed to get storage info: {type(e).__name__}: {str(e)}",
+            status_code=None
+        )

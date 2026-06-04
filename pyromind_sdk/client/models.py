@@ -255,9 +255,6 @@ class JupyterRequest(BaseModel):
     """Request model for creating/updating a Jupyter instance"""
     name: Optional[str] = None
     resources: Optional[ResourceConfig] = None
-    configuration: Optional[Dict[str, Any]] = None
-    public_key: Optional[Union[str, List[str]]] = None
-    timeout: Optional[int] = None
 
 
 class JupyterResponse(BaseModel):
@@ -291,9 +288,7 @@ class InferenceJobRequest(BaseModel):
     """
     model_path: str
     inference_framework: Optional[str] = None
-    timeout: Optional[int] = None
     resources: Optional[ResourceConfig] = None
-    environment_variables: Optional[Dict[str, str]] = None
     name: Optional[str] = None
     inf_image: Optional[str] = None
     model_name: Optional[str] = None

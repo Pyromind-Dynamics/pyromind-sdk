@@ -7,7 +7,7 @@ This example demonstrates basic usage of the PyroMind API Client SDK.
 The API key and base URL can be provided via:
 1. Environment variables (recommended):
    - PYROMIND_API_KEY: API key (required)
-   - PYROMIND_BASE_URL: Base URL (optional, defaults to https://api.pyromind.ai/api/v1)
+   - PYROMIND_BASE_URL: Base URL (optional, defaults to https://api-portal.pyromind.ai/api/v1)
 2. Parameters when initializing the client:
    - api_key: API key (required if PYROMIND_API_KEY not set)
    - base_url: Base URL (optional, will use PYROMIND_BASE_URL env var or default)
@@ -39,7 +39,7 @@ def main():
         
         # Example 2: List all Jupyter instances
         print("\n=== Listing all Jupyter instances ===")
-        instances = client.instance.list()
+        instances = client.jupyter.list()
         print(f"Found {len(instances)} Jupyter instance(s)")
         for instance in instances:
             print(f"  - {instance.name} (ID: {instance.id}, Status: {instance.status})")

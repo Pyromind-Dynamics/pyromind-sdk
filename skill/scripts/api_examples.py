@@ -27,7 +27,7 @@ def _build_client(api_key: Optional[str], base_url: Optional[str]) -> PyroMindAP
 
 def _ensure_no_duplicate(mode: str, client: PyroMindAPIClient, name: str) -> None:
     if mode == "jupyter":
-        duplicates = [x for x in client.instance.list() if x.name == name]
+        duplicates = [x for x in client.jupyter.list() if x.name == name]
     elif mode == "inference":
         duplicates = [x for x in client.inference.list() if x.name == name]
     else:
@@ -42,13 +42,13 @@ def _ensure_no_duplicate(mode: str, client: PyroMindAPIClient, name: str) -> Non
 
 
 def run_jupyter(client: PyroMindAPIClient, name: str, cpu: Union[int, str], memory: Union[int, str]) -> None:
-    instance = client.instance.create(
+    instance = client.jupyter.create(
         JupyterRequest(
             name=name,
             resources=ResourceConfig(cpu=cpu, memory=memory),
         )
     )
-    verified = client.instance.get_instance(instance.id)
+    verified = client.jupyter.get_instance(instance.id)
 
     print("Created Jupyter instance")
     print(f"- id: {verified.id}")
