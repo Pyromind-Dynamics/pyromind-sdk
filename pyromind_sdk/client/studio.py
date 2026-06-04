@@ -5,6 +5,7 @@ This module provides a client for managing studio tasks via the PyroMind API.
 """
 
 import logging
+import time
 from typing import List, Dict, Any, Optional
 from .base import PyroMindClient
 from .models import (
@@ -325,3 +326,148 @@ class StudioClient(PyroMindClient):
         )
         data = self._extract_data(response)
         return TrainingTaskCreateResponse(**data)
+
+    def _todict(self, obj):
+        """Convert a Pydantic model or dict to a plain dict."""
+        return obj if isinstance(obj, dict) else obj.model_dump()
+
+    def export_node_outputs(
+        self,
+        task_id: str,
+        nodes_info: List[Any],
+        workflow_nodes: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Export outputs for all nodes in a completed task, enriched with workflow input config.
+
+        Args:
+            task_id: ID of the studio task
+            nodes_info: List of node info objects from the task response (TrainingTaskNodeInfo)
+            workflow_nodes: Raw workflow node definitions used to look up input config
+
+        Returns:
+            List of dicts, each containing node_name, node_id, start_at, end_at,
+            duration, input config, output parameters, and optionally raw output data.
+        """
+        wf_by_name = {}
+        if workflow_nodes:
+            for wn in workflow_nodes:
+                nd = wn.get("data", {})
+                key = f"#{nd.get('id') or wn.get('id', '?')}"
+                wf_by_name[key] = {
+                    "config": nd.get("config", {}),
+                    "node_type": nd.get("nodeType", ""),
+                    "label": nd.get("label", ""),
+                }
+
+        results = []
+        for node in nodes_info:
+            nd = self._todict(node)
+            node_id = nd.get("node_id") or nd.get("id")
+            node_name = nd.get("node_name") or str(node_id)
+            wf_meta = wf_by_name.get(node_name, {})
+            entry = {
+                "node_key": node_name,
+                "node_id": node_id,
+                "node_type": wf_meta.get("node_type", ""),
+                "label": wf_meta.get("label", ""),
+                "start_at": nd.get("start_at"),
+                "end_at": nd.get("end_at"),
+                "duration": str(nd.get("duration", "")),
+                "input": wf_meta.get("config", {}),
+            }
+            try:
+                output = self.get_node_output(str(task_id), str(node_id))
+                if output:
+                    output.pop("exit_code", None)
+                    params = output.pop("parameters", [])
+                    entry["output"] = {p["name"]: p.get("value", "") for p in params}
+                    entry["raw"] = output
+                else:
+                    entry["output"] = None
+            except Exception as e:
+                entry["output_error"] = str(e)
+            results.append(entry)
+        return results
+
+    def wait_for_task_completion(
+        self,
+        task_id: str,
+        timeout: int = 600,
+        check_interval: int = 5,
+    ) -> str:
+        """
+        Poll a studio task until it reaches a terminal status or times out.
+
+        Args:
+            task_id: ID of the task to monitor
+            timeout: Maximum time to wait in seconds (default: 600)
+            check_interval: Seconds between status checks (default: 5)
+
+        Returns:
+            Final status string: "success", "failed", "error", "cancelled", "stopped",
+            or "timeout" if none reached within the deadline.
+        """
+        deadline = time.time() + timeout
+
+        while time.time() < deadline:
+            time.sleep(check_interval)
+            job = self.get_job(task_id)
+            status = (getattr(job, "status", "") or "").lower()
+
+            if status in ("completed", "succeeded"):
+                return "success"
+            if status in ("failed", "error", "cancelled", "stopped"):
+                return status
+
+        return "timeout"
+
+    def create_and_wait(
+        self,
+        request: TrainingTaskCreateRequest,
+        timeout: int = 600,
+        check_interval: int = 5,
+        export_node_outputs: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Create a studio task, poll until completion, and optionally export node outputs.
+
+        Args:
+            request: TrainingTaskCreateRequest with workflow configuration
+            timeout: Maximum time to wait in seconds (default: 600)
+            check_interval: Seconds between status checks (default: 5)
+            export_node_outputs: If True, fetch and include node outputs in result
+
+        Returns:
+            Dict with keys: task_id, task_name, status, error_message,
+            and optionally nodes (list of enriched node output dicts).
+        """
+        response = self.create(request)
+        task_id = response.task_id
+
+        status = self.wait_for_task_completion(task_id, timeout, check_interval)
+
+        job = None
+        error_message = None
+        try:
+            job = self.get_job(task_id)
+            error_message = getattr(job, "error_message", None) if status != "success" else None
+        except Exception:
+            pass
+
+        result = {
+            "task_id": task_id,
+            "task_name": response.name,
+            "status": status,
+            "error_message": error_message,
+        }
+
+        if export_node_outputs and job is not None:
+            nodes_info = getattr(job, "nodes", []) or []
+            if isinstance(nodes_info, list):
+                workflow_nodes = request.workflow.get("nodes", [])
+                result["nodes"] = self.export_node_outputs(
+                    task_id, nodes_info, workflow_nodes,
+                )
+
+        return result
