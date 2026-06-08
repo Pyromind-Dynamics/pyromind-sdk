@@ -8,7 +8,7 @@ In the real platform runtime environment, nodes should prioritize importing
 base classes from `app.models.nodes`.
 """
 ## todo update_version
-__version__ = "0.1.2"
+__version__ = "0.1.4.rc4"
 
 # Export YAML nodes functionality
 from .nodes import (

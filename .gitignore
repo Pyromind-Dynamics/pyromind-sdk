@@ -26,3 +26,11 @@ htmlcov/
 # Ignore test_storage.sh in root directory only
 /test_storage.sh
 build/
+/.codegraph
+/.agents
+/.claude
+/.hermes
+/.qoder
+/.trae
+/PROJECT_MAP.txt
+/skills-lock.json

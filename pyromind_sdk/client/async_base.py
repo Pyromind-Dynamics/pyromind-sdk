@@ -20,21 +20,27 @@ ENV_API_KEY = "PYROMIND_API_KEY"
 ENV_BASE_URL = "PYROMIND_BASE_URL"
 ENV_CLUSTER = "PYROMIND_CLUSTER"
 ENV_LOG_FORMAT = "PYROMIND_LOG_FORMAT"
+ENV_LOG_LEVEL = "PYROMIND_LOG_LEVEL"
 RETRY_STATUS_CODES = [502, 503, 504]
 
 ERROR_MESSAGE_MAX_LENGTH = 500
 
-# Default log format
+# Default log format and level
 DEFAULT_LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+DEFAULT_LOG_LEVEL = "ERROR"
 
 # Configure logger (always enabled)
 logger = logging.getLogger("pyromind_sdk.async")
-logger.setLevel(logging.INFO)
+
+# Get log level from environment variable or use default
+_log_level_str = os.getenv(ENV_LOG_LEVEL, DEFAULT_LOG_LEVEL).upper()
+_log_level = getattr(logging, _log_level_str, logging.INFO)
+logger.setLevel(_log_level)
 
 # Configure handler with format from environment variable or default
 _log_format = os.getenv(ENV_LOG_FORMAT, DEFAULT_LOG_FORMAT)
 _handler = logging.StreamHandler()
-_handler.setLevel(logging.INFO)
+_handler.setLevel(_log_level)
 _handler.setFormatter(logging.Formatter(_log_format))
 logger.addHandler(_handler)
 
@@ -95,8 +101,8 @@ class PyroMindAsyncClient:
         api_key = api_key.strip()
 
         # Get base URL from parameter, environment variable, or use default
-        if base_url is None:
-            base_url = os.getenv(ENV_BASE_URL, DEFAULT_API_BASE_URL)
+        if not base_url:
+            base_url = os.getenv(ENV_BASE_URL) or DEFAULT_API_BASE_URL
 
         if not base_url:
             raise ValueError(
@@ -107,8 +113,8 @@ class PyroMindAsyncClient:
         self.base_url = base_url.rstrip('/')
 
         # Get cluster from parameter, environment variable, or use default
-        if cluster is None:
-            cluster = os.getenv(ENV_CLUSTER, DEFAULT_CLUSTER)
+        if not cluster:
+            cluster = os.getenv(ENV_CLUSTER) or DEFAULT_CLUSTER
         self.cluster = cluster
 
         self.timeout = aiohttp.ClientTimeout(total=timeout)
@@ -355,15 +361,15 @@ class PyroMindAsyncClient:
         session = await self._get_session()
 
         # Log request
-        logger.info(f"[REQUEST] {request_context}")
+        logger.debug(f"[REQUEST] {request_context}")
         if params:
-            logger.info(f"[REQUEST] params: {params}")
+            logger.debug(f"[REQUEST] params: {params}")
         if json_data:
             safe_json = self._mask_sensitive_data(json_data)
-            logger.info(f"[REQUEST] body: {safe_json}")
+            logger.debug(f"[REQUEST] body: {safe_json}")
         # Log request headers (mask authorization)
         safe_headers = {k: '***' if k.lower() == 'authorization' else v for k, v in session.headers.items()}
-        logger.info(f"[REQUEST] headers: {safe_headers}")
+        logger.debug(f"[REQUEST] headers: {safe_headers}")
 
         last_exception = None
         for attempt in range(self.max_retries):
@@ -376,14 +382,14 @@ class PyroMindAsyncClient:
                     **kwargs
                 ) as response:
                     # Log response
-                    logger.info(f"[RESPONSE] {request_context} - Status: {response.status}")
+                    logger.debug(f"[RESPONSE] {request_context} - Status: {response.status}")
                     try:
                         if response.content:
                             resp_json = await response.json()
                             safe_resp = self._mask_sensitive_data(resp_json)
-                            logger.info(f"[RESPONSE] body: {safe_resp}")
+                            logger.debug(f"[RESPONSE] body: {safe_resp}")
                     except Exception:
-                        logger.info(f"[RESPONSE] body: <non-JSON content>")
+                        logger.debug(f"[RESPONSE] body: <non-JSON content>")
 
                     # Handle non-2xx responses
                     if not response.ok:
