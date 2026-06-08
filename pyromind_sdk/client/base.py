@@ -22,22 +22,28 @@ ENV_API_KEY = "PYROMIND_API_KEY"
 ENV_BASE_URL = "PYROMIND_BASE_URL"
 ENV_CLUSTER = "PYROMIND_CLUSTER"
 ENV_LOG_FORMAT = "PYROMIND_LOG_FORMAT"
+ENV_LOG_LEVEL = "PYROMIND_LOG_LEVEL"
 RETRY_STATUS_CODES = [502, 503, 504]
 RETRY_ALLOWED_METHODS = ["GET", "POST", "PUT", "DELETE"]
 
 ERROR_MESSAGE_MAX_LENGTH = 500
 
-# Default log format
+# Default log format and level
 DEFAULT_LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+DEFAULT_LOG_LEVEL = "ERROR"
 
 # Configure logger (always enabled)
 logger = logging.getLogger("pyromind_sdk")
-logger.setLevel(logging.INFO)
+
+# Get log level from environment variable or use default
+_log_level_str = os.getenv(ENV_LOG_LEVEL, DEFAULT_LOG_LEVEL).upper()
+_log_level = getattr(logging, _log_level_str, logging.INFO)
+logger.setLevel(_log_level)
 
 # Configure handler with format from environment variable or default
 _log_format = os.getenv(ENV_LOG_FORMAT, DEFAULT_LOG_FORMAT)
 _handler = logging.StreamHandler()
-_handler.setLevel(logging.INFO)
+_handler.setLevel(_log_level)
 _handler.setFormatter(logging.Formatter(_log_format))
 logger.addHandler(_handler)
 
@@ -370,7 +376,7 @@ class PyroMindClient:
         log_parts.append(f"headers={safe_headers}")
         if safe_json:
             log_parts.append(f"body={safe_json}")
-        logger.info(" | ".join(log_parts))
+        logger.debug(" | ".join(log_parts))
         
         try:
             response = self.session.request(
@@ -396,7 +402,7 @@ class PyroMindClient:
                     resp_log += f" | body={safe_resp}"
             except Exception:
                 pass
-            logger.info(resp_log)
+            logger.debug(resp_log)
             
             # Handle non-2xx responses
             if not response.ok:
