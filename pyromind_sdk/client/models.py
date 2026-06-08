@@ -655,6 +655,8 @@ class EchoMindJobRequest(BaseModel):
     training_round: int
     training_save_path: str
     resources: Optional[ResourceConfig] = None
+    execution_mode : Optional[str] = None               ## 执行模式
+    custom_runtime_script_path : Optional[str] = None   ## 自定义脚本地址
 
     @field_validator('api_mode', mode='before')
     @classmethod
