@@ -46,6 +46,7 @@ TEST_MODULES = [
     "test_echomind_integration.py",
     "test_studio_nodes_flow.py",
     "test_studio_nodes_integration.py",
+    "test_client_env_init.py",
 ]
 
 UNIT_TESTS = [

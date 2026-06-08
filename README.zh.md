@@ -1,6 +1,6 @@
 # PyroMind SDK
 
-适用于 [PyroMind AI](https://pyromind.ai/) 平台 API 的轻量级 Python SDK — 管理训练工作流、沙箱、Jupyter 实例、推理任务、EchoMind 等。
+适用于 [PyroMind AI](https://pyromind.ai/) 平台 API 的轻量级 Python SDK — 管理训练工作流、Jupyter 实例、推理任务、EchoMind 等。
 
 ## 安装
 
@@ -35,7 +35,6 @@ print(f"Created task: {task.task_id}")
 | 参数 | 必填 | 类型 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `api_key` | 是* | `str` | `PYROMIND_API_KEY` 环境变量 | API 认证 Bearer Token |
-| `base_url` | 否 | `str` | `PYROMIND_BASE_URL` 环境变量或 `https://api-portal.pyromind.ai/api/v1` | API 基础 URL |
 | `cluster` | 否 | `str` | `PYROMIND_CLUSTER` 环境变量或 `"us-west-2"` | 目标集群（`X-Cluster` 请求头） |
 | `timeout` | 否 | `int` | `30` | 请求超时时间（秒） |
 | `max_retries` | 否 | `int` | `3` | 失败请求最大重试次数 |
@@ -47,7 +46,6 @@ print(f"Created task: {task.task_id}")
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
 | `PYROMIND_API_KEY` | 是 | — | API Bearer Token |
-| `PYROMIND_BASE_URL` | 否 | `https://api-portal.pyromind.ai/api/v1` | API 基础 URL |
 | `PYROMIND_CLUSTER` | 否 | `us-west-2` | 目标集群标识 |
 | `PYROMIND_STORAGE_ENDPOINT` | 否 | `https://storage.pyromind.ai` | 存储端点 URL |
 | `PYROMIND_STORAGE_SECRET_KEY` | 否 | — | 存储密钥 |
@@ -62,11 +60,10 @@ pyromind_sdk/
 │   ├── client.py                    # PyroMindAPIClient（统一入口）
 │   ├── async_client.py              # PyroMindAsyncAPIClient（异步入口）
 │   ├── studio.py / async_studio.py  # Studio / 训练任务
-│   ├── sandbox.py / async_sandbox.py# 沙箱环境
 │   ├── jupyterLab.py / async_jupyterlab.py  # Jupyter 实例
 │   ├── inference.py / async_inference.py    # 推理任务
 │   ├── echomind.py / async_echomind.py      # EchoMind 实例
-│   ├── storage.py                   # 文件存储（MinIO/S3）
+│   ├── storage.py                   # 文件存储
 │   ├── profile.py                   # 用户信息与 SSH 密钥
 │   ├── models.py                    # Pydantic 数据模型
 │   └── workflow/                    # 工作流验证与转换
@@ -150,76 +147,7 @@ status = client.studio.wait_for_task_completion(task.task_id, timeout=600)
 print(f"Final status: {status}")
 ```
 
-### 沙箱（`client.sandboxes`）
 
-桌面沙箱环境，支持 VNC 访问。
-
-| 方法 | 输入 | 输出 | 描述 |
-|--------|------|------|------|
-| `list()` | — | `List[SandboxResponse]` | 列出所有沙箱 |
-| `create(request)` | `SandboxRequest` | `SandboxResponse` | 创建沙箱 |
-| `get_sandbox(sandbox_id)` | `str` | `SandboxResponse` | 获取沙箱详情 |
-| `update(sandbox_id, request)` | `str`, `SandboxRequest` | `SandboxResponse` | 更新沙箱配置 |
-| `delete(sandbox_id)` | `str` | `None` | 删除沙箱 |
-| `pause(sandbox_id)` / `resume(sandbox_id)` | `str` | `SandboxResponse` | 暂停/恢复沙箱 |
-| `execute_action(sandbox_id, request)` | `str`, `ActionRequest` | `ActionResponse` | 在沙箱中执行操作 |
-| `execute_batch_actions(sandbox_id, request)` | `str`, `BatchActionRequest` | `List[ActionResponse]` | 批量执行操作 |
-| `get_vnc(sandbox_id)` | `str` | `Dict[str, Any]` | 获取 VNC 连接信息 |
-| `wait_for_sandbox_status(...)` | `str` + 选项 | `bool` | 轮询直到目标状态 |
-| `create_and_wait(request, target_status)` | `SandboxRequest` + 选项 | `SandboxResponse` | 创建 + 轮询 |
-
-**`SandboxRequest` 参数说明：**
-
-| 参数 | 必填 | 类型 | 说明 |
-|------|------|------|------|
-| `sandbox_type` | 是 | `SandboxType` | `"code"`（Linux）或 `"win"`（Windows） |
-| `resources` | 否 | `ResourceConfig` | CPU/内存/GPU 配置 |
-| `configuration` | 否 | `SandboxConfiguration` | 屏幕分辨率、auto_destroy、vnc_password |
-| `name` | 否 | `str` | 沙箱显示名称 |
-
-**`ResourceConfig` 参数说明：**
-
-| 参数 | 必填 | 类型 | 说明 |
-|------|------|------|------|
-| `cpu` | 否 | `str`/`int` | CPU 核心数（如 `"4"` 或 `4`） |
-| `memory` | 否 | `str`/`int` | 内存（如 `"16Gi"` 或 `16`） |
-| `gpu` | 否 | `str`/`int` | GPU 数量（如 `"1"` 或 `1`） |
-| `gpu_card` | 否 | `str` | GPU 卡类型（如 `"L40S"`、`"H100"`） |
-
-**`ActionRequest` 参数说明：**
-
-| 参数 | 必填 | 类型 | 说明 |
-|------|------|------|------|
-| `action` | 是 | `str` | 操作类型（如 `"type"`、`"click"`、`"screenshot"`） |
-| `parameters` | 否 | `ActionParameters` | 命令、坐标、文本、超时等 |
-
-**示例：**
-
-```python
-from pyromind_sdk.client.models import SandboxRequest, SandboxType, ResourceConfig, ActionRequest
-
-# 创建 Linux 沙箱
-sb = client.sandboxes.create(
-    SandboxRequest(
-        sandbox_type=SandboxType.LINUX,
-        resources=ResourceConfig(cpu="4", memory="16Gi"),
-        name="my-sandbox"
-    )
-)
-print(f"Sandbox ID: {sb.id}")
-
-# 执行操作
-result = client.sandboxes.execute_action(
-    sb.id, ActionRequest(action="screenshot")
-)
-
-# 获取 VNC 连接
-vnc = client.sandboxes.get_vnc(sb.id)
-print(f"VNC URL: {vnc['web_vnc_url']}")
-
-# 清理
-client.sandboxes.delete(sb.id)
-```
 
 ### Jupyter（`client.jupyter`）
 
@@ -442,7 +370,6 @@ async with PyroMindAsyncAPIClient(api_key="your-api-key") as client:
 
 异步客户端（方法集与同步版一致）：
 - `client.studio` → `AsyncStudioClient`
-- `client.sandboxes` → `AsyncSandboxClient`
 - `client.instances` → `AsyncJupyterLabClient`
 - `client.inference` → `AsyncInferenceClient`
 - `client.echomind` → `AsyncEchoMindClient`
@@ -483,17 +410,6 @@ except PyroMindAPIError as e:
 | `nodes` | `List[TrainingTaskNodeInfo]` | 节点执行详情 |
 | `error_message` | `Optional[str]` | 失败时的错误信息 |
 | `created_at` | `datetime` | 创建时间戳 |
-
-### `SandboxResponse`（沙箱）
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `id` | `str` | 沙箱 ID |
-| `name` | `str` | 沙箱名称 |
-| `type` | `SandboxType` | `"code"`（Linux）或 `"win"`（Windows） |
-| `status` | `str` | 当前状态 |
-| `endpoint_url` | `Optional[str]` | Web 端点 URL |
-| `web_vnc_url` | `Optional[str]` | VNC Web 客户端 URL |
 
 ### `JupyterResponse`（Jupyter）
 
@@ -620,7 +536,6 @@ pytest
 | `studio_monitor.py` | 循环监控任务状态 |
 | `workflow_cli.py` | 工作流管理 CLI 工具 |
 | `complete_workflow_example.py` | 端到端工作流演示 |
-| `sandbox_example.py` | 沙箱生命周期管理 |
 | `jupyter_instance_example.py` | Jupyter 实例 CRUD |
 | `inference_example.py` | 推理任务管理 |
 | `echomind_example.py` | EchoMind 生命周期 |
@@ -629,7 +544,6 @@ pytest
 | `async_training_example.py` | 异步 Studio 训练 |
 | `async_inference_example.py` | 异步推理 |
 | `async_echomind_example.py` | 异步 EchoMind |
-| `async_sandbox_example.py` | 异步沙箱 |
 | `async_jupyter_instance_example.py` | 异步 Jupyter |
 
 ## 开发

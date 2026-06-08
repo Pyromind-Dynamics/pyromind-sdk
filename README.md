@@ -1,6 +1,6 @@
 # PyroMind SDK
 
-Lightweight Python SDK for the [PyroMind AI](https://pyromind.ai/) Platform API — manage training workflows, sandboxes, Jupyter instances, inference jobs, EchoMind and more.
+Lightweight Python SDK for the [PyroMind AI](https://pyromind.ai/) Platform API — manage training workflows, Jupyter instances, inference jobs, EchoMind and more.
 
 ## Installation
 
@@ -35,7 +35,6 @@ print(f"Created task: {task.task_id}")
 | Param | Required | Type | Default | Description |
 |-------|----------|------|---------|-------------|
 | `api_key` | Yes* | `str` | `PYROMIND_API_KEY` env | Bearer token for API auth |
-| `base_url` | No | `str` | `PYROMIND_BASE_URL` env or `https://api-portal.pyromind.ai/api/v1` | API base URL |
 | `cluster` | No | `str` | `PYROMIND_CLUSTER` env or `"us-west-2"` | Target cluster (`X-Cluster` header) |
 | `timeout` | No | `int` | `30` | Request timeout in seconds |
 | `max_retries` | No | `int` | `3` | Max retries for failed requests |
@@ -47,7 +46,6 @@ print(f"Created task: {task.task_id}")
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `PYROMIND_API_KEY` | Yes | — | API bearer token |
-| `PYROMIND_BASE_URL` | No | `https://api-portal.pyromind.ai/api/v1` | API base URL |
 | `PYROMIND_CLUSTER` | No | `us-west-2` | Target cluster identifier |
 | `PYROMIND_STORAGE_ENDPOINT` | No | `https://storage.pyromind.ai` | Storage endpoint URL |
 | `PYROMIND_STORAGE_SECRET_KEY` | No | — | Storage secret key |
@@ -62,11 +60,10 @@ pyromind_sdk/
 │   ├── client.py                    # PyroMindAPIClient (unified entry)
 │   ├── async_client.py              # PyroMindAsyncAPIClient (async entry)
 │   ├── studio.py / async_studio.py  # Studio / Training tasks
-│   ├── sandbox.py / async_sandbox.py# Sandbox environments
 │   ├── jupyterLab.py / async_jupyterlab.py  # Jupyter instances
 │   ├── inference.py / async_inference.py    # Inference jobs
 │   ├── echomind.py / async_echomind.py      # EchoMind instances
-│   ├── storage.py                   # File storage (MinIO/S3)
+│   ├── storage.py                   # File storage
 │   ├── profile.py                   # User profile & SSH keys
 │   ├── models.py                    # Pydantic models
 │   └── workflow/                    # Workflow validation & conversion
@@ -150,76 +147,7 @@ status = client.studio.wait_for_task_completion(task.task_id, timeout=600)
 print(f"Final status: {status}")
 ```
 
-### Sandbox (`client.sandboxes`)
 
-Desktop sandbox environments with VNC access.
-
-| Method | Input | Output | Description |
-|--------|-------|--------|-------------|
-| `list()` | — | `List[SandboxResponse]` | List all sandboxes |
-| `create(request)` | `SandboxRequest` | `SandboxResponse` | Create a new sandbox |
-| `get_sandbox(sandbox_id)` | `str` | `SandboxResponse` | Get sandbox details |
-| `update(sandbox_id, request)` | `str`, `SandboxRequest` | `SandboxResponse` | Update sandbox config |
-| `delete(sandbox_id)` | `str` | `None` | Delete a sandbox |
-| `pause(sandbox_id)` / `resume(sandbox_id)` | `str` | `SandboxResponse` | Pause/resume sandbox |
-| `execute_action(sandbox_id, request)` | `str`, `ActionRequest` | `ActionResponse` | Run action in sandbox |
-| `execute_batch_actions(sandbox_id, request)` | `str`, `BatchActionRequest` | `List[ActionResponse]` | Run batch actions |
-| `get_vnc(sandbox_id)` | `str` | `Dict[str, Any]` | Get VNC connection info |
-| `wait_for_sandbox_status(...)` | `str` + opts | `bool` | Poll until target status |
-| `create_and_wait(request, target_status)` | `SandboxRequest` + opts | `SandboxResponse` | Create + poll |
-
-**`SandboxRequest` parameters:**
-
-| Param | Required | Type | Description |
-|-------|----------|------|-------------|
-| `sandbox_type` | Yes | `SandboxType` | `"code"` (Linux) or `"win"` (Windows) |
-| `resources` | No | `ResourceConfig` | CPU/memory/gpu config |
-| `configuration` | No | `SandboxConfiguration` | Screen resolution, auto_destroy, vnc_password |
-| `name` | No | `str` | Sandbox display name |
-
-**`ResourceConfig` parameters:**
-
-| Param | Required | Type | Description |
-|-------|----------|------|-------------|
-| `cpu` | No | `str`/`int` | CPU cores (e.g. `"4"` or `4`) |
-| `memory` | No | `str`/`int` | Memory (e.g. `"16Gi"` or `16`) |
-| `gpu` | No | `str`/`int` | GPU count (e.g. `"1"` or `1`) |
-| `gpu_card` | No | `str` | GPU card type (e.g. `"L40S"`, `"H100"`) |
-
-**`ActionRequest` parameters:**
-
-| Param | Required | Type | Description |
-|-------|----------|------|-------------|
-| `action` | Yes | `str` | Action type (e.g. `"type"`, `"click"`, `"screenshot"`) |
-| `parameters` | No | `ActionParameters` | Command, coordinates, text, timeout, etc. |
-
-**Example:**
-
-```python
-from pyromind_sdk.client.models import SandboxRequest, SandboxType, ResourceConfig, ActionRequest
-
-# Create a Linux sandbox
-sb = client.sandboxes.create(
-    SandboxRequest(
-        sandbox_type=SandboxType.LINUX,
-        resources=ResourceConfig(cpu="4", memory="16Gi"),
-        name="my-sandbox"
-    )
-)
-print(f"Sandbox ID: {sb.id}")
-
-# Execute action
-result = client.sandboxes.execute_action(
-    sb.id, ActionRequest(action="screenshot")
-)
-
-# Get VNC connection
-vnc = client.sandboxes.get_vnc(sb.id)
-print(f"VNC URL: {vnc['web_vnc_url']}")
-
-# Cleanup
-client.sandboxes.delete(sb.id)
-```
 
 ### Jupyter (`client.jupyter`)
 
@@ -442,7 +370,6 @@ async with PyroMindAsyncAPIClient(api_key="your-api-key") as client:
 
 Async clients (same method set as sync):
 - `client.studio` → `AsyncStudioClient`
-- `client.sandboxes` → `AsyncSandboxClient`
 - `client.instances` → `AsyncJupyterLabClient`
 - `client.inference` → `AsyncInferenceClient`
 - `client.echomind` → `AsyncEchoMindClient`
@@ -483,17 +410,6 @@ Each service returns structured Pydantic model objects. Key fields:
 | `nodes` | `List[TrainingTaskNodeInfo]` | Node execution details |
 | `error_message` | `Optional[str]` | Error info if failed |
 | `created_at` | `datetime` | Creation timestamp |
-
-### `SandboxResponse` (Sandbox)
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | `str` | Sandbox ID |
-| `name` | `str` | Sandbox name |
-| `type` | `SandboxType` | `"code"` (Linux) or `"win"` (Windows) |
-| `status` | `str` | Current status |
-| `endpoint_url` | `Optional[str]` | Web endpoint URL |
-| `web_vnc_url` | `Optional[str]` | VNC web client URL |
 
 ### `JupyterResponse` (Jupyter)
 
@@ -620,7 +536,6 @@ pytest
 | `studio_monitor.py` | Monitor task status in a loop |
 | `workflow_cli.py` | CLI tool for workflow management |
 | `complete_workflow_example.py` | End-to-end workflow demo |
-| `sandbox_example.py` | Sandbox lifecycle management |
 | `jupyter_instance_example.py` | Jupyter instance CRUD |
 | `inference_example.py` | Inference job management |
 | `echomind_example.py` | EchoMind lifecycle |
@@ -629,7 +544,6 @@ pytest
 | `async_training_example.py` | Async studio training |
 | `async_inference_example.py` | Async inference |
 | `async_echomind_example.py` | Async EchoMind |
-| `async_sandbox_example.py` | Async sandbox |
 | `async_jupyter_instance_example.py` | Async Jupyter |
 
 ## Development

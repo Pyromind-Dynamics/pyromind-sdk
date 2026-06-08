@@ -33,6 +33,11 @@ ENV_STORAGE_ENDPOINT = "PYROMIND_STORAGE_ENDPOINT"
 ENV_STORAGE_SECRET_KEY = "PYROMIND_STORAGE_SECRET_KEY"
 ENV_STORAGE_BUCKET = "PYROMIND_STORAGE_BUCKET"
 
+CLUSTER_STORAGE_ENDPOINTS = {
+    "us-west-1": "https://storage.pyromind.ai",
+    "us-west-2": "https://storage-us-west-2.pyromind.ai",
+}
+
 
 class StorageClient:
     """
@@ -55,15 +60,16 @@ class StorageClient:
         secret_key: Optional[str] = None,
         bucket_name: Optional[str] = None,
         secure: bool = False,
-        region: Optional[str] = None
+        region: Optional[str] = None,
+        cluster: Optional[str] = None
     ):
         """
         Initialize the Storage Client
 
         Args:
             endpoint: Storage endpoint URL (e.g., "https://storage.pyromind.ai")
-                    If not provided, reads from PYROMIND_STORAGE_ENDPOINT env var
-                    Defaults to "https://storage.pyromind.ai" if not set
+                    Defaults to cluster-based endpoint if cluster is set,
+                    otherwise "https://storage.pyromind.ai"
             access_key: Access key for storage authentication
                        If not provided, reads from PYROMIND_API_KEY env var
             secret_key: Secret key for storage authentication
@@ -72,19 +78,22 @@ class StorageClient:
                         If not provided, reads from PYROMIND_STORAGE_BUCKET env var
             secure: Whether to use HTTPS (default: False)
             region: Storage region (optional)
+            cluster: Cluster identifier for endpoint resolution.
+                    Used to determine storage endpoint when endpoint is not
+                    explicitly provided. Reads from PYROMIND_CLUSTER env var
+                    if not provided. Defaults to "us-west-2".
 
         Raises:
             ValueError: If required credentials are not provided
         """
         # Get endpoint from parameter or environment variable
-        if endpoint is None:
-            endpoint = os.getenv(ENV_STORAGE_ENDPOINT, DEFAULT_STORAGE_ENDPOINT)
+        if not endpoint:
+            endpoint = os.getenv(ENV_STORAGE_ENDPOINT)
 
         if not endpoint:
-            raise ValueError(
-                f"Storage endpoint is required. Please provide it either as a parameter "
-                f"or set the {ENV_STORAGE_ENDPOINT} environment variable."
-            )
+            if cluster is None:
+                cluster = os.getenv(ENV_CLUSTER, DEFAULT_CLUSTER)
+            endpoint = CLUSTER_STORAGE_ENDPOINTS.get(cluster, "https://storage-us-west-2.pyromind.ai")
 
         # Get access key from parameter or environment variable
         if access_key is None:
