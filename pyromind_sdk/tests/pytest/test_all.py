@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pytest
@@ -55,6 +56,13 @@ UNIT_TESTS = [
 ]
 
 INTEGRATION_TESTS = [m for m in TEST_MODULES if m not in UNIT_TESTS]
+
+
+PYTEST_CLASS_MAP = {
+    "all":         "TestAllModules",
+    "quick":       "TestQuick",
+    "integration": "TestIntegration",
+}
 
 
 def get_test_file_path(module_name: str) -> Path:
@@ -116,6 +124,72 @@ class TestIntegration:
 # ============================================================================
 # Standalone Script Runner
 # ============================================================================
+
+def run_module_subprocess(module: str) -> tuple[str, int]:
+    """单个模块独立子进程（等价于单类的 main 执行方式）"""
+    test_file = Path(__file__).parent / module
+    if not test_file.exists():
+        print(f"[SKIP] {module} (file not found)")
+        return (module, 0)
+
+    print(f"[START] {module}")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(project_root)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", str(test_file), "-v", "-s", "--tb=short"],
+        env=env,
+    )
+    status = "PASS" if result.returncode == 0 else "FAIL"
+    print(f"[{status}] {module} (exit={result.returncode})")
+    return (module, result.returncode)
+
+
+def run_tests_parallel(modules: list, max_workers: int = 4) -> int:
+    """并行执行：每个模块启动独立 pytest 进程"""
+    print(f"\n并行执行 {len(modules)} 个模块（max_workers={max_workers}）")
+    print("-" * 60)
+
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(run_module_subprocess, m): m for m in modules}
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    results.sort(key=lambda x: x[0])
+    print("\n" + "=" * 60)
+    print("汇总:")
+    failed = []
+    for module, code in results:
+        mark = "PASS" if code == 0 else "FAIL"
+        print(f"  [{mark}] {module}")
+        if code != 0:
+            failed.append(module)
+
+    if failed:
+        print(f"\n失败: {', '.join(failed)}")
+        return 1
+    print("\n全部通过")
+    return 0
+
+
+def run_pytest_class(class_name: str) -> int:
+    """通过 subprocess 单独跑指定 pytest 类（与原嵌套 pytest.main 行为等价）"""
+    test_file = Path(__file__).resolve()
+    print(f"\n执行 pytest 类: {class_name}")
+    print("-" * 60)
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(project_root)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest",
+         f"{test_file.name}::{class_name}", "-v", "-s", "--tb=short"],
+        cwd=str(test_file.parent),
+        env=env,
+    )
+    return result.returncode
+
 
 def check_environment():
     """Check if required environment variables are set"""
@@ -193,8 +267,18 @@ Examples:
                         help="Run integration tests only")
     parser.add_argument("--unit", action="store_true",
                         help="Run unit tests only")
+    parser.add_argument(
+        "--class",
+        dest="pytest_class",
+        choices=list(PYTEST_CLASS_MAP.keys()),
+        help="按 pytest 类执行: all / quick / integration"
+    )
     parser.add_argument("-x", "--exitfirst", action="store_true",
                         help="Exit on first failure")
+    parser.add_argument("--parallel", action="store_true",
+                        help="并行执行（每个模块独立子进程）")
+    parser.add_argument("-j", "--jobs", type=int, default=4,
+                        help="并行度，默认 4")
     parser.add_argument("-k", type=str,
                         help="Run tests matching expression")
     parser.add_argument("--tb", type=str, default="short",
@@ -226,6 +310,8 @@ Examples:
         modules = INTEGRATION_TESTS
     elif args.unit:
         modules = UNIT_TESTS
+    elif args.pytest_class:
+        return run_pytest_class(PYTEST_CLASS_MAP[args.pytest_class])
 
     if not has_api_key and modules is None:
         modules = UNIT_TESTS
@@ -239,7 +325,11 @@ Examples:
     if args.tb:
         extra_args.extend(["--tb", args.tb])
 
-    exit_code = run_tests(modules=modules, extra_args=extra_args)
+    if args.parallel:
+        target = modules if modules is not None else TEST_MODULES
+        exit_code = run_tests_parallel(target, max_workers=args.jobs)
+    else:
+        exit_code = run_tests(modules=modules, extra_args=extra_args)
 
     print("\n" + "=" * 60)
     if exit_code == 0:
