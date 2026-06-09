@@ -43,7 +43,9 @@ async def create_echomind_example():
                 resources=ResourceConfig(
                     cpu="4",
                     memory="16Gi",
-                )
+                ),
+                execution_mode="manual",
+                custom_runtime_script_path="/scripts/custom.py"
             )
         )
         print(f"✓ EchoMind instance created successfully!")
@@ -58,6 +60,8 @@ async def create_echomind_example():
             print(f"  API Mode: {job.api_mode}")
             print(f"  Origin Model: {job.origin_model}")
             print(f"  Training Model: {job.training_model}")
+            print(f"  Execution Mode: {job.execution_mode}")
+            print(f"  Custom Runtime Script Path: {job.custom_runtime_script_path}")
             if job.secret_key:
                 print(f"  Secret Key: {job.secret_key[:8]}...")
         except Exception as e:
@@ -66,6 +70,8 @@ async def create_echomind_example():
         return job_id
         
     except PyroMindAPIError as e:
+        if e.status_code == 500:
+            raise
         print(f"✗ Failed to create EchoMind instance: {e.message}")
         if e.response:
             print(f"  Response: {e.response}")
@@ -92,6 +98,8 @@ async def list_echomind_example():
             print(f"    API Mode: {job.api_mode}")
             print(f"    Origin Model: {job.origin_model}")
             print(f"    Training Model: {job.training_model}")
+            print(f"    Execution Mode: {job.execution_mode}")
+            print(f"    Custom Runtime Script Path: {job.custom_runtime_script_path}")
             if job.resources:
                 print(f"    Resources:")
                 print(f"      CPU: {job.resources.cpu}")
@@ -100,6 +108,8 @@ async def list_echomind_example():
         return jobs
         
     except PyroMindAPIError as e:
+        if e.status_code == 500:
+            raise
         print(f"✗ Failed to list EchoMind instances: {e.message}")
         return []
     finally:
@@ -127,6 +137,8 @@ async def get_echomind_example(job_id: str):
         print(f"  Time Per Round: {job.time_per_round}")
         print(f"  Training Round: {job.training_round}")
         print(f"  Training Save Path: {job.training_save_path}")
+        print(f"  Execution Mode: {job.execution_mode}")
+        print(f"  Custom Runtime Script Path: {job.custom_runtime_script_path}")
         if job.secret_key:
             print(f"  Secret Key: {job.secret_key[:8]}...")
         if job.resources:
@@ -136,6 +148,8 @@ async def get_echomind_example(job_id: str):
         return job
         
     except PyroMindAPIError as e:
+        if e.status_code == 500:
+            raise
         print(f"✗ Failed to get EchoMind instance: {e.message}")
         return None
     finally:
@@ -166,7 +180,9 @@ async def update_echomind_example(job_id: str):
                 resources=ResourceConfig(
                     cpu="8",
                     memory="32Gi",
-                )
+                ),
+                execution_mode="manual",
+                custom_runtime_script_path="/scripts/custom.py"
             )
         )
         print(f"✓ EchoMind instance updated successfully!")
@@ -175,6 +191,8 @@ async def update_echomind_example(job_id: str):
         return job
         
     except PyroMindAPIError as e:
+        if e.status_code == 500:
+            raise
         print(f"✗ Failed to update EchoMind instance: {e.message}")
         return None
     finally:
@@ -194,6 +212,8 @@ async def pause_echomind_example(job_id: str):
         return job
         
     except PyroMindAPIError as e:
+        if e.status_code == 500:
+            raise
         print(f"✗ Failed to pause EchoMind instance: {e.message}")
         return None
     finally:
@@ -213,6 +233,8 @@ async def resume_echomind_example(job_id: str):
         return job
         
     except PyroMindAPIError as e:
+        if e.status_code == 500:
+            raise
         print(f"✗ Failed to resume EchoMind instance: {e.message}")
         return None
     finally:
@@ -230,6 +252,8 @@ async def delete_echomind_example(job_id: str):
         print(f"✓ EchoMind instance deleted successfully!")
         
     except PyroMindAPIError as e:
+        if e.status_code == 500:
+            raise
         print(f"✗ Failed to delete EchoMind instance: {e.message}")
     finally:
         await client.close()
