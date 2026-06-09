@@ -140,7 +140,7 @@ def calculate(input0: float, input1: float) -> dict:
 from pyromind_sdk import python_function_to_yaml
 
 config = python_function_to_yaml(
-    python_file_path="pyromind_sdk/examples/nodes/utils/calculator.py",
+    python_file_path="examples/nodes/utils/calculator.py",
     function_name="calculate",
     node_name="PythonCalculatorNode",
     output_path="pyromind_sdk/examples/nodes/python_calculator_node.generated.yaml",

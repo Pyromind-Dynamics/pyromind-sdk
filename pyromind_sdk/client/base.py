@@ -105,8 +105,8 @@ class PyroMindClient:
         api_key = api_key.strip()
 
         # Get base URL from parameter, environment variable, or use default
-        if base_url is None:
-            base_url = os.getenv(ENV_BASE_URL, DEFAULT_API_BASE_URL)
+        if not base_url:
+            base_url = os.getenv(ENV_BASE_URL) or DEFAULT_API_BASE_URL
 
         if not base_url:
             raise ValueError(
@@ -117,8 +117,8 @@ class PyroMindClient:
         self.base_url = base_url.rstrip('/')
 
         # Get cluster from parameter, environment variable, or use default
-        if cluster is None:
-            cluster = os.getenv(ENV_CLUSTER, DEFAULT_CLUSTER)
+        if not cluster:
+            cluster = os.getenv(ENV_CLUSTER) or DEFAULT_CLUSTER
         self.cluster = cluster
 
         self.timeout = timeout
