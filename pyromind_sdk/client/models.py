@@ -641,11 +641,20 @@ class ApiMode(str, Enum):
     ANTHROPIC = "anthropic"
 
 
+class ExecutionMode(str, Enum):
+    """Execution mode enumeration for EchoMind"""
+    MANUAL = "manual"
+    AUTOMATIC = "automatic"
+
+
 class EchoMindJobRequest(BaseModel):
     """Request model for creating/updating an EchoMind instance"""
     name: str
     api_url: str
-    api_mode: str = "openai"
+    api_mode: str = Field(
+        default="openai",
+        description=f"API mode, must be one of: {', '.join(m.value for m in ApiMode)}"
+    )
     origin_model: str
     access_key: str
     training_model: str
@@ -655,6 +664,11 @@ class EchoMindJobRequest(BaseModel):
     training_round: int
     training_save_path: str
     resources: Optional[ResourceConfig] = None
+    execution_mode: str = Field(
+        default="manual",
+        description=f"Execution mode, must be one of: {', '.join(m.value for m in ExecutionMode)}"
+    )
+    custom_runtime_script_path: Optional[str] = None   ## 自定义脚本地址
 
     @field_validator('api_mode', mode='before')
     @classmethod
@@ -700,6 +714,8 @@ class EchoMindJobResponse(BaseModel):
     secret_key: Optional[str] = None
     resources: Optional[ResourceConfig] = None
     created_at: Optional[Union[str, datetime]] = None
+    execution_mode: str = None
+    custom_runtime_script_path: Optional[str] = None   ## 自定义脚本地址
 
 
 class EchoMindJobListAPIResponse(BaseModel):

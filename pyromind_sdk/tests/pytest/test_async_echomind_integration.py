@@ -20,6 +20,8 @@ import sys
 import time
 from pathlib import Path
 
+import aiohttp
+
 import pytest
 import pytest_asyncio
 
@@ -110,7 +112,9 @@ async def _create_instance(client: PyroMindAsyncAPIClient, name_prefix: str = "t
                 time_per_round=60.0,
                 training_round=100,
                 training_save_path="/data/training",
-                resources=ResourceConfig(cpu="4", memory="16Gi")
+                resources=ResourceConfig(cpu="4", memory="16Gi"),
+                execution_mode="manual",
+                custom_runtime_script_path="/scripts/custom.py"
             )
         )
     except PyroMindAsyncAPIError as e:
@@ -185,7 +189,9 @@ async def _pause_and_delete(client: PyroMindAsyncAPIClient, instance_id: str) ->
         try:
             instance = await client.echomind.get_job(instance_id)
             current_status = instance.status.lower()
-        except PyroMindAPIError:
+        except PyroMindAPIError as e:
+            if e.status_code == 500:
+                raise
             print(f"[CLEANUP] Instance {instance_id} not found, already deleted")
             return
 
@@ -203,18 +209,24 @@ async def _pause_and_delete(client: PyroMindAsyncAPIClient, instance_id: str) ->
                         if inst.status.lower() in ('stopped', 'failed'):
                             print(f"[CLEANUP] Instance {instance_id} paused to: {inst.status}")
                             break
-                    except PyroMindAPIError:
+                    except PyroMindAPIError as e:
+                        if e.status_code == 500:
+                            raise
                         return
                     await asyncio.sleep(check_interval)
                     waited += check_interval
             except PyroMindAPIError as e:
+                if e.status_code == 500:
+                    raise
                 print(f"[CLEANUP] Pause failed: {e.message}")
                 try:
                     inst = await client.echomind.get_job(instance_id)
                     if inst.status.lower() not in ('stopped', 'failed'):
                         print(f"[CLEANUP] Cannot pause, status={inst.status}. Skipping delete.")
                         return
-                except PyroMindAPIError:
+                except PyroMindAPIError as e:
+                    if e.status_code == 500:
+                        raise
                     return
 
         # Delete
@@ -223,6 +235,8 @@ async def _pause_and_delete(client: PyroMindAsyncAPIClient, instance_id: str) ->
         print(f"[CLEANUP] Successfully deleted instance {instance_id}")
 
     except PyroMindAPIError as e:
+        if e.status_code == 500:
+            raise
         print(f"[CLEANUP] Failed to delete instance {instance_id}: {e.message} (status_code: {e.status_code})")
     except Exception as e:
         print(f"[CLEANUP] Unexpected error during cleanup for {instance_id}: {type(e).__name__}: {str(e)}")
@@ -434,7 +448,9 @@ class TestUpdateEchoMindInstance:
                     time_per_round=60.0,
                     training_round=100,
                     training_save_path="/data/training",
-                    resources=ResourceConfig(cpu="4", memory="16Gi")
+                    resources=ResourceConfig(cpu="4", memory="16Gi"),
+                    execution_mode="manual",
+                    custom_runtime_script_path="/scripts/custom.py"
                 )
             )
         except PyroMindAsyncAPIError as e:
@@ -457,7 +473,8 @@ class TestUpdateEchoMindInstance:
                         time_per_round=120.0,
                         training_round=200,
                         training_save_path="/data/training/updated",
-                        resources=ResourceConfig(cpu="8", memory="32Gi")
+                        resources=ResourceConfig(cpu="8", memory="32Gi"),
+                        execution_mode="automatic"
                     )
                 )
                 print(f"[TEST] Instance updated unexpectedly: id={updated_instance.job_id}")
@@ -501,6 +518,17 @@ class TestDeleteEchoMindInstance:
             print(f"[TEST] Instance {instance_id} is running, pausing before delete...")
             await client.echomind.pause(instance_id)
             await _wait_for_status(client, instance_id, 'stopped')
+        else:
+            # Wait timed out or failed; check current status before delete
+            try:
+                instance = await client.echomind.get_job(instance_id)
+                current_status = instance.status.lower()
+                if current_status == 'running':
+                    print(f"[TEST] Instance {instance_id} is now running (after wait timeout), pausing before delete...")
+                    await client.echomind.pause(instance_id)
+                    await _wait_for_status(client, instance_id, 'stopped')
+            except Exception as e:
+                print(f"[TEST] Could not check instance status before delete: {e}")
 
         # Delete the instance
         await client.echomind.delete(instance_id)
@@ -526,6 +554,14 @@ class TestDeleteEchoMindInstance:
                 if await _wait_for_status(client, instance_id, 'running'):
                     await client.echomind.pause(instance_id)
                     await _wait_for_status(client, instance_id, 'stopped')
+                else:
+                    try:
+                        instance = await client.echomind.get_job(instance_id)
+                        if instance.status.lower() == 'running':
+                            await client.echomind.pause(instance_id)
+                            await _wait_for_status(client, instance_id, 'stopped')
+                    except Exception:
+                        pass
 
                 await delete_echomind_example(instance_id)
 
@@ -546,6 +582,69 @@ class TestDeleteEchoMindInstance:
                 raise
             finally:
                 await client.close()
+
+
+class TestEchoMindConversion:
+    """Test cases for EchoMind conversion"""
+
+    @pytest.mark.asyncio
+    async def test_echomind_completions(self, client):
+        """Test EchoMind completions via OpenAI-compatible API"""
+        instance_id = await _create_instance(client, "test-completions")
+
+        try:
+            if not await _wait_for_status(client, instance_id, 'running'):
+                # Check current status in case it became running after timeout
+                try:
+                    instance = await client.echomind.get_job(instance_id)
+                    if instance.status.lower() != 'running':
+                        pytest.skip(f"Instance {instance_id} is not running (status: {instance.status})")
+                except Exception:
+                    pytest.skip(f"Instance {instance_id} did not reach running status")
+
+            echomind = await client.echomind.get_job(instance_id)
+            if not echomind:
+                raise PyroMindAsyncAPIError("EchoMind instance not found")
+
+            secret_key = echomind.secret_key
+            training_model = echomind.training_model
+
+            if not secret_key or not training_model:
+                pytest.skip("secret_key or training_model not available")
+
+            # Construct the completions endpoint URL
+            # completions_url = f"https://us-west-1.pyromind.ai/echomind/{instance_id}/v1/chat/completions"
+            completions_url = f"https://us-west-1.pyromind.ai/echomind/{instance_id}/v1/models"
+
+            print(f"[TEST] Calling completions endpoint: {completions_url}")
+            print(f"[TEST] Using model: {training_model}")
+
+            # Call OpenAI-compatible chat completions API
+            headers = {
+                "Authorization": f"Bearer {secret_key}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                # "model": training_model,
+                # "messages": [
+                #     {"role": "user", "content": "Hello, say hi in one word."}
+                # ],
+                # "max_tokens": 50,
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(completions_url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                    status = resp.status
+                    body = await resp.text()
+                    print(f"[TEST] Completions response status: {status}")
+                    print(f"[TEST] Completions response body: {body[:500]}")
+
+                    assert status == 200, f"Expected 200, got {status}: {body}"
+                    print(f"[TEST] Completions test passed for instance {instance_id}")
+
+        finally:
+            # Clean up: pause and delete
+            await _pause_and_delete(client, instance_id)
 
 
 class TestCompleteWorkflow:

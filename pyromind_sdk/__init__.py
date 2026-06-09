@@ -74,6 +74,7 @@ from .client import (
 # Export models
 from .client.models import (
     ApiMode,
+    ExecutionMode,
     EchoMindJobRequest,
     EchoMindJobResponse,
     ResourceConfig,
@@ -152,6 +153,7 @@ __all__ = [
     "PyroMindAsyncAPIClient",
     # Models
     "ApiMode",
+    "ExecutionMode",
     "EchoMindJobRequest",
     "EchoMindJobResponse",
     "ResourceConfig",
