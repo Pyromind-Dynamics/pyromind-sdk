@@ -74,16 +74,16 @@ class ResourceConfig(BaseModel):
 # Sandbox Models
 class SandboxType(str, Enum):
     """Sandbox type enumeration"""
-    LINUX = "code"
     WINDOWS = "win"
-    
+    OSWORLD = "osworld"
+
     @classmethod
     def from_api(cls, value: str) -> 'SandboxType':
         """Convert API value to SandboxType enum"""
         # Map old API values to new enum values
         mapping = {
-            'linux': 'code',
-            'windows': 'win'
+            'windows': 'win',
+            'osworld': 'osworld',
         }
         normalized = mapping.get(value, value)
         return cls(normalized)

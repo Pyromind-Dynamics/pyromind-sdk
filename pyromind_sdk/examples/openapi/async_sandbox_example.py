@@ -254,16 +254,164 @@ async def delete_sandbox_example(sandbox_id: str):
     """Example: Delete a sandbox (async)"""
     # API key is read from PYROMIND_API_KEY environment variable
     client = PyroMindAsyncAPIClient()
-    
+
     try:
         print(f"Deleting sandbox {sandbox_id}...")
         await client.sandboxes.delete(sandbox_id)
         print(f"✓ Sandbox deleted successfully!")
-        
+
     except PyroMindAPIError as e:
         print(f"✗ Failed to delete sandbox: {e.message}")
     finally:
         await client.close()
+
+
+# ---------------------------------------------------------------------------
+# OSWorld sandbox examples (async)
+# ---------------------------------------------------------------------------
+
+async def create_osworld_sandbox_example():
+    """Example: Create a new OSWorld sandbox (async)"""
+    client = PyroMindAsyncAPIClient()
+
+    try:
+        print("Creating a new OSWorld sandbox...")
+        sandbox = await client.sandboxes.create(
+            SandboxRequest(
+                name=f"osworld-sandbox-{int(time.time())}",
+                sandbox_type=SandboxType.OSWORLD,
+                # OSWorld template defaults to higher resources (CPU 8 / 16Gi)
+                resources=ResourceConfig(
+                    cpu="8",
+                    memory="16Gi",
+                    gpu=0,
+                ),
+                configuration=SandboxConfiguration(
+                    screen_resolution=ScreenResolution(
+                        width=1920,
+                        height=1080,
+                    )
+                ),
+            )
+        )
+        print(f"✓ OSWorld sandbox created successfully!")
+        print(f"  ID: {sandbox.id}")
+        print(f"  Name: {sandbox.name}")
+        print(f"  Type: {sandbox.type}")
+        print(f"  Status: {sandbox.status}")
+        return sandbox.id
+
+    except PyroMindAPIError as e:
+        print(f"✗ Failed to create OSWorld sandbox: {e.message}")
+        return None
+    except Exception as e:
+        print(f"✗ Failed to create OSWorld sandbox: {e}")
+        return None
+    finally:
+        await client.close()
+
+
+async def update_osworld_sandbox_example(sandbox_id: str):
+    """Example: Update an OSWorld sandbox (async)"""
+    client = PyroMindAsyncAPIClient()
+
+    try:
+        print(f"Updating OSWorld sandbox {sandbox_id}...")
+        updated_sandbox = await client.sandboxes.update(
+            sandbox_id=sandbox_id,
+            request=SandboxRequest(
+                name=f"updated-osworld-{int(time.time())}",
+                sandbox_type=SandboxType.OSWORLD,
+                resources=ResourceConfig(
+                    cpu="16",
+                    memory="32Gi",
+                    gpu=0,
+                ),
+                configuration=SandboxConfiguration(
+                    screen_resolution=ScreenResolution(
+                        width=2560,
+                        height=1440,
+                    )
+                ),
+            ),
+        )
+        print(f"✓ OSWorld sandbox updated successfully!")
+        print(f"  Name: {updated_sandbox.name}")
+        print(f"  Status: {updated_sandbox.status}")
+        return updated_sandbox
+
+    except PyroMindAPIError as e:
+        print(f"✗ Failed to update OSWorld sandbox: {e.message}")
+        return None
+    finally:
+        await client.close()
+
+
+async def pause_osworld_sandbox_example(sandbox_id: str):
+    """Example: Pause an OSWorld sandbox (async)"""
+    client = PyroMindAsyncAPIClient()
+    try:
+        print(f"Pausing OSWorld sandbox {sandbox_id}...")
+        sandbox = await client.sandboxes.pause(sandbox_id)
+        print(f"✓ OSWorld sandbox paused. Status: {sandbox.status}")
+        return sandbox
+    except PyroMindAPIError as e:
+        print(f"✗ Failed to pause OSWorld sandbox: {e.message}")
+        return None
+    finally:
+        await client.close()
+
+
+async def resume_osworld_sandbox_example(sandbox_id: str):
+    """Example: Resume an OSWorld sandbox (async)"""
+    client = PyroMindAsyncAPIClient()
+    try:
+        print(f"Resuming OSWorld sandbox {sandbox_id}...")
+        sandbox = await client.sandboxes.resume(sandbox_id)
+        print(f"✓ OSWorld sandbox resumed. Status: {sandbox.status}")
+        return sandbox
+    except PyroMindAPIError as e:
+        print(f"✗ Failed to resume OSWorld sandbox: {e.message}")
+        return None
+    finally:
+        await client.close()
+
+
+async def delete_osworld_sandbox_example(sandbox_id: str):
+    """Example: Delete an OSWorld sandbox (async)"""
+    client = PyroMindAsyncAPIClient()
+    try:
+        print(f"Deleting OSWorld sandbox {sandbox_id}...")
+        await client.sandboxes.delete(sandbox_id)
+        print(f"✓ OSWorld sandbox deleted successfully!")
+    except PyroMindAPIError as e:
+        print(f"✗ Failed to delete OSWorld sandbox: {e.message}")
+    finally:
+        await client.close()
+
+
+async def osworld_full_lifecycle_example():
+    """Full lifecycle demo for an OSWorld sandbox: create -> get -> pause ->
+    resume -> update -> delete (async)."""
+    print("-" * 60)
+    print("OSWorld Sandbox Lifecycle Demo (Async)")
+    print("-" * 60)
+
+    sandbox_id = await create_osworld_sandbox_example()
+    if not sandbox_id:
+        return
+
+    # Allow the sandbox to start before subsequent operations.
+    print("\nWaiting for OSWorld sandbox to be ready...")
+    await asyncio.sleep(5)
+
+    await get_sandbox_example(sandbox_id)
+    await pause_osworld_sandbox_example(sandbox_id)
+    await asyncio.sleep(2)
+    await resume_osworld_sandbox_example(sandbox_id)
+    await asyncio.sleep(2)
+    await update_osworld_sandbox_example(sandbox_id)
+    await delete_osworld_sandbox_example(sandbox_id)
 
 
 async def main():
