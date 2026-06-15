@@ -268,8 +268,19 @@ def delete_sandbox_example(sandbox_id: str):
 # OSWorld sandbox examples
 # ---------------------------------------------------------------------------
 
-def create_osworld_sandbox_example():
-    """Example: Create a new OSWorld sandbox"""
+# OSWorld 自定义系统镜像默认值（juicefs 上的相对路径 / subPath）。
+# 留空时服务端会回退到内部默认镜像；这里显式给个示例值供演示。
+DEFAULT_OSWORLD_SYSTEM_IMAGE_PATH = "template/Ubuntu.qcow2"
+
+
+def create_osworld_sandbox_example(system_image_path: str = DEFAULT_OSWORLD_SYSTEM_IMAGE_PATH):
+    """Example: Create a new OSWorld sandbox
+
+    Args:
+        system_image_path: 可选，OSWorld 自定义系统镜像的 juicefs subPath。
+            未提供时使用 :data:`DEFAULT_OSWORLD_SYSTEM_IMAGE_PATH`，
+            置 ``None`` 则交由服务端使用内部默认镜像。
+    """
     client = PyroMindAPIClient()
 
     try:
@@ -288,7 +299,8 @@ def create_osworld_sandbox_example():
                     screen_resolution=ScreenResolution(
                         width=1920,
                         height=1080,
-                    )
+                    ),
+                    system_image_path=system_image_path,
                 ),
             )
         )
@@ -309,8 +321,16 @@ def create_osworld_sandbox_example():
         client.close()
 
 
-def update_osworld_sandbox_example(sandbox_id: str):
-    """Example: Update an OSWorld sandbox"""
+def update_osworld_sandbox_example(
+    sandbox_id: str,
+    system_image_path: str = DEFAULT_OSWORLD_SYSTEM_IMAGE_PATH,
+):
+    """Example: Update an OSWorld sandbox
+
+    Args:
+        sandbox_id: 要更新的 OSWorld sandbox ID。
+        system_image_path: 可选，OSWorld 自定义系统镜像的 juicefs subPath。
+    """
     client = PyroMindAPIClient()
 
     try:
@@ -329,7 +349,8 @@ def update_osworld_sandbox_example(sandbox_id: str):
                     screen_resolution=ScreenResolution(
                         width=2560,
                         height=1440,
-                    )
+                    ),
+                    system_image_path=system_image_path,
                 ),
             ),
         )

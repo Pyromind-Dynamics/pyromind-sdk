@@ -18,6 +18,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -120,17 +121,25 @@ def _create_sandbox(
     memory: str = "8Gi",
     width: int = 1920,
     height: int = 1080,
+    system_image_path: Optional[str] = None,
 ) -> SandboxResponse:
-    """Create a sandbox of the requested type and return the response."""
+    """Create a sandbox of the requested type and return the response.
+
+    ``system_image_path`` is OSWorld-only; it is ignored when ``None`` and
+    forwarded as a configuration field otherwise.
+    """
+    config_kwargs = {
+        "screen_resolution": ScreenResolution(width=width, height=height),
+    }
+    if system_image_path is not None:
+        config_kwargs["system_image_path"] = system_image_path
     try:
         sandbox = client.sandboxes.create(
             SandboxRequest(
                 name=f"{name_prefix}-{int(time.time())}",
                 sandbox_type=sandbox_type,
                 resources=ResourceConfig(cpu=cpu, memory=memory, gpu=0),
-                configuration=SandboxConfiguration(
-                    screen_resolution=ScreenResolution(width=width, height=height),
-                ),
+                configuration=SandboxConfiguration(**config_kwargs),
             )
         )
     except PyroMindAPIError as e:
@@ -742,12 +751,15 @@ class TestCompleteWorkflow:
 # OSWorld sandboxes have a much longer boot time (~120s readiness probe).
 OSWORLD_BOOT_TIMEOUT = 600
 
+# OSWorld 自定义系统镜像默认值（juicefs subPath）。与示例保持一致。
+OSWORLD_SYSTEM_IMAGE_PATH = "template/Ubuntu.qcow2"
+
 
 class TestCreateOSWorldSandbox:
     """Test cases for creating OSWorld sandboxes"""
 
     def test_create_osworld_sandbox(self, client):
-        """Test creating an OSWorld sandbox directly via the client."""
+        """Test creating an OSWorld sandbox directly via the client (with system_image_path)."""
         sandbox_name = f"test-create-osworld-{int(time.time())}"
         print(f"[TEST] Creating OSWorld sandbox with name: {sandbox_name}")
         try:
@@ -758,6 +770,7 @@ class TestCreateOSWorldSandbox:
                     resources=ResourceConfig(cpu="8", memory="16Gi", gpu=0),
                     configuration=SandboxConfiguration(
                         screen_resolution=ScreenResolution(width=1920, height=1080),
+                        system_image_path=OSWORLD_SYSTEM_IMAGE_PATH,
                     ),
                 )
             )
@@ -775,6 +788,28 @@ class TestCreateOSWorldSandbox:
             )
             assert sb_type_value == SandboxType.OSWORLD.value, (
                 f"Expected osworld, got {sb_type_value}"
+            )
+        finally:
+            _pause_and_delete(client, sandbox.id)
+
+    def test_create_osworld_sandbox_with_system_image_path_roundtrip(self, client):
+        """Verify system_image_path is preserved when retrieving the sandbox."""
+        sandbox = _create_sandbox(
+            client,
+            "test-osworld-imgpath",
+            sandbox_type=SandboxType.OSWORLD,
+            cpu="8",
+            memory="16Gi",
+            system_image_path=OSWORLD_SYSTEM_IMAGE_PATH,
+        )
+        try:
+            retrieved = client.sandboxes.get_sandbox(sandbox.id)
+            cfg = retrieved.configuration
+            cfg_dict = cfg.dict() if hasattr(cfg, "dict") else (cfg or {})
+            print(f"[TEST] Retrieved configuration: {cfg_dict}")
+            assert cfg_dict.get("system_image_path") == OSWORLD_SYSTEM_IMAGE_PATH, (
+                f"Expected system_image_path={OSWORLD_SYSTEM_IMAGE_PATH}, got "
+                f"{cfg_dict.get('system_image_path')}"
             )
         finally:
             _pause_and_delete(client, sandbox.id)

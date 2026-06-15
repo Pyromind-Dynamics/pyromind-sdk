@@ -270,8 +270,19 @@ async def delete_sandbox_example(sandbox_id: str):
 # OSWorld sandbox examples (async)
 # ---------------------------------------------------------------------------
 
-async def create_osworld_sandbox_example():
-    """Example: Create a new OSWorld sandbox (async)"""
+# OSWorld 自定义系统镜像默认值（juicefs 上的相对路径 / subPath）。
+# 留空时服务端会回退到内部默认镜像；这里显式给个示例值供演示。
+DEFAULT_OSWORLD_SYSTEM_IMAGE_PATH = "template/Ubuntu.qcow2"
+
+
+async def create_osworld_sandbox_example(system_image_path: str = DEFAULT_OSWORLD_SYSTEM_IMAGE_PATH):
+    """Example: Create a new OSWorld sandbox (async)
+
+    Args:
+        system_image_path: 可选，OSWorld 自定义系统镜像的 juicefs subPath。
+            未提供时使用 :data:`DEFAULT_OSWORLD_SYSTEM_IMAGE_PATH`，
+            置 ``None`` 则交由服务端使用内部默认镜像。
+    """
     client = PyroMindAsyncAPIClient()
 
     try:
@@ -290,7 +301,8 @@ async def create_osworld_sandbox_example():
                     screen_resolution=ScreenResolution(
                         width=1920,
                         height=1080,
-                    )
+                    ),
+                    system_image_path=system_image_path,
                 ),
             )
         )
@@ -311,8 +323,16 @@ async def create_osworld_sandbox_example():
         await client.close()
 
 
-async def update_osworld_sandbox_example(sandbox_id: str):
-    """Example: Update an OSWorld sandbox (async)"""
+async def update_osworld_sandbox_example(
+    sandbox_id: str,
+    system_image_path: str = DEFAULT_OSWORLD_SYSTEM_IMAGE_PATH,
+):
+    """Example: Update an OSWorld sandbox (async)
+
+    Args:
+        sandbox_id: 要更新的 OSWorld sandbox ID。
+        system_image_path: 可选，OSWorld 自定义系统镜像的 juicefs subPath。
+    """
     client = PyroMindAsyncAPIClient()
 
     try:
@@ -331,7 +351,8 @@ async def update_osworld_sandbox_example(sandbox_id: str):
                     screen_resolution=ScreenResolution(
                         width=2560,
                         height=1440,
-                    )
+                    ),
+                    system_image_path=system_image_path,
                 ),
             ),
         )
