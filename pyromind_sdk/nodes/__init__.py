@@ -17,6 +17,7 @@ from .yaml_loader import (
     validate_command_template,
     parse_input_type,
     parse_parameters,
+    validate_parameter_order,
 )
 from .python_to_yaml import (
     convert_node_class_to_yaml,

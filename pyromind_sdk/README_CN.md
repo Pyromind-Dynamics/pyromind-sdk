@@ -57,6 +57,8 @@ parameters:
     type: "output"
 ```
 
+> **参数顺序要求**：`parameters` 列表中，`required_type: "required"` 的参数必须排在 `required_type: "optional"` 的参数之前，否则加载时会抛出验证错误。
+
 ## 主要类
 
 ### 基础节点类

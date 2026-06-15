@@ -463,7 +463,24 @@ def _validate_default_for_dtype(
         )
 
 
-def parse_parameters(parameters: List[Dict[str, Any]]) -> Dict[str, Any]:
+def validate_parameter_order(parameters: List[Dict[str, Any]], yaml_file_path: str = "") -> None:
+    """Validate that required parameters appear before optional parameters in the YAML."""
+    seen_optional = False
+    for i, param in enumerate(parameters):
+        name = param.get("name", f"index {i}")
+        required_type = param.get("required_type", "required")
+        if required_type == "required":
+            if seen_optional:
+                loc = f" in {yaml_file_path}" if yaml_file_path else ""
+                raise ValueError(
+                    f"Required parameter '{name}' must appear before optional parameters{loc}. "
+                    f"Move '{name}' above all optional parameters."
+                )
+        else:
+            seen_optional = True
+
+
+def parse_parameters(parameters: List[Dict[str, Any]], yaml_file_path: str = "") -> Dict[str, Any]:
     """
     Parse unified parameters format.
 
@@ -498,6 +515,9 @@ def parse_parameters(parameters: List[Dict[str, Any]]) -> Dict[str, Any]:
         raise ValueError(
             f"Too many parameters: {len(parameters)} > {MAX_PARAMETER_COUNT}"
         )
+
+    # Validate parameter ordering: required before optional
+    validate_parameter_order(parameters, yaml_file_path or "")
 
     inputs_required = {}
     inputs_optional = {}
@@ -705,7 +725,7 @@ def create_node_class_from_yaml(
         )
 
     # New format: Uses unified parameters
-    parsed = parse_parameters(yaml_config["parameters"])
+    parsed = parse_parameters(yaml_config["parameters"], yaml_file_path or "")
     inputs_config = parsed["inputs"]
     return_types = parsed["return_types"]
     return_names = parsed["return_names"]
