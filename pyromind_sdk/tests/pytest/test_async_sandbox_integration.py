@@ -133,21 +133,21 @@ async def _create_sandbox(
     """Create a sandbox of the requested type and return the response.
 
     ``system_image_path`` is OSWorld-only; it is ignored when ``None`` and
-    forwarded as a configuration field otherwise.
+    forwarded as a top-level request field otherwise.
     """
-    config_kwargs = {
-        "screen_resolution": ScreenResolution(width=width, height=height),
+    request_kwargs = {
+        "name": f"{name_prefix}-{int(time.time())}",
+        "sandbox_type": sandbox_type,
+        "resources": ResourceConfig(cpu=cpu, memory=memory, gpu=0),
+        "configuration": SandboxConfiguration(
+            screen_resolution=ScreenResolution(width=width, height=height),
+        ),
     }
     if system_image_path is not None:
-        config_kwargs["system_image_path"] = system_image_path
+        request_kwargs["system_image_path"] = system_image_path
     try:
         sandbox = await client.sandboxes.create(
-            SandboxRequest(
-                name=f"{name_prefix}-{int(time.time())}",
-                sandbox_type=sandbox_type,
-                resources=ResourceConfig(cpu=cpu, memory=memory, gpu=0),
-                configuration=SandboxConfiguration(**config_kwargs),
-            )
+            SandboxRequest(**request_kwargs)
         )
     except ANY_API_ERROR as e:
         skip_if_insufficient_resources(e)
@@ -696,8 +696,8 @@ class TestCreateOSWorldSandbox:
                     resources=ResourceConfig(cpu="8", memory="16Gi", gpu=0),
                     configuration=SandboxConfiguration(
                         screen_resolution=ScreenResolution(width=1920, height=1080),
-                        system_image_path=OSWORLD_SYSTEM_IMAGE_PATH,
                     ),
+                    system_image_path=OSWORLD_SYSTEM_IMAGE_PATH,
                 )
             )
         except ANY_API_ERROR as e:
@@ -747,12 +747,10 @@ class TestCreateOSWorldSandbox:
         )
         try:
             retrieved = await client.sandboxes.get_sandbox(sandbox.id)
-            cfg = retrieved.configuration
-            cfg_dict = cfg.dict() if hasattr(cfg, "dict") else (cfg or {})
-            print(f"[TEST] Retrieved configuration: {cfg_dict}")
-            assert cfg_dict.get("system_image_path") == OSWORLD_SYSTEM_IMAGE_PATH, (
+            print(f"[TEST] Retrieved system_image_path: {retrieved.system_image_path}")
+            assert retrieved.system_image_path == OSWORLD_SYSTEM_IMAGE_PATH, (
                 f"Expected system_image_path={OSWORLD_SYSTEM_IMAGE_PATH}, got "
-                f"{cfg_dict.get('system_image_path')}"
+                f"{retrieved.system_image_path}"
             )
         finally:
             await _pause_and_delete(client, sandbox.id)

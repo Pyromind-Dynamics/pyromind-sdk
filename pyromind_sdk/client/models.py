@@ -110,9 +110,6 @@ class SandboxConfiguration(BaseModel):
     screen_resolution: Optional[ScreenResolution] = None
     auto_destroy: Optional[bool] = True
     vnc_password: Optional[str] = None
-    # OSWorld 专用：自定义系统镜像在 juicefs 上的相对路径（subPath）。
-    # 仅 sandbox_type=OSWORLD 时生效；未提供时服务端使用默认镜像 (template/Ubuntu.qcow2)。
-    system_image_path: Optional[str] = None
 
 
 class SandboxRequest(BaseModel):
@@ -121,6 +118,9 @@ class SandboxRequest(BaseModel):
     resources: Optional[ResourceConfig] = None
     configuration: Optional[SandboxConfiguration] = None
     name: Optional[str] = None
+    # OSWorld 专用：自定义系统镜像在 juicefs 上的相对路径（subPath）。
+    # 仅 sandbox_type=OSWORLD 时生效；未提供时服务端使用默认镜像。
+    system_image_path: Optional[str] = None
 
 
 class SandboxUsage(BaseModel):
@@ -150,6 +150,8 @@ class SandboxResponse(BaseModel):
     endpoint: Optional[str] = None
     screen_size: Optional[ScreenResolution] = None
     last_activity: Optional[datetime] = None
+    # OSWorld 专用：自定义系统镜像在 juicefs 上的相对路径（subPath）
+    system_image_path: Optional[str] = None
 
 
 

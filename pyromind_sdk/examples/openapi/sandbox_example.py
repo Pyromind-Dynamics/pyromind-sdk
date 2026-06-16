@@ -300,8 +300,8 @@ def create_osworld_sandbox_example(system_image_path: str = DEFAULT_OSWORLD_SYST
                         width=1920,
                         height=1080,
                     ),
-                    system_image_path=system_image_path,
                 ),
+                system_image_path=system_image_path,
             )
         )
         print(f"✓ OSWorld sandbox created successfully!")
@@ -350,8 +350,8 @@ def update_osworld_sandbox_example(
                         width=2560,
                         height=1440,
                     ),
-                    system_image_path=system_image_path,
                 ),
+                system_image_path=system_image_path,
             ),
         )
         print(f"✓ OSWorld sandbox updated successfully!")
