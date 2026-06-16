@@ -850,6 +850,11 @@ def create_node_class_from_yaml(
             environment = yaml_config.get("environment")
 
             # Build command template
+            # If GpuPodExecutionNode and accelerate mode, pass gpu_count placeholder
+            # so accelerate launch uses --num_processes matching the requested GPU count.
+            gpu_count = None
+            if is_accelerate_mode and "GpuPodExecutionNode" in base_class_names:
+                gpu_count = "{{gpu_count}}"
             command_template = build_command_template(
                 python_code=resolved_python_code,
                 function_name=function_name,
@@ -860,6 +865,7 @@ def create_node_class_from_yaml(
                 conda_env=conda_env,
                 workdir=workdir,
                 environment=environment,
+                gpu_count=gpu_count,
             )
             class_dict["COMMAND_TEMPLATE"] = command_template
 
