@@ -463,7 +463,30 @@ def _validate_default_for_dtype(
         )
 
 
-def parse_parameters(parameters: List[Dict[str, Any]]) -> Dict[str, Any]:
+def validate_parameter_order(parameters: List[Dict[str, Any]], yaml_file_path: str = "", strict: bool = True) -> None:
+    """Validate that required parameters appear before optional parameters in the YAML."""
+    seen_optional = False
+    for i, param in enumerate(parameters):
+        name = param.get("name", f"index {i}")
+        if param.get("type", "input") == "output":
+            continue
+        required_type = param.get("required_type", "required")
+        if required_type == "required":
+            if seen_optional:
+                loc = f" in {yaml_file_path}" if yaml_file_path else ""
+                if strict:
+                    raise ValueError(
+                        f"Required parameter '{name}' must appear before optional parameters{loc}. "
+                        f"Move '{name}' above all optional parameters."
+                    )
+                logger.warning(
+                    f"Parameter ordering: required '{name}' appears after optional parameters{loc}"
+                )
+        else:
+            seen_optional = True
+
+
+def parse_parameters(parameters: List[Dict[str, Any]], yaml_file_path: str = "", strict: bool = True) -> Dict[str, Any]:
     """
     Parse unified parameters format.
 
@@ -498,6 +521,9 @@ def parse_parameters(parameters: List[Dict[str, Any]]) -> Dict[str, Any]:
         raise ValueError(
             f"Too many parameters: {len(parameters)} > {MAX_PARAMETER_COUNT}"
         )
+
+    # Validate parameter ordering: required before optional
+    validate_parameter_order(parameters, yaml_file_path or "", strict=strict)
 
     inputs_required = {}
     inputs_optional = {}
@@ -646,7 +672,8 @@ def parse_parameters(parameters: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def create_node_class_from_yaml(
-    yaml_config: Dict[str, Any], class_name: str, yaml_file_path: Optional[str] = None
+    yaml_config: Dict[str, Any], class_name: str, yaml_file_path: Optional[str] = None,
+    strict: bool = True,
 ) -> type:
     """
     Create node class from YAML configuration
@@ -705,7 +732,7 @@ def create_node_class_from_yaml(
         )
 
     # New format: Uses unified parameters
-    parsed = parse_parameters(yaml_config["parameters"])
+    parsed = parse_parameters(yaml_config["parameters"], yaml_file_path or "", strict=strict)
     inputs_config = parsed["inputs"]
     return_types = parsed["return_types"]
     return_names = parsed["return_names"]
@@ -830,6 +857,11 @@ def create_node_class_from_yaml(
             environment = yaml_config.get("environment")
 
             # Build command template
+            # If GpuPodExecutionNode and accelerate mode, pass gpu_count placeholder
+            # so accelerate launch uses --num_processes matching the requested GPU count.
+            gpu_count = None
+            if is_accelerate_mode and "GpuPodExecutionNode" in base_class_names:
+                gpu_count = "{{gpu_count}}"
             command_template = build_command_template(
                 python_code=resolved_python_code,
                 function_name=function_name,
@@ -840,6 +872,7 @@ def create_node_class_from_yaml(
                 conda_env=conda_env,
                 workdir=workdir,
                 environment=environment,
+                gpu_count=gpu_count,
             )
             class_dict["COMMAND_TEMPLATE"] = command_template
 
