@@ -257,8 +257,16 @@ def build_command_template(
         )
 
     bash_commands.extend(heredoc_commands)
+    # TODO 临时安装sdk
+    # 4. Install pyromind-sdk if not available (skip for accelerate mode)
+    python_exec = (python_command or "python3").strip()
+    if python_exec != "accelerate":
+        bash_commands.append(
+            f"{python_exec} -c \"import pyromind_sdk\" 2>/dev/null || "
+            f"{python_exec} -m pip install pyromind-sdk -q"
+        )
 
-    # 4. Execute wrapper command
+    # 5. Execute wrapper command
     wrapper_cmd_full = " ".join([wrapper_cmd] + wrapper_args)
     bash_commands.append(wrapper_cmd_full)
     
