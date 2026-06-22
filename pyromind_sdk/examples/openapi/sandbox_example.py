@@ -82,8 +82,8 @@ def update_sandbox_example(sandbox_id: str):
                 ),
                 configuration=SandboxConfiguration(
                     screen_resolution=ScreenResolution(
-                        width=2560,
-                        height=1440
+                        width=1920,
+                        height=1080
                     )
                 ),
                 sandbox_type=SandboxType.WINDOWS
@@ -347,8 +347,8 @@ def update_osworld_sandbox_example(
                 ),
                 configuration=SandboxConfiguration(
                     screen_resolution=ScreenResolution(
-                        width=2560,
-                        height=1440,
+                        width=1920,
+                        height=1080,
                     ),
                 ),
                 system_image_path=system_image_path,

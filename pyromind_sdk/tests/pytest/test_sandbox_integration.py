@@ -421,7 +421,7 @@ class TestUpdateSandbox:
                     sandbox_type=SandboxType.WINDOWS,
                     resources=ResourceConfig(cpu="6", memory="12Gi", gpu=0),
                     configuration=SandboxConfiguration(
-                        screen_resolution=ScreenResolution(width=2560, height=1440),
+                        screen_resolution=ScreenResolution(width=1920, height=1080),
                     ),
                 ),
             )
@@ -452,7 +452,7 @@ class TestUpdateSandbox:
                         sandbox_type=SandboxType.WINDOWS,
                         resources=ResourceConfig(cpu="4", memory="8Gi", gpu=0),
                         configuration=SandboxConfiguration(
-                            screen_resolution=ScreenResolution(width=2560, height=1440),
+                            screen_resolution=ScreenResolution(width=1920, height=1080),
                         ),
                     ),
                 )
