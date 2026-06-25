@@ -4,7 +4,7 @@ YAML node configuration system
 Provides functionality for loading nodes from YAML configuration files.
 """
 ## todo update_version
-__version__ = "0.1.4.rc4"
+__version__ = "0.1.4.rc5"
 
 from .yaml_loader import (
     load_nodes_from_yaml,
@@ -17,6 +17,7 @@ from .yaml_loader import (
     validate_command_template,
     parse_input_type,
     parse_parameters,
+    validate_parameter_order,
 )
 from .python_to_yaml import (
     convert_node_class_to_yaml,

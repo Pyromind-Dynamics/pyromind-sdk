@@ -47,6 +47,7 @@ def _build_wrapper_command(
     python_command: str,
     wrapper_module: str,
     accelerate_config_file: Optional[str] = None,
+    num_processes: Optional[str] = None,
 ) -> str:
     """
     Build wrapper invocation command.
@@ -67,7 +68,11 @@ def _build_wrapper_command(
         cfg_escaped = shlex.quote(accelerate_config_file)
         # `accelerate launch` already chooses the Python executable. Passing an
         # extra `python` token makes it treated as a script path and fails.
-        return f"accelerate launch --config_file {cfg_escaped} -m {wrapper_module}"
+        cmd = f"accelerate launch"
+        if num_processes:
+            cmd += f" --num_processes {num_processes}"
+        cmd += f" --config_file {cfg_escaped} -m {wrapper_module}"
+        return cmd
     return f"{python_command_stripped} -m {wrapper_module}"
 
 
@@ -81,6 +86,7 @@ def build_command_template(
     conda_env: Optional[str] = None,
     workdir: Optional[str] = None,
     environment: Optional[Dict[str, str]] = None,
+    gpu_count: Optional[str] = None,
 ) -> List[str]:
     """
     Build complete COMMAND_TEMPLATE
@@ -97,6 +103,7 @@ def build_command_template(
         conda_env: Conda environment name (optional)
         workdir: Working directory (optional)
         environment: Environment variable dictionary (optional)
+        gpu_count: GPU count placeholder (optional, used for accelerate --num_processes)
         
     Returns:
         COMMAND_TEMPLATE list
@@ -115,10 +122,12 @@ def build_command_template(
         # Reuse generic /tmp/<input_name> heredoc path to avoid duplicate config writes.
         accelerate_config_path = f"/tmp/{accelerate_input_name}"
 
+    is_accelerate = (python_command or "").strip() == "accelerate"
     wrapper_cmd = _build_wrapper_command(
         python_command=python_command,
         wrapper_module=wrapper_module,
         accelerate_config_file=accelerate_config_path,
+        num_processes=gpu_count if is_accelerate and gpu_count else None,
     )
     
     # Build output path dictionary (using placeholders)
@@ -248,8 +257,16 @@ def build_command_template(
         )
 
     bash_commands.extend(heredoc_commands)
+    # TODO 临时安装sdk
+    # 4. Install pyromind-sdk if not available (skip for accelerate mode)
+    python_exec = (python_command or "python3").strip()
+    if python_exec != "accelerate":
+        bash_commands.append(
+            f"{python_exec} -c \"import pyromind_sdk\" 2>/dev/null || "
+            f"{python_exec} -m pip install pyromind-sdk -q"
+        )
 
-    # 4. Execute wrapper command
+    # 5. Execute wrapper command
     wrapper_cmd_full = " ".join([wrapper_cmd] + wrapper_args)
     bash_commands.append(wrapper_cmd_full)
     
