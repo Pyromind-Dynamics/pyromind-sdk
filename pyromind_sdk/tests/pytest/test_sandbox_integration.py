@@ -64,16 +64,6 @@ spec = importlib.util.spec_from_file_location(
 sandbox_example = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sandbox_example)
 
-# Import functions from the module (Windows sandbox helpers)
-create_sandbox_example = sandbox_example.create_sandbox_example
-list_sandboxes_example = sandbox_example.list_sandboxes_example
-get_sandbox_example = sandbox_example.get_sandbox_example
-update_sandbox_example = sandbox_example.update_sandbox_example
-execute_action_example = sandbox_example.execute_action_example
-get_vnc_example = sandbox_example.get_vnc_example
-delete_sandbox_example = sandbox_example.delete_sandbox_example
-pause_sandbox_example = sandbox_example.pause_sandbox_example
-resume_sandbox_example = sandbox_example.resume_sandbox_example
 # OSWorld example helpers
 create_osworld_sandbox_example = sandbox_example.create_osworld_sandbox_example
 update_osworld_sandbox_example = sandbox_example.update_osworld_sandbox_example
@@ -116,7 +106,7 @@ def client(api_key, base_url):
 def _create_sandbox(
     client: PyroMindAPIClient,
     name_prefix: str = "test",
-    sandbox_type: SandboxType = SandboxType.WINDOWS,
+    sandbox_type: SandboxType = SandboxType.OSWORLD,
     cpu: str = "4",
     memory: str = "8Gi",
     width: int = 1920,
