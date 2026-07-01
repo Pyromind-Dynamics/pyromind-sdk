@@ -134,7 +134,7 @@ def complete_workflow():
                         model_length=4096,
                         inference_framework=selected_framework,
                         inf_image=selected_image,
-                        startup_args=["--max-model-len", "8192"],
+                        startup_args=[{"--max-model-len": 8192}],
                         resources=ResourceConfig(cpu="4", memory="32Gi", gpu=1, gpu_card="L40S"),
                     )
                 )

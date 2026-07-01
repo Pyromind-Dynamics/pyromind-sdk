@@ -280,6 +280,57 @@ class JupyterAPIResponse(BaseModel):
 
 
 # Inference Models
+def _normalize_startup_arg_key(key: Any) -> str:
+    return str(key or "").strip()
+
+
+def _normalize_startup_arg_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if text else None
+
+
+def _normalize_startup_args(value: Any) -> Optional[List[str]]:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        value = [value]
+    if not isinstance(value, list):
+        raise ValueError("startup_args must be a list")
+
+    args: List[str] = []
+    for item in value:
+        if item is None:
+            continue
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                args.append(text)
+            continue
+        if isinstance(item, dict):
+            if any(key in item for key in ("key", "name", "arg", "value")):
+                key = _normalize_startup_arg_key(item.get("key") or item.get("name") or item.get("arg"))
+                arg_value = _normalize_startup_arg_value(item.get("value"))
+                if not key:
+                    continue
+                args.append(key)
+                if arg_value is not None:
+                    args.append(arg_value)
+                continue
+            for raw_key, raw_value in item.items():
+                key = _normalize_startup_arg_key(raw_key)
+                arg_value = _normalize_startup_arg_value(raw_value)
+                if not key:
+                    continue
+                args.append(key)
+                if arg_value is not None:
+                    args.append(arg_value)
+            continue
+        raise ValueError("startup_args items must be strings or dictionaries")
+    return args
+
+
 class InferenceJobRequest(BaseModel):
     """
     Request model for creating an inference job
@@ -293,7 +344,12 @@ class InferenceJobRequest(BaseModel):
     inf_image: Optional[str] = None
     model_name: Optional[str] = None
     model_length: Optional[int] = None
-    startup_args: Optional[List[str]] = None
+    startup_args: Optional[List[Union[str, Dict[str, Any]]]] = None
+
+    @field_validator("startup_args", mode="before")
+    @classmethod
+    def validate_startup_args(cls, value: Any) -> Optional[List[str]]:
+        return _normalize_startup_args(value)
 
 
 

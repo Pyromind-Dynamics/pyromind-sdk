@@ -57,7 +57,7 @@ def create_inference_job_example():
                 model_length=4096,
                 inference_framework=selected_framework,
                 inf_image=selected_image,
-                startup_args=["--max-model-len", "8192"],
+                startup_args=[{"--max-model-len": 8192}],
                 resources=ResourceConfig(
                     cpu="4",
                     memory="32Gi",
@@ -189,7 +189,7 @@ def update_inference_job_example(job_id: str):
                 model_length=4096,
                 inference_framework=selected_framework,
                 inf_image=selected_image,
-                startup_args=["--max-model-len", "8192"],
+                startup_args=[{"--max-model-len": 8192}],
                 resources=ResourceConfig(
                     cpu="4",
                     memory="32Gi",
