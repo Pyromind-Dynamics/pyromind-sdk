@@ -210,6 +210,7 @@ print(f"Jupyter ID: {jupyter.id}, URL: {jupyter.url}")
 | `inf_image` | 否 | `str` | 推理镜像（通过 `get_inf_image()` 获取） |
 | `model_name` | 否 | `str` | 模型名称覆盖 |
 | `model_length` | 否 | `int` | 模型上下文长度 |
+| `startup_args` | 否 | `List[str]` | 自定义推理服务启动参数；与系统默认参数重复时以用户参数为准 |
 
 **示例：**
 
@@ -226,6 +227,7 @@ job_id = client.inference.create(
         model_path="/path/to/model",
         inference_framework=frameworks[0],
         resources=ResourceConfig(cpu="8", memory="32Gi", gpu="1", gpu_card="H100"),
+        startup_args=["--trust-remote-code", "--max-model-len", "8192"],
         name="my-inference"
     )
 )

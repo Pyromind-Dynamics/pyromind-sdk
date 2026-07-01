@@ -316,6 +316,7 @@ job_id = client.inference.create(
             gpu=1,
             gpu_card="L40S"
         ),
+        startup_args=["--trust-remote-code", "--max-model-len", "8192"],
         name=f"example-inference-{int(time.time())}",
         environment_variables={
             "MODEL_PATH": "/workspace/models/Qwen/Qwen3-0.6B/",

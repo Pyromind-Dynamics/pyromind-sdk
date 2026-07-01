@@ -124,8 +124,10 @@ async def _create_job(client: PyroMindAsyncAPIClient, name_prefix: str = "test")
                 name=name,
                 model_path="/workspace/models/Qwen/Qwen3-0.6B/",
                 model_name="glm-5",
+                model_length=4096,
                 inference_framework=framework,
                 inf_image=image,
+                startup_args=["--max-model-len", "8192"],
                 resources=ResourceConfig(cpu="4", memory="32Gi", gpu=1, gpu_card="L40S")
             )
         )
@@ -364,8 +366,10 @@ class TestUpdateInferenceJob:
                 InferenceJobRequest(
                     model_path="/workspace/models/Qwen/Qwen3-0.6B/",
                     model_name="glm-5",
+                    model_length=4096,
                     inference_framework=framework,
                     inf_image=image,
+                    startup_args=["--max-model-len", "8192"],
                     resources=ResourceConfig(cpu="4", memory="64Gi", gpu=1, gpu_card="L40S"),
                     name=f"pending-inference-example-{int(time.time())}"
                 )
@@ -380,8 +384,10 @@ class TestUpdateInferenceJob:
                 request=InferenceJobRequest(
                     model_path="/workspace/models/Qwen/Qwen3-0.6B/",
                     model_name="glm-5",
+                    model_length=4096,
                     inference_framework=framework,
                     inf_image=image,
+                    startup_args=["--max-model-len", "8192"],
                     resources=ResourceConfig(cpu="4", memory="64Gi", gpu=9, gpu_card="H100"),
                     name=f"updated-inference-example-{int(time.time())}"
                 )

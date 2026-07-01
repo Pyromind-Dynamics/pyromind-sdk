@@ -117,19 +117,34 @@ def complete_workflow():
         # Step 4: Create an inference job
         print("\n[Step 4] Creating inference job...")
         try:
-            inference_job = client.inference.create(
-                InferenceJobRequest(
-                    name="ml-inference-job",
-                    model_path="/models/trained-model",
-                    image="pytorch/pytorch:latest",
-                    resources=ResourceConfig(cpu="4", memory="8Gi", gpu=1),
-                    endpoint_url="https://api.example.com/inference"
+            frameworks = client.inference.get_framework()
+            selected_framework = frameworks[0] if frameworks else None
+            images = client.inference.get_inf_image(selected_framework) if selected_framework else []
+            selected_image = images[0] if images else None
+
+            if not selected_framework or not selected_image:
+                print("✗ Failed to create inference job: no available framework or image")
+                inference_job_id = None
+            else:
+                inference_job_id = client.inference.create(
+                    InferenceJobRequest(
+                        name="ml-inference-job",
+                        model_path="/workspace/models/Qwen/Qwen3-0.6B/",
+                        model_name="glm-5",
+                        model_length=4096,
+                        inference_framework=selected_framework,
+                        inf_image=selected_image,
+                        startup_args=["--max-model-len", "8192"],
+                        resources=ResourceConfig(cpu="4", memory="32Gi", gpu=1, gpu_card="L40S"),
+                    )
                 )
-            )
-            print(f"✓ Inference job created: {inference_job.id}")
-            if inference_job.endpoint_url:
-                print(f"  Endpoint URL: {inference_job.endpoint_url}")
-            inference_job_id = inference_job.id
+                print(f"✓ Inference job created: {inference_job_id}")
+                try:
+                    inference_job = client.inference.get_job(inference_job_id)
+                    if inference_job.endpoint_url:
+                        print(f"  Endpoint URL: {inference_job.endpoint_url}")
+                except PyroMindAPIError as e:
+                    print(f"  Note: Could not fetch inference job details: {e.message}")
         except PyroMindAPIError as e:
             print(f"✗ Failed to create inference job: {e.message}")
             inference_job_id = None

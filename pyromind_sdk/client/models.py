@@ -293,6 +293,7 @@ class InferenceJobRequest(BaseModel):
     inf_image: Optional[str] = None
     model_name: Optional[str] = None
     model_length: Optional[int] = None
+    startup_args: Optional[List[str]] = None
 
 
 
@@ -313,6 +314,7 @@ class InferenceJobResponse(BaseModel):
     model_name: Optional[str] = None
     model_length: Optional[int] = None
     inf_image: Optional[str] = None
+    startup_args: Optional[List[str]] = None
 
 
 class InferenceJobListAPIResponse(BaseModel):
