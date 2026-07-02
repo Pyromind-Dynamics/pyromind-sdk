@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from pyromind_sdk.client.workflow import to_workflow_lite, to_workflow_standard
-from pyromind_sdk.client.workflow import DslConverter
+from pyromind_sdk.client.workflow import DslConverter, DslValidator
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -39,7 +39,7 @@ def main() -> int:
         description="Convert workflow between standard, lite, and DSL formats.",
     )
     parser.add_argument("input", type=Path, help="Input workflow file.")
-    parser.add_argument("output", type=Path, help="Output workflow file.")
+    parser.add_argument("output", type=Path, nargs="?", help="Output workflow file.")
     parser.add_argument(
         "--to-standard",
         action="store_true",
@@ -50,9 +50,32 @@ def main() -> int:
         action="store_true",
         help="Convert between standard and Python DSL format (instead of lite).",
     )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Validate DSL file (requires --dsl, ignores output).",
+    )
     args = parser.parse_args()
 
     converter = DslConverter()
+
+    if args.validate:
+        if not args.dsl:
+            print("Error: --validate requires --dsl")
+            return 1
+        code = _load_text(args.input)
+        ok, errors = DslValidator().validate(code)
+        if ok:
+            print(f"Valid DSL: {args.input}")
+            return 0
+        print(f"Invalid DSL: {args.input}")
+        for e in errors:
+            print(f"  - {e}")
+        return 1
+
+    if not args.output:
+        print("Error: output file is required for conversion")
+        return 1
 
     if args.dsl:
         if args.to_standard:

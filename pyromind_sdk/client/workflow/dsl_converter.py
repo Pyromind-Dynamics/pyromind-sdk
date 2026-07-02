@@ -90,7 +90,7 @@ class DslConverter:
             if not node_def and node_type in self.node_info:
                 defaults = _get_defaults(self.node_info[node_type])
 
-            args = []
+            args = [f"id={nid}"]
             inp = node_def.get("input", {}) if node_def else {}
             if not inp and node_type in self.node_info:
                 inp = self.node_info[node_type].get("input", {})

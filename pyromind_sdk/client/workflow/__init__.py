@@ -5,9 +5,17 @@ This module provides tools for working with workflows:
 - Converter: Convert between standard and lite workflow formats
 - DslConverter: Convert between xyflow JSON and Python DSL formats
 - Validator: Validate workflows in both formats with comprehensive checks
+- DslValidator: Validate DSL format and check for DAG cycles
 """
 
 from .dsl_converter import DslConverter
+
+from .dsl_validator import (
+    DslValidator,
+    DslValidationError,
+    DslFormatError,
+    DslCycleError,
+)
 
 from .converter import (
     WorkflowLiteConverter,
@@ -36,6 +44,11 @@ from .validator import (
 __all__ = [
     # DSL Converter
     "DslConverter",
+    # DSL Validator
+    "DslValidator",
+    "DslValidationError",
+    "DslFormatError",
+    "DslCycleError",
     # Converter
     "WorkflowLiteConverter",
     "WorkflowMapper",
