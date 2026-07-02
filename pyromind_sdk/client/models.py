@@ -74,16 +74,16 @@ class ResourceConfig(BaseModel):
 # Sandbox Models
 class SandboxType(str, Enum):
     """Sandbox type enumeration"""
-    LINUX = "code"
-    WINDOWS = "win"
-    
+    # WINDOWS = "win"
+    OSWORLD = "osworld"
+
     @classmethod
     def from_api(cls, value: str) -> 'SandboxType':
         """Convert API value to SandboxType enum"""
         # Map old API values to new enum values
         mapping = {
-            'linux': 'code',
-            'windows': 'win'
+            # 'windows': 'win',
+            'osworld': 'osworld',
         }
         normalized = mapping.get(value, value)
         return cls(normalized)
@@ -118,6 +118,9 @@ class SandboxRequest(BaseModel):
     resources: Optional[ResourceConfig] = None
     configuration: Optional[SandboxConfiguration] = None
     name: Optional[str] = None
+    # OSWorld 专用：自定义系统镜像在 juicefs 上的相对路径（subPath）。
+    # 仅 sandbox_type=OSWORLD 时生效；未提供时服务端使用默认镜像。
+    system_image_path: Optional[str] = None
 
 
 class SandboxUsage(BaseModel):
@@ -147,6 +150,8 @@ class SandboxResponse(BaseModel):
     endpoint: Optional[str] = None
     screen_size: Optional[ScreenResolution] = None
     last_activity: Optional[datetime] = None
+    # OSWorld 专用：自定义系统镜像在 juicefs 上的相对路径（subPath）
+    system_image_path: Optional[str] = None
 
 
 

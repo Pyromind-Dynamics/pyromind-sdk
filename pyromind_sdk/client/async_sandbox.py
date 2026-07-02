@@ -51,6 +51,7 @@ class AsyncSandboxClient(PyroMindAsyncClient):
             "updated_at": sandbox_data.get("updated_at") or sandbox_data.get("last_activity"),
             "endpoint_url": sandbox_data.get("endpoint") or sandbox_data.get("endpoint_url"),
             "web_vnc_url": sandbox_data.get("web_vnc_url"),
+            "system_image_path": sandbox_data.get("system_image_path"),
         }
 
         if "screen_size" in sandbox_data and sandbox_data["screen_size"]:
