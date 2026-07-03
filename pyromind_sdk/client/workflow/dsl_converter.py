@@ -61,7 +61,7 @@ class DslConverter:
         node_outputs = {}
         for nid in sorted_ids:
             node = node_by_id[nid]
-            node_def = node.get("data", {}).get("nodeDefinition", {})
+            node_def = node.get("data", {}).get("nodeDefinition") or {}
             names = node_def.get("output_name", [])
             if not names:
                 node_type = _get_node_type(node)
@@ -82,7 +82,7 @@ class DslConverter:
             node = node_by_id[nid]
             data = node.get("data", {})
             node_type = _get_node_type(node)
-            node_def = data.get("nodeDefinition", {})
+            node_def = data.get("nodeDefinition") or {}
             defaults = _get_defaults(node_def) if node_def else {}
             config = data.get("config", {}) or {}
             conns = incoming.get(nid, {})
@@ -96,16 +96,23 @@ class DslConverter:
                 inp = self.node_info[node_type].get("input", {})
             ordered = list(inp.get("required", {})) + list(inp.get("optional", {}))
 
-            for p in ordered:
-                if p in conns:
-                    args.append(f"{p}={conns[p]}")
-                elif p in config:
-                    val = config[p]
-                    if val in ("", None):
+            if not ordered and config:
+                for k, v in config.items():
+                    if k == "controlMode":
                         continue
-                    if defaults.get(p) is not None and defaults[p] == val:
-                        continue
-                    args.append(f"{p}={self._to_literal(val)}")
+                    if v not in ("", None):
+                        args.append(f"{k}={self._to_literal(v)}")
+            else:
+                for p in ordered:
+                    if p in conns:
+                        args.append(f"{p}={conns[p]}")
+                    elif p in config:
+                        val = config[p]
+                        if val in ("", None):
+                            continue
+                        if defaults.get(p) is not None and defaults[p] == val:
+                            continue
+                        args.append(f"{p}={self._to_literal(val)}")
 
             lhs = node_var[nid]
             lines.append(f"{lhs} = {node_type}(" + ", ".join(args) + ")")
