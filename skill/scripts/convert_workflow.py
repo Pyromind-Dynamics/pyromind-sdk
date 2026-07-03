@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from pyromind_sdk.client.workflow import to_workflow_lite, to_workflow_standard
-from pyromind_sdk.client.workflow import DslConverter, DslValidator
+from pyromind_sdk.client.workflow import DslConverter, DslFormatter, DslValidator
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -55,9 +55,21 @@ def main() -> int:
         action="store_true",
         help="Validate DSL file (requires --dsl, ignores output).",
     )
+    parser.add_argument(
+        "--format",
+        action="store_true",
+        help="Format DSL .py file (standalone, no conversion).",
+    )
     args = parser.parse_args()
 
     converter = DslConverter()
+
+    if args.format and not args.dsl:
+        code = _load_text(args.input)
+        result = DslFormatter().format(code)
+        _save_text(args.output, result)
+        print(f"Formatted: {args.input} -> {args.output}")
+        return 0
 
     if args.validate:
         if not args.dsl:
@@ -86,6 +98,8 @@ def main() -> int:
         else:
             source = _load_json(args.input)
             result = converter.to_python(source)
+            if args.format:
+                result = DslFormatter().format(result)
             _save_text(args.output, result)
             direction = "standard -> dsl"
     else:
