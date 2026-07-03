@@ -8,41 +8,56 @@ import json
 from typing import Any, Dict, List, Union
 
 
-def convert_string_to_python_type(value: str, type_spec: Any) -> Any:
-    """
-    Convert string value to Python type
-    
-    Args:
-        value: String value
-        type_spec: Type specification ("STRING", "INT", "FLOAT", "BOOLEAN", or list)
-        
-    Returns:
-        Converted Python value
-    """
+def _convert_single_type(value: str, type_spec: str) -> Any:
     if type_spec == "STRING":
         return str(value)
-    elif type_spec == "ACCELERATE_CONFIG":
-        # Keep accelerate config as raw text content.
+    if type_spec == "ACCELERATE_CONFIG":
         return str(value)
-    elif type_spec == "INT":
+    if type_spec == "INT":
         return int(value)
-    elif type_spec == "FLOAT":
+    if type_spec == "FLOAT":
         return float(value)
-    elif type_spec == "BOOLEAN":
+    if type_spec == "BOOLEAN":
         if isinstance(value, str):
             return value.lower() in ("true", "1", "yes", "on")
         return bool(value)
-    elif type_spec in ("PATH", "MODEL", "ENV"):
-        # PATH/MODEL/ENV are represented as strings at runtime.
+    if type_spec in ("PATH", "MODEL", "ENV"):
         return str(value)
-    elif isinstance(type_spec, list):
-        # Choice type, value must be one in the list
+    return None
+
+
+def convert_string_to_python_type(value: str, type_spec: Any) -> Any:
+    """
+    Convert string value to Python type.
+    Supports pipe-separated union types (e.g. "STRING|PATH").
+
+    Args:
+        value: String value
+        type_spec: Type specification ("STRING", "INT", "FLOAT", "BOOLEAN",
+                    or "STRING|PATH" for union, or list for choice)
+
+    Returns:
+        Converted Python value
+    """
+    if isinstance(type_spec, list):
         if value not in type_spec:
             raise ValueError(f"Value '{value}' not in allowed choices: {type_spec}")
         return value
-    else:
-        # Unknown type: safe fallthrough
+
+    if "|" in type_spec:
+        for single_type in type_spec.split("|"):
+            single_type = single_type.strip()
+            if not single_type:
+                continue
+            result = _convert_single_type(value, single_type)
+            if result is not None:
+                return result
         return str(value)
+
+    result = _convert_single_type(value, type_spec)
+    if result is not None:
+        return result
+    return str(value)
 
 
 def convert_inputs(inputs: Dict[str, Any], input_types: Dict[str, Any]) -> Dict[str, Any]:
@@ -80,36 +95,40 @@ def convert_inputs(inputs: Dict[str, Any], input_types: Dict[str, Any]) -> Dict[
     return converted
 
 
-def validate_output_type(value: Any, type_spec: str) -> bool:
-    """
-    Validate if output value matches specified type
-    
-    Args:
-        value: Value to validate
-        type_spec: Type specification ("STRING", "INT", "FLOAT", "BOOLEAN")
-        
-    Returns:
-        Whether it matches the type requirement
-    """
+def _validate_single_output_type(value: Any, type_spec: str) -> bool:
     if type_spec == "STRING":
         return isinstance(value, str)
-    elif type_spec in ("PATH", "MODEL", "ENV"):
+    if type_spec in ("PATH", "MODEL", "ENV"):
         return isinstance(value, str)
-    elif type_spec == "INT":
+    if type_spec == "INT":
         return isinstance(value, int)
-    elif type_spec == "FLOAT":
+    if type_spec == "FLOAT":
         return isinstance(value, (int, float))
-    elif type_spec == "BOOLEAN":
+    if type_spec == "BOOLEAN":
         return isinstance(value, bool)
-    else:
-        # Unknown type, allow through
-        import warnings
-        warnings.warn(
-            f"Unknown type '{type_spec}' in validate_output_type, allowing through. ",
-            UserWarning,
-            stacklevel=2
-        )
-        return True
+    return True
+
+
+def validate_output_type(value: Any, type_spec: str) -> bool:
+    """
+    Validate if output value matches specified type.
+    Supports pipe-separated union types (e.g. "STRING|PATH").
+
+    Args:
+        value: Value to validate
+        type_spec: Type specification ("STRING", "INT", "FLOAT", "BOOLEAN",
+                    or "STRING|PATH" for union)
+
+    Returns:
+        Whether it matches at least one type in the specification
+    """
+    for single_type in type_spec.split("|"):
+        single_type = single_type.strip()
+        if not single_type:
+            continue
+        if _validate_single_output_type(value, single_type):
+            return True
+    return False
 
 
 def convert_output_to_string(output: Any) -> str:

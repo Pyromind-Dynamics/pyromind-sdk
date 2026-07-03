@@ -162,7 +162,7 @@ class DslConverter:
                             "output_name": value.id
                         }
                     else:
-                        raise ValueError(f"Undefined variable '{value.id}' referenced by node '{node_type}'")
+                        raise ValueError(f"Undefined variable '{value.id}' referenced by node '{node_type}' at line {node.lineno}, column {node.col_offset}")
                 elif isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name):
                     if value.value.id in var_to_node:
                         node_connections[param_name] = {
@@ -170,7 +170,7 @@ class DslConverter:
                             "output_name": value.attr
                         }
                     else:
-                        raise ValueError(f"Undefined variable '{value.value.id}' referenced by node '{node_type}'")
+                        raise ValueError(f"Undefined variable '{value.value.id}' referenced by node '{node_type}' at line {node.lineno}, column {node.col_offset}")
                 elif isinstance(value, ast.Constant):
                     config[param_name] = value.value
                 elif isinstance(value, ast.List):
@@ -215,6 +215,32 @@ class DslConverter:
             "name": name,
             "nodes": nodes,
             "edges": edges,
+        }
+
+    def from_python_with_metadata(self, code: str, name: str = "workflow") -> dict:
+        workflow = self.from_python(code, name=name)
+        node_line_map = {}
+        if code.strip():
+            tree = ast.parse(code)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Assign):
+                    continue
+                if not isinstance(node.value, ast.Call):
+                    continue
+                node_id = str(node.lineno)
+                for keyword in node.value.keywords:
+                    if keyword.arg == "id" and isinstance(keyword.value, ast.Constant):
+                        node_id = str(keyword.value.value)
+                        break
+                node_line_map[node_id] = node.lineno
+        return {
+            "workflow": workflow,
+            "metadata": {
+                "node_line_map": node_line_map,
+                "line_node_map": {
+                    str(line): node_id for node_id, line in node_line_map.items()
+                },
+            },
         }
 
     @staticmethod
