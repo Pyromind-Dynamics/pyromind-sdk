@@ -119,6 +119,10 @@ class DslConverter:
 
         return "\n".join(lines)
 
+    @staticmethod
+    def _normalise_indent(code: str) -> str:
+        return "\n".join(line.lstrip() for line in code.splitlines())
+
     def from_python(self, code: str, name: str = "workflow") -> dict:
         if not code.strip():
             return {
@@ -126,7 +130,7 @@ class DslConverter:
                 "nodes": [],
                 "edges": [],
             }
-        tree = ast.parse(code)
+        tree = ast.parse(self._normalise_indent(code))
         nodes = []
         edges = []
         var_to_node = {}
@@ -228,7 +232,7 @@ class DslConverter:
         workflow = self.from_python(code, name=name)
         node_line_map = {}
         if code.strip():
-            tree = ast.parse(code)
+            tree = ast.parse(self._normalise_indent(code))
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Assign):
                     continue
