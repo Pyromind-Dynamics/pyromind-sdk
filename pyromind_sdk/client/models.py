@@ -414,7 +414,7 @@ class WorkflowRunRequest(BaseModel):
     """Request model for running a workflow with injected primitive node values"""
     workflow_name: str
     primitive_node_map: Dict[str, Any] = {}
-    execution_mode: Optional[str]
+    execution_argos: Optional[list]
 
 
 class CreateTrainingNodeRequest(BaseModel):
