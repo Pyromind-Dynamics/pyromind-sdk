@@ -408,6 +408,7 @@ class TrainingTaskCreateRequest(BaseModel):
     """Request model for creating a training task"""
     name: str
     workflow: Dict[str, Any]  # Workflow JSON structure similar to convert_workflow_to_prompt's workflow field
+    out_id: str  # Map external system task ID
 
 
 class WorkflowRunRequest(BaseModel):
