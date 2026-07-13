@@ -871,3 +871,15 @@ class UserPubKey(BaseModel):
 class UserPubKeyListResponse(BaseModel):
     """User public key list response model"""
     keys: List[UserPubKey] = Field(default_factory=list)
+
+
+
+
+
+class TrainingTaskEventType(str, Enum):
+    """Training task event type enumeration"""
+    TRAINING_TASK_STATUS_CHANGED = "training_task_status_changed"
+    TRAINING_NODE_STATUS_CHANGED = "training_node_status_changed"
+
+
+
