@@ -883,3 +883,18 @@ class TrainingTaskEventType(str, Enum):
 
 
 
+class StudioTaskStatus(str, Enum):
+    NEW = ("new", 1)
+    PENDING = ("Pending", 10)                   ## Pending 表示提交成功待启动
+    RUNNING = ("Running", 100)
+    FAILED = ("Failed", 1000, True)
+    SUCCEEDED = ("Succeeded", 1000, True)
+    ERROR = ("Error", 1000, True)
+    TERMINATED = ("Terminated", 1000, True)     ## 手工终止
+
+    def __new__(cls, value: str, level: int, is_end: bool = False):
+        obj = str.__new__(cls, value)  # 因为继承了 str，要这样构造
+        obj._value_ = value
+        obj.is_end = is_end
+        obj.level = level   ## level只能从小的值更新到大的值
+        return obj
