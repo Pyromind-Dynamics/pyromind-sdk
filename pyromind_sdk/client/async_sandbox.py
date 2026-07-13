@@ -10,6 +10,7 @@ from .async_base import PyroMindAsyncClient
 from .models import (
     SandboxRequest,
     SandboxResponse,
+    InternalIPResponse,
     ActionRequest,
     ActionResponse,
     BatchActionRequest,
@@ -127,6 +128,24 @@ class AsyncSandboxClient(PyroMindAsyncClient):
             data = self._convert_sandbox_data(data, sandbox_id)
 
         return SandboxResponse(**data)
+
+    async def get_internal_ip(self, sandbox_id: str) -> InternalIPResponse:
+        """
+        Get the internal Pod IP of a sandbox (async).
+
+        Args:
+            sandbox_id: ID of the sandbox to inspect
+
+        Returns:
+            InternalIPResponse containing the normalized resource ID and IP
+        """
+        response = await self.get(f"/sandboxes/{sandbox_id}/internal_ip")
+        data = self._extract_data(response)
+        normalized = {
+            "id": data.get("sandbox_id") or data.get("id") or sandbox_id,
+            "internal_ip": data.get("internal_ip"),
+        }
+        return InternalIPResponse(**normalized)
 
     async def wait_for_sandbox_status(
         self,
