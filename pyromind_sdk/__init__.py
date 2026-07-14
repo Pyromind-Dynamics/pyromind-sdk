@@ -77,6 +77,7 @@ from .client.models import (
     ExecutionMode,
     EchoMindJobRequest,
     EchoMindJobResponse,
+    InternalIPResponse,
     ResourceConfig,
 )
 
@@ -156,6 +157,7 @@ __all__ = [
     "ExecutionMode",
     "EchoMindJobRequest",
     "EchoMindJobResponse",
+    "InternalIPResponse",
     "ResourceConfig",
     # Workflow functionality
     "WorkflowLiteConverter",

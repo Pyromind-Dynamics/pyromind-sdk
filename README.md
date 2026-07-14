@@ -227,7 +227,7 @@ job_id = client.inference.create(
         model_path="/path/to/model",
         inference_framework=frameworks[0],
         resources=ResourceConfig(cpu="8", memory="32Gi", gpu="1", gpu_card="H100"),
-        startup_args=[{"--trust-remote-code": None}, {"--max-model-len": 8192}],
+        startup_args=[{"--trust-remote-code": None}],
         name="my-inference"
     )
 )
