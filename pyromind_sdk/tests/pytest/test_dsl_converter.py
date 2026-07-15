@@ -42,6 +42,31 @@ def test_from_python_produces_valid_workflow():
 import pytest
 
 
+def test_to_python_quotes_string_node_ids():
+    workflow = {
+        "nodes": [{"id": "node-01", "type": "SleepNode", "data": {
+            "config": {"duration": 5},
+        }}],
+        "edges": [],
+    }
+
+    result = DslConverter().to_python(workflow)
+
+    assert "id=\"node-01\"" in result
+
+
+def test_to_python_rejects_numeric_string_node_ids_with_leading_zero():
+    workflow = {
+        "nodes": [{"id": "01", "type": "SleepNode", "data": {
+            "config": {"duration": 5},
+        }}],
+        "edges": [],
+    }
+
+    with pytest.raises(TypeError, match="invalid type/format"):
+        DslConverter().to_python(workflow)
+
+
 def test_roundtrip_preserves_node_count():
     with open(TEST_DATA / "sample_workflow.json") as f:
         workflow = json.load(f)

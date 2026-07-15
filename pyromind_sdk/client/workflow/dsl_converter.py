@@ -6,6 +6,7 @@ DSL format uses object.property syntax: var = NodeType(id=N, param=ref.output)
 """
 import ast
 import json
+import re
 import uuid
 from collections import defaultdict, deque
 from typing import Dict, List, Any, Optional
@@ -90,7 +91,7 @@ class DslConverter:
             if not node_def and node_type in self.node_info:
                 defaults = _get_defaults(self.node_info[node_type])
 
-            args = [f"id={nid}"]
+            args = [f"id={self._format_node_id(nid)}"]
             inp = node_def.get("input", {}) if node_def else {}
             if not inp and node_type in self.node_info:
                 inp = self.node_info[node_type].get("input", {})
@@ -306,3 +307,19 @@ class DslConverter:
     @staticmethod
     def _to_literal(v: Any) -> str:
         return json.dumps(v, ensure_ascii=False)
+
+    @classmethod
+    def _format_node_id(cls, node_id: Any) -> str:
+        """Format a node ID as a valid Python literal.
+
+        XYFlow IDs are commonly strings.  A string such as ``"01"`` must
+        not be emitted as ``id=01`` because that is invalid Python syntax and
+        usually indicates that a numeric ID was supplied with the wrong type.
+        """
+        if isinstance(node_id, str) and re.fullmatch(r"[+-]?0\d+", node_id):
+            raise TypeError(
+                f"Node ID {node_id!r} has an invalid type/format: "
+                "numeric node IDs must be integers without leading zeros "
+                "(for example, use 1 instead of '01')."
+            )
+        return cls._to_literal(node_id)
