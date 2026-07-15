@@ -19,6 +19,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import pytest
 import pytest_asyncio
@@ -28,6 +29,11 @@ from pyromind_sdk.client.models import (
     InferenceJobRequest,
     ResourceConfig,
 )
+
+PREFERRED_INFERENCE_IMAGES = {
+    "vllm": "vllm/vllm-openai:v0.19.0-cu130-ubuntu2404",
+    "sglang": "lmsysorg/sglang:v0.5.10.post1-cu130",
+}
 
 
 def skip_if_insufficient_resources(error: Exception) -> None:
@@ -65,17 +71,25 @@ update_inference_job_example = inference_example.update_inference_job_example
 delete_inference_job_example = inference_example.delete_inference_job_example
 
 
-async def get_available_framework_and_image(client: PyroMindAsyncAPIClient) -> tuple:
+async def get_available_framework_and_image(client: PyroMindAsyncAPIClient, framework: Optional[str] = None) -> tuple:
     """Get available inference framework and image from the API."""
     try:
-        frameworks = await client.inference.get_framework()
-        if not frameworks:
-            return None, None
-
-        framework = frameworks[0]
+        if not framework:
+            frameworks = await client.inference.get_framework()
+            if not frameworks:
+                return None, None
+            framework = "vllm" if "vllm" in frameworks else frameworks[0]
         images = await client.inference.get_inf_image(framework)
         if not images:
             return None, None
+        preferred_image = PREFERRED_INFERENCE_IMAGES.get(framework)
+        if preferred_image:
+            if preferred_image not in images:
+                pytest.skip(
+                    f"Preferred image for framework '{framework}' is not configured on this cluster: "
+                    f"{preferred_image}. Available images: {images}"
+                )
+            return framework, preferred_image
 
         return framework, images[0]
     except Exception as e:
@@ -111,23 +125,28 @@ async def client(api_key, base_url):
         yield client
 
 
-async def _create_job(client: PyroMindAsyncAPIClient, name_prefix: str = "test") -> str:
+async def _create_job(client: PyroMindAsyncAPIClient, name_prefix: str = "test", framework: Optional[str] = None) -> str:
     """Create an inference job and return the job_id."""
-    framework, image = await get_available_framework_and_image(client)
+    framework, image = await get_available_framework_and_image(client, framework)
     if not framework or not image:
         pytest.skip("No available inference frameworks or images")
 
     name = f"{name_prefix}-{int(time.time())}"
+    startup_args = None
+    model_length=4096
+    if framework == "vllm":
+        startup_args = [{"--mm-processor-kwargs": '{"max_soft_tokens":1120}'}]
+        model_length = None
     try:
         job_id = await client.inference.create(
             InferenceJobRequest(
                 name=name,
                 model_path="/workspace/models/Qwen/Qwen3-0.6B/",
                 model_name="glm-5",
-                model_length=4096,
+                model_length=model_length,
                 inference_framework=framework,
                 inf_image=image,
-                startup_args=[{"--max-model-len": 8192}],
+                startup_args=startup_args,
                 resources=ResourceConfig(cpu="4", memory="32Gi", gpu=1, gpu_card="L40S")
             )
         )
@@ -282,6 +301,29 @@ class TestCreateInferenceJob:
             await _pause_and_delete(client, job_id)
 
     @pytest.mark.asyncio
+    async def test_create_vllm_inference_job_with_mm_processor_kwargs(self, client):
+        """Test creating a vLLM inference job with mm processor startup args."""
+        framework, _ = await get_available_framework_and_image(client, "vllm")
+        if framework != "vllm":
+            pytest.skip("vllm framework is not available on this cluster")
+
+        job_id = await _create_job(client, "test-create-vllm", framework="vllm")
+        try:
+            assert isinstance(job_id, str)
+            assert job_id
+
+            if not await _wait_for_status(client, job_id, "running"):
+                raise PyroMindAsyncAPIError(f"inference {job_id} create failed")
+
+            job = await client.inference.get_job(job_id)
+            startup_args = job.startup_args or []
+            assert "--mm-processor-kwargs" in startup_args, (
+                f"Expected vllm startup_args to include --mm-processor-kwargs, got {startup_args}"
+            )
+        finally:
+            await _pause_and_delete(client, job_id)
+
+    @pytest.mark.asyncio
     async def test_create_inference_job_example_function(self, client):
         """Test the create_inference_job_example function"""
         job_id = await create_inference_job_example()
@@ -350,6 +392,33 @@ class TestGetInferenceJob:
         assert error.status_code in [404, 400], f"Expected 404 or 400 status code, got: {error.status_code}"
 
 
+class TestGetInferenceInternalIP:
+    """Test cases for getting inference internal IPs"""
+
+    @pytest.mark.asyncio
+    async def test_get_inference_internal_ip(self, client):
+        """Test getting the internal IP of a running vLLM inference job."""
+        framework, _ = await get_available_framework_and_image(client, "vllm")
+        if framework != "vllm":
+            pytest.skip("vllm framework is not available on this cluster")
+
+        job_id = await _create_job(client, "test-inner-ip", framework="vllm")
+        try:
+            if not await _wait_for_status(client, job_id, "running"):
+                pytest.skip("Inference job did not reach running status")
+            try:
+                ip_info = await client.inference.get_internal_ip(job_id)
+            except PyroMindAsyncAPIError as e:
+                skip_if_insufficient_resources(e)
+                raise
+
+            assert ip_info.id == job_id
+            assert isinstance(ip_info.internal_ip, str)
+            assert ip_info.internal_ip.strip()
+            print(f"[TEST] Inference internal IP: id={ip_info.id}, internal_ip={ip_info.internal_ip}")
+        finally:
+            await _pause_and_delete(client, job_id)
+
 class TestUpdateInferenceJob:
     """Test cases for updating inference jobs"""
 
@@ -369,7 +438,6 @@ class TestUpdateInferenceJob:
                     model_length=4096,
                     inference_framework=framework,
                     inf_image=image,
-                    startup_args=[{"--max-model-len": 8192}],
                     resources=ResourceConfig(cpu="4", memory="64Gi", gpu=1, gpu_card="L40S"),
                     name=f"pending-inference-example-{int(time.time())}"
                 )
@@ -387,7 +455,6 @@ class TestUpdateInferenceJob:
                     model_length=4096,
                     inference_framework=framework,
                     inf_image=image,
-                    startup_args=[{"--max-model-len": 8192}],
                     resources=ResourceConfig(cpu="4", memory="64Gi", gpu=9, gpu_card="H100"),
                     name=f"updated-inference-example-{int(time.time())}"
                 )

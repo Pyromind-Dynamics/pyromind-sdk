@@ -12,6 +12,7 @@ from .models import (
     EchoMindJobListAPIResponse,
     EchoMindJobAPIResponse,
     EchoMindJobCreateAPIResponse,
+    InternalIPResponse,
 )
 
 
@@ -83,6 +84,24 @@ class AsyncEchoMindClient(PyroMindAsyncClient):
 
         api_response = EchoMindJobAPIResponse(job=job_data)
         return api_response.job
+
+    async def get_internal_ip(self, job_id: str) -> InternalIPResponse:
+        """
+        Get the internal Pod IP of an EchoMind instance (async).
+
+        Args:
+            job_id: ID of the EchoMind instance to inspect
+
+        Returns:
+            InternalIPResponse containing the normalized resource ID and IP
+        """
+        response = await self.get(f"/echomind/{job_id}/internal_ip")
+        data = self._extract_data(response)
+        normalized = {
+            "id": data.get("job_id") or data.get("id") or job_id,
+            "internal_ip": data.get("internal_ip"),
+        }
+        return InternalIPResponse(**normalized)
 
     async def update(self, job_id: str, request: EchoMindJobRequest) -> EchoMindJobResponse:
         """

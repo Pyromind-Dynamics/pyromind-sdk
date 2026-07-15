@@ -343,6 +343,38 @@ class TestCreateOSWorldSandbox:
             await _pause_and_delete(client, sandbox.id)
 
 
+class TestGetOSWorldSandboxInternalIP:
+    """Test cases for getting OSWorld sandbox internal IPs"""
+
+    @pytest.mark.asyncio
+    async def test_get_osworld_sandbox_internal_ip(self, client):
+        """Test getting the internal IP of a running OSWorld sandbox."""
+        sandbox = await _create_sandbox(
+            client,
+            "test-osworld-inner-ip",
+            sandbox_type=SandboxType.OSWORLD,
+            cpu="8",
+            memory="16Gi",
+        )
+        try:
+            if not await _wait_for_status(
+                client, sandbox.id, "running", timeout=OSWORLD_BOOT_TIMEOUT
+            ):
+                pytest.skip("OSWorld sandbox did not reach running status")
+            try:
+                ip_info = await client.sandboxes.get_internal_ip(sandbox.id)
+            except ANY_API_ERROR as e:
+                skip_if_insufficient_resources(e)
+                raise
+
+            assert ip_info.id == sandbox.id
+            assert isinstance(ip_info.internal_ip, str)
+            assert ip_info.internal_ip.strip()
+            print(f"[TEST] Sandbox internal IP: id={ip_info.id}, internal_ip={ip_info.internal_ip}")
+        finally:
+            await _pause_and_delete(client, sandbox.id)
+
+
 class TestUpdateOSWorldSandbox:
     """Test cases for updating OSWorld sandboxes"""
 
