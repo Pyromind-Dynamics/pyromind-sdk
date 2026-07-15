@@ -408,12 +408,14 @@ class TrainingTaskCreateRequest(BaseModel):
     """Request model for creating a training task"""
     name: str
     workflow: Dict[str, Any]  # Workflow JSON structure similar to convert_workflow_to_prompt's workflow field
+    out_id: str  # Map external system task ID
 
 
 class WorkflowRunRequest(BaseModel):
     """Request model for running a workflow with injected primitive node values"""
     workflow_name: str
     primitive_node_map: Dict[str, Any] = {}
+    execution_argos: Optional[list]
 
 
 class CreateTrainingNodeRequest(BaseModel):
@@ -869,3 +871,30 @@ class UserPubKey(BaseModel):
 class UserPubKeyListResponse(BaseModel):
     """User public key list response model"""
     keys: List[UserPubKey] = Field(default_factory=list)
+
+
+
+
+
+class TrainingTaskEventType(str, Enum):
+    """Training task event type enumeration"""
+    TRAINING_TASK_STATUS_CHANGED = "training_task_status_changed"
+    TRAINING_NODE_STATUS_CHANGED = "training_node_status_changed"
+
+
+
+class StudioTaskStatus(str, Enum):
+    NEW = ("new", 1)
+    PENDING = ("Pending", 10)                   ## Pending 表示提交成功待启动
+    RUNNING = ("Running", 100)
+    FAILED = ("Failed", 1000, True)
+    SUCCEEDED = ("Succeeded", 1000, True)
+    ERROR = ("Error", 1000, True)
+    TERMINATED = ("Terminated", 1000, True)     ## 手工终止
+
+    def __new__(cls, value: str, level: int, is_end: bool = False):
+        obj = str.__new__(cls, value)  # 因为继承了 str，要这样构造
+        obj._value_ = value
+        obj.is_end = is_end
+        obj.level = level   ## level只能从小的值更新到大的值
+        return obj
