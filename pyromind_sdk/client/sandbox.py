@@ -10,6 +10,7 @@ from .base import PyroMindClient
 from .models import (
     SandboxRequest,
     SandboxResponse,
+    InternalIPResponse,
     ActionRequest,
     ActionResponse,
     BatchActionRequest,
@@ -141,6 +142,24 @@ class SandboxClient(PyroMindClient):
             data = self._convert_sandbox_data(data, sandbox_id)
         
         return SandboxResponse(**data)
+
+    def get_internal_ip(self, sandbox_id: str) -> InternalIPResponse:
+        """
+        Get the internal Pod IP of a sandbox.
+
+        Args:
+            sandbox_id: ID of the sandbox to inspect
+
+        Returns:
+            InternalIPResponse containing the normalized resource ID and IP
+        """
+        response = self.get(f"/sandboxes/{sandbox_id}/internal_ip")
+        data = self._extract_data(response)
+        normalized = {
+            "id": data.get("sandbox_id") or data.get("id") or sandbox_id,
+            "internal_ip": data.get("internal_ip"),
+        }
+        return InternalIPResponse(**normalized)
 
     def wait_for_sandbox_status(
         self,

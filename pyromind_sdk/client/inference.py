@@ -9,6 +9,7 @@ from .base import PyroMindClient
 from .models import (
     InferenceJobRequest,
     InferenceJobResponse,
+    InternalIPResponse,
 )
 
 
@@ -84,6 +85,24 @@ class InferenceClient(PyroMindClient):
         
         # Backend returns the job data directly in the data field
         return InferenceJobResponse(**data)
+
+    def get_internal_ip(self, job_id: str) -> InternalIPResponse:
+        """
+        Get the internal Pod IP of an inference job.
+
+        Args:
+            job_id: ID of the inference job to inspect
+
+        Returns:
+            InternalIPResponse containing the normalized resource ID and IP
+        """
+        response = self.get(f"/inference/{job_id}/internal_ip")
+        data = self._extract_data(response)
+        normalized = {
+            "id": data.get("job_id") or data.get("id") or job_id,
+            "internal_ip": data.get("internal_ip"),
+        }
+        return InternalIPResponse(**normalized)
     
     def update(self, job_id: str, request: InferenceJobRequest) -> InferenceJobResponse:
         """
@@ -184,4 +203,3 @@ class InferenceClient(PyroMindClient):
         if isinstance(data, dict) and "images" in data:
             return data["images"]
         return []
-

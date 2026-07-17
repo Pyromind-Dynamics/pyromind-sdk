@@ -18,6 +18,12 @@ class APIResponse(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
 
+class InternalIPResponse(BaseModel):
+    """Normalized internal Pod IP response model."""
+    id: str
+    internal_ip: str
+
+
 class ResourceConfig(BaseModel):
     """Resource configuration model"""
     cpu: Optional[str] = None
