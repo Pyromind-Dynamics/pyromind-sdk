@@ -79,9 +79,17 @@ class ResourceConfig(BaseModel):
 
 # Sandbox Models
 class SandboxType(str, Enum):
-    """Sandbox type enumeration"""
-    # WINDOWS = "win"
+    """Sandbox type enumeration.
+
+    Attributes:
+        OSWORLD: OSWorld sandbox with GUI desktop environment (VNC), supports
+            custom system images via ``system_image_path``.
+        SWEBENCH: SWE-bench code sandbox (headless container), requires a
+            user-provided container image via the ``image`` field. Supports
+            shell command execution through the ``/exec`` endpoint.
+    """
     OSWORLD = "osworld"
+    SWEBENCH = "swebench"
 
     @classmethod
     def from_api(cls, value: str) -> 'SandboxType':
@@ -90,6 +98,7 @@ class SandboxType(str, Enum):
         mapping = {
             # 'windows': 'win',
             'osworld': 'osworld',
+            'swebench': 'swebench',
         }
         normalized = mapping.get(value, value)
         return cls(normalized)
@@ -119,14 +128,38 @@ class SandboxConfiguration(BaseModel):
 
 
 class SandboxRequest(BaseModel):
-    """Request model for creating a sandbox"""
+    """Request model for creating a sandbox.
+
+    Attributes:
+        sandbox_type: The type of sandbox to create (``OSWORLD`` or ``SWEBENCH``).
+        resources: CPU / memory / GPU resource limits for the sandbox pod.
+        configuration: Optional GUI configuration (screen resolution, VNC password, etc.).
+            Ignored for headless sandbox types such as ``SWEBENCH``.
+        name: Human-readable name for the sandbox. Auto-generated when omitted.
+        system_image_path: **OSWorld only.** JuiceFS sub-path to a custom system
+            image (e.g. ``"template/Ubuntu.qcow2"``). Ignored for other sandbox types;
+            the server falls back to its built-in default image when ``None``.
+        image: **SWE-bench only (required).** Docker/OCI container image reference
+            (e.g. ``"swebench/swesmith.x86_64:latest"``). Ignored for other sandbox types.
+    """
     sandbox_type: SandboxType
     resources: Optional[ResourceConfig] = None
     configuration: Optional[SandboxConfiguration] = None
     name: Optional[str] = None
-    # OSWorld 专用：自定义系统镜像在 juicefs 上的相对路径（subPath）。
-    # 仅 sandbox_type=OSWORLD 时生效；未提供时服务端使用默认镜像。
-    system_image_path: Optional[str] = None
+    system_image_path: Optional[str] = Field(
+        default=None,
+        description=(
+            "OSWorld only: JuiceFS sub-path of a custom system image "
+            "(e.g. 'template/Ubuntu.qcow2'). Ignored for other sandbox types."
+        ),
+    )
+    image: Optional[str] = Field(
+        default=None,
+        description=(
+            "SWE-bench only (required): Docker/OCI container image reference "
+            "(e.g. 'swebench/swesmith.x86_64:latest'). Ignored for other sandbox types."
+        ),
+    )
 
 
 class SandboxUsage(BaseModel):
@@ -141,7 +174,26 @@ class SandboxUsage(BaseModel):
 
 
 class SandboxResponse(BaseModel):
-    """Sandbox response model"""
+    """Sandbox response model returned by the API.
+
+    Attributes:
+        id: Unique sandbox identifier (UUID).
+        name: Human-readable sandbox name.
+        type: Sandbox type (``OSWORLD`` or ``SWEBENCH``).
+        status: Current lifecycle status (e.g. ``"creating"``, ``"running"``, ``"stopped"``).
+        configuration: GUI / screen configuration (``None`` for headless sandboxes).
+        usage: Real-time resource usage statistics.
+        created_at: ISO-8601 creation timestamp.
+        updated_at: ISO-8601 last-activity timestamp.
+        endpoint_url: Public API endpoint URL of the sandbox (``None`` for types without Ingress).
+        web_vnc_url: Web-based VNC URL (``None`` for headless sandbox types such as ``SWEBENCH``).
+        uid: Owner UID.
+        endpoint: Legacy alias for ``endpoint_url``.
+        screen_size: Legacy alias for ``configuration.screen_resolution``.
+        last_activity: Legacy alias for ``updated_at``.
+        system_image_path: **OSWorld only.** JuiceFS sub-path of the system image in use.
+        image: **SWE-bench only.** Docker/OCI container image reference in use.
+    """
     id: str
     name: str
     type: SandboxType
@@ -156,8 +208,14 @@ class SandboxResponse(BaseModel):
     endpoint: Optional[str] = None
     screen_size: Optional[ScreenResolution] = None
     last_activity: Optional[datetime] = None
-    # OSWorld 专用：自定义系统镜像在 juicefs 上的相对路径（subPath）
-    system_image_path: Optional[str] = None
+    system_image_path: Optional[str] = Field(
+        default=None,
+        description="OSWorld only: storage sub-path of the system image in use.",
+    )
+    image: Optional[str] = Field(
+        default=None,
+        description="SWE-bench only: Docker image reference in use.",
+    )
 
 
 
@@ -223,6 +281,50 @@ class ActionResponse(BaseModel):
 class ActionAPIResponse(BaseModel):
     """Action API response"""
     action: ActionResponse
+
+
+# SWE-bench Exec Models
+class SwebenchExecRequest(BaseModel):
+    """Request model for executing a shell command in a SWE-bench sandbox.
+
+    The command is executed inside the sandbox's running container via the
+    Kubernetes exec API.  Only sandboxes of type ``SWEBENCH`` support this
+    endpoint; calling it against other sandbox types will return a 400 error.
+
+    Attributes:
+        command: Shell command string to execute (e.g. ``"uname -a"``).
+            Leading/trailing whitespace is stripped by the SDK before sending.
+            Must be non-empty after stripping.
+        cwd: Working directory inside the container (e.g. ``"/workspace"``).
+            Defaults to ``""`` which means the container's default workdir.
+            Leading/trailing whitespace is stripped by the SDK before sending.
+        timeout: Maximum execution time in seconds (1–600).  When ``None``
+            the server applies its own default (currently 30 s).  If the
+            command exceeds the timeout it is killed and ``exception_info``
+            will contain a timeout message.
+    """
+    command: str = Field(..., min_length=1, description="Shell command to execute")
+    cwd: str = Field(default="", description="Working directory for command execution")
+    timeout: Optional[int] = Field(default=None, ge=1, le=600, description="Execution timeout in seconds (max 600)")
+
+
+class SwebenchExecResponse(BaseModel):
+    """Response model for shell command execution in a SWE-bench sandbox.
+
+    Attributes:
+        output: Combined stdout and stderr of the command.  Empty string when
+            the command produced no output or could not start.
+        returncode: Process exit code (``0`` = success).  ``-1`` indicates
+            that the exit code could not be determined (e.g. exec failure).
+        exception_info: Human-readable error description when the execution
+            failed at the infrastructure level (pod not found, timeout, etc.).
+            Empty string on normal command execution (even when returncode ≠ 0).
+        extra: Optional server-side metadata (e.g. timing information).
+    """
+    output: str = Field(default="", description="Combined stdout and stderr of the command")
+    returncode: int = Field(default=-1, description="Process exit code (0 = success, -1 = unknown)")
+    exception_info: str = Field(default="", description="Infrastructure-level error message (empty on normal exec)")
+    extra: Optional[Dict[str, Any]] = Field(default=None, description="Optional server-side metadata")
 
 
 class BatchActionRequest(BaseModel):

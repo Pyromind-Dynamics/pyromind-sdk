@@ -16,6 +16,8 @@ from .models import (
     BatchActionRequest,
     VNCResponse,
     VNCConnectionInfo,
+    SwebenchExecRequest,
+    SwebenchExecResponse,
 )
 
 
@@ -57,6 +59,7 @@ class SandboxClient(PyroMindClient):
             "endpoint_url": sandbox_data.get("endpoint") or sandbox_data.get("endpoint_url"),
             "web_vnc_url": sandbox_data.get("web_vnc_url"),
             "system_image_path": sandbox_data.get("system_image_path"),
+            "image": sandbox_data.get("image"),
         }
         
         # Convert screen_size to screen_resolution if present
@@ -381,3 +384,38 @@ class SandboxClient(PyroMindClient):
             "auth_type": vnc_response.connection_info.auth_type,
         }
         return result
+
+    def exec_command(
+        self,
+        sandbox_id: str,
+        command: str,
+        cwd: str = "",
+        timeout: Optional[int] = None,
+    ) -> SwebenchExecResponse:
+        """
+        Execute a shell command in a SWE-bench sandbox.
+
+        This method sends a command to the sandbox's running container and
+        returns stdout/stderr output, the exit code, and any exception info.
+        Only swebench type sandboxes support this method.
+
+        Args:
+            sandbox_id: ID of the swebench sandbox
+            command: Shell command to execute (e.g. "uname -a")
+            cwd: Working directory for command execution (default: "/")
+            timeout: Execution timeout in seconds, max 600 (default: 30)
+
+        Returns:
+            SwebenchExecResponse with output, returncode, and exception_info
+        """
+        request = SwebenchExecRequest(
+            command=command.strip(),
+            cwd=cwd.strip() if cwd else "",
+            timeout=timeout,
+        )
+        response = self.post(
+            f"/sandboxes/{sandbox_id}/exec",
+            json_data=request.model_dump(exclude_none=True),
+        )
+        data = self._extract_data(response)
+        return SwebenchExecResponse(**data)

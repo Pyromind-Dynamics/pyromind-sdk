@@ -23,6 +23,7 @@ from pyromind_sdk.client.models import (
     ScreenResolution,
     ActionRequest,
     ActionParameters,
+    SwebenchExecResponse,
 )
 
 
@@ -409,6 +410,170 @@ async def delete_osworld_sandbox_example(sandbox_id: str):
         print(f"✗ Failed to delete OSWorld sandbox: {e.message}")
     finally:
         await client.close()
+
+
+# ---------------------------------------------------------------------------
+# SWE-bench sandbox examples (async)
+# ---------------------------------------------------------------------------
+
+# Default container image used in examples.
+DEFAULT_SWEBENCH_IMAGE = "swebench/swesmith.x86_64:latest"
+
+
+async def create_swebench_sandbox_example(image: str = DEFAULT_SWEBENCH_IMAGE):
+    """Example: Create a new SWE-bench sandbox (async).
+
+    Args:
+        image: Docker/OCI container image reference.  Defaults to
+            :data:`DEFAULT_SWEBENCH_IMAGE`.
+    """
+    client = PyroMindAsyncAPIClient()
+
+    try:
+        print("Creating a new SWE-bench sandbox...")
+        sandbox = await client.sandboxes.create(
+            SandboxRequest(
+                name=f"swebench-sandbox-{int(time.time())}",
+                sandbox_type=SandboxType.SWEBENCH,
+                resources=ResourceConfig(
+                    cpu="4",
+                    memory="8Gi",
+                    gpu=0,
+                ),
+                image=image,
+            )
+        )
+        print(f"✓ SWE-bench sandbox created successfully!")
+        print(f"  ID: {sandbox.id}")
+        print(f"  Name: {sandbox.name}")
+        print(f"  Type: {sandbox.type}")
+        print(f"  Status: {sandbox.status}")
+        print(f"  Image: {sandbox.image}")
+        return sandbox.id
+
+    except PyroMindAPIError as e:
+        print(f"✗ Failed to create SWE-bench sandbox: {e.message}")
+        return None
+    except Exception as e:
+        print(f"✗ Failed to create SWE-bench sandbox: {e}")
+        return None
+    finally:
+        await client.close()
+
+
+async def exec_swebench_command_example(
+    sandbox_id: str,
+    command: str = "uname -a",
+    cwd: str = "",
+    timeout: int = 30,
+):
+    """Example: Execute a shell command in a SWE-bench sandbox (async).
+
+    Args:
+        sandbox_id: ID of the running SWE-bench sandbox.
+        command: Shell command to execute.
+        cwd: Working directory inside the container.
+        timeout: Execution timeout in seconds (max 600).
+    """
+    client = PyroMindAsyncAPIClient()
+
+    try:
+        print(f"Executing command in SWE-bench sandbox {sandbox_id}...")
+        print(f"  Command: {command}")
+        result: SwebenchExecResponse = await client.sandboxes.exec_command(
+            sandbox_id=sandbox_id,
+            command=command,
+            cwd=cwd,
+            timeout=timeout,
+        )
+        print(f"✓ Command executed!")
+        print(f"  Return code: {result.returncode}")
+        if result.output:
+            print(f"  Output:\n{result.output}")
+        if result.exception_info:
+            print(f"  Exception: {result.exception_info}")
+        return result
+
+    except PyroMindAPIError as e:
+        print(f"✗ Failed to execute command: {e.message}")
+        return None
+    finally:
+        await client.close()
+
+
+async def pause_swebench_sandbox_example(sandbox_id: str):
+    """Example: Pause a SWE-bench sandbox (async)."""
+    client = PyroMindAsyncAPIClient()
+    try:
+        print(f"Pausing SWE-bench sandbox {sandbox_id}...")
+        sandbox = await client.sandboxes.pause(sandbox_id)
+        print(f"✓ SWE-bench sandbox paused. Status: {sandbox.status}")
+        return sandbox
+    except PyroMindAPIError as e:
+        print(f"✗ Failed to pause SWE-bench sandbox: {e.message}")
+        return None
+    finally:
+        await client.close()
+
+
+async def resume_swebench_sandbox_example(sandbox_id: str):
+    """Example: Resume a paused SWE-bench sandbox (async)."""
+    client = PyroMindAsyncAPIClient()
+    try:
+        print(f"Resuming SWE-bench sandbox {sandbox_id}...")
+        sandbox = await client.sandboxes.resume(sandbox_id)
+        print(f"✓ SWE-bench sandbox resumed. Status: {sandbox.status}")
+        return sandbox
+    except PyroMindAPIError as e:
+        print(f"✗ Failed to resume SWE-bench sandbox: {e.message}")
+        return None
+    finally:
+        await client.close()
+
+
+async def delete_swebench_sandbox_example(sandbox_id: str):
+    """Example: Delete a SWE-bench sandbox (async)."""
+    client = PyroMindAsyncAPIClient()
+    try:
+        print(f"Deleting SWE-bench sandbox {sandbox_id}...")
+        await client.sandboxes.delete(sandbox_id)
+        print(f"✓ SWE-bench sandbox deleted successfully!")
+    except PyroMindAPIError as e:
+        print(f"✗ Failed to delete SWE-bench sandbox: {e.message}")
+    finally:
+        await client.close()
+
+
+async def swebench_full_lifecycle_example(image: str = DEFAULT_SWEBENCH_IMAGE):
+    """Full lifecycle demo for a SWE-bench sandbox (async):
+    create -> exec -> pause -> resume -> exec -> delete."""
+    print("-" * 60)
+    print("SWE-bench Sandbox Lifecycle Demo (Async)")
+    print("-" * 60)
+
+    sandbox_id = await create_swebench_sandbox_example(image)
+    if not sandbox_id:
+        return
+
+    print("\nWaiting for SWE-bench sandbox to be ready...")
+    await asyncio.sleep(5)
+
+    # Execute a simple command
+    await exec_swebench_command_example(sandbox_id, command="echo hello && date")
+
+    # Pause
+    await pause_swebench_sandbox_example(sandbox_id)
+    await asyncio.sleep(2)
+
+    # Resume
+    await resume_swebench_sandbox_example(sandbox_id)
+    await asyncio.sleep(2)
+
+    # Execute another command after resume
+    await exec_swebench_command_example(sandbox_id, command="uname -a")
+
+    # Cleanup
+    await delete_swebench_sandbox_example(sandbox_id)
 
 
 async def osworld_full_lifecycle_example():

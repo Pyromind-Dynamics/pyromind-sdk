@@ -38,6 +38,8 @@ from pyromind_sdk.client.models import (
     ScreenResolution,
     ActionRequest,
     ActionParameters,
+    SwebenchExecRequest,
+    SwebenchExecResponse,
 )
 
 
@@ -86,6 +88,12 @@ update_osworld_sandbox_example = sandbox_example.update_osworld_sandbox_example
 pause_osworld_sandbox_example = sandbox_example.pause_osworld_sandbox_example
 resume_osworld_sandbox_example = sandbox_example.resume_osworld_sandbox_example
 delete_osworld_sandbox_example = sandbox_example.delete_osworld_sandbox_example
+# SWE-bench example helpers (async)
+create_swebench_sandbox_example = sandbox_example.create_swebench_sandbox_example
+exec_swebench_command_example = sandbox_example.exec_swebench_command_example
+pause_swebench_sandbox_example = sandbox_example.pause_swebench_sandbox_example
+resume_swebench_sandbox_example = sandbox_example.resume_swebench_sandbox_example
+delete_swebench_sandbox_example = sandbox_example.delete_swebench_sandbox_example
 
 
 @pytest.fixture(scope="module")
@@ -129,22 +137,30 @@ async def _create_sandbox(
     width: int = 1920,
     height: int = 1080,
     system_image_path: Optional[str] = None,
+    image: Optional[str] = None,
 ) -> SandboxResponse:
     """Create a sandbox of the requested type and return the response.
 
     ``system_image_path`` is OSWorld-only; it is ignored when ``None`` and
     forwarded as a top-level request field otherwise.
+
+    ``image`` is SWE-bench-only; it is ignored when ``None`` and forwarded
+    as a top-level request field otherwise.
     """
     request_kwargs = {
         "name": f"{name_prefix}-{int(time.time())}",
         "sandbox_type": sandbox_type,
         "resources": ResourceConfig(cpu=cpu, memory=memory, gpu=0),
-        "configuration": SandboxConfiguration(
-            screen_resolution=ScreenResolution(width=width, height=height),
-        ),
     }
+    # SWE-bench is headless — no screen resolution / configuration needed.
+    if sandbox_type != SandboxType.SWEBENCH:
+        request_kwargs["configuration"] = SandboxConfiguration(
+            screen_resolution=ScreenResolution(width=width, height=height),
+        )
     if system_image_path is not None:
         request_kwargs["system_image_path"] = system_image_path
+    if image is not None:
+        request_kwargs["image"] = image
     try:
         sandbox = await client.sandboxes.create(
             SandboxRequest(**request_kwargs)
@@ -487,6 +503,303 @@ class TestDeleteOSWorldSandbox:
             try:
                 await client.sandboxes.get_sandbox(sandbox_id)
                 pytest.skip("OSWorld sandbox still exists after deletion attempt")
+            except ANY_API_ERROR:
+                pass
+        except Exception:
+            await _pause_and_delete(client, sandbox_id)
+            raise
+
+
+# ---------------------------------------------------------------------------
+# SWE-bench sandbox test cases (async)
+# ---------------------------------------------------------------------------
+
+# SWE-bench sandboxes are headless containers, boot time is shorter than OSWorld.
+SWEBENCH_BOOT_TIMEOUT = 300
+
+# Default container image used in SWE-bench tests.
+SWEBENCH_TEST_IMAGE = "swebench/swesmith.x86_64:latest"
+
+
+class TestCreateSwebenchSandbox:
+    """Test cases for creating SWE-bench sandboxes (async)."""
+
+    @pytest.mark.asyncio
+    async def test_create_swebench_sandbox(self, client):
+        """Test creating a SWE-bench sandbox directly via the async client."""
+        sandbox_name = f"test-create-swebench-{int(time.time())}"
+        print(f"[TEST] Creating SWE-bench sandbox with name: {sandbox_name}")
+        try:
+            sandbox = await client.sandboxes.create(
+                SandboxRequest(
+                    name=sandbox_name,
+                    sandbox_type=SandboxType.SWEBENCH,
+                    resources=ResourceConfig(cpu="4", memory="8Gi", gpu=0),
+                    image=SWEBENCH_TEST_IMAGE,
+                )
+            )
+        except ANY_API_ERROR as e:
+            skip_if_insufficient_resources(e)
+            raise
+
+        try:
+            assert sandbox is not None
+            assert sandbox.id is not None
+            assert sandbox.name is not None
+            assert sandbox.status is not None
+            sb_type_value = (
+                sandbox.type.value if hasattr(sandbox.type, "value") else str(sandbox.type)
+            )
+            assert sb_type_value == SandboxType.SWEBENCH.value, (
+                f"Expected swebench, got {sb_type_value}"
+            )
+        finally:
+            await _pause_and_delete(client, sandbox.id)
+
+    @pytest.mark.asyncio
+    async def test_create_swebench_sandbox_with_image_roundtrip(self, client):
+        """Verify image is preserved when retrieving the sandbox (async)."""
+        sandbox = await _create_sandbox(
+            client,
+            "test-swebench-imgpath",
+            sandbox_type=SandboxType.SWEBENCH,
+            cpu="4",
+            memory="8Gi",
+            image=SWEBENCH_TEST_IMAGE,
+        )
+        try:
+            retrieved = await client.sandboxes.get_sandbox(sandbox.id)
+            print(f"[TEST] Retrieved image: {retrieved.image}")
+            assert retrieved.image == SWEBENCH_TEST_IMAGE, (
+                f"Expected image={SWEBENCH_TEST_IMAGE}, got {retrieved.image}"
+            )
+        finally:
+            await _pause_and_delete(client, sandbox.id)
+
+    @pytest.mark.asyncio
+    async def test_create_swebench_sandbox_example_function(self):
+        """Test create_swebench_sandbox_example async helper."""
+        sandbox_id = await create_swebench_sandbox_example()
+        try:
+            if sandbox_id:
+                assert isinstance(sandbox_id, str)
+                assert len(sandbox_id) > 0
+        finally:
+            if sandbox_id:
+                client = PyroMindAsyncAPIClient()
+                try:
+                    await _pause_and_delete(client, sandbox_id)
+                finally:
+                    await client.close()
+
+
+class TestExecSwebenchCommand:
+    """Test cases for executing commands in a SWE-bench sandbox (async)."""
+
+    @pytest.mark.asyncio
+    async def test_exec_simple_command(self, client):
+        """Execute a simple echo command and verify output (async)."""
+        sandbox = await _create_sandbox(
+            client,
+            "test-swebench-exec",
+            sandbox_type=SandboxType.SWEBENCH,
+            cpu="4",
+            memory="8Gi",
+            image=SWEBENCH_TEST_IMAGE,
+        )
+        try:
+            if not await _wait_for_status(
+                client, sandbox.id, "running", timeout=SWEBENCH_BOOT_TIMEOUT
+            ):
+                pytest.skip("SWE-bench sandbox did not reach running status")
+
+            result = await client.sandboxes.exec_command(
+                sandbox_id=sandbox.id,
+                command="echo hello_from_swebench",
+            )
+            print(f"[TEST] exec result: returncode={result.returncode}, output={result.output!r}")
+            assert result.returncode == 0, (
+                f"Expected returncode=0, got {result.returncode}; "
+                f"exception_info={result.exception_info!r}"
+            )
+            assert "hello_from_swebench" in result.output
+            assert result.exception_info == ""
+
+        finally:
+            await _pause_and_delete(client, sandbox.id)
+
+    @pytest.mark.asyncio
+    async def test_exec_with_cwd(self, client):
+        """Execute a command with a custom working directory (async)."""
+        sandbox = await _create_sandbox(
+            client,
+            "test-swebench-cwd",
+            sandbox_type=SandboxType.SWEBENCH,
+            cpu="4",
+            memory="8Gi",
+            image=SWEBENCH_TEST_IMAGE,
+        )
+        try:
+            if not await _wait_for_status(
+                client, sandbox.id, "running", timeout=SWEBENCH_BOOT_TIMEOUT
+            ):
+                pytest.skip("SWE-bench sandbox did not reach running status")
+
+            result = await client.sandboxes.exec_command(
+                sandbox_id=sandbox.id,
+                command="pwd",
+                cwd="/tmp",
+            )
+            print(f"[TEST] exec pwd result: returncode={result.returncode}, output={result.output!r}")
+            assert result.returncode == 0
+            assert "/tmp" in result.output
+
+        finally:
+            await _pause_and_delete(client, sandbox.id)
+
+    @pytest.mark.asyncio
+    async def test_exec_with_nonzero_exit(self, client):
+        """Execute a command that exits with a non-zero code (async)."""
+        sandbox = await _create_sandbox(
+            client,
+            "test-swebench-nonzero",
+            sandbox_type=SandboxType.SWEBENCH,
+            cpu="4",
+            memory="8Gi",
+            image=SWEBENCH_TEST_IMAGE,
+        )
+        try:
+            if not await _wait_for_status(
+                client, sandbox.id, "running", timeout=SWEBENCH_BOOT_TIMEOUT
+            ):
+                pytest.skip("SWE-bench sandbox did not reach running status")
+
+            result = await client.sandboxes.exec_command(
+                sandbox_id=sandbox.id,
+                command="exit 42",
+            )
+            print(f"[TEST] exec exit 42 result: returncode={result.returncode}")
+            assert result.returncode == 42
+
+        finally:
+            await _pause_and_delete(client, sandbox.id)
+
+    @pytest.mark.asyncio
+    async def test_exec_example_function(self, client):
+        """Test exec_swebench_command_example async helper end-to-end."""
+        sandbox = await _create_sandbox(
+            client,
+            "test-swebench-exec-fn",
+            sandbox_type=SandboxType.SWEBENCH,
+            cpu="4",
+            memory="8Gi",
+            image=SWEBENCH_TEST_IMAGE,
+        )
+        try:
+            if not await _wait_for_status(
+                client, sandbox.id, "running", timeout=SWEBENCH_BOOT_TIMEOUT
+            ):
+                pytest.skip("SWE-bench sandbox did not reach running status")
+
+            result = await exec_swebench_command_example(sandbox.id, command="uname -a")
+            if result:
+                assert isinstance(result, SwebenchExecResponse)
+                assert result.returncode == 0
+                assert len(result.output) > 0
+
+        finally:
+            await _pause_and_delete(client, sandbox.id)
+
+
+class TestPauseSwebenchSandbox:
+    """Test cases for pausing SWE-bench sandboxes (async)."""
+
+    @pytest.mark.asyncio
+    async def test_pause_swebench_sandbox_example_function(self, client):
+        """Test pause_swebench_sandbox_example async helper end-to-end."""
+        sandbox = await _create_sandbox(
+            client,
+            "test-pause-swebench",
+            sandbox_type=SandboxType.SWEBENCH,
+            cpu="4",
+            memory="8Gi",
+            image=SWEBENCH_TEST_IMAGE,
+        )
+        try:
+            if not await _wait_for_status(
+                client, sandbox.id, "running", timeout=SWEBENCH_BOOT_TIMEOUT
+            ):
+                pytest.skip("SWE-bench sandbox did not reach running status")
+            paused = await pause_swebench_sandbox_example(sandbox.id)
+            if paused:
+                assert paused.id == sandbox.id
+                assert paused.status is not None
+        finally:
+            await _pause_and_delete(client, sandbox.id)
+
+
+class TestResumeSwebenchSandbox:
+    """Test cases for resuming SWE-bench sandboxes (async)."""
+
+    @pytest.mark.asyncio
+    async def test_resume_swebench_sandbox_example_function(self, client):
+        """Test resume_swebench_sandbox_example async helper end-to-end."""
+        sandbox = await _create_sandbox(
+            client,
+            "test-resume-swebench",
+            sandbox_type=SandboxType.SWEBENCH,
+            cpu="4",
+            memory="8Gi",
+            image=SWEBENCH_TEST_IMAGE,
+        )
+        try:
+            if not await _wait_for_status(
+                client, sandbox.id, "running", timeout=SWEBENCH_BOOT_TIMEOUT
+            ):
+                pytest.skip("SWE-bench sandbox did not reach running status")
+            await client.sandboxes.pause(sandbox.id)
+            await _wait_for_status(client, sandbox.id, "stopped", timeout=120)
+
+            resumed = await resume_swebench_sandbox_example(sandbox.id)
+            if resumed:
+                assert resumed.id == sandbox.id
+                assert resumed.status is not None
+            await _wait_for_status(
+                client, sandbox.id, "running", timeout=SWEBENCH_BOOT_TIMEOUT
+            )
+        finally:
+            await _pause_and_delete(client, sandbox.id)
+
+
+class TestDeleteSwebenchSandbox:
+    """Test cases for deleting SWE-bench sandboxes (async)."""
+
+    @pytest.mark.asyncio
+    async def test_delete_swebench_sandbox_example_function(self, client):
+        """Test delete_swebench_sandbox_example async helper end-to-end."""
+        sandbox = await _create_sandbox(
+            client,
+            "test-delete-swebench",
+            sandbox_type=SandboxType.SWEBENCH,
+            cpu="4",
+            memory="8Gi",
+            image=SWEBENCH_TEST_IMAGE,
+        )
+        sandbox_id = sandbox.id
+
+        try:
+            if await _wait_for_status(
+                client, sandbox_id, "running", timeout=SWEBENCH_BOOT_TIMEOUT
+            ):
+                await pause_swebench_sandbox_example(sandbox_id)
+                await _wait_for_status(client, sandbox_id, "stopped", timeout=120)
+
+            await delete_swebench_sandbox_example(sandbox_id)
+
+            await asyncio.sleep(5)
+            try:
+                await client.sandboxes.get_sandbox(sandbox_id)
+                pytest.skip("SWE-bench sandbox still exists after deletion attempt")
             except ANY_API_ERROR:
                 pass
         except Exception:
