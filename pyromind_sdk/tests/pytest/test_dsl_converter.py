@@ -55,7 +55,7 @@ def test_to_python_quotes_string_node_ids():
     assert "id=\"node-01\"" in result
 
 
-def test_to_python_rejects_numeric_string_node_ids_with_leading_zero():
+def test_to_python_normalizes_leading_zero_node_ids():
     workflow = {
         "nodes": [{"id": "01", "type": "SleepNode", "data": {
             "config": {"duration": 5},
@@ -63,8 +63,11 @@ def test_to_python_rejects_numeric_string_node_ids_with_leading_zero():
         "edges": [],
     }
 
-    with pytest.raises(TypeError, match="invalid type/format"):
-        DslConverter().to_python(workflow)
+    result = DslConverter().to_python(workflow)
+
+    # "01" is normalized to integer 1
+    assert "id=1" in result
+    assert 'id="01"' not in result
 
 
 def test_roundtrip_preserves_node_count():

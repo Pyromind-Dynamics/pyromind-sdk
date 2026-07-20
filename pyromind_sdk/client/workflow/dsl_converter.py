@@ -312,14 +312,9 @@ class DslConverter:
     def _format_node_id(cls, node_id: Any) -> str:
         """Format a node ID as a valid Python literal.
 
-        XYFlow IDs are commonly strings.  A string such as ``"01"`` must
-        not be emitted as ``id=01`` because that is invalid Python syntax and
-        usually indicates that a numeric ID was supplied with the wrong type.
+        Leading-zero numeric strings (e.g. "01", "0001") are normalized to
+        integers so that ``id=1`` is emitted instead of ``id="01"``.
         """
-        if isinstance(node_id, str) and re.fullmatch(r"[+-]?0\d+", node_id):
-            raise TypeError(
-                f"Node ID {node_id!r} has an invalid type/format: "
-                "numeric node IDs must be integers without leading zeros "
-                "(for example, use 1 instead of '01')."
-            )
+        if isinstance(node_id, str) and re.fullmatch(r"0\d+", node_id):
+            node_id = int(node_id)
         return cls._to_literal(node_id)
