@@ -87,8 +87,6 @@ def get_default_inputs(input_types: Dict[str, Any]) -> Dict[str, Any]:
                 inputs[input_name] = 0
             elif input_type == "FLOAT":
                 inputs[input_name] = 0.0
-            else:
-                inputs[input_name] = ""
             if input_name in inputs:
                 logger.warning(f"Set default value for input {input_name} of type {input_type} to {inputs[input_name]}, we suggest you to set a default value in the node definition")
             else:
