@@ -279,7 +279,8 @@ def validate_lite_format(
 def validate_standard_format(
     data: Dict[str, Any],
     node_info: Optional[Dict] = None,
-    strict: bool = False
+    strict: bool = False,
+    exclude_string_types: bool = False
 ) -> Tuple[bool, List[str]]:
     """
     Validate workflow in standard format.
@@ -294,6 +295,8 @@ def validate_standard_format(
         data: Workflow dictionary in standard format
         node_info: Optional node information for type validation
         strict: If True, raise exception on first error
+        exclude_string_types: If True, ignore STRING when a type union has
+            more specific non-STRING members.
 
     Returns:
         Tuple of (is_valid, error_messages)
@@ -329,7 +332,13 @@ def validate_standard_format(
 
     # Step 5: Type compatibility validation
     if node_info:
-        type_errors = _validate_type_compatibility(data, node_map, link_map, node_info)
+        type_errors = _validate_type_compatibility(
+            data,
+            node_map,
+            link_map,
+            node_info,
+            exclude_string_types=exclude_string_types,
+        )
         errors.extend(type_errors)
         
         # Validate config/widgets_values against node_info
@@ -1210,7 +1219,8 @@ def _validate_type_compatibility(
     workflow: Dict,
     node_map: Dict,
     link_map: Dict,
-    node_info: Dict
+    node_info: Dict,
+    exclude_string_types: bool = False
 ) -> List[str]:
     """Validate type compatibility across all connections (supports xyflow edges and legacy links)."""
     errors = []
@@ -1247,7 +1257,7 @@ def _validate_type_compatibility(
             if target_input_type is None:
                 target_input_type = "AUTO"
 
-            if not _is_type_compatible(source_output_type, target_input_type):
+            if not _is_type_compatible(source_output_type, target_input_type, exclude_string_types=exclude_string_types):
                 errors.append(
                     f"Edge '{edge.get('id')}': Type mismatch between "
                     f"{source_node_type}.{source_handle} ({source_output_type}) "
@@ -1288,7 +1298,7 @@ def _validate_type_compatibility(
             if target_expected_type is None:
                 target_expected_type = "AUTO"
 
-            if not _is_type_compatible(source_expected_type, target_expected_type):
+            if not _is_type_compatible(source_expected_type, target_expected_type, exclude_string_types=exclude_string_types):
                 errors.append(
                     f"Link {link_id}: Type mismatch between source ({source_expected_type}) "
                     f"and target ({target_expected_type})"
@@ -1297,36 +1307,63 @@ def _validate_type_compatibility(
     return errors
 
 
-def _is_type_compatible(source_type: str, target_type: str) -> bool:
-    """Check if source type is compatible with target type."""
-    # Same types are always compatible
+def _is_single_type_compatible(source_type: str, target_type: str) -> bool:
     if source_type == target_type:
         return True
 
-    # AUTO is compatible with everything
     if source_type == "AUTO" or target_type == "AUTO":
         return True
 
-    # Wildcard types
     if source_type == "*" or target_type == "*":
         return True
 
-    # COMBO can be used as STRING
     if source_type == "COMBO" and target_type == "STRING":
         return True
     if source_type == "STRING" and target_type == "COMBO":
         return True
 
-    # Model types
     model_types = ["MODEL", "VAE", "LATENT", "CLIP", "STYLE_MODEL"]
     if source_type in model_types and target_type in model_types:
         return True
 
-    # Number types
     number_types = ["INT", "FLOAT", "NUMBER"]
     if source_type in number_types and target_type in number_types:
         return True
+    return False
 
+
+def _normalise_type_union(type_value: Any, exclude_string_types: bool = False) -> List[str]:
+    raw_types = []
+    if isinstance(type_value, (list, tuple, set)):
+        for item in type_value:
+            raw_types.extend(_normalise_type_union(item, exclude_string_types=exclude_string_types))
+    else:
+        raw_types.extend(str(type_value).replace(",", "|").split("|"))
+
+    types = []
+    for raw_type in raw_types:
+        normalised = str(raw_type).strip().upper()
+        if normalised and normalised not in types:
+            types.append(normalised)
+
+    if exclude_string_types:
+        non_string_types = [item for item in types if item != "STRING"]
+        return non_string_types or types or ["ANY"]
+    return types or ["ANY"]
+
+
+def _is_type_compatible(source_type: str, target_type: str, exclude_string_types: bool = False) -> bool:
+    """
+    Check if source type is compatible with target type.
+    Supports list and pipe-separated union types. STRING is only ignored when
+    exclude_string_types=True.
+    """
+    source_types = _normalise_type_union(source_type, exclude_string_types=exclude_string_types)
+    target_types = _normalise_type_union(target_type, exclude_string_types=exclude_string_types)
+    for st in source_types:
+        for tt in target_types:
+            if _is_single_type_compatible(st, tt):
+                return True
     return False
 
 
