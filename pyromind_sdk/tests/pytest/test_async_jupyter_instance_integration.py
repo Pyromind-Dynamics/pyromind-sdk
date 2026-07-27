@@ -323,6 +323,30 @@ class TestGetJupyterInstance:
         assert error.status_code in [404, 400], f"Expected 404 or 400, got: {error.status_code}"
 
 
+class TestGetJupyterInternalIP:
+    """Test cases for getting Jupyter internal IPs"""
+
+    @pytest.mark.asyncio
+    async def test_get_jupyter_internal_ip(self, client):
+        """Test getting the internal IP of a running Jupyter instance."""
+        instance = await _create_instance(client, "test-inner-ip")
+        try:
+            if not await _wait_for_status(client, instance.id, "running"):
+                pytest.skip("Jupyter instance did not reach running status")
+            try:
+                ip_info = await client.instances.get_internal_ip(instance.id)
+            except PyroMindAsyncAPIError as e:
+                skip_if_insufficient_resources(e)
+                raise
+
+            assert ip_info.id == instance.id
+            assert isinstance(ip_info.internal_ip, str)
+            assert ip_info.internal_ip.strip()
+            print(f"[TEST] Jupyter internal IP: id={ip_info.id}, internal_ip={ip_info.internal_ip}")
+        finally:
+            await _pause_and_delete(client, instance.id)
+
+
 class TestUpdateJupyterInstance:
     """Test cases for updating Jupyter instances"""
 

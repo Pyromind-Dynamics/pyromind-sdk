@@ -210,6 +210,7 @@ Inference job management.
 | `inf_image` | No | `str` | Inference image (get via `get_inf_image()`) |
 | `model_name` | No | `str` | Model name override |
 | `model_length` | No | `int` | Model context length |
+| `startup_args` | No | `List[dict]` or `List[str]` | Custom inference server startup args. Prefer `[{"--arg": value}]`; include the leading `-` or `--` yourself. Duplicate default options are overridden by user args |
 
 **Example:**
 
@@ -226,6 +227,7 @@ job_id = client.inference.create(
         model_path="/path/to/model",
         inference_framework=frameworks[0],
         resources=ResourceConfig(cpu="8", memory="32Gi", gpu="1", gpu_card="H100"),
+        startup_args=[{"--trust-remote-code": None}],
         name="my-inference"
     )
 )

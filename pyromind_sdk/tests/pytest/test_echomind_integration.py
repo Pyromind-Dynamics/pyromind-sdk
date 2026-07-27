@@ -352,6 +352,29 @@ class TestGetEchoMindInstance:
         assert error.status_code in [404, 400, 500], f"Expected 404, 400 or 500 status code, got: {error.status_code}"
 
 
+class TestGetEchoMindInternalIP:
+    """Test cases for getting EchoMind internal IPs"""
+
+    def test_get_echomind_internal_ip(self, client):
+        """Test getting the internal IP of a running EchoMind instance."""
+        instance_id = _create_instance(client, "test-inner-ip")
+        try:
+            if not _wait_for_status(client, instance_id, "running"):
+                pytest.skip("EchoMind instance did not reach running status")
+            try:
+                ip_info = client.echomind.get_internal_ip(instance_id)
+            except PyroMindAPIError as e:
+                skip_if_insufficient_resources(e)
+                raise
+
+            assert ip_info.id == instance_id
+            assert isinstance(ip_info.internal_ip, str)
+            assert ip_info.internal_ip.strip()
+            print(f"[TEST] EchoMind internal IP: id={ip_info.id}, internal_ip={ip_info.internal_ip}")
+        finally:
+            _pause_and_delete(client, instance_id)
+
+
 class TestPauseResumeEchoMindInstance:
     """Test cases for pausing and resuming EchoMind instances"""
 

@@ -54,6 +54,7 @@ def create_inference_job_example():
             InferenceJobRequest(
                 model_path="/workspace/models/Qwen/Qwen3-0.6B/",
                 model_name="glm-5",
+                model_length=4096,
                 inference_framework=selected_framework,
                 inf_image=selected_image,
                 resources=ResourceConfig(
@@ -184,6 +185,7 @@ def update_inference_job_example(job_id: str):
             request=InferenceJobRequest(
                 model_path="/workspace/models/Qwen/Qwen3-0.6B/",
                 model_name="glm-5",
+                model_length=4096,
                 inference_framework=selected_framework,
                 inf_image=selected_image,
                 resources=ResourceConfig(

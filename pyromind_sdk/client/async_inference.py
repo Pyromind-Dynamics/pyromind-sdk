@@ -9,6 +9,7 @@ from .async_base import PyroMindAsyncClient
 from .models import (
     InferenceJobRequest,
     InferenceJobResponse,
+    InternalIPResponse,
 )
 
 
@@ -75,6 +76,24 @@ class AsyncInferenceClient(PyroMindAsyncClient):
         data = self._extract_data(response)
 
         return InferenceJobResponse(**data)
+
+    async def get_internal_ip(self, job_id: str) -> InternalIPResponse:
+        """
+        Get the internal Pod IP of an inference job (async).
+
+        Args:
+            job_id: ID of the inference job to inspect
+
+        Returns:
+            InternalIPResponse containing the normalized resource ID and IP
+        """
+        response = await self.get(f"/inference/{job_id}/internal_ip")
+        data = self._extract_data(response)
+        normalized = {
+            "id": data.get("job_id") or data.get("id") or job_id,
+            "internal_ip": data.get("internal_ip"),
+        }
+        return InternalIPResponse(**normalized)
 
     async def update(self, job_id: str, request: InferenceJobRequest) -> InferenceJobResponse:
         """

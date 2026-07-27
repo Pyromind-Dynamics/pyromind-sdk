@@ -9,6 +9,7 @@ from .base import PyroMindClient
 from .models import (
     JupyterRequest,
     JupyterResponse,
+    InternalIPResponse,
 )
 
 
@@ -141,6 +142,24 @@ class JupyterLabClient(PyroMindClient):
             instance_data = self._convert_instance_data(instance_data, jupyter_id)
         
         return JupyterResponse(**instance_data)
+
+    def get_internal_ip(self, jupyter_id: str) -> InternalIPResponse:
+        """
+        Get the internal Pod IP of a JupyterLab instance.
+
+        Args:
+            jupyter_id: ID of the JupyterLab instance to inspect
+
+        Returns:
+            InternalIPResponse containing the normalized resource ID and IP
+        """
+        response = self.get(f"/jupyterlab/{jupyter_id}/internal_ip")
+        data = self._extract_data(response)
+        normalized = {
+            "id": data.get("jupyter_id") or data.get("id") or jupyter_id,
+            "internal_ip": data.get("internal_ip"),
+        }
+        return InternalIPResponse(**normalized)
     
     def update(self, jupyter_id: str, request: JupyterRequest) -> JupyterResponse:
         """
