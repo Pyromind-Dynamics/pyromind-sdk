@@ -18,6 +18,12 @@ class APIResponse(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
 
+class InternalIPResponse(BaseModel):
+    """Normalized internal Pod IP response model."""
+    id: str
+    internal_ip: str
+
+
 class ResourceConfig(BaseModel):
     """Resource configuration model"""
     cpu: Optional[str] = None
@@ -74,16 +80,16 @@ class ResourceConfig(BaseModel):
 # Sandbox Models
 class SandboxType(str, Enum):
     """Sandbox type enumeration"""
-    LINUX = "code"
-    WINDOWS = "win"
-    
+    # WINDOWS = "win"
+    OSWORLD = "osworld"
+
     @classmethod
     def from_api(cls, value: str) -> 'SandboxType':
         """Convert API value to SandboxType enum"""
         # Map old API values to new enum values
         mapping = {
-            'linux': 'code',
-            'windows': 'win'
+            # 'windows': 'win',
+            'osworld': 'osworld',
         }
         normalized = mapping.get(value, value)
         return cls(normalized)
@@ -118,6 +124,9 @@ class SandboxRequest(BaseModel):
     resources: Optional[ResourceConfig] = None
     configuration: Optional[SandboxConfiguration] = None
     name: Optional[str] = None
+    # OSWorld 专用：自定义系统镜像在 juicefs 上的相对路径（subPath）。
+    # 仅 sandbox_type=OSWORLD 时生效；未提供时服务端使用默认镜像。
+    system_image_path: Optional[str] = None
 
 
 class SandboxUsage(BaseModel):
@@ -147,6 +156,8 @@ class SandboxResponse(BaseModel):
     endpoint: Optional[str] = None
     screen_size: Optional[ScreenResolution] = None
     last_activity: Optional[datetime] = None
+    # OSWorld 专用：自定义系统镜像在 juicefs 上的相对路径（subPath）
+    system_image_path: Optional[str] = None
 
 
 
@@ -280,6 +291,57 @@ class JupyterAPIResponse(BaseModel):
 
 
 # Inference Models
+def _normalize_startup_arg_key(key: Any) -> str:
+    return str(key or "").strip()
+
+
+def _normalize_startup_arg_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if text else None
+
+
+def _normalize_startup_args(value: Any) -> Optional[List[str]]:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        value = [value]
+    if not isinstance(value, list):
+        raise ValueError("startup_args must be a list")
+
+    args: List[str] = []
+    for item in value:
+        if item is None:
+            continue
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                args.append(text)
+            continue
+        if isinstance(item, dict):
+            if any(key in item for key in ("key", "name", "arg", "value")):
+                key = _normalize_startup_arg_key(item.get("key") or item.get("name") or item.get("arg"))
+                arg_value = _normalize_startup_arg_value(item.get("value"))
+                if not key:
+                    continue
+                args.append(key)
+                if arg_value is not None:
+                    args.append(arg_value)
+                continue
+            for raw_key, raw_value in item.items():
+                key = _normalize_startup_arg_key(raw_key)
+                arg_value = _normalize_startup_arg_value(raw_value)
+                if not key:
+                    continue
+                args.append(key)
+                if arg_value is not None:
+                    args.append(arg_value)
+            continue
+        raise ValueError("startup_args items must be strings or dictionaries")
+    return args
+
+
 class InferenceJobRequest(BaseModel):
     """
     Request model for creating an inference job
@@ -293,6 +355,12 @@ class InferenceJobRequest(BaseModel):
     inf_image: Optional[str] = None
     model_name: Optional[str] = None
     model_length: Optional[int] = None
+    startup_args: Optional[List[Union[str, Dict[str, Any]]]] = None
+
+    @field_validator("startup_args", mode="before")
+    @classmethod
+    def validate_startup_args(cls, value: Any) -> Optional[List[str]]:
+        return _normalize_startup_args(value)
 
 
 
@@ -313,6 +381,7 @@ class InferenceJobResponse(BaseModel):
     model_name: Optional[str] = None
     model_length: Optional[int] = None
     inf_image: Optional[str] = None
+    startup_args: Optional[List[str]] = None
 
 
 class InferenceJobListAPIResponse(BaseModel):

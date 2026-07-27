@@ -4,6 +4,7 @@ from unittest import mock
 import pytest
 
 from pyromind_sdk.client.base import PyroMindClient, DEFAULT_API_BASE_URL, DEFAULT_CLUSTER
+from pyromind_sdk.client.models import InferenceJobRequest
 from pyromind_sdk.client.storage import StorageClient
 
 
@@ -172,3 +173,29 @@ class TestStorageClientEndpoint:
             cluster="us-west-2",
         )
         assert client.endpoint == "storage-us-west-2.pyromind.ai"
+
+
+class TestInferenceStartupArgs:
+    def test_dict_startup_args_are_serialized_to_argv(self):
+        request = InferenceJobRequest(
+            model_path="/workspace/models/test",
+            startup_args=[{"--max-length": 12323}, {"-q": None}, {"--trust-remote-code": None}],
+        )
+
+        assert request.startup_args == ["--max-length", "12323", "-q", "--trust-remote-code"]
+
+    def test_dict_startup_args_do_not_auto_prefix_key(self):
+        request = InferenceJobRequest(
+            model_path="/workspace/models/test",
+            startup_args=[{"max-length": 12323}],
+        )
+
+        assert request.startup_args == ["max-length", "12323"]
+
+    def test_legacy_argv_startup_args_still_work(self):
+        request = InferenceJobRequest(
+            model_path="/workspace/models/test",
+            startup_args=["--max-length", "12323"],
+        )
+
+        assert request.startup_args == ["--max-length", "12323"]
