@@ -26,6 +26,65 @@ ENV_LOG_LEVEL = "PYROMIND_LOG_LEVEL"
 RETRY_STATUS_CODES = [502, 503, 504]
 RETRY_ALLOWED_METHODS = ["GET", "POST", "PUT", "DELETE"]
 
+# Cluster -> per-env API base URL mapping.
+#
+# The terminal CLI resolves `--cluster <code>` (optionally with an `#env`
+# suffix, e.g. `us-west-1#pre`) to a per-cluster direct API base URL via
+# this table. Portal (`api-portal.pyromind.ai`) does not proxy WebSocket,
+# so terminal connections must use the per-cluster direct domains here.
+CLUSTER_RESOURCE = {
+    "us-west-1": {
+        "http": {
+            "prod": "https://api.pyromind.ai",
+            "pre": "https://pre-api.pyromind.ai",
+            "pre2": "https://pre2-api.pyromind.ai",
+            "dev": "http://localhost:8001",
+        },
+    },
+    "us-west-2": {
+        "http": {
+            "prod": "https://api-us-west-2.pyromind.ai",
+            "pre": "https://pre-api-us-west-2.pyromind.ai",
+            "pre2": "https://pre2-api-us-west-2.pyromind.ai",
+            "dev": "http://localhost:8002",
+        },
+    },
+}
+
+
+def parse_cluster_code(cluster: str):
+    """Split a cluster identifier into (cluster_code, env).
+
+    Accepted shapes:
+      * "us-west-1"       -> ("us-west-1", "prod")
+      * "us-west-1#pre"   -> ("us-west-1", "pre")
+      * "us-west-1#pre2"  -> ("us-west-1", "pre2")
+    """
+    if not cluster:
+        return "", "prod"
+    cluster = cluster.strip()
+    if "#" in cluster:
+        code, env = cluster.split("#", 1)
+        return code.strip(), (env.strip() or "prod")
+    return cluster, "prod"
+
+
+def resolve_base_url_from_cluster(cluster: str) -> str:
+    """Return the per-cluster API base URL (with trailing /api/v1).
+
+    Raises ValueError if the cluster code or env suffix is unknown.
+    """
+    code, env = parse_cluster_code(cluster)
+    cfg = CLUSTER_RESOURCE.get(code)
+    if not cfg:
+        valid = ", ".join(sorted(CLUSTER_RESOURCE))
+        raise ValueError(f"Unknown cluster {code!r}. Valid clusters: {valid}")
+    base = cfg.get("http", {}).get(env)
+    if not base:
+        valid_envs = ", ".join(sorted(cfg.get("http", {})))
+        raise ValueError(f"Unknown env {env!r} for cluster {code!r}. Valid envs: {valid_envs}")
+    return base.rstrip("/") + "/api/v1"
+
 ERROR_MESSAGE_MAX_LENGTH = 500
 
 # Default log format and level

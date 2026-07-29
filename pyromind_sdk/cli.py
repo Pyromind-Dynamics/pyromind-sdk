@@ -3,6 +3,7 @@
 Usage:
   python -m pyromind_sdk.cli python-to-yaml <python-file> <function> \
     --node-name <NodeName> --output <yaml>
+  python -m pyromind_sdk.cli terminal <sandbox-id> [--api-key KEY] [--base-url URL]
 
 Notes:
 - This project uses argparse; we expose a `main(argv)` function for pytest.
@@ -44,6 +45,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="YAML 'python_command'",
     )
 
+    terminal = subparsers.add_parser(
+        "terminal",
+        help="Open an interactive terminal into a running custom sandbox",
+    )
+    terminal.add_argument("sandbox_id", type=str, help="Sandbox id, e.g. sb-xxxx")
+    terminal.add_argument(
+        "--cluster", type=str, required=True,
+        help=(
+            "Target cluster code, e.g. us-west-1, us-west-2. "
+            "Append #env for non-prod: us-west-1#pre, us-west-1#pre2, us-west-1#dev. "
+            "Resolved to a per-cluster direct domain (required)."
+        ),
+    )
+    terminal.add_argument(
+        "--api-key", type=str, default=None,
+        help="API key (defaults to $PYROMIND_API_KEY; optional, falls back to cookie auth)",
+    )
+    terminal.add_argument(
+        "--base-url", type=str, default=None,
+        help=(
+            "Override the API base URL (defaults to resolving from --cluster via "
+            "CLUSTER_RESOURCE; if unset, also reads $PYROMIND_BASE_URL)"
+        ),
+    )
+
     return parser
 
 
@@ -54,6 +80,11 @@ def _dump_yaml(config: Dict[str, Any]) -> str:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "terminal":
+        from pyromind_sdk.terminal import run_terminal
+
+        return run_terminal(args.sandbox_id, cluster=args.cluster, api_key=args.api_key, base_url=args.base_url)
 
     if args.command == "python-to-yaml":
         python_file: Path = args.python_file
