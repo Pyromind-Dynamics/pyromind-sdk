@@ -34,6 +34,5 @@ build/
 /.trae
 /PROJECT_MAP.txt
 /skills-lock.json
+/script/sec.txt
 
-
-script/sec.txt
