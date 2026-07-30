@@ -8,7 +8,7 @@ In the real platform runtime environment, nodes should prioritize importing
 base classes from `app.models.nodes`.
 """
 ## todo update_version
-__version__ = "0.1.8.dev1"
+__version__ = "0.1.8"
 
 # Export YAML nodes functionality
 from .nodes import (
@@ -79,6 +79,8 @@ from .client.models import (
     EchoMindJobResponse,
     InternalIPResponse,
     ResourceConfig,
+    VolumeMount,
+    PortMapping,
 )
 
 # Export workflow functionality
@@ -159,6 +161,8 @@ __all__ = [
     "EchoMindJobResponse",
     "InternalIPResponse",
     "ResourceConfig",
+    "VolumeMount",
+    "PortMapping",
     # Workflow functionality
     "WorkflowLiteConverter",
     "LayoutGenerator",

@@ -11,6 +11,8 @@ The API key can be provided via:
 If neither is provided, the client will raise a ValueError.
 """
 
+import os
+import tempfile
 import time
 
 from pyromind_sdk import PyroMindAPIClient, PyroMindAPIError
@@ -21,6 +23,8 @@ from pyromind_sdk.client.models import (
     ResourceConfig,
     ScreenResolution,
     SwebenchExecResponse,
+    VolumeMount,
+    PortMapping,
 )
 
 # ---------------------------------------------------------------------------
@@ -63,7 +67,7 @@ def create_osworld_sandbox_example(system_image_path: str = DEFAULT_OSWORLD_SYST
                 system_image_path=system_image_path,
             )
         )
-        print(f"✓ OSWorld sandbox created successfully!")
+        print("✓ OSWorld sandbox created successfully!")
         print(f"  ID: {sandbox.id}")
         print(f"  Name: {sandbox.name}")
         print(f"  Type: {sandbox.type}")
@@ -113,7 +117,7 @@ def update_osworld_sandbox_example(
                 system_image_path=system_image_path,
             ),
         )
-        print(f"✓ OSWorld sandbox updated successfully!")
+        print("✓ OSWorld sandbox updated successfully!")
         print(f"  Name: {updated_sandbox.name}")
         print(f"  Status: {updated_sandbox.status}")
         return updated_sandbox
@@ -161,7 +165,7 @@ def delete_osworld_sandbox_example(sandbox_id: str):
     try:
         print(f"Deleting OSWorld sandbox {sandbox_id}...")
         client.sandboxes.delete(sandbox_id)
-        print(f"✓ OSWorld sandbox deleted successfully!")
+        print("✓ OSWorld sandbox deleted successfully!")
     except PyroMindAPIError as e:
         print(f"✗ Failed to delete OSWorld sandbox: {e.message}")
     finally:
@@ -199,7 +203,7 @@ def create_swebench_sandbox_example(image: str = DEFAULT_SWEBENCH_IMAGE):
                 image=image,
             )
         )
-        print(f"✓ SWE-bench sandbox created successfully!")
+        print("✓ SWE-bench sandbox created successfully!")
         print(f"  ID: {sandbox.id}")
         print(f"  Name: {sandbox.name}")
         print(f"  Type: {sandbox.type}")
@@ -242,7 +246,7 @@ def exec_swebench_command_example(
             cwd=cwd,
             timeout=timeout,
         )
-        print(f"✓ Command executed!")
+        print("✓ Command executed!")
         print(f"  Return code: {result.returncode}")
         if result.output:
             print(f"  Output:\n{result.output}")
@@ -293,7 +297,7 @@ def delete_swebench_sandbox_example(sandbox_id: str):
     try:
         print(f"Deleting SWE-bench sandbox {sandbox_id}...")
         client.sandboxes.delete(sandbox_id)
-        print(f"✓ SWE-bench sandbox deleted successfully!")
+        print("✓ SWE-bench sandbox deleted successfully!")
     except PyroMindAPIError as e:
         print(f"✗ Failed to delete SWE-bench sandbox: {e.message}")
     finally:
@@ -311,25 +315,32 @@ def swebench_full_lifecycle_example(image: str = DEFAULT_SWEBENCH_IMAGE):
     if not sandbox_id:
         return
 
-    print("\nWaiting for SWE-bench sandbox to be ready...")
-    time.sleep(5)
+    client = PyroMindAPIClient()
+    try:
+        if not _wait_for_running(client, sandbox_id):
+            print("✗ SWE-bench sandbox never reached RUNNING")
+            return
 
-    # Execute a simple command
-    exec_swebench_command_example(sandbox_id, command="echo hello && date")
+        # Execute a simple command
+        exec_swebench_command_example(sandbox_id, command="echo hello && date")
 
-    # Pause
-    pause_swebench_sandbox_example(sandbox_id)
-    time.sleep(2)
+        # Pause
+        pause_swebench_sandbox_example(sandbox_id)
+        time.sleep(2)
 
-    # Resume
-    resume_swebench_sandbox_example(sandbox_id)
-    time.sleep(2)
+        # Resume
+        resume_swebench_sandbox_example(sandbox_id)
+        if not _wait_for_running(client, sandbox_id):
+            print("✗ SWE-bench sandbox did not re-enter RUNNING after resume")
+            return
 
-    # Execute another command after resume
-    exec_swebench_command_example(sandbox_id, command="uname -a")
+        # Execute another command after resume
+        exec_swebench_command_example(sandbox_id, command="uname -a")
 
-    # Cleanup
-    delete_swebench_sandbox_example(sandbox_id)
+        # Cleanup
+        delete_swebench_sandbox_example(sandbox_id)
+    finally:
+        client.close()
 
 
 def osworld_full_lifecycle_example():
@@ -343,59 +354,346 @@ def osworld_full_lifecycle_example():
     if not sandbox_id:
         return
 
-    # Allow the sandbox to start before subsequent operations.
-    print("\nWaiting for OSWorld sandbox to be ready...")
-    time.sleep(5)
+    client = PyroMindAPIClient()
+    try:
+        if not _wait_for_running(client, sandbox_id):
+            print("✗ OSWorld sandbox never reached RUNNING")
+            return
 
-    get_sandbox_example(sandbox_id)
-    pause_osworld_sandbox_example(sandbox_id)
-    time.sleep(2)
-    resume_osworld_sandbox_example(sandbox_id)
-    time.sleep(2)
-    update_osworld_sandbox_example(sandbox_id)
-    delete_osworld_sandbox_example(sandbox_id)
+        pause_osworld_sandbox_example(sandbox_id)
+        time.sleep(2)
+        resume_osworld_sandbox_example(sandbox_id)
+        if not _wait_for_running(client, sandbox_id):
+            print("✗ OSWorld sandbox did not re-enter RUNNING after resume")
+            return
+        update_osworld_sandbox_example(sandbox_id)
+        delete_osworld_sandbox_example(sandbox_id)
+    finally:
+        client.close()
+
+
+# ---------------------------------------------------------------------------
+# Custom sandbox + file operation examples
+# ---------------------------------------------------------------------------
+
+# Default container image used for CUSTOM sandbox examples. Any Docker/OCI
+# image that has a shell works; ``python:3.11-slim`` is small and ships with
+# ``sh`` + basic POSIX tooling, good enough for file ops.
+DEFAULT_CUSTOM_IMAGE = "python:3.11-slim"
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+def _wait_for_running(
+    client: PyroMindAPIClient,
+    sandbox_id: str,
+    timeout: int = 300,
+    interval: int = 3,
+) -> bool:
+    """Poll the sandbox until its status becomes ``running``.
+
+    Returns ``True`` on success, ``False`` if it transitions to ``failed``
+    or the timeout elapses. Prints a single-line progress message so the
+    example output is informative without being noisy.
+    """
+    waited = 0
+    while waited < timeout:
+        try:
+            sb = client.sandboxes.get_sandbox(sandbox_id)
+            status = (sb.status or "").lower()
+            if status == "running":
+                print(f"[WAIT] {sandbox_id} -> running after {waited}s")
+                return True
+            if status == "failed":
+                print(f"[WAIT] {sandbox_id} -> failed after {waited}s")
+                return False
+        except PyroMindAPIError as e:
+            print(f"[WAIT] get_sandbox error: {e.message}")
+            return False
+        time.sleep(interval)
+        waited += interval
+    print(f"[WAIT] {sandbox_id} timeout after {waited}s")
+    return False
+
+
+def create_custom_sandbox_example(
+    image: str = DEFAULT_CUSTOM_IMAGE,
+    volume_mounts=None,
+    port_mappings=None,
+):
+    """Example: Create a new CUSTOM sandbox.
+
+    CUSTOM sandboxes are headless (no VNC) and support the three file
+    endpoints (``read_file`` / ``write_file`` / ``delete_file``) plus
+    the streaming ``write_file_stream`` shortcut.
+
+    By default we mount ``hostPath=/workspace`` onto ``/data`` inside the
+    container, so all subsequent file ops should use ``/data/<name>`` as
+    their path. Data written there survives pod restarts; anything written
+    to a non-mounted path (e.g. ``/workspace``) lives in the container's
+    ephemeral overlay and is lost on pause/delete.
+
+    Args:
+        image: Docker/OCI container image reference. Defaults to
+            :data:`DEFAULT_CUSTOM_IMAGE`.
+        volume_mounts: Optional ``list[VolumeMount]`` (docker ``-v`` style).
+            When ``None`` (default) we mount ``/workspace`` → ``/data``.
+            Pass ``[]`` to disable default mount, or a custom list to
+            override entirely.
+        port_mappings: Optional ``list[PortMapping]`` (docker ``-p`` style).
+            Example::
+
+                port_mappings = [
+                    PortMapping(container_port=8080, host_port=30080, name="http"),
+                ]
+    """
+    client = PyroMindAPIClient()
+
+    if volume_mounts is None:
+        volume_mounts = [
+            VolumeMount(
+                host_path="/workspace",
+                mount_path="/data",
+                read_only=False,
+            ),
+        ]
+
+    # If the caller didn't supply port_mappings, demonstrate how to declare
+    # one: expose the container's 8080 port. The operator / ingress layer
+    # assigns the real ``host_port``; passing ``None`` here means "let the
+    # platform pick". Comment out the next three lines if you don't need
+    # any port exposed in your example run.
+    if port_mappings is None:
+        port_mappings = [
+            PortMapping(container_port=8080, name="http"),
+        ]
+
+    try:
+        print("Creating a new CUSTOM sandbox...")
+        sandbox = client.sandboxes.create(
+            SandboxRequest(
+                name=f"custom-sandbox-{int(time.time())}",
+                sandbox_type=SandboxType.CUSTOM,
+                resources=ResourceConfig(
+                    cpu="4",
+                    memory="8Gi",
+                    gpu=0,
+                ),
+                image=image,
+                volume_mounts=volume_mounts,
+                port_mappings=port_mappings,
+            )
+        )
+        print("✓ CUSTOM sandbox created successfully!")
+        print(f"  ID:     {sandbox.id}")
+        print(f"  Name:   {sandbox.name}")
+        print(f"  Type:   {sandbox.type}")
+        print(f"  Status: {sandbox.status}")
+        print(f"  Image:  {sandbox.image}")
+        return sandbox.id
+
+    except PyroMindAPIError as e:
+        print(f"✗ Failed to create CUSTOM sandbox: {e.message}")
+        return None
+    except Exception as e:
+        print(f"✗ Failed to create CUSTOM sandbox: {e}")
+        return None
+    finally:
+        client.close()
+
+
+def write_file_example(sandbox_id: str, path: str = "/data/hello.txt",
+                       data: bytes = b"hello pyromind\n"):
+    """Example: Write bytes to a file inside a CUSTOM sandbox (one-shot).
+
+    The SDK buffers the full payload and sends it as a single
+    ``application/octet-stream`` body. Use ``write_file_stream_example``
+    when uploading large files or when the source is a local path /
+    file-like object.
+    """
+    client = PyroMindAPIClient()
+    try:
+        print(f"Writing {len(data)} bytes to {path} ...")
+        result = client.sandboxes.write_file(sandbox_id, path, data)
+        print(f"✓ write_file OK -> path={result['path']}, "
+              f"size={result['size']}, transport_bytes={result.get('transport_bytes')}")
+        return result
+    except PyroMindAPIError as e:
+        print(f"✗ write_file failed: {e.message}")
+        return None
+    finally:
+        client.close()
+
+
+def write_file_stream_example(sandbox_id: str, source,
+                              path: str = "/data/streamed.bin"):
+    """Example: Streaming upload to a file inside a CUSTOM sandbox.
+
+    ``source`` can be any of:
+      * a local file path (``str`` or :class:`os.PathLike`);
+      * ``bytes`` / ``bytearray`` / ``memoryview``;
+      * a seekable file-like object (``hasattr(source, 'read')``).
+
+    The SDK streams the body so the server does **not** buffer the whole
+    payload in memory — recommended for anything larger than a few MB.
+    """
+    client = PyroMindAPIClient()
+    try:
+        src_repr = source if isinstance(source, (str, bytes)) else type(source).__name__
+        print(f"Streaming upload from {src_repr!r} -> {path} ...")
+        result = client.sandboxes.write_file_stream(sandbox_id, path, source)
+        print(f"✓ write_file_stream OK -> path={result['path']}, "
+              f"size={result['size']}, transport_bytes={result.get('transport_bytes')}")
+        return result
+    except PyroMindAPIError as e:
+        print(f"✗ write_file_stream failed: {e.message}")
+        return None
+    except ValueError as e:
+        # _resolve_upload_source raises ValueError for unsupported sources.
+        print(f"✗ write_file_stream rejected source: {e}")
+        return None
+    finally:
+        client.close()
+
+
+def read_file_example(sandbox_id: str, path: str = "/data/hello.txt"):
+    """Example: Read a file from a CUSTOM sandbox as ``bytes``."""
+    client = PyroMindAPIClient()
+    try:
+        print(f"Reading {path} ...")
+        content: bytes = client.sandboxes.read_file(sandbox_id, path)
+        preview = content[:64]
+        print(f"✓ read_file OK -> {len(content)} bytes "
+              f"(preview={preview!r}{'...' if len(content) > 64 else ''})")
+        return content
+    except PyroMindAPIError as e:
+        print(f"✗ read_file failed: {e.message}")
+        return None
+    finally:
+        client.close()
+
+
+def delete_file_example(sandbox_id: str, path: str = "/data/hello.txt",
+                        recursive: bool = False):
+    """Example: Delete a file or (with ``recursive=True``) a directory inside
+    a CUSTOM sandbox."""
+    client = PyroMindAPIClient()
+    try:
+        print(f"Deleting {path} (recursive={recursive}) ...")
+        result = client.sandboxes.delete_file(
+            sandbox_id, path, recursive=recursive
+        )
+        print(f"✓ delete_file OK -> {result}")
+        return result
+    except PyroMindAPIError as e:
+        print(f"✗ delete_file failed: {e.message}")
+        return None
+    finally:
+        client.close()
+
+
+def pause_custom_sandbox_example(sandbox_id: str):
+    """Example: Pause a CUSTOM sandbox."""
+    client = PyroMindAPIClient()
+    try:
+        print(f"Pausing CUSTOM sandbox {sandbox_id}...")
+        sandbox = client.sandboxes.pause(sandbox_id)
+        print(f"✓ CUSTOM sandbox paused. Status: {sandbox.status}")
+        return sandbox
+    except PyroMindAPIError as e:
+        print(f"✗ Failed to pause CUSTOM sandbox: {e.message}")
+        return None
+    finally:
+        client.close()
+
+
+def delete_custom_sandbox_example(sandbox_id: str):
+    """Example: Delete a CUSTOM sandbox (must already be stopped)."""
+    client = PyroMindAPIClient()
+    try:
+        print(f"Deleting CUSTOM sandbox {sandbox_id}...")
+        client.sandboxes.delete(sandbox_id)
+        print("✓ CUSTOM sandbox deleted successfully!")
+    except PyroMindAPIError as e:
+        print(f"✗ Failed to delete CUSTOM sandbox: {e.message}")
+    finally:
+        client.close()
+
+
+def custom_sandbox_full_lifecycle_example(image: str = DEFAULT_CUSTOM_IMAGE):
+    """Full lifecycle demo for a CUSTOM sandbox:
+
+    create → wait for RUNNING →
+        write_file (bytes) → read_file back →
+        write_file_stream (local path) → read_file back →
+        delete_file → delete_file(recursive)
+    → pause → delete.
+
+    Uses :func:`_wait_for_running` so boot time is detected reliably
+    instead of relying on a fixed ``sleep()``.
+    """
+    print("-" * 60)
+    print("CUSTOM Sandbox + File Ops Lifecycle Demo")
+    print("-" * 60)
+
+    sandbox_id = create_custom_sandbox_example(image)
+    if not sandbox_id:
+        return
+
+    client = PyroMindAPIClient()
+    try:
+        if not _wait_for_running(client, sandbox_id):
+            print("✗ CUSTOM sandbox never reached RUNNING")
+            return
+
+        # 1) write bytes + read back
+        write_file_example(sandbox_id, "/data/hello.txt", b"hello pyromind\n")
+        read_file_example(sandbox_id, "/data/hello.txt")
+
+        # 2) stream a local file (8 KiB synthetic payload) + read back
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(os.urandom(8 * 1024))
+            tmp_path = tmp.name
+        try:
+            write_file_stream_example(sandbox_id, tmp_path,
+                                      path="/data/streamed.bin")
+            read_file_example(sandbox_id, "/data/streamed.bin")
+        finally:
+            os.unlink(tmp_path)
+
+        # 3) delete the two files
+        delete_file_example(sandbox_id, "/data/hello.txt")
+        delete_file_example(sandbox_id, "/data/streamed.bin")
+
+        # 4) directory: write two files under /data/demo/, then recursive delete
+        write_file_example(sandbox_id, "/data/demo/a.txt", b"a")
+        write_file_example(sandbox_id, "/data/demo/sub/b.txt", b"b")
+        delete_file_example(sandbox_id, "/data/demo", recursive=True)
+
+        # 5) cleanup
+        pause_custom_sandbox_example(sandbox_id)
+        time.sleep(2)
+        delete_custom_sandbox_example(sandbox_id)
+    finally:
+        client.close()
 
 
 def main():
-    """Main example function"""
+    """Run the CUSTOM sandbox + file ops lifecycle demo.
+
+    The legacy OSWorld / SWE-bench ``*_full_lifecycle_example()`` functions
+    are still available as callables but not driven from here — they
+    require real infra resources and a longer boot time than the quick
+    file-ops demo below.
+    """
     print("=" * 60)
     print("Sandbox Management Examples")
     print("=" * 60)
-    
-    # List existing sandboxes
-    sandboxes = list_sandboxes_example()
-    
-    # If we have sandboxes, demonstrate operations
-    if sandboxes:
-        sandbox_id = sandboxes[0].id
-        print(f"\nUsing sandbox: {sandbox_id}")
-        
-        # Get sandbox details
-        get_sandbox_example(sandbox_id)
-        
-        # Update sandbox
-        update_sandbox_example(sandbox_id)
-        
-        # Execute an action
-        execute_action_example(sandbox_id)
-        
-        # Get VNC info (if available)
-        get_vnc_example(sandbox_id)
-    else:
-        print("\nNo existing sandboxes found. Creating a new one...")
-        sandbox_id = create_sandbox_example()
-        
-        if sandbox_id:
-            # Wait a bit for sandbox to be ready
-            import time
-            print("\nWaiting for sandbox to be ready...")
-            time.sleep(2)
-            
-            # Update sandbox
-            update_sandbox_example(sandbox_id)
-            
-            # Execute an action
-            execute_action_example(sandbox_id)
+    print("\nRunning CUSTOM sandbox + file ops lifecycle demo.\n")
+    custom_sandbox_full_lifecycle_example()
 
 
 if __name__ == "__main__":

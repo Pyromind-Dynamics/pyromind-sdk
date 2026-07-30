@@ -87,9 +87,14 @@ class SandboxType(str, Enum):
         SWEBENCH: SWE-bench code sandbox (headless container), requires a
             user-provided container image via the ``image`` field. Supports
             shell command execution through the ``/exec`` endpoint.
+        CUSTOM: Custom sandbox (headless container). Supports file operations
+            via ``read_file`` / ``write_file`` / ``write_file_stream`` /
+            ``delete_file`` endpoints; requires a user-provided container
+            image via the ``image`` field.
     """
     OSWORLD = "osworld"
     SWEBENCH = "swebench"
+    CUSTOM = "custom"
 
     @classmethod
     def from_api(cls, value: str) -> 'SandboxType':
@@ -99,6 +104,7 @@ class SandboxType(str, Enum):
             # 'windows': 'win',
             'osworld': 'osworld',
             'swebench': 'swebench',
+            'custom': 'custom',
         }
         normalized = mapping.get(value, value)
         return cls(normalized)
@@ -127,20 +133,86 @@ class SandboxConfiguration(BaseModel):
     vnc_password: Optional[str] = None
 
 
+class VolumeMount(BaseModel):
+    """Host-to-container path mount (similar to ``docker -v host:container``).
+
+    Attributes:
+        name: Optional K8s volume name (auto-generated when omitted).
+        host_path: Path on the node (e.g. ``"/workspace"``).
+        mount_path: Mount point inside the container (e.g. ``"/data"``).
+        read_only: Mount as read-only inside the container.
+    """
+    name: Optional[str] = Field(
+        default=None,
+        min_length=1, max_length=63,
+        description="K8s volume name; auto-generated if omitted.",
+    )
+    host_path: str = Field(
+        ..., min_length=1, max_length=512,
+        description="Host (node) path, e.g. '/workspace'.",
+    )
+    mount_path: str = Field(
+        ..., min_length=1, max_length=512,
+        description="Container mount path, e.g. '/data'.",
+    )
+    read_only: bool = Field(
+        default=False,
+        description="Mount as read-only inside the container.",
+    )
+
+
+class PortMapping(BaseModel):
+    """Container port exposed via a node-port (similar to ``docker -p host:container``).
+
+    Attributes:
+        container_port: Port the container listens on (1–65535).
+        host_port: Optional port exposed on the node. Defaults to
+            ``container_port`` when omitted.
+        name: Optional port name (used to build access URLs / K8s Service
+            port name). ``None`` = auto-generated.
+        protocol: ``"TCP"`` or ``"UDP"`` (default ``TCP``).
+    """
+    container_port: int = Field(
+        ..., ge=1, le=65535,
+        description="Container port to listen on.",
+    )
+    host_port: Optional[int] = Field(
+        default=None, ge=1, le=65535,
+        description="Node port exposed externally. Defaults to container_port.",
+    )
+    name: Optional[str] = Field(
+        default=None, max_length=63,
+        description="Optional port name; used to build access URLs.",
+    )
+    protocol: Optional[str] = Field(
+        default="TCP",
+        description="Protocol: 'TCP' or 'UDP'.",
+    )
+
+
 class SandboxRequest(BaseModel):
     """Request model for creating a sandbox.
 
     Attributes:
-        sandbox_type: The type of sandbox to create (``OSWORLD`` or ``SWEBENCH``).
+        sandbox_type: The type of sandbox to create (``OSWORLD``, ``SWEBENCH``,
+            or ``CUSTOM``).
         resources: CPU / memory / GPU resource limits for the sandbox pod.
         configuration: Optional GUI configuration (screen resolution, VNC password, etc.).
-            Ignored for headless sandbox types such as ``SWEBENCH``.
+            Ignored for headless sandbox types (``SWEBENCH`` / ``CUSTOM``).
         name: Human-readable name for the sandbox. Auto-generated when omitted.
         system_image_path: **OSWorld only.** JuiceFS sub-path to a custom system
             image (e.g. ``"template/Ubuntu.qcow2"``). Ignored for other sandbox types;
             the server falls back to its built-in default image when ``None``.
-        image: **SWE-bench only (required).** Docker/OCI container image reference
-            (e.g. ``"swebench/swesmith.x86_64:latest"``). Ignored for other sandbox types.
+        image: **SWE-bench / CUSTOM (required).** Docker/OCI container image reference.
+        volume_mounts: Optional hostPath mounts. Typical CUSTOM usage is
+            ``VolumeMount(host_path="/workspace", mount_path="/data")`` to
+            expose a node directory inside the container. When creating a
+            sandbox for file operations, mount the working directory here and
+            use ``mount_path`` in every ``write_file`` / ``read_file`` /
+            ``delete_file`` call.
+        port_mappings: Optional port exposures (docker ``-p`` style). Each
+            ``PortMapping(container_port=8080)`` opens that port on the node.
+            Useful for CUSTOM sandboxes running HTTP / gRPC servers.
     """
     sandbox_type: SandboxType
     resources: Optional[ResourceConfig] = None
@@ -156,10 +228,25 @@ class SandboxRequest(BaseModel):
     image: Optional[str] = Field(
         default=None,
         description=(
-            "SWE-bench only (required): Docker/OCI container image reference "
-            "(e.g. 'swebench/swesmith.x86_64:latest'). Ignored for other sandbox types."
+            "SWE-bench / CUSTOM (required): Docker/OCI container image reference. "
+            "Ignored for OSWorld."
         ),
     )
+    volume_mounts: Optional[List[VolumeMount]] = Field(
+        default=None,
+        description=(
+            "Optional hostPath mounts (docker -v style). Each entry needs a "
+            "host_path and a mount_path."
+        ),
+    )
+    port_mappings: Optional[List[PortMapping]] = Field(
+        default=None,
+        description=(
+            "Optional port mappings (docker -p style). Each entry needs at "
+            "least a container_port."
+        ),
+    )
+
 
 
 class SandboxUsage(BaseModel):
@@ -179,20 +266,22 @@ class SandboxResponse(BaseModel):
     Attributes:
         id: Unique sandbox identifier (UUID).
         name: Human-readable sandbox name.
-        type: Sandbox type (``OSWORLD`` or ``SWEBENCH``).
+        type: Sandbox type (``OSWORLD``, ``SWEBENCH``, or ``CUSTOM``).
         status: Current lifecycle status (e.g. ``"creating"``, ``"running"``, ``"stopped"``).
         configuration: GUI / screen configuration (``None`` for headless sandboxes).
         usage: Real-time resource usage statistics.
         created_at: ISO-8601 creation timestamp.
         updated_at: ISO-8601 last-activity timestamp.
         endpoint_url: Public API endpoint URL of the sandbox (``None`` for types without Ingress).
-        web_vnc_url: Web-based VNC URL (``None`` for headless sandbox types such as ``SWEBENCH``).
+        web_vnc_url: Web-based VNC URL (``None`` for headless sandbox types such as ``SWEBENCH`` / ``CUSTOM``).
         uid: Owner UID.
         endpoint: Legacy alias for ``endpoint_url``.
         screen_size: Legacy alias for ``configuration.screen_resolution``.
         last_activity: Legacy alias for ``updated_at``.
         system_image_path: **OSWorld only.** JuiceFS sub-path of the system image in use.
-        image: **SWE-bench only.** Docker/OCI container image reference in use.
+        image: **SWE-bench / CUSTOM.** Docker/OCI container image reference in use.
+        volume_mounts: **SWE-bench / CUSTOM.** Active hostPath mounts (docker ``-v`` style).
+        port_mappings: **SWE-bench / CUSTOM.** Active port mappings (docker ``-p`` style).
     """
     id: str
     name: str
@@ -214,7 +303,15 @@ class SandboxResponse(BaseModel):
     )
     image: Optional[str] = Field(
         default=None,
-        description="SWE-bench only: Docker image reference in use.",
+        description="SWE-bench / CUSTOM: Docker image reference in use.",
+    )
+    volume_mounts: Optional[List[VolumeMount]] = Field(
+        default=None,
+        description="Active hostPath mounts (docker -v style).",
+    )
+    port_mappings: Optional[List[PortMapping]] = Field(
+        default=None,
+        description="Active port mappings (docker -p style).",
     )
 
 
