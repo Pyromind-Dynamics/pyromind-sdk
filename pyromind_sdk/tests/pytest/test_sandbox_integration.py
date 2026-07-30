@@ -34,6 +34,8 @@ from pyromind_sdk.client.models import (
     ActionParameters,
     SwebenchExecRequest,
     SwebenchExecResponse,
+    VolumeMount,
+    PortMapping,
 )
 
 
@@ -80,6 +82,16 @@ pause_swebench_sandbox_example = sandbox_example.pause_swebench_sandbox_example
 resume_swebench_sandbox_example = sandbox_example.resume_swebench_sandbox_example
 delete_swebench_sandbox_example = sandbox_example.delete_swebench_sandbox_example
 
+# CUSTOM sandbox + file-operation example helpers
+create_custom_sandbox_example = sandbox_example.create_custom_sandbox_example
+write_file_example = sandbox_example.write_file_example
+write_file_stream_example = sandbox_example.write_file_stream_example
+read_file_example = sandbox_example.read_file_example
+delete_file_example = sandbox_example.delete_file_example
+pause_custom_sandbox_example = sandbox_example.pause_custom_sandbox_example
+delete_custom_sandbox_example = sandbox_example.delete_custom_sandbox_example
+custom_sandbox_full_lifecycle_example = sandbox_example.custom_sandbox_full_lifecycle_example
+
 
 @pytest.fixture(scope="module")
 def api_key():
@@ -122,22 +134,28 @@ def _create_sandbox(
     height: int = 1080,
     system_image_path: Optional[str] = None,
     image: Optional[str] = None,
+    volume_mounts: Optional[list] = None,
+    port_mappings: Optional[list] = None,
 ) -> SandboxResponse:
     """Create a sandbox of the requested type and return the response.
 
     ``system_image_path`` is OSWorld-only; it is ignored when ``None`` and
     forwarded as a top-level request field otherwise.
 
-    ``image`` is SWE-bench-only; it is ignored when ``None`` and forwarded
-    as a top-level request field otherwise.
+    ``image`` is required for SWE-bench and CUSTOM sandbox types; it is
+    ignored when ``None`` and forwarded as a top-level request field otherwise.
+
+    ``volume_mounts`` and ``port_mappings`` are optional and forwarded as
+    lists of ``VolumeMount`` / ``PortMapping`` instances (or dicts) when
+    provided.
     """
     request_kwargs = {
         "name": f"{name_prefix}-{int(time.time())}",
         "sandbox_type": sandbox_type,
         "resources": ResourceConfig(cpu=cpu, memory=memory, gpu=0),
     }
-    # SWE-bench is headless — no screen resolution / configuration needed.
-    if sandbox_type != SandboxType.SWEBENCH:
+    # Headless types (SWE-bench / CUSTOM) don't need screen resolution.
+    if sandbox_type not in (SandboxType.SWEBENCH, SandboxType.CUSTOM):
         request_kwargs["configuration"] = SandboxConfiguration(
             screen_resolution=ScreenResolution(width=width, height=height),
         )
@@ -145,6 +163,10 @@ def _create_sandbox(
         request_kwargs["system_image_path"] = system_image_path
     if image is not None:
         request_kwargs["image"] = image
+    if volume_mounts is not None:
+        request_kwargs["volume_mounts"] = volume_mounts
+    if port_mappings is not None:
+        request_kwargs["port_mappings"] = port_mappings
     try:
         sandbox = client.sandboxes.create(
             SandboxRequest(**request_kwargs)
@@ -774,6 +796,202 @@ class TestDeleteSwebenchSandbox:
         except Exception:
             _pause_and_delete(client, sandbox_id)
             raise
+
+
+
+# ---------------------------------------------------------------------------
+# CUSTOM sandbox + file-operation test cases
+# ---------------------------------------------------------------------------
+
+# Default image used by the CUSTOM file-op tests. Override via env if needed.
+CUSTOM_TEST_IMAGE = os.getenv("PYROMIND_CUSTOM_SANDBOX_IMAGE", "python:3.11-slim")
+
+# CUSTOM sandboxes boot much faster than OSWorld (no desktop stack).
+CUSTOM_BOOT_TIMEOUT = 300
+
+# Node (hostPath) -> container mount used by the CUSTOM file-op tests.
+# Anything written under /data/<name> inside the container lives on the
+# node's /workspace and therefore survives pod restarts.
+CUSTOM_HOST_MOUNT_PATH = "/workspace"
+CUSTOM_CONTAINER_MOUNT_PATH = "/data"
+CUSTOM_DEFAULT_VOLUME_MOUNTS = [
+    VolumeMount(
+        host_path=CUSTOM_HOST_MOUNT_PATH,
+        mount_path=CUSTOM_CONTAINER_MOUNT_PATH,
+        read_only=False,
+    ),
+]
+
+
+class TestCreateCustomSandbox:
+    """Test cases for creating CUSTOM sandboxes."""
+
+    def test_create_custom_sandbox_example_function(self, client):
+        """Test create_custom_sandbox_example helper end-to-end."""
+        sandbox_id = create_custom_sandbox_example(CUSTOM_TEST_IMAGE)
+        try:
+            assert sandbox_id is not None
+            sandbox = client.sandboxes.get_sandbox(sandbox_id)
+            assert sandbox.id == sandbox_id
+            assert sandbox.type is not None
+            print(f"[OK] CUSTOM sandbox created: {sandbox_id}, status={sandbox.status}")
+        finally:
+            _pause_and_delete(client, sandbox_id)
+
+
+class TestCustomSandboxFileOperations:
+    """End-to-end file op tests against a real RUNNING CUSTOM sandbox.
+
+    Each test owns its sandbox: create -> wait running -> run -> pause -> delete.
+    """
+
+    def test_write_and_read_bytes(self, client):
+        """write_file(bytes) -> read_file returns identical payload."""
+        sandbox = _create_sandbox(
+            client,
+            "test-custom-write-bytes",
+            sandbox_type=SandboxType.CUSTOM,
+            cpu="4",
+            memory="8Gi",
+            image=CUSTOM_TEST_IMAGE,
+            volume_mounts=CUSTOM_DEFAULT_VOLUME_MOUNTS,
+        )
+        try:
+            if not _wait_for_status(
+                client, sandbox.id, "running", timeout=CUSTOM_BOOT_TIMEOUT
+            ):
+                pytest.skip("CUSTOM sandbox did not reach running status")
+
+            remote = "/data/_it_write_bytes.txt"
+            body = b"hello from pyromind_sdk IT @ " + str(time.time()).encode()
+            wr = client.sandboxes.write_file(sandbox.id, remote, body)
+            assert wr["path"] == remote
+            assert wr["size"] == len(body)
+            assert "transport_bytes" in wr
+
+            got = client.sandboxes.read_file(sandbox.id, remote)
+            assert got == body
+            print(f"[OK] write+read {len(body)} bytes")
+        finally:
+            _pause_and_delete(client, sandbox.id)
+
+    def test_write_file_stream_from_local_path(self, client):
+        """write_file_stream(local_path) round-trips via read_file."""
+        import tempfile
+
+        sandbox = _create_sandbox(
+            client,
+            "test-custom-stream-path",
+            sandbox_type=SandboxType.CUSTOM,
+            cpu="4",
+            memory="8Gi",
+            image=CUSTOM_TEST_IMAGE,
+            volume_mounts=CUSTOM_DEFAULT_VOLUME_MOUNTS,
+        )
+        try:
+            if not _wait_for_status(
+                client, sandbox.id, "running", timeout=CUSTOM_BOOT_TIMEOUT
+            ):
+                pytest.skip("CUSTOM sandbox did not reach running status")
+
+            payload = os.urandom(256 * 1024)  # 256 KiB
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                tmp.write(payload)
+                tmp_path = tmp.name
+            remote = "/data/_it_stream_path.bin"
+            try:
+                wr = client.sandboxes.write_file_stream(sandbox.id, remote, tmp_path)
+                assert wr["size"] == len(payload)
+                back = client.sandboxes.read_file(sandbox.id, remote)
+                assert back == payload
+            finally:
+                os.unlink(tmp_path)
+            print(f"[OK] stream(path) {len(payload)} bytes")
+        finally:
+            _pause_and_delete(client, sandbox.id)
+
+    def test_write_file_stream_large(self, client):
+        """8 MiB streaming upload should succeed without buffering server-side."""
+        import io
+
+        sandbox = _create_sandbox(
+            client,
+            "test-custom-stream-large",
+            sandbox_type=SandboxType.CUSTOM,
+            cpu="4",
+            memory="8Gi",
+            image=CUSTOM_TEST_IMAGE,
+            volume_mounts=CUSTOM_DEFAULT_VOLUME_MOUNTS,
+        )
+        try:
+            if not _wait_for_status(
+                client, sandbox.id, "running", timeout=CUSTOM_BOOT_TIMEOUT
+            ):
+                pytest.skip("CUSTOM sandbox did not reach running status")
+
+            size = 8 * 1024 * 1024
+            payload = (b"pyromind-sdk-large-stream-" * 64)[:size]
+            remote = "/data/_it_stream_large.bin"
+            t0 = time.time()
+            wr = client.sandboxes.write_file_stream(
+                sandbox.id, remote, io.BytesIO(payload)
+            )
+            elapsed = time.time() - t0
+            assert wr["size"] == size
+            back = client.sandboxes.read_file(sandbox.id, remote)
+            assert back == payload
+            print(f"[OK] stream(large) {size} bytes in {elapsed:.2f}s "
+                  f"(transport={wr['transport_bytes']})")
+        finally:
+            _pause_and_delete(client, sandbox.id)
+
+    def test_delete_file_and_directory(self, client):
+        """delete_file + delete_file(recursive=True) both remove the targets."""
+        sandbox = _create_sandbox(
+            client,
+            "test-custom-delete",
+            sandbox_type=SandboxType.CUSTOM,
+            cpu="4",
+            memory="8Gi",
+            image=CUSTOM_TEST_IMAGE,
+            volume_mounts=CUSTOM_DEFAULT_VOLUME_MOUNTS,
+        )
+        try:
+            if not _wait_for_status(
+                client, sandbox.id, "running", timeout=CUSTOM_BOOT_TIMEOUT
+            ):
+                pytest.skip("CUSTOM sandbox did not reach running status")
+
+            # Single file delete
+            remote = "/data/_it_to_delete.txt"
+            client.sandboxes.write_file(sandbox.id, remote, b"delete me")
+            dr = client.sandboxes.delete_file(sandbox.id, remote)
+            assert dr.get("success") is True or dr.get("path") == remote
+            with pytest.raises(PyroMindAPIError):
+                client.sandboxes.read_file(sandbox.id, remote)
+
+            # Recursive directory delete
+            remote_dir = "/data/_it_dir"
+            client.sandboxes.write_file(sandbox.id, f"{remote_dir}/a.txt", b"a")
+            client.sandboxes.write_file(sandbox.id, f"{remote_dir}/sub/b.txt", b"b")
+            dr = client.sandboxes.delete_file(sandbox.id, remote_dir, recursive=True)
+            assert dr.get("success") is True or dr.get("path") == remote_dir
+            with pytest.raises(PyroMindAPIError):
+                client.sandboxes.read_file(sandbox.id, f"{remote_dir}/a.txt")
+            print(f"[OK] delete + recursive delete")
+        finally:
+            _pause_and_delete(client, sandbox.id)
+
+
+class TestCustomSandboxFullLifecycle:
+    """Smoke-test the end-to-end example helper."""
+
+    def test_custom_sandbox_full_lifecycle_example_function(self, client):
+        """Run create_custom_sandbox_example + file ops + pause + delete."""
+        # The helper handles create/file-ops/pause/delete internally; we just
+        # assert it completes without raising.
+        custom_sandbox_full_lifecycle_example(CUSTOM_TEST_IMAGE)
+        print("[OK] custom_sandbox_full_lifecycle_example completed")
 
 
 if __name__ == "__main__":

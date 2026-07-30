@@ -5,7 +5,8 @@ This module provides an async client for managing sandboxes via the PyroMind API
 """
 
 import asyncio
-from typing import List, Optional, Dict, Any
+import os
+from typing import List, Optional, Dict, Any, Union, IO
 from .async_base import PyroMindAsyncClient
 from .models import (
     SandboxRequest,
@@ -56,6 +57,8 @@ class AsyncSandboxClient(PyroMindAsyncClient):
             "web_vnc_url": sandbox_data.get("web_vnc_url"),
             "system_image_path": sandbox_data.get("system_image_path"),
             "image": sandbox_data.get("image"),
+            "volume_mounts": sandbox_data.get("volume_mounts"),
+            "port_mappings": sandbox_data.get("port_mappings"),
         }
 
         if "screen_size" in sandbox_data and sandbox_data["screen_size"]:
@@ -383,3 +386,174 @@ class AsyncSandboxClient(PyroMindAsyncClient):
         )
         data = self._extract_data(response)
         return SwebenchExecResponse(**data)
+
+    # ===================== File Operations (custom sandbox) =====================
+
+    @staticmethod
+    def _resolve_upload_source(source):
+        """Normalize upload source to (body, size, owns_handle).
+
+        See :class:`SandboxClient._resolve_upload_source` for accepted types.
+        Returns a 3-tuple: ``(body, size, owns_handle)`` where ``owns_handle``
+        is True when this helper opened a file and the caller must close it.
+        """
+        if isinstance(source, (str, os.PathLike)):
+            stat = os.stat(source)
+            return open(source, "rb"), stat.st_size, True
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            buf = bytes(source)
+            return buf, len(buf), False
+        if hasattr(source, "read"):
+            try:
+                start = source.tell()
+                source.seek(0, 2)
+                size = source.tell() - start
+                source.seek(start)
+            except (OSError, AttributeError) as exc:
+                raise ValueError(
+                    "File-like source must be seekable so we can compute Content-Length"
+                ) from exc
+            return source, size, False
+        raise TypeError(
+            f"Unsupported write_file_stream source type: {type(source).__name__}"
+        )
+
+    async def read_file(self, sandbox_id: str, path: str) -> bytes:
+        """
+        Read a file from a custom sandbox as raw bytes (async).
+
+        Only supported for custom type sandboxes. Max 1 GB.
+
+        Args:
+            sandbox_id: ID of the custom sandbox
+            path: Absolute path of the file inside the container
+
+        Returns:
+            File content as bytes
+        """
+        import aiohttp as _aiohttp
+        url = self._build_url(f"/sandboxes/{sandbox_id}/files/read")
+        session = await self._get_session()
+        request_context = f"GET {url}"
+        async with session.request("GET", url, params={"path": path}) as response:
+            if not response.ok:
+                await self._handle_error_response(response, request_context)
+            return await response.read()
+
+    async def write_file(self, sandbox_id: str, path: str, data: Union[bytes, bytearray]) -> Dict[str, Any]:
+        """
+        Write raw bytes to a file inside a custom sandbox (async).
+
+        Buffered convenience wrapper around :meth:`write_file_stream`. For
+        streaming uploads prefer ``write_file_stream`` so we can set
+        ``Content-Length`` accurately for the server-side tar archive.
+
+        Args:
+            sandbox_id: ID of the custom sandbox
+            path: Absolute path of the file inside the container
+            data: File content as bytes / bytearray
+
+        Returns:
+            dict with ``path``, ``size`` (logical) and ``transport_bytes``.
+        """
+        return await self.write_file_stream(sandbox_id, path, source=data)
+
+    async def write_file_stream(
+        self,
+        sandbox_id: str,
+        path: str,
+        source: Union[str, os.PathLike, bytes, bytearray, IO[bytes]],
+    ) -> Dict[str, Any]:
+        """
+        Stream-upload a file into a custom sandbox (async).
+
+        Server builds a single-member POSIX tar archive and pipes it to
+        ``tar -xf -`` in the pod (docker-rt style). We MUST set
+        ``Content-Length`` so the tar header can carry an accurate size.
+
+        Accepted ``source``:
+
+        - ``str`` / ``os.PathLike``: local file path; opened binary.
+        - ``bytes`` / ``bytearray`` / ``memoryview``: in-memory buffer.
+        - file-like object with ``read()``: must be seekable.
+
+        Only supported for custom type sandboxes. Max 1 GB.
+
+        Args:
+            sandbox_id: ID of the custom sandbox.
+            path: Absolute destination path inside the container.
+            source: See above.
+
+        Returns:
+            dict with ``path`` (str), ``size`` (int) and ``transport_bytes`` (int).
+
+        Raises:
+            PyroMindAPIError: On non-2xx response (411 LENGTH_REQUIRED,
+                413 FILE_TOO_LARGE, etc.).
+        """
+        import aiohttp as _aiohttp
+        from aiohttp.payload import BufferedReaderPayload
+
+        body, size, owns_handle = self._resolve_upload_source(source)
+        url = self._build_url(f"/sandboxes/{sandbox_id}/files/write")
+        session = await self._get_session()
+        request_context = f"PUT {url}"
+
+        # Build aiohttp payload with explicit Content-Length so the server
+        # can embed the exact size in its tar header.
+        if isinstance(body, (bytes, bytearray, memoryview)):
+            payload = _aiohttp.BytesPayload(
+                bytes(body),
+                content_type="application/octet-stream",
+            )
+        else:
+            payload = BufferedReaderPayload(
+                body,
+                content_type="application/octet-stream",
+                content_length=size,
+            )
+
+        try:
+            async with session.request(
+                "PUT",
+                url,
+                params={"path": path},
+                data=payload,
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "Content-Length": str(size),
+                },
+            ) as response:
+                if not response.ok:
+                    await self._handle_error_response(response, request_context)
+                try:
+                    resp_payload = await response.json()
+                except Exception:
+                    resp_payload = {}
+        finally:
+            if owns_handle and hasattr(body, "close"):
+                try:
+                    body.close()
+                except Exception:
+                    pass
+        return self._extract_data(resp_payload) if resp_payload else {}
+
+    async def delete_file(self, sandbox_id: str, path: str, recursive: bool = False) -> Dict[str, Any]:
+        """
+        Delete a file or directory inside a custom sandbox (async).
+
+        Args:
+            sandbox_id: ID of the custom sandbox
+            path: Absolute path of the file/directory inside the container
+            recursive: Whether to delete directories recursively
+
+        Returns:
+            dict returned by the backend.
+        """
+        response = await self._request(
+            "DELETE",
+            f"/sandboxes/{sandbox_id}/files/delete",
+            params={"path": path, "recursive": str(recursive).lower()},
+        )
+        return self._extract_data(response) if response else {}
+

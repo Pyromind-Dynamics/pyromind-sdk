@@ -4,8 +4,9 @@ SandBoxes API Client
 This module provides a client for managing sandboxes via the PyroMind API.
 """
 
+import os
 import time
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional, Dict, Any, Union, IO
 from .base import PyroMindClient
 from .models import (
     SandboxRequest,
@@ -60,6 +61,8 @@ class SandboxClient(PyroMindClient):
             "web_vnc_url": sandbox_data.get("web_vnc_url"),
             "system_image_path": sandbox_data.get("system_image_path"),
             "image": sandbox_data.get("image"),
+            "volume_mounts": sandbox_data.get("volume_mounts"),
+            "port_mappings": sandbox_data.get("port_mappings"),
         }
         
         # Convert screen_size to screen_resolution if present
@@ -419,3 +422,190 @@ class SandboxClient(PyroMindClient):
         )
         data = self._extract_data(response)
         return SwebenchExecResponse(**data)
+
+    # ===================== File Operations (custom sandbox) =====================
+
+    @staticmethod
+    def _resolve_upload_source(source):
+        """Normalize upload source to (body, size).
+
+        Accepted source types:
+          - ``str`` / ``os.PathLike``: local file path, opened as binary.
+          - ``bytes`` / ``bytearray`` / ``memoryview``: in-memory buffer.
+          - file-like object with ``.read()``: used as-is; ``seek(0, 2)`` to compute size.
+
+        Returns:
+            (body, size): ``body`` is either bytes (small case) or a file-like
+            object streamable by ``requests``; ``size`` is the exact byte count
+            (used as ``Content-Length`` so the server can build a valid tar
+            archive for docker-rt style streaming write).
+        """
+        if isinstance(source, (str, os.PathLike)):
+            stat = os.stat(source)
+            return open(source, "rb"), stat.st_size
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            buf = bytes(source)
+            return buf, len(buf)
+        if hasattr(source, "read"):
+            try:
+                start = source.tell()
+                source.seek(0, 2)
+                size = source.tell() - start
+                source.seek(start)
+            except (OSError, AttributeError) as exc:
+                raise ValueError(
+                    "File-like source must be seekable so we can compute Content-Length"
+                ) from exc
+            return source, size
+        raise TypeError(
+            f"Unsupported write_file_stream source type: {type(source).__name__}"
+        )
+
+    def read_file(self, sandbox_id: str, path: str) -> bytes:
+        """
+        Read a file from a custom sandbox as raw bytes.
+
+        Streams the file content directly from the container via tar+exec.
+        Only supported for custom type sandboxes. Max 1 GB.
+
+        Args:
+            sandbox_id: ID of the custom sandbox
+            path: Absolute path of the file inside the container
+
+        Returns:
+            File content as bytes
+
+        Raises:
+            PyroMindAPIError: On non-2xx response (INVALID_SANDBOX_TYPE,
+                FILE_READ_ERROR, FILE_READ_FAILED, SANDBOX_NOT_FOUND)
+        """
+        url = self._build_url(f"/sandboxes/{sandbox_id}/files/read")
+        # Bypass _request() because the response body is raw bytes, not JSON.
+        response = self.session.request(
+            method="GET",
+            url=url,
+            params={"path": path},
+            timeout=self.timeout,
+        )
+        if not response.ok:
+            # Best-effort: parse error JSON if the server returned it, else fall back
+            # to _handle_error_response which raises PyroMindAPIError.
+            try:
+                err_ctx = f"GET {url}"
+            except Exception:
+                err_ctx = f"GET /sandboxes/{sandbox_id}/files/read"
+            self._handle_error_response(response, err_ctx)
+        return response.content
+
+    def write_file(self, sandbox_id: str, path: str, data: Union[bytes, bytearray]) -> Dict[str, Any]:
+        """
+        Write raw bytes to a file inside a custom sandbox.
+
+        Buffered convenience wrapper around :meth:`write_file_stream`. For
+        streaming uploads (local files, generators, large byte buffers) prefer
+        ``write_file_stream`` directly so we can set ``Content-Length`` and
+        avoid an in-memory copy.
+
+        Only supported for custom type sandboxes. Max 1 GB.
+
+        Args:
+            sandbox_id: ID of the custom sandbox
+            path: Absolute path of the file inside the container
+            data: File content as bytes / bytearray
+
+        Returns:
+            dict with ``path`` (str), ``size`` (int, logical file size) and
+            ``transport_bytes`` (int, bytes written to pod stdin incl. tar
+            overhead).
+        """
+        return self.write_file_stream(sandbox_id, path, source=data)
+
+    def write_file_stream(
+        self,
+        sandbox_id: str,
+        path: str,
+        source: Union[str, os.PathLike, bytes, bytearray, IO[bytes]],
+    ) -> Dict[str, Any]:
+        """
+        Stream-upload a file into a custom sandbox.
+
+        The server builds a single-member POSIX tar archive around the body
+        and pipes it to ``tar -xf -`` inside the pod (docker-rt style). We
+        MUST set ``Content-Length`` so the server can put an accurate size in
+        the tar header; this helper resolves the size from the source type.
+
+        Accepted ``source``:
+
+        - ``str`` / ``os.PathLike``: local file path; opened binary, size from stat.
+        - ``bytes`` / ``bytearray`` / ``memoryview``: in-memory buffer.
+        - file-like object with ``read()``: must be seekable so we can measure.
+
+        Parent directories on the container are created automatically. Max 1 GB.
+
+        Args:
+            sandbox_id: ID of the custom sandbox.
+            path: Absolute destination path inside the container.
+            source: See above.
+
+        Returns:
+            dict with ``path`` (str), ``size`` (int, logical file size) and
+            ``transport_bytes`` (int, bytes written to pod stdin incl. tar
+            protocol overhead).
+
+        Raises:
+            PyroMindAPIError: On non-2xx response (411 LENGTH_REQUIRED if the
+                server cannot determine size, 413 FILE_TOO_LARGE, etc.).
+        """
+        body, size = self._resolve_upload_source(source)
+        url = self._build_url(f"/sandboxes/{sandbox_id}/files/write")
+        try:
+            response = self.session.request(
+                method="PUT",
+                url=url,
+                params={"path": path},
+                data=body,
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "Content-Length": str(size),
+                },
+                timeout=self.timeout,
+            )
+        finally:
+            # 如果我们打开了本地文件，确保关闭它（requests 不会自动关）。
+            if isinstance(source, (str, os.PathLike)) and hasattr(body, "close"):
+                try:
+                    body.close()
+                except Exception:
+                    pass
+        if not response.ok:
+            self._handle_error_response(
+                response, f"PUT /sandboxes/{sandbox_id}/files/write"
+            )
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
+        return self._extract_data(payload) if payload else {}
+
+    def delete_file(self, sandbox_id: str, path: str, recursive: bool = False) -> Dict[str, Any]:
+        """
+        Delete a file or directory inside a custom sandbox.
+
+        Set recursive=True to remove a directory (equivalent to rm -rf).
+        Only supported for custom type sandboxes.
+
+        Args:
+            sandbox_id: ID of the custom sandbox
+            path: Absolute path of the file/directory inside the container
+            recursive: Whether to delete directories recursively
+
+        Returns:
+            dict returned by the backend (typically includes path / recursive / result).
+        """
+        response = self._request(
+            "DELETE",
+            f"/sandboxes/{sandbox_id}/files/delete",
+            params={"path": path, "recursive": str(recursive).lower()},
+        )
+        return self._extract_data(response) or {}
+
