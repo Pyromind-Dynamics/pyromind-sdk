@@ -790,6 +790,7 @@ def create_node_class_from_yaml(
         # Check if it's a Python function node
         python_code = yaml_config.get("python_code")
         function_name = yaml_config.get("function_name")
+        test_function_name = yaml_config.get("test_function_name")
 
         if python_code and function_name:
             # Python function node: generate COMMAND_TEMPLATE
@@ -876,6 +877,25 @@ def create_node_class_from_yaml(
             )
             class_dict["COMMAND_TEMPLATE"] = command_template
 
+            ## 组织测试命令
+            if test_function_name:
+                validate_parameter_name(
+                    test_function_name
+                )
+                test_command_template = build_command_template(
+                    python_code=resolved_python_code,
+                    function_name=test_function_name,
+                    input_types=input_types,
+                    output_names=return_names,
+                    return_types=return_types if return_types else None,
+                    python_command=python_command,
+                    conda_env=conda_env,
+                    workdir=workdir,
+                    environment=environment,
+                    gpu_count=gpu_count,
+                )
+                class_dict["TEST_COMMAND"] = test_command_template
+
             # Python function 节点：通过 base_class 获取 IMAGE_ID
             # 检查是否有基类提供了非 alpine 的 IMAGE_ID（如 JupyterLabPodExecutionNode）
             if not any(
@@ -901,6 +921,27 @@ def create_node_class_from_yaml(
             # Validate command template security
             validate_command_template(command_template)
             class_dict["COMMAND_TEMPLATE"] = command_template
+
+
+        ## 加载 test_command_template 自定义测试命令
+        ## 如果有 test_command_template，默认使用 test_command_template; test_command_template的优先级高于test_function_name
+        test_command_template = yaml_config.get("test_command_template", None)
+        if test_command_template:
+            if isinstance(test_command_template, str):
+                # If it's a string, split by lines
+                test_command_template = [
+                    line.strip()
+                    for line in test_command_template.split("\n")
+                    if line.strip()
+                ]
+            elif isinstance(test_command_template, list):
+                pass
+            else:
+                raise ValueError(
+                    f"test_command_template must be a list or string, got {type(test_command_template)}"
+                )
+            class_dict["TEST_COMMAND"] = test_command_template
+
 
         # Argument template (optional)
         args_template = yaml_config.get("args_template", [])
