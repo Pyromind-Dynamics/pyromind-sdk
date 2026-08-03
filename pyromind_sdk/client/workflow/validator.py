@@ -445,16 +445,17 @@ def _validate_nodes(nodes: List[Dict], node_map: Dict[str, Dict], node_info: Opt
             errors.append("Found node without 'id' field")
             continue
 
-        # Validate type
+        # Xyflow stores the business node type in data.nodeType.  Its top-level
+        # ``type`` is a frontend renderer hint (commonly "default"), so it is
+        # optional for backend validation.
         node_type = node.get("type")
         data = node.get("data", {})
-        if node_type == "default":
-            # Xyflow format: type is "default", actual type is in data.nodeType
-            if not data.get("nodeType"):
-                errors.append(f"Node {node_id} type is 'default' but 'data.nodeType' is missing")
-            continue
-
-        if not node_type:
+        xyflow_node_type = data.get("nodeType") if isinstance(data, dict) else None
+        if xyflow_node_type:
+            pass
+        elif node_type == "default":
+            errors.append(f"Node {node_id} type is 'default' but 'data.nodeType' is missing")
+        elif not node_type:
             errors.append(f"Node {node_id} is missing 'type' field")
         elif not isinstance(node_type, str):
             errors.append(f"Node {node_id} 'type' must be a string, got {type(node_type).__name__}")

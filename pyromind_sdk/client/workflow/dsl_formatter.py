@@ -45,11 +45,16 @@ class DslFormatter:
         return parts if len(parts) > 1 else [line]
 
     def format_or_raise(self, code: str) -> str:
+        stripped = self._strip_indent(code)
         try:
-            ast.parse(code)
+            ast.parse(stripped)
         except SyntaxError as e:
             raise ValueError(f"Invalid DSL syntax: {e}")
         return self.format(code)
+
+    @staticmethod
+    def _strip_indent(code: str) -> str:
+        return "\n".join(line.lstrip() for line in code.splitlines())
 
     @staticmethod
     def _format_node_line(line: str) -> str:
