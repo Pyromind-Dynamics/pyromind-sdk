@@ -42,6 +42,34 @@ def test_from_python_produces_valid_workflow():
 import pytest
 
 
+def test_to_python_quotes_string_node_ids():
+    workflow = {
+        "nodes": [{"id": "node-01", "type": "SleepNode", "data": {
+            "config": {"duration": 5},
+        }}],
+        "edges": [],
+    }
+
+    result = DslConverter().to_python(workflow)
+
+    assert "id=\"node-01\"" in result
+
+
+def test_to_python_normalizes_leading_zero_node_ids():
+    workflow = {
+        "nodes": [{"id": "01", "type": "SleepNode", "data": {
+            "config": {"duration": 5},
+        }}],
+        "edges": [],
+    }
+
+    result = DslConverter().to_python(workflow)
+
+    # "01" is normalized to integer 1
+    assert "id=1" in result
+    assert 'id="01"' not in result
+
+
 def test_roundtrip_preserves_node_count():
     with open(TEST_DATA / "sample_workflow.json") as f:
         workflow = json.load(f)

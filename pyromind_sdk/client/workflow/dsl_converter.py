@@ -6,6 +6,7 @@ DSL format uses object.property syntax: var = NodeType(id=N, param=ref.output)
 """
 import ast
 import json
+import re
 import uuid
 from collections import defaultdict, deque
 from typing import Dict, List, Any, Optional
@@ -90,7 +91,7 @@ class DslConverter:
             if not node_def and node_type in self.node_info:
                 defaults = _get_defaults(self.node_info[node_type])
 
-            args = [f"id={nid}"]
+            args = [f"id={self._format_node_id(nid)}"]
             inp = node_def.get("input", {}) if node_def else {}
             if not inp and node_type in self.node_info:
                 inp = self.node_info[node_type].get("input", {})
@@ -119,6 +120,10 @@ class DslConverter:
 
         return "\n".join(lines)
 
+    @staticmethod
+    def _normalise_indent(code: str) -> str:
+        return "\n".join(line.lstrip() for line in code.splitlines())
+
     def from_python(self, code: str, name: str = "workflow") -> dict:
         if not code.strip():
             return {
@@ -126,7 +131,7 @@ class DslConverter:
                 "nodes": [],
                 "edges": [],
             }
-        tree = ast.parse(code)
+        tree = ast.parse(self._normalise_indent(code))
         nodes = []
         edges = []
         var_to_node = {}
@@ -228,7 +233,7 @@ class DslConverter:
         workflow = self.from_python(code, name=name)
         node_line_map = {}
         if code.strip():
-            tree = ast.parse(code)
+            tree = ast.parse(self._normalise_indent(code))
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Assign):
                     continue
@@ -302,3 +307,14 @@ class DslConverter:
     @staticmethod
     def _to_literal(v: Any) -> str:
         return json.dumps(v, ensure_ascii=False)
+
+    @classmethod
+    def _format_node_id(cls, node_id: Any) -> str:
+        """Format a node ID as a valid Python literal.
+
+        Leading-zero numeric strings (e.g. "01", "0001") are normalized to
+        integers so that ``id=1`` is emitted instead of ``id="01"``.
+        """
+        if isinstance(node_id, str) and re.fullmatch(r"0\d+", node_id):
+            node_id = int(node_id)
+        return cls._to_literal(node_id)
