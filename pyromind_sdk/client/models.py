@@ -84,26 +84,19 @@ class SandboxType(str, Enum):
     Attributes:
         OSWORLD: OSWorld sandbox with GUI desktop environment (VNC), supports
             custom system images via ``system_image_path``.
-        SWEBENCH: SWE-bench code sandbox (headless container), requires a
-            user-provided container image via the ``image`` field. Supports
-            shell command execution through the ``/exec`` endpoint.
         CUSTOM: Custom sandbox (headless container). Supports file operations
             via ``read_file`` / ``write_file`` / ``write_file_stream`` /
             ``delete_file`` endpoints; requires a user-provided container
             image via the ``image`` field.
     """
     OSWORLD = "osworld"
-    SWEBENCH = "swebench"
     CUSTOM = "custom"
 
     @classmethod
     def from_api(cls, value: str) -> 'SandboxType':
         """Convert API value to SandboxType enum"""
-        # Map old API values to new enum values
         mapping = {
-            # 'windows': 'win',
             'osworld': 'osworld',
-            'swebench': 'swebench',
             'custom': 'custom',
         }
         normalized = mapping.get(value, value)
@@ -194,16 +187,15 @@ class SandboxRequest(BaseModel):
     """Request model for creating a sandbox.
 
     Attributes:
-        sandbox_type: The type of sandbox to create (``OSWORLD``, ``SWEBENCH``,
-            or ``CUSTOM``).
+        sandbox_type: The type of sandbox to create (``OSWORLD`` or ``CUSTOM``).
         resources: CPU / memory / GPU resource limits for the sandbox pod.
         configuration: Optional GUI configuration (screen resolution, VNC password, etc.).
-            Ignored for headless sandbox types (``SWEBENCH`` / ``CUSTOM``).
+            Ignored for headless sandbox types (``CUSTOM``).
         name: Human-readable name for the sandbox. Auto-generated when omitted.
         system_image_path: **OSWorld only.** JuiceFS sub-path to a custom system
             image (e.g. ``"template/Ubuntu.qcow2"``). Ignored for other sandbox types;
             the server falls back to its built-in default image when ``None``.
-        image: **SWE-bench / CUSTOM (required).** Docker/OCI container image reference.
+        image: **CUSTOM (required).** Docker/OCI container image reference.
         volume_mounts: Optional hostPath mounts. Typical CUSTOM usage is
             ``VolumeMount(host_path="/workspace", mount_path="/data")`` to
             expose a node directory inside the container. When creating a
@@ -228,7 +220,7 @@ class SandboxRequest(BaseModel):
     image: Optional[str] = Field(
         default=None,
         description=(
-            "SWE-bench / CUSTOM (required): Docker/OCI container image reference. "
+            "CUSTOM (required): Docker/OCI container image reference. "
             "Ignored for OSWorld."
         ),
     )
@@ -266,22 +258,22 @@ class SandboxResponse(BaseModel):
     Attributes:
         id: Unique sandbox identifier (UUID).
         name: Human-readable sandbox name.
-        type: Sandbox type (``OSWORLD``, ``SWEBENCH``, or ``CUSTOM``).
+        type: Sandbox type (``OSWORLD`` or ``CUSTOM``).
         status: Current lifecycle status (e.g. ``"creating"``, ``"running"``, ``"stopped"``).
         configuration: GUI / screen configuration (``None`` for headless sandboxes).
         usage: Real-time resource usage statistics.
         created_at: ISO-8601 creation timestamp.
         updated_at: ISO-8601 last-activity timestamp.
         endpoint_url: Public API endpoint URL of the sandbox (``None`` for types without Ingress).
-        web_vnc_url: Web-based VNC URL (``None`` for headless sandbox types such as ``SWEBENCH`` / ``CUSTOM``).
+        web_vnc_url: Web-based VNC URL (``None`` for ``CUSTOM`` type).
         uid: Owner UID.
         endpoint: Legacy alias for ``endpoint_url``.
         screen_size: Legacy alias for ``configuration.screen_resolution``.
         last_activity: Legacy alias for ``updated_at``.
         system_image_path: **OSWorld only.** JuiceFS sub-path of the system image in use.
-        image: **SWE-bench / CUSTOM.** Docker/OCI container image reference in use.
-        volume_mounts: **SWE-bench / CUSTOM.** Active hostPath mounts (docker ``-v`` style).
-        port_mappings: **SWE-bench / CUSTOM.** Active port mappings (docker ``-p`` style).
+        image: **CUSTOM.** Docker/OCI container image reference in use.
+        volume_mounts: **CUSTOM.** Active hostPath mounts (docker ``-v`` style).
+        port_mappings: **CUSTOM.** Active port mappings (docker ``-p`` style).
     """
     id: str
     name: str
@@ -303,7 +295,7 @@ class SandboxResponse(BaseModel):
     )
     image: Optional[str] = Field(
         default=None,
-        description="SWE-bench / CUSTOM: Docker image reference in use.",
+        description="CUSTOM: Docker image reference in use.",
     )
     volume_mounts: Optional[List[VolumeMount]] = Field(
         default=None,
@@ -380,13 +372,12 @@ class ActionAPIResponse(BaseModel):
     action: ActionResponse
 
 
-# SWE-bench Exec Models
+# Exec Models
 class SwebenchExecRequest(BaseModel):
-    """Request model for executing a shell command in a SWE-bench sandbox.
+    """Request model for executing a shell command in a sandbox.
 
     The command is executed inside the sandbox's running container via the
-    Kubernetes exec API.  Only sandboxes of type ``SWEBENCH`` support this
-    endpoint; calling it against other sandbox types will return a 400 error.
+    Kubernetes exec API.
 
     Attributes:
         command: Shell command string to execute (e.g. ``"uname -a"``).
@@ -406,7 +397,7 @@ class SwebenchExecRequest(BaseModel):
 
 
 class SwebenchExecResponse(BaseModel):
-    """Response model for shell command execution in a SWE-bench sandbox.
+    """Response model for shell command execution in a sandbox.
 
     Attributes:
         output: Combined stdout and stderr of the command.  Empty string when

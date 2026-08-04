@@ -364,10 +364,10 @@ class AsyncSandboxClient(PyroMindAsyncClient):
         timeout: Optional[int] = None,
     ) -> SwebenchExecResponse:
         """
-        Execute a shell command in a SWE-bench sandbox (async).
+        Execute a shell command in a sandbox (async).
 
         Args:
-            sandbox_id: ID of the swebench sandbox
+            sandbox_id: ID of the sandbox
             command: Shell command to execute (e.g. "uname -a")
             cwd: Working directory for command execution (default: "/")
             timeout: Execution timeout in seconds, max 600 (default: 30)
