@@ -1266,6 +1266,24 @@ class TestValidationFunctions:
         error_list = [e for e in errors if not e.startswith("Warning:")]
         assert len(error_list) == 0
 
+    def test_validate_standard_format_accepts_xyflow_node_without_renderer_type(self):
+        """DSL conversion emits the business node type in data.nodeType only."""
+        standard = {
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "nodes": [
+                {
+                    "id": "1",
+                    "data": {"nodeType": "NodeA", "config": {}},
+                }
+            ],
+            "edges": [],
+        }
+
+        is_valid, errors = validate_standard_format(standard)
+
+        assert is_valid is True
+        assert not errors
+
     def test_validate_standard_format_null_links(self):
         """Test validating xyflow format with empty edges (no errors expected)."""
         standard = {
