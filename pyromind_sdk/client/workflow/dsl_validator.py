@@ -30,11 +30,15 @@ class DslValidator:
     - DAG cycle detection
     """
 
+    @staticmethod
+    def _normalise_indent(code: str) -> str:
+        return "\n".join(line.lstrip() for line in code.splitlines())
+
     def validate(self, code: str) -> Tuple[bool, List[str]]:
         errors = []
 
         try:
-            tree = ast.parse(code)
+            tree = ast.parse(self._normalise_indent(code))
         except SyntaxError as e:
             return False, [f"Syntax error: {e}"]
 
