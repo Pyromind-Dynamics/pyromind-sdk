@@ -6,6 +6,15 @@ local keystrokes are sent as binary frames, terminal output comes back as
 binary frames, and window size changes are sent as ``{"type": "resize"}``
 JSON control frames.
 
+Keep-alive / idle policy (mirrors the web console):
+  * A ``{"type": "ping"}`` control frame is sent every 60 s so middleboxes
+    (nginx, ALB, Cloudflare) see bidirectional traffic and keep the TCP
+    session alive.
+  * Only *real* traffic (stdin keystrokes, terminal output, resize frames)
+    resets the idle clock.  Ping/pong frames do not.
+  * After 30 minutes of no real activity the session is torn down with an
+    explicit close code.
+
 Usage:
   python -m pyromind_sdk.cli terminal <sandbox-id>
 """
@@ -17,6 +26,7 @@ import json
 import os
 import signal
 import sys
+import time
 from typing import Optional
 
 import aiohttp
@@ -28,6 +38,14 @@ from pyromind_sdk.client.base import (
     ENV_CLUSTER,
     resolve_base_url_from_cluster,
 )
+
+
+# Keep-alive / idle policy — must match the server's expectations.
+# PING_INTERVAL_S: how often we send {"type":"ping"} to keep middleboxes alive.
+# IDLE_TIMEOUT_S:  how long the socket can sit without *real* traffic before
+#                  we tear it down.  Ping/pong frames do NOT reset this clock.
+_PING_INTERVAL_S = 60
+_IDLE_TIMEOUT_S = 30 * 60  # 30 minutes
 
 
 class TerminalError(RuntimeError):
@@ -47,12 +65,21 @@ def _websocket_url(base_url: str, sandbox_id: str, api_key: str, cols: int, rows
 
 
 async def _run_session(url: str) -> None:
-    """Pump bytes between the local TTY (already in raw mode) and the WebSocket."""
+    """Pump bytes between the local TTY (already in raw mode) and the WebSocket.
+
+    In addition to the stdin writer and stdout reader, two background tasks
+    enforce the keep-alive / idle policy:
+      * ``send_pings``    — sends ``{"type":"ping"}`` every ``_PING_INTERVAL_S``
+      * ``idle_watchdog`` — closes the session after ``_IDLE_TIMEOUT_S`` of
+                            inactivity (real data only; pings don't count)
+    """
     loop = asyncio.get_running_loop()
     stdin_fd = sys.stdin.fileno()
     stdout_fd = sys.stdout.fileno()
     outbound: asyncio.Queue = asyncio.Queue()
     session_over = asyncio.Event()
+    # Shared mutable timestamp — only *real* I/O resets it.
+    last_activity = [time.monotonic()]
 
     async with aiohttp.ClientSession() as session:
         try:
@@ -67,12 +94,14 @@ async def _run_session(url: str) -> None:
         def on_stdin_readable():
             data = os.read(stdin_fd, 4096)
             if data:
+                last_activity[0] = time.monotonic()
                 outbound.put_nowait(data)
             else:  # local EOF
                 session_over.set()
 
         def on_resize():
             size = os.get_terminal_size(stdout_fd)
+            last_activity[0] = time.monotonic()
             outbound.put_nowait(json.dumps({"type": "resize", "cols": size.columns, "rows": size.lines}))
 
         loop.add_reader(stdin_fd, on_stdin_readable)
@@ -90,23 +119,65 @@ async def _run_session(url: str) -> None:
         async def receive_output():
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.BINARY:
+                    last_activity[0] = time.monotonic()
                     os.write(stdout_fd, msg.data)
                 elif msg.type == aiohttp.WSMsgType.TEXT:
+                    # Server {"type":"pong"} is keep-alive only — do not render
+                    # it to the terminal and do not reset the idle timer.
+                    try:
+                        obj = json.loads(msg.data)
+                        if isinstance(obj, dict) and obj.get("type") == "pong":
+                            continue
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    last_activity[0] = time.monotonic()
                     os.write(stdout_fd, msg.data.encode("utf-8", errors="replace"))
                 elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
                     break
             session_over.set()
 
+        async def send_pings():
+            """Send ``{"type":"ping"}`` every ``_PING_INTERVAL_S`` to keep the
+            connection alive through middleboxes.  Cancelled on session teardown.
+            """
+            try:
+                while not session_over.is_set():
+                    await asyncio.sleep(_PING_INTERVAL_S)
+                    if not session_over.is_set():
+                        try:
+                            await ws.send_str(json.dumps({"type": "ping"}))
+                        except Exception:
+                            break
+            except asyncio.CancelledError:
+                pass
+
+        async def idle_watchdog():
+            """Tear the session down after ``_IDLE_TIMEOUT_S`` of no real I/O."""
+            try:
+                while not session_over.is_set():
+                    await asyncio.sleep(min(_PING_INTERVAL_S, 30))
+                    if time.monotonic() - last_activity[0] >= _IDLE_TIMEOUT_S:
+                        os.write(
+                            stdout_fd,
+                            b"\r\n\033[31mIdle timeout (30 min). Closing session.\033[0m\r\n",
+                        )
+                        session_over.set()
+                        return
+            except asyncio.CancelledError:
+                pass
+
         sender = asyncio.create_task(send_outbound())
         receiver = asyncio.create_task(receive_output())
+        pinger = asyncio.create_task(send_pings())
+        watchdog = asyncio.create_task(idle_watchdog())
         try:
             await session_over.wait()
         finally:
             loop.remove_signal_handler(signal.SIGWINCH)
             loop.remove_reader(stdin_fd)
-            for task in (sender, receiver):
+            for task in (sender, receiver, pinger, watchdog):
                 task.cancel()
-            await asyncio.gather(sender, receiver, return_exceptions=True)
+            await asyncio.gather(sender, receiver, pinger, watchdog, return_exceptions=True)
             await ws.close()
 
 
