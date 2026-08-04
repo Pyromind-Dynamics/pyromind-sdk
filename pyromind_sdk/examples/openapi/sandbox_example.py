@@ -194,7 +194,7 @@ def create_swebench_sandbox_example(image: str = DEFAULT_SWEBENCH_IMAGE):
         sandbox = client.sandboxes.create(
             SandboxRequest(
                 name=f"swebench-sandbox-{int(time.time())}",
-                sandbox_type=SandboxType.SWEBENCH,
+                sandbox_type=SandboxType.CUSTOM,
                 resources=ResourceConfig(
                     cpu="4",
                     memory="8Gi",

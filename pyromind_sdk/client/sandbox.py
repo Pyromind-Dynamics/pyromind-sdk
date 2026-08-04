@@ -319,14 +319,13 @@ class SandboxClient(PyroMindClient):
         timeout: Optional[int] = None,
     ) -> SwebenchExecResponse:
         """
-        Execute a shell command in a SWE-bench sandbox.
+        Execute a shell command in a sandbox.
 
         This method sends a command to the sandbox's running container and
         returns stdout/stderr output, the exit code, and any exception info.
-        Only swebench type sandboxes support this method.
 
         Args:
-            sandbox_id: ID of the swebench sandbox
+            sandbox_id: ID of the sandbox
             command: Shell command to execute (e.g. "uname -a")
             cwd: Working directory for command execution (default: "/")
             timeout: Execution timeout in seconds, max 600 (default: 30)

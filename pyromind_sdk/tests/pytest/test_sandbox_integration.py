@@ -154,8 +154,8 @@ def _create_sandbox(
         "sandbox_type": sandbox_type,
         "resources": ResourceConfig(cpu=cpu, memory=memory, gpu=0),
     }
-    # Headless types (SWE-bench / CUSTOM) don't need screen resolution.
-    if sandbox_type not in (SandboxType.SWEBENCH, SandboxType.CUSTOM):
+    # Headless type (CUSTOM) doesn't need screen resolution.
+    if sandbox_type != SandboxType.CUSTOM:
         request_kwargs["configuration"] = SandboxConfiguration(
             screen_resolution=ScreenResolution(width=width, height=height),
         )
@@ -529,7 +529,7 @@ class TestCreateSwebenchSandbox:
             sandbox = client.sandboxes.create(
                 SandboxRequest(
                     name=sandbox_name,
-                    sandbox_type=SandboxType.SWEBENCH,
+                    sandbox_type=SandboxType.CUSTOM,
                     resources=ResourceConfig(cpu="4", memory="8Gi", gpu=0),
                     image=SWEBENCH_TEST_IMAGE,
                 )
@@ -546,7 +546,7 @@ class TestCreateSwebenchSandbox:
             sb_type_value = (
                 sandbox.type.value if hasattr(sandbox.type, "value") else str(sandbox.type)
             )
-            assert sb_type_value == SandboxType.SWEBENCH.value, (
+            assert sb_type_value == SandboxType.CUSTOM.value, (
                 f"Expected swebench, got {sb_type_value}"
             )
         finally:
@@ -557,7 +557,7 @@ class TestCreateSwebenchSandbox:
         sandbox = _create_sandbox(
             client,
             "test-swebench-imgpath",
-            sandbox_type=SandboxType.SWEBENCH,
+            sandbox_type=SandboxType.CUSTOM,
             cpu="4",
             memory="8Gi",
             image=SWEBENCH_TEST_IMAGE,
@@ -595,7 +595,7 @@ class TestExecSwebenchCommand:
         sandbox = _create_sandbox(
             client,
             "test-swebench-exec",
-            sandbox_type=SandboxType.SWEBENCH,
+            sandbox_type=SandboxType.CUSTOM,
             cpu="4",
             memory="8Gi",
             image=SWEBENCH_TEST_IMAGE,
@@ -626,7 +626,7 @@ class TestExecSwebenchCommand:
         sandbox = _create_sandbox(
             client,
             "test-swebench-cwd",
-            sandbox_type=SandboxType.SWEBENCH,
+            sandbox_type=SandboxType.CUSTOM,
             cpu="4",
             memory="8Gi",
             image="swebench/swesmith.x86_64.oauthlib_1776_oauthlib.1fd52536:latest",
@@ -660,7 +660,7 @@ class TestExecSwebenchCommand:
         sandbox = _create_sandbox(
             client,
             "test-swebench-nonzero",
-            sandbox_type=SandboxType.SWEBENCH,
+            sandbox_type=SandboxType.CUSTOM,
             cpu="4",
             memory="8Gi",
             image=SWEBENCH_TEST_IMAGE,
@@ -686,7 +686,7 @@ class TestExecSwebenchCommand:
         sandbox = _create_sandbox(
             client,
             "test-swebench-exec-fn",
-            sandbox_type=SandboxType.SWEBENCH,
+            sandbox_type=SandboxType.CUSTOM,
             cpu="4",
             memory="8Gi",
             image=SWEBENCH_TEST_IMAGE,
@@ -715,7 +715,7 @@ class TestPauseSwebenchSandbox:
         sandbox = _create_sandbox(
             client,
             "test-pause-swebench",
-            sandbox_type=SandboxType.SWEBENCH,
+            sandbox_type=SandboxType.CUSTOM,
             cpu="4",
             memory="8Gi",
             image=SWEBENCH_TEST_IMAGE,
@@ -741,7 +741,7 @@ class TestResumeSwebenchSandbox:
         sandbox = _create_sandbox(
             client,
             "test-resume-swebench",
-            sandbox_type=SandboxType.SWEBENCH,
+            sandbox_type=SandboxType.CUSTOM,
             cpu="4",
             memory="8Gi",
             image=SWEBENCH_TEST_IMAGE,
@@ -771,7 +771,7 @@ class TestDeleteSwebenchSandbox:
         sandbox = _create_sandbox(
             client,
             "test-delete-swebench",
-            sandbox_type=SandboxType.SWEBENCH,
+            sandbox_type=SandboxType.CUSTOM,
             cpu="4",
             memory="8Gi",
             image=SWEBENCH_TEST_IMAGE,
