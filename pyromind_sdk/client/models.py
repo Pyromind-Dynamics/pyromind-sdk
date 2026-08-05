@@ -85,7 +85,7 @@ class SandboxType(str, Enum):
         OSWORLD: OSWorld sandbox with GUI desktop environment (VNC), supports
             custom system images via ``system_image_path``.
         CUSTOM: Custom sandbox (headless container). Supports file operations
-            via ``read_file`` / ``write_file`` / ``write_file_stream`` /
+            via ``read_file`` / ``write_file`` /
             ``delete_file`` endpoints; requires a user-provided container
             image via the ``image`` field.
     """

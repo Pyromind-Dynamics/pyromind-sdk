@@ -85,7 +85,6 @@ delete_swebench_sandbox_example = sandbox_example.delete_swebench_sandbox_exampl
 # CUSTOM sandbox + file-operation example helpers
 create_custom_sandbox_example = sandbox_example.create_custom_sandbox_example
 write_file_example = sandbox_example.write_file_example
-write_file_stream_example = sandbox_example.write_file_stream_example
 read_file_example = sandbox_example.read_file_example
 delete_file_example = sandbox_example.delete_file_example
 pause_custom_sandbox_example = sandbox_example.pause_custom_sandbox_example
@@ -875,8 +874,8 @@ class TestCustomSandboxFileOperations:
         finally:
             _pause_and_delete(client, sandbox.id)
 
-    def test_write_file_stream_from_local_path(self, client):
-        """write_file_stream(local_path) round-trips via read_file."""
+    def test_write_file_from_local_path(self, client):
+        """write_file(local_path) round-trips via read_file."""
         import tempfile
 
         sandbox = _create_sandbox(
@@ -900,7 +899,7 @@ class TestCustomSandboxFileOperations:
                 tmp_path = tmp.name
             remote = "/data/_it_stream_path.bin"
             try:
-                wr = client.sandboxes.write_file_stream(sandbox.id, remote, tmp_path)
+                wr = client.sandboxes.write_file(sandbox.id, remote, tmp_path)
                 assert wr["size"] == len(payload)
                 back = client.sandboxes.read_file(sandbox.id, remote)
                 assert back == payload
@@ -910,7 +909,7 @@ class TestCustomSandboxFileOperations:
         finally:
             _pause_and_delete(client, sandbox.id)
 
-    def test_write_file_stream_large(self, client):
+    def test_write_file_large(self, client):
         """8 MiB streaming upload should succeed without buffering server-side."""
         import io
 
@@ -933,7 +932,7 @@ class TestCustomSandboxFileOperations:
             payload = (b"pyromind-sdk-large-stream-" * 64)[:size]
             remote = "/data/_it_stream_large.bin"
             t0 = time.time()
-            wr = client.sandboxes.write_file_stream(
+            wr = client.sandboxes.write_file(
                 sandbox.id, remote, io.BytesIO(payload)
             )
             elapsed = time.time() - t0
