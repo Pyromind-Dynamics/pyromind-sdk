@@ -380,7 +380,7 @@ class SandboxClient(PyroMindClient):
                 ) from exc
             return source, size
         raise TypeError(
-            f"Unsupported write_file_stream source type: {type(source).__name__}"
+            f"Unsupported write_file source type: {type(source).__name__}"
         )
 
     def read_file(self, sandbox_id: str, path: str) -> bytes:
@@ -419,42 +419,18 @@ class SandboxClient(PyroMindClient):
             self._handle_error_response(response, err_ctx)
         return response.content
 
-    def write_file(self, sandbox_id: str, path: str, data: Union[bytes, bytearray]) -> Dict[str, Any]:
-        """
-        Write raw bytes to a file inside a custom sandbox.
+    # 分块大小：每块 2 MB（避免单次请求超时）
+    _CHUNK_SIZE = 2 * 1024 * 1024
 
-        Buffered convenience wrapper around :meth:`write_file_stream`. For
-        streaming uploads (local files, generators, large byte buffers) prefer
-        ``write_file_stream`` directly so we can set ``Content-Length`` and
-        avoid an in-memory copy.
-
-        Only supported for custom type sandboxes. Max 1 GB.
-
-        Args:
-            sandbox_id: ID of the custom sandbox
-            path: Absolute path of the file inside the container
-            data: File content as bytes / bytearray
-
-        Returns:
-            dict with ``path`` (str), ``size`` (int, logical file size) and
-            ``transport_bytes`` (int, bytes written to pod stdin incl. tar
-            overhead).
-        """
-        return self.write_file_stream(sandbox_id, path, source=data)
-
-    def write_file_stream(
+    def write_file(
         self,
         sandbox_id: str,
         path: str,
         source: Union[str, os.PathLike, bytes, bytearray, IO[bytes]],
     ) -> Dict[str, Any]:
         """
-        Stream-upload a file into a custom sandbox.
-
-        The server builds a single-member POSIX tar archive around the body
-        and pipes it to ``tar -xf -`` inside the pod (docker-rt style). We
-        MUST set ``Content-Length`` so the server can put an accurate size in
-        the tar header; this helper resolves the size from the source type.
+        Write a file into a custom sandbox. Automatically splits into 100 MB
+        chunks to bypass nginx body size limits. Max 1 GB.
 
         Accepted ``source``:
 
@@ -462,7 +438,7 @@ class SandboxClient(PyroMindClient):
         - ``bytes`` / ``bytearray`` / ``memoryview``: in-memory buffer.
         - file-like object with ``read()``: must be seekable so we can measure.
 
-        Parent directories on the container are created automatically. Max 1 GB.
+        Parent directories on the container are created automatically.
 
         Args:
             sandbox_id: ID of the custom sandbox.
@@ -470,44 +446,97 @@ class SandboxClient(PyroMindClient):
             source: See above.
 
         Returns:
-            dict with ``path`` (str), ``size`` (int, logical file size) and
-            ``transport_bytes`` (int, bytes written to pod stdin incl. tar
-            protocol overhead).
+            dict with ``path`` (str) and ``size`` (int, logical file size).
 
         Raises:
-            PyroMindAPIError: On non-2xx response (411 LENGTH_REQUIRED if the
-                server cannot determine size, 413 FILE_TOO_LARGE, etc.).
+            PyroMindAPIError: On non-2xx response.
         """
         body, size = self._resolve_upload_source(source)
-        url = self._build_url(f"/sandboxes/{sandbox_id}/files/write")
         try:
-            response = self.session.request(
-                method="PUT",
-                url=url,
-                params={"path": path},
-                data=body,
-                headers={
-                    "Content-Type": "application/octet-stream",
-                    "Content-Length": str(size),
-                },
-                timeout=self.timeout,
-            )
+            return self._chunked_write_file(
+                sandbox_id, path, body, size)
         finally:
-            # 如果我们打开了本地文件，确保关闭它（requests 不会自动关）。
             if isinstance(source, (str, os.PathLike)) and hasattr(body, "close"):
                 try:
                     body.close()
                 except Exception:
                     pass
-        if not response.ok:
-            self._handle_error_response(
-                response, f"PUT /sandboxes/{sandbox_id}/files/write"
-            )
+
+    def _chunked_write_file(
+        self, sandbox_id: str, path: str, body, size: int
+    ) -> Dict[str, Any]:
+        """Internal: chunked upload (init → part × N → complete)."""
+        import math
+
+        chunk_size = self._CHUNK_SIZE
+        total_chunks = math.ceil(size / chunk_size)
+        base_url = self._build_url(f"/sandboxes/{sandbox_id}/files/chunks")
+        request_context = f"write_file /sandboxes/{sandbox_id}"
+
+        # Step 1: init
+        init_resp = self.session.request(
+            method="POST",
+            url=f"{base_url}/init",
+            params={
+                "path": path,
+                "total_size": size,
+                "total_chunks": total_chunks,
+            },
+            timeout=self.timeout,
+        )
+        if not init_resp.ok:
+            self._handle_error_response(init_resp, f"{request_context} (init)")
+        upload_id = self._extract_data(init_resp.json())["upload_id"]
+
+        # Step 2: upload each chunk
+        uploaded_bytes = 0
         try:
-            payload = response.json()
+            for i in range(total_chunks):
+                chunk_data = body.read(chunk_size) if hasattr(body, "read") else body[i * chunk_size:(i + 1) * chunk_size]
+                if not chunk_data:
+                    break
+                uploaded_bytes += len(chunk_data)
+
+                part_resp = self.session.request(
+                    method="PUT",
+                    url=f"{base_url}/{upload_id}/part",
+                    params={"chunk_index": i},
+                    data=chunk_data,
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "Content-Length": str(len(chunk_data)),
+                    },
+                    timeout=self.timeout,
+                )
+                if not part_resp.ok:
+                    self._handle_error_response(
+                        part_resp, f"{request_context} (part {i}/{total_chunks})"
+                    )
+
+            # Step 3: complete
+            complete_resp = self.session.request(
+                method="POST",
+                url=f"{base_url}/{upload_id}/complete",
+                params={"path": path, "total_chunks": total_chunks},
+                timeout=self.timeout,
+            )
+            if not complete_resp.ok:
+                self._handle_error_response(complete_resp, f"{request_context} (complete)")
+            return self._extract_data(complete_resp.json())
+
         except Exception:
-            payload = {}
-        return self._extract_data(payload) if payload else {}
+            # Best-effort abort on failure
+            try:
+                self.session.request(
+                    method="DELETE",
+                    url=f"{base_url}/{upload_id}",
+                    timeout=self.timeout,
+                )
+            except Exception:
+                pass
+            raise
+
+
 
     def delete_file(self, sandbox_id: str, path: str, recursive: bool = False) -> Dict[str, Any]:
         """

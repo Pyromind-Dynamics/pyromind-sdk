@@ -10,7 +10,7 @@ Covers the three custom-sandbox file endpoints:
 and the SDK methods:
     - ``SandboxClient.read_file``
     - ``SandboxClient.write_file``
-    - ``SandboxClient.write_file_stream``
+    - ``SandboxClient.write_file``
     - ``SandboxClient.delete_file``
 
 Each test goes through the **full lifecycle independently**, mirroring
@@ -255,8 +255,8 @@ class TestSyncFileOperations:
         finally:
             _pause_and_delete(client, sandbox.id)
 
-    def test_write_file_stream_from_path(self, client, custom_image):
-        """write_file_stream(path) uploads a local file without buffering server-side."""
+    def test_write_file_from_path(self, client, custom_image):
+        """write_file(path) uploads a local file without buffering server-side."""
         sandbox = _create_sandbox(client, "test-stream-path", image=custom_image)
         try:
             if not _wait_for_status(client, sandbox.id, "running",
@@ -269,7 +269,7 @@ class TestSyncFileOperations:
                 tmp.write(payload)
                 tmp_path = tmp.name
             try:
-                result = client.sandboxes.write_file_stream(
+                result = client.sandboxes.write_file(
                     sandbox.id, remote, tmp_path
                 )
                 assert result["size"] == len(payload)
@@ -277,12 +277,12 @@ class TestSyncFileOperations:
                 assert back == payload
             finally:
                 os.unlink(tmp_path)
-            print(f"[OK] write_file_stream(path) round-trip {len(payload)} bytes")
+            print(f"[OK] write_file(path) round-trip {len(payload)} bytes")
         finally:
             _pause_and_delete(client, sandbox.id)
 
-    def test_write_file_stream_from_fileobj(self, client, custom_image):
-        """write_file_stream accepts seekable file-like objects (io.BytesIO, ...)."""
+    def test_write_file_from_fileobj(self, client, custom_image):
+        """write_file accepts seekable file-like objects (io.BytesIO, ...)."""
         sandbox = _create_sandbox(client, "test-stream-fobj", image=custom_image)
         try:
             if not _wait_for_status(client, sandbox.id, "running",
@@ -291,17 +291,17 @@ class TestSyncFileOperations:
 
             remote = "/data/_sdk_stream_fobj.bin"
             payload = b"fileobj-stream-" + os.urandom(1024)
-            result = client.sandboxes.write_file_stream(
+            result = client.sandboxes.write_file(
                 sandbox.id, remote, io.BytesIO(payload)
             )
             assert result["size"] == len(payload)
             back = client.sandboxes.read_file(sandbox.id, remote)
             assert back == payload
-            print(f"[OK] write_file_stream(file-like) round-trip {len(payload)} bytes")
+            print(f"[OK] write_file(file-like) round-trip {len(payload)} bytes")
         finally:
             _pause_and_delete(client, sandbox.id)
 
-    def test_write_file_stream_large(self, client, custom_image):
+    def test_write_file_large(self, client, custom_image):
         """Streaming upload of a multi-MB payload; server should not buffer."""
         sandbox = _create_sandbox(client, "test-stream-large", image=custom_image)
         try:
@@ -313,7 +313,7 @@ class TestSyncFileOperations:
             size = 8 * 1024 * 1024  # 8 MiB
             payload = (b"pyromind-sdk-large-stream-" * 64)[:size]
             t0 = time.time()
-            result = client.sandboxes.write_file_stream(
+            result = client.sandboxes.write_file(
                 sandbox.id, remote, io.BytesIO(payload)
             )
             elapsed = time.time() - t0
@@ -321,7 +321,7 @@ class TestSyncFileOperations:
             back = client.sandboxes.read_file(sandbox.id, remote)
             assert back == payload
             print(
-                f"[OK] write_file_stream(large) {len(payload)} bytes in {elapsed:.2f}s "
+                f"[OK] write_file(large) {len(payload)} bytes in {elapsed:.2f}s "
                 f"(transport_bytes={result['transport_bytes']})"
             )
         finally:
@@ -376,7 +376,7 @@ class TestAsyncFileOperations:
 
     @pytest.mark.asyncio
     async def test_async_write_then_read(self, client, custom_image):
-        """Async mirror: write + read + write_file_stream + delete."""
+        """Async mirror: write + read + write_file + delete."""
         from pyromind_sdk.client.async_sandbox import AsyncSandboxClient
 
         sandbox = _create_sandbox(client, "test-async-files", image=custom_image)
@@ -406,9 +406,9 @@ class TestAsyncFileOperations:
                 )
                 assert got == body
 
-                # write_file_stream (file-like)
+                # write_file (file-like)
                 stream_body = b"async-stream-" + os.urandom(64)
-                sr = await async_client.write_file_stream(
+                sr = await async_client.write_file(
                     sandbox.id,
                     "/data/_sdk_async_stream.bin",
                     io.BytesIO(stream_body),

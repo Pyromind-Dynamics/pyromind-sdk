@@ -428,7 +428,7 @@ def create_custom_sandbox_example(
 
     CUSTOM sandboxes are headless (no VNC) and support the three file
     endpoints (``read_file`` / ``write_file`` / ``delete_file``) plus
-    the streaming ``write_file_stream`` shortcut.
+    the streaming ``write_file`` shortcut.
 
     By default we mount ``hostPath=/workspace`` onto ``/data`` inside the
     container, so all subsequent file ops should use ``/data/<name>`` as
@@ -505,31 +505,8 @@ def create_custom_sandbox_example(
         client.close()
 
 
-def write_file_example(sandbox_id: str, path: str = "/data/hello.txt",
-                       data: bytes = b"hello pyromind\n"):
-    """Example: Write bytes to a file inside a CUSTOM sandbox (one-shot).
-
-    The SDK buffers the full payload and sends it as a single
-    ``application/octet-stream`` body. Use ``write_file_stream_example``
-    when uploading large files or when the source is a local path /
-    file-like object.
-    """
-    client = PyroMindAPIClient()
-    try:
-        print(f"Writing {len(data)} bytes to {path} ...")
-        result = client.sandboxes.write_file(sandbox_id, path, data)
-        print(f"✓ write_file OK -> path={result['path']}, "
-              f"size={result['size']}, transport_bytes={result.get('transport_bytes')}")
-        return result
-    except PyroMindAPIError as e:
-        print(f"✗ write_file failed: {e.message}")
-        return None
-    finally:
-        client.close()
-
-
-def write_file_stream_example(sandbox_id: str, source,
-                              path: str = "/data/streamed.bin"):
+def write_file_example(sandbox_id: str, source,
+                       path: str = "/data/streamed.bin"):
     """Example: Streaming upload to a file inside a CUSTOM sandbox.
 
     ``source`` can be any of:
@@ -544,16 +521,16 @@ def write_file_stream_example(sandbox_id: str, source,
     try:
         src_repr = source if isinstance(source, (str, bytes)) else type(source).__name__
         print(f"Streaming upload from {src_repr!r} -> {path} ...")
-        result = client.sandboxes.write_file_stream(sandbox_id, path, source)
-        print(f"✓ write_file_stream OK -> path={result['path']}, "
+        result = client.sandboxes.write_file(sandbox_id, path, source)
+        print(f"✓ write_file OK -> path={result['path']}, "
               f"size={result['size']}, transport_bytes={result.get('transport_bytes')}")
         return result
     except PyroMindAPIError as e:
-        print(f"✗ write_file_stream failed: {e.message}")
+        print(f"✗ write_file failed: {e.message}")
         return None
     except ValueError as e:
         # _resolve_upload_source raises ValueError for unsupported sources.
-        print(f"✗ write_file_stream rejected source: {e}")
+        print(f"✗ write_file rejected source: {e}")
         return None
     finally:
         client.close()
@@ -628,7 +605,7 @@ def custom_sandbox_full_lifecycle_example(image: str = DEFAULT_CUSTOM_IMAGE):
 
     create → wait for RUNNING →
         write_file (bytes) → read_file back →
-        write_file_stream (local path) → read_file back →
+        write_file (local path) → read_file back →
         delete_file → delete_file(recursive)
     → pause → delete.
 
@@ -658,7 +635,7 @@ def custom_sandbox_full_lifecycle_example(image: str = DEFAULT_CUSTOM_IMAGE):
             tmp.write(os.urandom(8 * 1024))
             tmp_path = tmp.name
         try:
-            write_file_stream_example(sandbox_id, tmp_path,
+            write_file_example(sandbox_id, tmp_path,
                                       path="/data/streamed.bin")
             read_file_example(sandbox_id, "/data/streamed.bin")
         finally:
@@ -697,4 +674,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # main()
+    from pyromind_sdk import SandboxClient
+
+    sandbox_client = SandboxClient()
+    ## 使用file link 上传本地文件
+    source = open("/Users/jiangwenchang/Downloads/account.db", "rb")
+    sandbox_client.write_file("sb-94d290262ee8", "/workspace/testDir/account.db", source="/Users/jiangwenchang/Downloads/test.xtx")
+

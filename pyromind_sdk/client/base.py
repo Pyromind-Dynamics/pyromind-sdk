@@ -254,14 +254,13 @@ class PyroMindClient:
     
     def _format_400_error(self, response, error_data: Dict[str, Any]) -> str:
         """Format error message for 400 Bad Request"""
-        base_message = (
-            "Bad Request (400). The request was invalid or malformed. "
-            "This usually means there's an issue with the request parameters, "
-            "request body format, or missing required fields."
-        )
-        response_text = response.text[:ERROR_MESSAGE_MAX_LENGTH]
-        suffix = "..." if len(response.text) > ERROR_MESSAGE_MAX_LENGTH else ""
-        return f"{base_message}\nResponse: {response_text}{suffix}"
+        # 只提取关键错误信息，避免与外层 response 字段重复
+        err = error_data.get('error', {})
+        code = err.get('code', '')
+        msg = err.get('message', '')
+        if code or msg:
+            return f"{code}: {msg}" if code else msg
+        return "Bad Request (400)"
     
     def _format_401_error(self, error_data: Dict[str, Any]) -> str:
         """Format error message for 401 Unauthorized"""
@@ -388,7 +387,8 @@ class PyroMindClient:
         
         # Log error (single line)
         safe_error_data = self._mask_sensitive_data(error_data)
-        logger.error(f"[ERROR] {request_context} - Status: {response.status_code} | message: {error_message} | response: {safe_error_data}")
+        resp_headers = dict(response.headers)
+        logger.error(f"[ERROR] {request_context} - Status: {response.status_code} | message: {error_message} | response: {safe_error_data} | headers: {resp_headers}")
         
         raise PyroMindAPIError(
             message=f"{request_context} failed: {error_message}",
