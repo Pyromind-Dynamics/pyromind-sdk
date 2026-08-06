@@ -13,6 +13,7 @@ If neither is provided, the client will raise a ValueError.
 
 import asyncio
 import time
+from typing import List, Union
 
 from pyromind_sdk import PyroMindAsyncAPIClient, PyroMindAPIError
 from pyromind_sdk.client.models import (
@@ -463,7 +464,7 @@ async def create_swebench_sandbox_example(image: str = DEFAULT_SWEBENCH_IMAGE):
 
 async def exec_swebench_command_example(
     sandbox_id: str,
-    command: str = "uname -a",
+    command: Union[str, List[str]] = "uname -a",
     cwd: str = "",
     timeout: int = 30,
 ):
@@ -471,7 +472,8 @@ async def exec_swebench_command_example(
 
     Args:
         sandbox_id: ID of the running SWE-bench sandbox.
-        command: Shell command to execute.
+        command: Shell command to execute.  Either a ``str``
+            (e.g. ``"uname -a"``) or a ``List[str]`` argv array.
         cwd: Working directory inside the container.
         timeout: Execution timeout in seconds (max 600).
     """

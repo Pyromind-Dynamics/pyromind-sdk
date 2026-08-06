@@ -380,9 +380,9 @@ class SwebenchExecRequest(BaseModel):
     Kubernetes exec API.
 
     Attributes:
-        command: Shell command string to execute (e.g. ``"uname -a"``).
-            Leading/trailing whitespace is stripped by the SDK before sending.
-            Must be non-empty after stripping.
+        command: Shell command to execute.  Either a ``str`` (run via
+            ``/bin/sh -c``) or a ``List[str]`` argv array (e.g.
+            ``["ls", "-la"]``).
         cwd: Working directory inside the container (e.g. ``"/workspace"``).
             Defaults to ``""`` which means the container's default workdir.
             Leading/trailing whitespace is stripped by the SDK before sending.
@@ -391,7 +391,7 @@ class SwebenchExecRequest(BaseModel):
             command exceeds the timeout it is killed and ``exception_info``
             will contain a timeout message.
     """
-    command: str = Field(..., min_length=1, description="Shell command to execute")
+    command: Union[str, List[str]] = Field(..., description="Shell command to execute")
     cwd: str = Field(default="", description="Working directory for command execution")
     timeout: Optional[int] = Field(default=None, ge=1, le=600, description="Execution timeout in seconds (max 600)")
 

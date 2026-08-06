@@ -359,7 +359,7 @@ class AsyncSandboxClient(PyroMindAsyncClient):
     async def exec_command(
         self,
         sandbox_id: str,
-        command: str,
+        command: Union[str, List[str]],
         cwd: str = "",
         timeout: Optional[int] = None,
     ) -> SwebenchExecResponse:
@@ -368,15 +368,20 @@ class AsyncSandboxClient(PyroMindAsyncClient):
 
         Args:
             sandbox_id: ID of the sandbox
-            command: Shell command to execute (e.g. "uname -a")
-            cwd: Working directory for command execution (default: "/")
+            command: Shell command to execute.  Either a ``str``
+                (e.g. ``"uname -a"``, run via ``/bin/sh -c``) or a
+                ``List[str]`` argv array (e.g. ``["ls", "-la", "/workspace"]``).
+            cwd: Working directory for command execution (default: "")
             timeout: Execution timeout in seconds, max 600 (default: 30)
 
         Returns:
             SwebenchExecResponse with output, returncode, and exception_info
         """
+        # Strip whitespace for str commands; pass list as-is
+        if isinstance(command, str):
+            command = command.strip()
         request = SwebenchExecRequest(
-            command=command.strip(),
+            command=command,
             cwd=cwd.strip() if cwd else "",
             timeout=timeout,
         )

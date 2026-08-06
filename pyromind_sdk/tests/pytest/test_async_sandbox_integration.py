@@ -685,6 +685,43 @@ class TestExecSwebenchCommand:
             await _pause_and_delete(client, sandbox.id)
 
     @pytest.mark.asyncio
+    async def test_exec_with_argv_list(self, client):
+        """Execute a command as argv list (bypasses shell, async)."""
+        sandbox = await _create_sandbox(
+            client,
+            "test-exec-argv-list",
+            sandbox_type=SandboxType.CUSTOM,
+            cpu="4",
+            memory="8Gi",
+            image=SWEBENCH_TEST_IMAGE,
+        )
+        try:
+            if not await _wait_for_status(
+                client, sandbox.id, "running", timeout=SWEBENCH_BOOT_TIMEOUT
+            ):
+                pytest.skip("SWE-bench sandbox did not reach running status")
+
+            result = await client.sandboxes.exec_command(
+                sandbox_id=sandbox.id,
+                command=["echo", "hello from argv list"],
+            )
+            print(f"[TEST] exec argv list result: returncode={result.returncode}, output={result.output!r}")
+            assert result.returncode == 0
+            assert "hello from argv list" in result.output
+
+            # Test with cwd
+            result2 = await client.sandboxes.exec_command(
+                sandbox_id=sandbox.id,
+                command=["ls", "-la"],
+                cwd="/tmp",
+            )
+            print(f"[TEST] exec argv list with cwd: returncode={result2.returncode}, output={result2.output[:80]!r}")
+            assert result2.returncode == 0
+
+        finally:
+            await _pause_and_delete(client, sandbox.id)
+
+    @pytest.mark.asyncio
     async def test_exec_example_function(self, client):
         """Test exec_swebench_command_example async helper end-to-end."""
         sandbox = await _create_sandbox(
