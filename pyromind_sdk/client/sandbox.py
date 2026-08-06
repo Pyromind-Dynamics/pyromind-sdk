@@ -6,17 +6,14 @@ This module provides a client for managing sandboxes via the PyroMind API.
 
 import os
 import time
+import traceback
 from typing import List, Optional, Dict, Any, Union, IO
+
 from .base import PyroMindClient
 from .models import (
     SandboxRequest,
     SandboxResponse,
     InternalIPResponse,
-    ActionRequest,
-    ActionResponse,
-    BatchActionRequest,
-    VNCResponse,
-    VNCConnectionInfo,
     SwebenchExecRequest,
     SwebenchExecResponse,
 )
@@ -199,8 +196,7 @@ class SandboxClient(PyroMindClient):
                 if current_status not in intermediate_statuses:
                     return False
             except Exception as e:
-                # Transient network/API issues can happen during provisioning.
-                pass
+                traceback.print_exc()
 
             time.sleep(check_interval)
             waited += check_interval
@@ -233,6 +229,7 @@ class SandboxClient(PyroMindClient):
         try:
             return self.get_sandbox(sandbox.id)
         except Exception as e:
+            traceback.print_exc()
             return sandbox
     
     def update(self, sandbox_id: str, request: SandboxRequest) -> SandboxResponse:
@@ -314,7 +311,7 @@ class SandboxClient(PyroMindClient):
     def exec_command(
         self,
         sandbox_id: str,
-        command: str,
+        command: Union[str, List[str]],
         cwd: str = "",
         timeout: Optional[int] = None,
     ) -> SwebenchExecResponse:
@@ -326,15 +323,20 @@ class SandboxClient(PyroMindClient):
 
         Args:
             sandbox_id: ID of the sandbox
-            command: Shell command to execute (e.g. "uname -a")
-            cwd: Working directory for command execution (default: "/")
+            command: Shell command to execute.  Either a ``str``
+                (e.g. ``"uname -a"``, run via ``/bin/sh -c``) or a
+                ``List[str]`` argv array (e.g. ``["ls", "-la", "/workspace"]``).
+            cwd: Working directory for command execution (default: "")
             timeout: Execution timeout in seconds, max 600 (default: 30)
 
         Returns:
             SwebenchExecResponse with output, returncode, and exception_info
         """
+        # Strip whitespace for str commands; pass list as-is
+        if isinstance(command, str):
+            command = command.strip()
         request = SwebenchExecRequest(
-            command=command.strip(),
+            command=command,
             cwd=cwd.strip() if cwd else "",
             timeout=timeout,
         )
@@ -459,8 +461,8 @@ class SandboxClient(PyroMindClient):
             if isinstance(source, (str, os.PathLike)) and hasattr(body, "close"):
                 try:
                     body.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    traceback.print_exc()
 
     def _chunked_write_file(
         self, sandbox_id: str, path: str, body, size: int
@@ -524,17 +526,18 @@ class SandboxClient(PyroMindClient):
                 self._handle_error_response(complete_resp, f"{request_context} (complete)")
             return self._extract_data(complete_resp.json())
 
-        except Exception:
+        except Exception as e:
             # Best-effort abort on failure
+            traceback.print_exc()
             try:
                 self.session.request(
                     method="DELETE",
                     url=f"{base_url}/{upload_id}",
                     timeout=self.timeout,
                 )
-            except Exception:
-                pass
-            raise
+            except Exception as e:
+                traceback.print_exc()
+            raise e
 
 
 

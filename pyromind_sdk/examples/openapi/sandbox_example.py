@@ -14,6 +14,7 @@ If neither is provided, the client will raise a ValueError.
 import os
 import tempfile
 import time
+from typing import List, Union
 
 from pyromind_sdk import PyroMindAPIClient, PyroMindAPIError
 from pyromind_sdk.client.models import (
@@ -223,7 +224,7 @@ def create_swebench_sandbox_example(image: str = DEFAULT_SWEBENCH_IMAGE):
 
 def exec_swebench_command_example(
     sandbox_id: str,
-    command: str = "uname -a",
+    command: Union[str, List[str]] = "uname -a",
     cwd: str = "",
     timeout: int = 30,
 ):
@@ -231,7 +232,8 @@ def exec_swebench_command_example(
 
     Args:
         sandbox_id: ID of the running SWE-bench sandbox.
-        command: Shell command to execute.
+        command: Shell command to execute.  Either a ``str``
+            (e.g. ``"uname -a"``) or a ``List[str]`` argv array.
         cwd: Working directory inside the container.
         timeout: Execution timeout in seconds (max 600).
     """
@@ -572,6 +574,51 @@ def delete_file_example(sandbox_id: str, path: str = "/data/hello.txt",
         client.close()
 
 
+def exec_command_example(
+    sandbox_id: str,
+    command: Union[str, List[str]] = "ls -la",
+    cwd: str = "",
+    timeout: int = 30,
+):
+    """Example: Execute a shell command in a CUSTOM sandbox.
+
+    Args:
+        sandbox_id: ID of the running CUSTOM sandbox.
+        command: Shell command to execute.  Either a ``str``
+            (e.g. ``"ls -la /workspace"``) or a ``List[str]`` argv array
+            (e.g. ``["ls", "-la"]``).
+        cwd: Working directory inside the container (default: ``""``).
+        timeout: Execution timeout in seconds, max 600 (default: 30).
+
+    Returns:
+        :class:`SwebenchExecResponse` with ``output``, ``returncode``,
+        and ``exception_info``.
+    """
+    client = PyroMindAPIClient()
+    try:
+        print(f"Executing command in CUSTOM sandbox {sandbox_id}...")
+        print(f"  Command: {command}")
+        if cwd:
+            print(f"  CWD:     {cwd}")
+        result: SwebenchExecResponse = client.sandboxes.exec_command(
+            sandbox_id=sandbox_id,
+            command=command,
+            cwd=cwd,
+            timeout=timeout,
+        )
+        print(f"✓ Command executed! returncode={result.returncode}")
+        if result.output:
+            print(f"  Output:\n{result.output}")
+        if result.exception_info:
+            print(f"  Exception: {result.exception_info}")
+        return result
+    except PyroMindAPIError as e:
+        print(f"✗ exec_command failed: {e.message}")
+        return None
+    finally:
+        client.close()
+
+
 def pause_custom_sandbox_example(sandbox_id: str):
     """Example: Pause a CUSTOM sandbox."""
     client = PyroMindAPIClient()
@@ -604,6 +651,7 @@ def custom_sandbox_full_lifecycle_example(image: str = DEFAULT_CUSTOM_IMAGE):
     """Full lifecycle demo for a CUSTOM sandbox:
 
     create → wait for RUNNING →
+        exec_command (uname) →
         write_file (bytes) → read_file back →
         write_file (local path) → read_file back →
         delete_file → delete_file(recursive)
@@ -626,11 +674,17 @@ def custom_sandbox_full_lifecycle_example(image: str = DEFAULT_CUSTOM_IMAGE):
             print("✗ CUSTOM sandbox never reached RUNNING")
             return
 
-        # 1) write bytes + read back
+        # 1) exec a command to verify the sandbox is alive
+        exec_command_example(sandbox_id, "uname -a")
+        exec_command_example(sandbox_id, "ls -la", cwd="/workspace")
+        # argv list form (bypasses shell, no quoting issues)
+        exec_command_example(sandbox_id, ["echo", "hello from argv list"], cwd="/workspace")
+
+        # 2) write bytes + read back
         write_file_example(sandbox_id, "/data/hello.txt", b"hello pyromind\n")
         read_file_example(sandbox_id, "/data/hello.txt")
 
-        # 2) stream a local file (8 KiB synthetic payload) + read back
+        # 3) stream a local file (8 KiB synthetic payload) + read back
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
             tmp.write(os.urandom(8 * 1024))
             tmp_path = tmp.name
@@ -641,16 +695,16 @@ def custom_sandbox_full_lifecycle_example(image: str = DEFAULT_CUSTOM_IMAGE):
         finally:
             os.unlink(tmp_path)
 
-        # 3) delete the two files
+        # 4) delete the two files
         delete_file_example(sandbox_id, "/data/hello.txt")
         delete_file_example(sandbox_id, "/data/streamed.bin")
 
-        # 4) directory: write two files under /data/demo/, then recursive delete
+        # 5) directory: write two files under /data/demo/, then recursive delete
         write_file_example(sandbox_id, "/data/demo/a.txt", b"a")
         write_file_example(sandbox_id, "/data/demo/sub/b.txt", b"b")
         delete_file_example(sandbox_id, "/data/demo", recursive=True)
 
-        # 5) cleanup
+        # 6) cleanup
         pause_custom_sandbox_example(sandbox_id)
         time.sleep(2)
         delete_custom_sandbox_example(sandbox_id)
@@ -674,11 +728,14 @@ def main():
 
 
 if __name__ == "__main__":
-    # main()
-    from pyromind_sdk import SandboxClient
+    main()
+    # from pyromind_sdk import SandboxClient
+    #
+    # sandbox_client = SandboxClient()
 
-    sandbox_client = SandboxClient()
+    # 测试命令执行
+    # exec_command_example("sb-aa7d2226052c", "ls -lha", cwd="/workspace")
     ## 使用file link 上传本地文件
-    source = open("/Users/jiangwenchang/Downloads/account.db", "rb")
-    sandbox_client.write_file("sb-94d290262ee8", "/workspace/testDir/account.db", source="/Users/jiangwenchang/Downloads/test.xtx")
+    # source = open("/Users/jiangwenchang/Downloads/anthropic-ai-claude-code-local-linux-x64.tgz", "rb")
+    # sandbox_client.write_file("sb-aa7d2226052c", "/workspace/testDir/anthropic-ai-claude-code-local-linux-x64.tgz", source=source)
 
