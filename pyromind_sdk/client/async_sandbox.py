@@ -503,7 +503,6 @@ class AsyncSandboxClient(PyroMindAsyncClient):
             "POST",
             f"{base_url}/init",
             params={
-                "path": path,
                 "total_size": size,
                 "total_chunks": total_chunks,
             },

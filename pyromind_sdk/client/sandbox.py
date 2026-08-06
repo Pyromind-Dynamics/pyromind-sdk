@@ -480,7 +480,6 @@ class SandboxClient(PyroMindClient):
             method="POST",
             url=f"{base_url}/init",
             params={
-                "path": path,
                 "total_size": size,
                 "total_chunks": total_chunks,
             },
