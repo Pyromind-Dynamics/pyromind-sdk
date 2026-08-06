@@ -36,10 +36,7 @@ from pyromind_sdk.client.models import (
     SandboxType,
     ResourceConfig,
     ScreenResolution,
-    ActionRequest,
-    ActionParameters,
-    SwebenchExecRequest,
-    SwebenchExecResponse,
+    SandboxExecResponse,
 )
 
 
@@ -740,7 +737,7 @@ class TestExecSwebenchCommand:
 
             result = await exec_swebench_command_example(sandbox.id, command="uname -a")
             if result:
-                assert isinstance(result, SwebenchExecResponse)
+                assert isinstance(result, SandboxExecResponse)
                 assert result.returncode == 0
                 assert len(result.output) > 0
 

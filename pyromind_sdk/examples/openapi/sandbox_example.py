@@ -23,7 +23,7 @@ from pyromind_sdk.client.models import (
     SandboxType,
     ResourceConfig,
     ScreenResolution,
-    SwebenchExecResponse,
+    SandboxExecResponse,
     VolumeMount,
     PortMapping,
 )
@@ -242,7 +242,7 @@ def exec_swebench_command_example(
     try:
         print(f"Executing command in SWE-bench sandbox {sandbox_id}...")
         print(f"  Command: {command}")
-        result: SwebenchExecResponse = client.sandboxes.exec_command(
+        result: SandboxExecResponse = client.sandboxes.exec_command(
             sandbox_id=sandbox_id,
             command=command,
             cwd=cwd,
@@ -252,6 +252,8 @@ def exec_swebench_command_example(
         print(f"  Return code: {result.returncode}")
         if result.output:
             print(f"  Output:\n{result.output}")
+        if result.stderr:
+            print(f"  Stderr:\n{result.stderr}")
         if result.exception_info:
             print(f"  Exception: {result.exception_info}")
         return result
@@ -591,7 +593,7 @@ def exec_command_example(
         timeout: Execution timeout in seconds, max 600 (default: 30).
 
     Returns:
-        :class:`SwebenchExecResponse` with ``output``, ``returncode``,
+        :class:`SandboxExecResponse` with ``output``, ``stderr``, ``returncode``,
         and ``exception_info``.
     """
     client = PyroMindAPIClient()
@@ -600,7 +602,7 @@ def exec_command_example(
         print(f"  Command: {command}")
         if cwd:
             print(f"  CWD:     {cwd}")
-        result: SwebenchExecResponse = client.sandboxes.exec_command(
+        result: SandboxExecResponse = client.sandboxes.exec_command(
             sandbox_id=sandbox_id,
             command=command,
             cwd=cwd,
@@ -609,6 +611,8 @@ def exec_command_example(
         print(f"✓ Command executed! returncode={result.returncode}")
         if result.output:
             print(f"  Output:\n{result.output}")
+        if result.stderr:
+            print(f"  Stderr:\n{result.stderr}")
         if result.exception_info:
             print(f"  Exception: {result.exception_info}")
         return result

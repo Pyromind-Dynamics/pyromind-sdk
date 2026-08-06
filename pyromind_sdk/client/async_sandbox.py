@@ -16,8 +16,8 @@ from .models import (
     ActionResponse,
     BatchActionRequest,
     VNCResponse,
-    SwebenchExecRequest,
-    SwebenchExecResponse,
+    SandboxExecRequest,
+    SandboxExecResponse,
 )
 
 
@@ -362,7 +362,7 @@ class AsyncSandboxClient(PyroMindAsyncClient):
         command: Union[str, List[str]],
         cwd: str = "",
         timeout: Optional[int] = None,
-    ) -> SwebenchExecResponse:
+    ) -> SandboxExecResponse:
         """
         Execute a shell command in a sandbox (async).
 
@@ -375,12 +375,12 @@ class AsyncSandboxClient(PyroMindAsyncClient):
             timeout: Execution timeout in seconds, max 600 (default: 30)
 
         Returns:
-            SwebenchExecResponse with output, returncode, and exception_info
+            SandboxExecResponse with output, stderr, returncode, and exception_info
         """
         # Strip whitespace for str commands; pass list as-is
         if isinstance(command, str):
             command = command.strip()
-        request = SwebenchExecRequest(
+        request = SandboxExecRequest(
             command=command,
             cwd=cwd.strip() if cwd else "",
             timeout=timeout,
@@ -390,7 +390,7 @@ class AsyncSandboxClient(PyroMindAsyncClient):
             json_data=request.model_dump(exclude_none=True),
         )
         data = self._extract_data(response)
-        return SwebenchExecResponse(**data)
+        return SandboxExecResponse(**data)
 
     # ===================== File Operations (custom sandbox) =====================
 

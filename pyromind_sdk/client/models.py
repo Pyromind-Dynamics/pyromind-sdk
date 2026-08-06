@@ -373,7 +373,7 @@ class ActionAPIResponse(BaseModel):
 
 
 # Exec Models
-class SwebenchExecRequest(BaseModel):
+class SandboxExecRequest(BaseModel):
     """Request model for executing a shell command in a sandbox.
 
     The command is executed inside the sandbox's running container via the
@@ -396,12 +396,14 @@ class SwebenchExecRequest(BaseModel):
     timeout: Optional[int] = Field(default=None, ge=1, le=600, description="Execution timeout in seconds (max 600)")
 
 
-class SwebenchExecResponse(BaseModel):
+class SandboxExecResponse(BaseModel):
     """Response model for shell command execution in a sandbox.
 
     Attributes:
-        output: Combined stdout and stderr of the command.  Empty string when
+        output: stdout of the command.  Empty string when
             the command produced no output or could not start.
+        stderr: stderr of the command.  Empty string when
+            the command produced no error output or could not start.
         returncode: Process exit code (``0`` = success).  ``-1`` indicates
             that the exit code could not be determined (e.g. exec failure).
         exception_info: Human-readable error description when the execution
@@ -409,7 +411,8 @@ class SwebenchExecResponse(BaseModel):
             Empty string on normal command execution (even when returncode ≠ 0).
         extra: Optional server-side metadata (e.g. timing information).
     """
-    output: str = Field(default="", description="Combined stdout and stderr of the command")
+    output: str = Field(default="", description="stdout of the command")
+    stderr: str = Field(default="", description="stderr of the command")
     returncode: int = Field(default=-1, description="Process exit code (0 = success, -1 = unknown)")
     exception_info: str = Field(default="", description="Infrastructure-level error message (empty on normal exec)")
     extra: Optional[Dict[str, Any]] = Field(default=None, description="Optional server-side metadata")

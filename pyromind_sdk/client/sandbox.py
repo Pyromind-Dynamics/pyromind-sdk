@@ -14,8 +14,8 @@ from .models import (
     SandboxRequest,
     SandboxResponse,
     InternalIPResponse,
-    SwebenchExecRequest,
-    SwebenchExecResponse,
+    SandboxExecRequest,
+    SandboxExecResponse,
 )
 
 
@@ -314,7 +314,7 @@ class SandboxClient(PyroMindClient):
         command: Union[str, List[str]],
         cwd: str = "",
         timeout: Optional[int] = None,
-    ) -> SwebenchExecResponse:
+    ) -> SandboxExecResponse:
         """
         Execute a shell command in a sandbox.
 
@@ -330,12 +330,12 @@ class SandboxClient(PyroMindClient):
             timeout: Execution timeout in seconds, max 600 (default: 30)
 
         Returns:
-            SwebenchExecResponse with output, returncode, and exception_info
+            SandboxExecResponse with output, returncode, and exception_info
         """
         # Strip whitespace for str commands; pass list as-is
         if isinstance(command, str):
             command = command.strip()
-        request = SwebenchExecRequest(
+        request = SandboxExecRequest(
             command=command,
             cwd=cwd.strip() if cwd else "",
             timeout=timeout,
@@ -345,7 +345,7 @@ class SandboxClient(PyroMindClient):
             json_data=request.model_dump(exclude_none=True),
         )
         data = self._extract_data(response)
-        return SwebenchExecResponse(**data)
+        return SandboxExecResponse(**data)
 
     # ===================== File Operations (custom sandbox) =====================
 

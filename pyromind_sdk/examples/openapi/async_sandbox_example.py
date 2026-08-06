@@ -24,7 +24,7 @@ from pyromind_sdk.client.models import (
     ScreenResolution,
     ActionRequest,
     ActionParameters,
-    SwebenchExecResponse,
+    SandboxExecResponse,
 )
 
 
@@ -482,7 +482,7 @@ async def exec_swebench_command_example(
     try:
         print(f"Executing command in SWE-bench sandbox {sandbox_id}...")
         print(f"  Command: {command}")
-        result: SwebenchExecResponse = await client.sandboxes.exec_command(
+        result: SandboxExecResponse = await client.sandboxes.exec_command(
             sandbox_id=sandbox_id,
             command=command,
             cwd=cwd,
@@ -492,6 +492,8 @@ async def exec_swebench_command_example(
         print(f"  Return code: {result.returncode}")
         if result.output:
             print(f"  Output:\n{result.output}")
+        if result.stderr:
+            print(f"  Stderr:\n{result.stderr}")
         if result.exception_info:
             print(f"  Exception: {result.exception_info}")
         return result
