@@ -743,3 +743,8 @@ if __name__ == "__main__":
     # source = open("/Users/jiangwenchang/Downloads/2-平安健康保险理赔流程指南.pdf", "rb")
     # sandbox_client.write_file("sb-94d290262ee8", "/workspace/testDir/2-平安健康保险理赔流程指南.pdf", source=source)
 
+    #---
+    # client = SandboxClient()
+    # client_list = client.list()
+
+
