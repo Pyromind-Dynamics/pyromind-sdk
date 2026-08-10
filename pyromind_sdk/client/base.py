@@ -217,9 +217,10 @@ class PyroMindClient:
         """
         if isinstance(response, dict):
             if "data" in response:
-                return response["data"]
-            # If response doesn't have 'data' field, return the whole response
-            # (for backward compatibility)
+                if isinstance(response["data"], list):
+                    return [response["data"]]
+                elif "sandboxes" in response["data"] and isinstance(response["data"]["sandboxes"], list):
+                    return response["data"]["sandboxes"]
             return response
         return response
     
