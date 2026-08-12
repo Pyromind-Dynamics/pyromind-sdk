@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import time
 from typing import Any
 
 from kubernetes import client
@@ -28,6 +29,7 @@ from .portforward import (
 )
 
 logger = logging.getLogger("docker_rt.reconcile")
+_last_sync = 0.0
 
 LABEL_MANAGED = "docker-rt.managed"
 LABEL_CONTAINER_ID = "docker-rt.container-id"
@@ -79,14 +81,24 @@ async def reconcile_pyromind_sandboxes(
     store: ContainerStore,
     *,
     policy: str | None = None,
+    force: bool = False,
     **kwargs: Any,
 ) -> dict[str, int]:
     """Adopt Running sandboxes from k8s_middleware into the local store."""
     from .pyromind_sdk_env import PyromindSDK, get_sandbox_client
 
+    global _last_sync
     policy = (policy or os.getenv("DOCKER_RT_ORPHAN_POLICY", "adopt")).lower()
     if policy == "reap":
         return {"adopted": 0, "reaped": 0}
+    ttl = float(os.getenv("PYROMIND_DOCKER_RT_SYNC_TTL", "5") or "5")
+    now = time.monotonic()
+    if not force and now - _last_sync < ttl:
+        return {
+            "adopted": len(store.list(all_containers=True)),
+            "reaped": 0,
+            "cached": True,
+        }
 
     try:
         sandboxes = get_sandbox_client().list()
@@ -94,6 +106,7 @@ async def reconcile_pyromind_sandboxes(
         logger.warning("PyromindSDK reconcile list failed: %s", exc)
         return {"adopted": 0, "reaped": 0}
 
+    seen_ids = {sandbox.id for sandbox in sandboxes}
     adopted = 0
     for sandbox in sandboxes:
         sandbox_id = sandbox.id
@@ -146,7 +159,21 @@ async def reconcile_pyromind_sandboxes(
             )
         except Exception as exc:
             logger.warning("adopt sandbox %s failed: %s", sandbox_id, exc)
-    return {"adopted": adopted, "reaped": 0}
+    reaped = 0
+    for record in store.list(all_containers=True):
+        kube_env = getattr(record, "kube_env", None)
+        if (
+            record.state == ContainerState.CREATED
+            or kube_env is None
+            or not isinstance(kube_env, PyromindSDK)
+        ):
+            continue
+        sandbox_id = getattr(kube_env, "sandbox_id", None) or record.pod_name
+        if sandbox_id and sandbox_id not in seen_ids:
+            await store.remove(record)
+            reaped += 1
+    _last_sync = now
+    return {"adopted": adopted, "reaped": reaped}
 
 
 def delete_pod(

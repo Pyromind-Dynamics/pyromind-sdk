@@ -204,18 +204,6 @@ class PyromindSDK:
         self.pod_name = response.id
         self.name = response.name or self.name
 
-    def _find_existing(self, name: str | None) -> Any | None:
-        if not name:
-            return None
-        try:
-            return next(
-                (s for s in self._client.list() if s.name == name),
-                None,
-            )
-        except Exception as exc:
-            self.logger.debug("find existing sandbox %s failed: %s", name, exc)
-            return None
-
     def _create_sandbox(
         self,
         *,
@@ -232,19 +220,6 @@ class PyromindSDK:
         gpu: str | None,
         gpu_card: str | None,
     ) -> None:
-        existing = self._find_existing(name)
-        if existing is not None:
-            self.logger.info(
-                "attaching existing k8s_middleware sandbox %s (%s)",
-                existing.id,
-                existing.status,
-            )
-            self._bind_response(existing)
-            if (existing.status or "").lower() in {"stopped", "paused"}:
-                self._client.resume(existing.id)
-                self.sandbox_status = "Pending"
-            return
-
         request = SandboxRequest(
             sandbox_type=SandboxType.CUSTOM,
             name=name,
@@ -268,19 +243,7 @@ class PyromindSDK:
             msg = f"{getattr(exc, 'message', '')} {getattr(exc, 'response', '')}"
             if "INSTANCE_EXIST" not in msg and "already exists" not in msg.lower():
                 raise
-            existing = self._find_existing(name)
-            if existing is None:
-                raise
-            self.logger.info(
-                "create conflict; attaching existing sandbox %s (%s)",
-                existing.id,
-                existing.status,
-            )
-            self._bind_response(existing)
-            if (existing.status or "").lower() in {"stopped", "paused"}:
-                self._client.resume(existing.id)
-                self.sandbox_status = "Pending"
-            return
+            raise RuntimeError(f"Sandbox {name!r} already exists") from exc
         self._bind_response(response)
 
     @staticmethod
