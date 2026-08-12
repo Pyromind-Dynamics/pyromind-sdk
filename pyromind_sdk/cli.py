@@ -139,13 +139,16 @@ def _start_docker_rt_daemon(args: argparse.Namespace) -> int:
     child_env["PYROMIND_DOCKER_RT_SKIP_WRAPPER_PROMPT"] = "1"
     log_path = args.log_file or os.getenv("DOCKER_RT_LOG_FILE", "/tmp/docker-rt.log")
     sock_path = args.sock or os.getenv("DOCKER_RT_SOCK", "/tmp/docker-rt.sock")
-    from pyromind_sdk.docker_rt.backend.socklock import assert_socket_available
+    tcp_host = os.getenv("DOCKER_RT_HOST", "").strip()
+    tcp_port = int(os.getenv("DOCKER_RT_PORT", os.getenv("PORT", "2375")))
+    if not tcp_host:
+        from pyromind_sdk.docker_rt.backend.socklock import assert_socket_available
 
-    try:
-        assert_socket_available(sock_path)
-    except RuntimeError as exc:
-        print(f"docker-rt failed to start: {exc}", file=sys.stderr)
-        return 1
+        try:
+            assert_socket_available(sock_path)
+        except RuntimeError as exc:
+            print(f"docker-rt failed to start: {exc}", file=sys.stderr)
+            return 1
     log_fh = open(log_path, "ab")
     proc = subprocess.Popen(
         cmd,
@@ -162,7 +165,24 @@ def _start_docker_rt_daemon(args: argparse.Namespace) -> int:
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             break
-        if os.path.exists(sock_path):
+        if tcp_host:
+            probe = None
+            try:
+                probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                probe.settimeout(0.2)
+                probe.connect((tcp_host, tcp_port))
+                probe.close()
+                started = True
+                break
+            except OSError:
+                pass
+            finally:
+                if probe is not None:
+                    try:
+                        probe.close()
+                    except Exception:
+                        pass
+        elif os.path.exists(sock_path):
             probe = None
             try:
                 probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

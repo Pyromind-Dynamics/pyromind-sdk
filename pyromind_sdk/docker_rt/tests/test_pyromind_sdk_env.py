@@ -118,3 +118,21 @@ def test_inspect_sandbox_mode_default(monkeypatch: MonkeyPatch) -> None:
     assert result["id"] == "sb-1"
     assert result["status"] == "Running"
     assert result["resources"]["cpu"] == "4"
+
+
+def test_pyromind_terminal_url_uses_base_url(monkeypatch: MonkeyPatch) -> None:
+    from ..aio_server import _pyromind_terminal_url
+
+    adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.sandbox_id = "sb-1"
+    monkeypatch.setenv(
+        "PYROMIND_BASE_URL", "https://pre-api.pyromind.ai/api/v1"
+    )
+    monkeypatch.delenv("PYROMIND_API_KEY", raising=False)
+
+    url = _pyromind_terminal_url(adapter)
+
+    assert url.startswith(
+        "wss://pre-api.pyromind.ai/api/v1/sandboxes/sb-1/terminal?"
+    )
+    assert "cols=80&rows=24" in url

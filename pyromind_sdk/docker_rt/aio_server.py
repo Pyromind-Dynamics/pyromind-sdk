@@ -1543,7 +1543,7 @@ async def inspect_container(request: web.Request) -> web.Response:
     if record is None:
         backend = os.getenv("DOCKER_RT_BACKEND", "kube").lower().replace("-", "_")
         if backend in {"k8s_middleware", "pyromind_sdk", "pyromind"}:
-            await reconcile_pyromind_sandboxes(store)
+            await reconcile_pyromind_sandboxes(store, force=True)
             record = store.get(cid)
     if record is None:
         return _err(404, f"No such container: {cid}")
@@ -3010,7 +3010,7 @@ async def on_startup(app: web.Application) -> None:
             # Continue: reconcile will no-op; create/start will surface the same error.
     try:
         if is_pyromind:
-            stats = await reconcile_pyromind_sandboxes(store)
+            stats = await reconcile_pyromind_sandboxes(store, force=True)
         else:
             stats = await reconcile_on_startup(
                 store,

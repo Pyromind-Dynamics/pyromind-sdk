@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import stat
 from pathlib import Path
@@ -67,10 +68,27 @@ def install_wrapper() -> Path:
     real_docker = find_real_docker()
     WRAPPER_DIR.mkdir(parents=True, exist_ok=True)
     script = f"""#!/usr/bin/env bash
-REAL_DOCKER={real_docker!r}
+REAL_DOCKER={shlex.quote(real_docker)}
 is_docker_rt() {{
+  local ctx="" host="" i
+  for ((i=1; i<=$#; i++)); do
+    case "${{!i}}" in
+      --context|-c) i=$((i+1)); ctx="${{!i}}" ;;
+      --context=*|-c=*) ctx="${{!i#*=}}" ;;
+      -H|--host) i=$((i+1)); host="${{!i}}" ;;
+      -H=*|--host=*) host="${{!i#*=}}" ;;
+    esac
+  done
+  if [[ -n "$host" ]]; then
+    [[ "$host" == "unix:///tmp/docker-rt.sock" || "$host" == "unix:///tmp/docker-rt"* ]]
+    return
+  fi
+  if [[ -n "$ctx" ]]; then
+    [[ "$ctx" == "docker-rt" ]]
+    return
+  fi
   if [[ -n "${{DOCKER_HOST:-}}" ]]; then
-    [[ "$DOCKER_HOST" == "unix:///tmp/docker-rt.sock" ]]
+    [[ "$DOCKER_HOST" == "unix:///tmp/docker-rt.sock" || "$DOCKER_HOST" == "unix:///tmp/docker-rt"* ]]
     return
   fi
   [[ "$("$REAL_DOCKER" context show 2>/dev/null)" == "docker-rt" ]]
