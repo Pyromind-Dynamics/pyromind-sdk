@@ -12,7 +12,10 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -70,6 +73,49 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    docker_rt = subparsers.add_parser(
+        "docker-rt",
+        aliases=["docker_rt"],
+        help="Start the embedded docker-rt Docker Engine API daemon",
+    )
+    docker_rt.add_argument(
+        "--sock", default=None,
+        help="Unix socket path (defaults to $DOCKER_RT_SOCK or /tmp/docker-rt.sock)",
+    )
+    docker_rt.add_argument(
+        "--daemon", action="store_true",
+        help="Start docker-rt in the background and return immediately",
+    )
+    docker_rt.add_argument(
+        "--log-file", default=None,
+        help="Daemon log file (default: /tmp/docker-rt.log)",
+    )
+    docker_rt.add_argument(
+        "--pid-file", default=None,
+        help="Write the daemon PID to this file",
+    )
+
+    docker_rt_context = subparsers.add_parser(
+        "docker-rt-context",
+        aliases=["docker_rt_context"],
+        help="Register / switch the Docker CLI to the docker-rt context",
+    )
+    docker_rt_context.add_argument(
+        "--sock", default=None,
+        help="Unix socket path (defaults to $DOCKER_RT_SOCK or /tmp/docker-rt.sock)",
+    )
+
+    docker_install = subparsers.add_parser(
+        "docker-install",
+        aliases=["docker_install"],
+        help="Install the local docker wrapper used by docker-rt",
+    )
+    docker_uninstall = subparsers.add_parser(
+        "docker-uninstall",
+        aliases=["docker_uninstall"],
+        help="Remove the local docker wrapper used by docker-rt",
+    )
+
     return parser
 
 
@@ -77,9 +123,78 @@ def _dump_yaml(config: Dict[str, Any]) -> str:
     return yaml.dump(config, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
 
+def _start_docker_rt_daemon(args: argparse.Namespace) -> int:
+    cmd = [sys.executable, "-m", "pyromind_sdk.cli", "docker-rt"]
+    if args.sock:
+        cmd += ["--sock", args.sock]
+
+    child_env = os.environ.copy()
+    child_env["PYROMIND_DOCKER_RT_SKIP_WRAPPER_PROMPT"] = "1"
+    log_path = args.log_file or os.getenv("DOCKER_RT_LOG_FILE", "/tmp/docker-rt.log")
+    log_fh = open(log_path, "ab")
+    proc = subprocess.Popen(
+        cmd,
+        env=child_env,
+        stdin=subprocess.DEVNULL,
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    log_fh.close()
+
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        print(
+            f"docker-rt failed to start (exit={proc.returncode}); see {log_path}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.pid_file:
+        Path(args.pid_file).write_text(str(proc.pid), encoding="utf-8")
+
+    print(f"docker-rt started pid={proc.pid} log={log_path}")
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command in {"docker-install", "docker_install"}:
+        from pyromind_sdk.docker_rt.install_wrapper import install_wrapper
+
+        path = install_wrapper()
+        print(f"Installed docker wrapper: {path}")
+        print("New terminals will use it automatically.")
+        return 0
+
+    if args.command in {"docker-uninstall", "docker_uninstall"}:
+        from pyromind_sdk.docker_rt.install_wrapper import uninstall_main
+
+        return uninstall_main()
+
+    if args.command in {"docker-rt", "docker_rt"}:
+        from pyromind_sdk.docker_rt.install_wrapper import ensure_wrapper_installed
+
+        if os.getenv("PYROMIND_DOCKER_RT_SKIP_WRAPPER_PROMPT") != "1" and (
+            not ensure_wrapper_installed()
+        ):
+            return 1
+        if args.sock:
+            os.environ["DOCKER_RT_SOCK"] = args.sock
+        if args.daemon:
+            return _start_docker_rt_daemon(args)
+        from pyromind_sdk.docker_rt.server import main as docker_rt_main
+
+        return docker_rt_main()
+
+    if args.command in {"docker-rt-context", "docker_rt_context"}:
+        if args.sock:
+            os.environ["DOCKER_RT_SOCK"] = args.sock
+        from pyromind_sdk.docker_rt.register_context import main as docker_rt_context_main
+
+        return docker_rt_context_main()
 
     if args.command == "terminal":
         from pyromind_sdk.terminal import run_terminal

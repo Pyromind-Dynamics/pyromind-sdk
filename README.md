@@ -28,6 +28,336 @@ task = client.studio.create(
 print(f"Created task: {task.task_id}")
 ```
 
+## Docker CLI over Kubernetes (docker-rt)
+
+`pyromind_sdk.docker_rt` is an embedded Docker Engine API facade: it listens on a
+Unix socket (or TCP), translates `docker` commands into Kubernetes Pod
+operations, and exposes `KubeEnvironment` as the SDK-side adapter.
+
+```bash
+pip install -e .
+
+# start the daemon (Docker Desktop / any reachable cluster)
+docker-rt
+# same daemon, via the unified SDK CLI
+# pyromind docker-rt
+
+# SDK defaults: kube-context=docker-desktop, namespace=default,
+# node-selector=disabled. Override any of them with DOCKER_RT_* env vars.
+
+# background daemon
+pyromind docker-rt --daemon
+# pyromind docker-rt --daemon --log-file /tmp/docker-rt.log --pid-file /tmp/docker-rt.pid
+
+# point the Docker CLI at it
+docker-rt-context
+
+docker version
+docker run -d --name demo busybox:1.36 sleep 300
+docker ps
+docker exec demo echo hello
+```
+
+### `pyromind docker-rt` parameters
+
+| Argument | Meaning | Default |
+|----------|---------|---------|
+| `--sock SOCK` | Unix socket path exposed to the Docker CLI | `$DOCKER_RT_SOCK` or `/tmp/docker-rt.sock` |
+| `--daemon` | Start docker-rt in the background and return immediately | disabled |
+| `--log-file FILE` | Log file used by `--daemon` | `$DOCKER_RT_LOG_FILE` or `/tmp/docker-rt.log` |
+| `--pid-file FILE` | Write the daemon PID to `FILE` | not written |
+| `-h`, `--help` | Show help and exit | - |
+
+```bash
+pyromind docker-rt \
+  --daemon \
+  --sock /tmp/docker-rt.sock \
+  --log-file /tmp/docker-rt.log \
+  --pid-file /tmp/docker-rt.pid
+```
+
+#### docker-rt environment variables
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `DOCKER_RT_SOCK` | `/tmp/docker-rt.sock` | Unix socket path |
+| `DOCKER_RT_HOST` / `DOCKER_RT_PORT` | empty / `2375` | Listen on TCP instead of Unix socket |
+| `DOCKER_RT_LOG_FILE` | `/tmp/docker-rt.log` | Daemon log file |
+| `DOCKER_RT_KUBECONFIG` / `KUBECONFIG` | `~/.kube/config` or package `.kube.yaml` | kubeconfig path |
+| `DOCKER_RT_KUBE_CONTEXT` | `docker-desktop` | Kubernetes context name |
+| `DOCKER_RT_NAMESPACE` | `default` | Target Kubernetes namespace |
+| `DOCKER_RT_NODE_SELECTOR` | `none` | Pod `nodeSelector` (`key=val,...`; `none` disables) |
+| `DOCKER_RT_BACKEND` | `kube` | Backend: `kube` or `k8s-middleware` |
+| `DOCKER_RT_GPU_CARD` | empty | GPU card name when using `docker run --gpus` with the k8s-middleware backend |
+| `DOCKER_RT_INSPECT_MODE` | `sandbox` | `docker inspect` structure: `sandbox` or `standard` |
+| `DOCKER_RT_DEFAULT_IMAGE` | SWE-bench default image | `docker images` default entry |
+| `DOCKER_RT_PORT_FORWARD_MODE` | `auto` | `-p` backend: `auto` / `direct` / `api` |
+| `DOCKER_RT_BUILDKIT_ADDR` | empty | `buildctl` address, e.g. `unix:///run/buildkit/buildkitd.sock` |
+| `DOCKER_RT_BUILD_REGISTRY` | empty | Push prefix for short image tags |
+| `DOCKER_RT_BUILD_PUSH` | `true` | Whether build pushes to the registry |
+| `DOCKER_RT_BUILD_TIMEOUT` | `3600` | `buildctl` timeout in seconds |
+| `DOCKER_RT_SERVICE_DNS` | `true` | Create ClusterIP Service for Compose service DNS |
+| `DOCKER_RT_ORPHAN_POLICY` | `adopt` | `adopt` restores managed Pods; `reap` deletes them on startup |
+| `DOCKER_RT_CLEANUP_ON_EXIT` | `false` | Delete managed Pods on SIGINT/SIGTERM when `true` |
+| `DOCKER_RT_JUICEFS_UID` | derived from namespace | JuiceFS subPath user id |
+| `DOCKER_RT_JUICEFS_PVC` | auto-discovered | JuiceFS PVC name |
+| `DOCKER_RT_JUICEFS_HOST_PREFIXES` | empty | Extra host path to JuiceFS subPath mappings |
+| `DOCKER_RT_CONTEXT` | `docker-rt` | Docker context name used by `docker-rt-context` |
+| `LOG_LEVEL` | `INFO` | Log level |
+
+#### `docker inspect` output
+
+Default `DOCKER_RT_INSPECT_MODE=sandbox`. `docker inspect` returns only:
+
+```json
+{
+  "id": "sb-94d290262ee8",
+  "name": "test-for-doc",
+  "type": "custom",
+  "status": "Stopped",
+  "configuration": {},
+  "resources": {},
+  "created_at": "",
+  "updated_at": "",
+  "image": "",
+  "volume_mounts": [],
+  "port_mappings": []
+}
+```
+
+Set `DOCKER_RT_INSPECT_MODE=standard` to keep the standard Docker inspect
+fields as well.
+
+#### GPU card via Docker flags
+
+`docker run --gpus` passes the GPU count. To specify the GPU card model without
+setting `DOCKER_RT_GPU_CARD`, use the `docker-rt.gpu-card` label:
+
+```bash
+docker create \
+  --name gpu-demo \
+  --cpus 4 \
+  --memory 8g \
+  --gpus 1 \
+  --label docker-rt.gpu-card=L40S \
+  busybox:1.36 sleep 300
+```
+
+To use the shorter `--gpu-card L40S` syntax, run `pyromind docker-rt` once.
+Every `pyromind docker-rt` run asks for confirmation, installs
+`~/.pyromind/bin/docker`, and adds it to your shell PATH. Declining the prompt
+still starts docker-rt, but `--gpu-card` shorthand is unavailable; use
+`--label docker-rt.gpu-card=L40S` or `DOCKER_RT_GPU_CARD` instead.
+You can also install it manually:
+
+```bash
+pyromind docker-install
+```
+
+Before `pip uninstall pyromind-sdk`, remove the wrapper manually:
+
+```bash
+pyromind docker-uninstall
+# or
+pyromind-docker-uninstall
+```
+
+`pip uninstall` has no uninstall hook, so this explicit command deletes
+`~/.pyromind/bin/docker` and removes the PATH line from your shell rc file.
+
+After installation, open a new terminal and use:
+
+```bash
+docker create \
+  --name gpu-demo \
+  --gpus 1 \
+  --gpu-card L40S \
+  busybox:1.36 sleep 300
+```
+
+`docker ps` only shows Running sandboxes by default; use `docker ps -a` to see
+Stopped sandboxes too.
+
+When the docker wrapper is active, `docker ps` uses the custom header:
+`ID / NAME / STATUS / PORTS / IMAGE`.
+
+### Docker command reference
+
+#### `docker run` / `docker create`
+
+`docker run` creates and starts a sandbox; `docker create` only creates a local
+record; `docker start` actually creates/starts the sandbox
+(Pending -> Running).
+
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| `--name` | sandbox name | `--name gpu-demo` |
+| image | container image | `busybox:1.36` |
+| `--cpus` | CPU count | `--cpus 4` |
+| `--memory` | memory size | `--memory 8g` |
+| `--gpus` | GPU count | `--gpus 1` |
+| `--gpu-card` / `--gpu_card` | GPU card model, requires wrapper | `--gpu-card L40S` |
+| `--label docker-rt.gpu-card=L40S` | GPU card model, no wrapper needed | `--label docker-rt.gpu-card=L40S` |
+| `-p` / `--publish` | port mapping | `-p 8080:80` |
+| `-v` / `--volume` | volume mount | `-v /workspace:/data` |
+| `-v ...:ro` | read-only mount | `-v /workspace:/data:ro` |
+| `-e` / `--env` | environment variable (not supported by k8s-middleware yet) | `-e FOO=bar` |
+| `-w` / `--workdir` | working directory (not supported by k8s-middleware yet) | `-w /workspace` |
+| `--tmpfs` | temporary memory disk (not supported by k8s-middleware yet) | `--tmpfs /tmp:rw` |
+
+Example:
+
+```bash
+docker create \
+  --name gpu-demo \
+  --cpus 4 \
+  --memory 8g \
+  --gpus 1 \
+  --label docker-rt.gpu-card=L40S \
+  -p 8080:80 \
+  -v /workspace:/data:ro \
+  busybox:1.36 sleep 300
+
+docker start gpu-demo
+```
+
+#### `docker ps` / `docker ps -a`
+
+```bash
+docker ps      # Running only
+docker ps -a   # Running + Stopped
+```
+
+With the wrapper active, the header is:
+
+```text
+ID  NAME  STATUS  RESOURCES  PORTS  VOLUMES  IMAGE
+```
+
+Long values are truncated with `...`; use `docker inspect` for full details.
+
+#### `docker inspect`
+
+```bash
+docker inspect gpu-demo
+docker inspect gpu-demo --format '{{json .resources}}'
+```
+
+The default response only contains sandbox fields. Set
+`DOCKER_RT_INSPECT_MODE=standard` to keep standard Docker inspect fields.
+
+#### `docker exec`
+
+```bash
+docker exec gpu-demo echo hello
+docker exec -w /workspace gpu-demo ls -la
+```
+
+Non-interactive exec is supported; `docker exec -it <name>` reuses the
+k8s_middleware `/sandboxes/{id}/terminal` WebSocket and opens an interactive
+shell. The original `pyromind terminal <sandbox-id>` subcommand keeps its
+existing parameters and logic.
+
+#### `docker logs`
+
+```bash
+docker logs gpu-demo
+docker logs -f gpu-demo
+```
+
+The k8s_middleware backend does not expose `/logs` yet.
+
+#### `docker cp`
+
+```bash
+docker cp gpu-demo:/etc/os-release /tmp/os-release
+docker cp /tmp/file.txt gpu-demo:/workspace/file.txt
+```
+
+#### `docker stop` / `docker start`
+
+```bash
+docker stop gpu-demo
+docker start gpu-demo
+```
+
+With the k8s_middleware backend, stop maps to pause and start maps to resume.
+
+#### `docker restart`
+
+```bash
+docker restart gpu-demo
+```
+
+Maps to pause then resume.
+
+#### `docker rename`
+
+```bash
+docker rename gpu-demo gpu-demo-2
+```
+
+With the k8s_middleware backend, name-only changes skip the StatefulSet rollout.
+
+#### `docker rm`
+
+```bash
+docker rm -f gpu-demo
+```
+
+With the k8s_middleware backend, it pauses before deleting.
+
+#### `docker port`
+
+```bash
+docker port gpu-demo
+```
+
+Ports come from k8s_middleware `port_mappings`.
+
+#### `docker events`
+
+```bash
+docker events --since 0s
+```
+
+Currently this is an in-process event stream; history is lost after daemon
+restart.
+
+#### Unsupported Docker commands
+
+After starting docker-rt, these commands are not supported:
+
+```text
+docker build
+docker buildx build
+docker compose build
+docker compose up --build
+```
+
+They depend on a real Docker daemon / BuildKit container lifecycle. Build the
+image with normal Docker/BuildKit first and push it to a registry, then use
+`docker run` with that image.
+
+Chain: `Docker CLI -> docker-rt daemon -> KubeEnvironment -> Kubernetes API`.
+The current implementation uses the official Kubernetes Python SDK directly; a
+future adapter can replace that hop with the `k8s_middleware` HTTP API.
+
+To run through `k8s_middleware` OpenAPI instead:
+
+```bash
+DOCKER_RT_BACKEND=k8s-middleware \
+PYROMIND_API_KEY=your-key \
+PYROMIND_BASE_URL=https://api.pyromind.ai/api/v1 \
+PYROMIND_CLUSTER=us-west-2 \
+pyromind docker-rt
+```
+
+In this mode `docker-rt` uses the `PyromindSDK` adapter, which reads the
+current sandbox, merges changed fields, and submits the full sandbox update.
+`PortForwarder` is retained for local port access. `k8s_middleware` skips the
+StatefulSet rollout when only the sandbox `name` changes.
+
 ## Configuration
 
 ### Client parameters

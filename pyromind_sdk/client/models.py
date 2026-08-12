@@ -285,6 +285,7 @@ class SandboxResponse(BaseModel):
     updated_at: Optional[datetime] = None
     endpoint_url: Optional[str] = None
     web_vnc_url: Optional[str] = None
+    resources: Optional[ResourceConfig] = None
     uid: Optional[str] = None
     endpoint: Optional[str] = None
     screen_size: Optional[ScreenResolution] = None

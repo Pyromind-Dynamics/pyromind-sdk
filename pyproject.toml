@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pyromind-sdk"
 ## todo update_version
-version = "0.1.9"
+version = "0.1.10.dev"
 description = "Lightweight SDK stub for local development and testing of third-party nodes without the full platform codebase"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -32,10 +32,16 @@ dependencies = [
     "urllib3>=1.26.0",
     "minio>=7.0.0",
     "aiohttp>=3.8.0",
+    "kubernetes>=29.0.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
 ]
 
 [project.scripts]
 pyromind = "pyromind_sdk.cli:main"
+docker-rt = "pyromind_sdk.docker_rt.server:main"
+docker-rt-context = "pyromind_sdk.docker_rt.register_context:main"
+pyromind-docker-uninstall = "pyromind_sdk.docker_rt.install_wrapper:uninstall_main"
 
 [project.optional-dependencies]
 dev = [
@@ -50,10 +56,23 @@ Repository = "https://github.com/pyromind/pyromind-sdk"
 Issues = "https://github.com/pyromind/pyromind-sdk/issues"
 
 [tool.setuptools]
-packages = ["pyromind_sdk", "pyromind_sdk.common", "pyromind_sdk.nodes", "pyromind_sdk.tests", "pyromind_sdk.client", "pyromind_sdk.client.workflow"]
+packages = [
+    "pyromind_sdk",
+    "pyromind_sdk.common",
+    "pyromind_sdk.nodes",
+    "pyromind_sdk.tests",
+    "pyromind_sdk.client",
+    "pyromind_sdk.client.workflow",
+    "pyromind_sdk.docker_rt",
+    "pyromind_sdk.docker_rt.api",
+    "pyromind_sdk.docker_rt.backend",
+    "pyromind_sdk.docker_rt.backend.kube",
+    "pyromind_sdk.docker_rt.tests",
+]
 
 [tool.setuptools.package-data]
 pyromind_sdk = ["*.md"]
+"pyromind_sdk.docker_rt" = ["*.md", "requirements.txt", "requirements-dev.txt"]
 "pyromind_sdk.examples" = ["*.yaml", "utils/*.py"]
 
 [tool.pytest.ini_options]
@@ -67,4 +86,3 @@ python_functions = ["test_*"]
 # Asyncio configuration for async tests (use STRICT mode to avoid auto-detection)
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
-

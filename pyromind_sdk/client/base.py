@@ -217,10 +217,14 @@ class PyroMindClient:
         """
         if isinstance(response, dict):
             if "data" in response:
-                if isinstance(response["data"], list):
-                    return [response["data"]]
-                elif "sandboxes" in response["data"] and isinstance(response["data"]["sandboxes"], list):
-                    return response["data"]["sandboxes"]
+                data = response["data"]
+                if (
+                    isinstance(data, dict)
+                    and "sandboxes" in data
+                    and isinstance(data["sandboxes"], list)
+                ):
+                    return data["sandboxes"]
+                return data
             return response
         return response
     

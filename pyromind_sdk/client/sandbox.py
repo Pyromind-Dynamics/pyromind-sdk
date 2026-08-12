@@ -48,7 +48,11 @@ class SandboxClient(PyroMindClient):
         converted_sandbox = {
             "id": sandbox_id_value,
             "name": sandbox_data.get("name") or sandbox_id_value,
-            "type": sandbox_data.get("sandbox_type") or sandbox_data.get("type") or "",
+            "type": (
+                sandbox_data.get("sandbox_type")
+                or sandbox_data.get("type")
+                or "custom"
+            ),
             "status": sandbox_data.get("status") or "",
             "configuration": sandbox_data.get("configuration"),
             "usage": sandbox_data.get("usage"),
@@ -58,6 +62,7 @@ class SandboxClient(PyroMindClient):
             "web_vnc_url": sandbox_data.get("web_vnc_url"),
             "system_image_path": sandbox_data.get("system_image_path"),
             "image": sandbox_data.get("image"),
+            "resources": sandbox_data.get("resources"),
             "volume_mounts": sandbox_data.get("volume_mounts"),
             "port_mappings": sandbox_data.get("port_mappings"),
         }
@@ -561,4 +566,3 @@ class SandboxClient(PyroMindClient):
             params={"path": path, "recursive": str(recursive).lower()},
         )
         return self._extract_data(response) or {}
-
