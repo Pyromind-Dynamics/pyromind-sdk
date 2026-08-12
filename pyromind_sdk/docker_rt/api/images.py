@@ -19,6 +19,11 @@ def image_id(name: str) -> str:
     return f"sha256:{digest}"
 
 
+def _strip_sha256(value: str) -> str:
+    prefix = "sha256:"
+    return value[len(prefix):] if value.startswith(prefix) else value
+
+
 def _image_id(name: str) -> str:
     """Backward-compatible alias."""
     return image_id(name)
@@ -100,17 +105,17 @@ def resolve_image_name(ref: str, names: Iterable[str]) -> str | None:
         if ref == n or ref == _repo_tag(n):
             return n
     # Full or bare content digest
-    bare = ref.removeprefix("sha256:")
+    bare = _strip_sha256(ref)
     for n in known:
         digest = image_id(n)
-        if ref == digest or bare == digest.removeprefix("sha256:"):
+        if ref == digest or bare == _strip_sha256(digest):
             return n
     # Short id prefix (docker CLI often uses 12 hex chars)
     if len(bare) >= 12 and all(c in "0123456789abcdef" for c in bare.lower()):
         hits = [
             n
             for n in known
-            if image_id(n).removeprefix("sha256:").startswith(bare.lower())
+            if _strip_sha256(image_id(n)).startswith(bare.lower())
         ]
         if len(hits) == 1:
             return hits[0]

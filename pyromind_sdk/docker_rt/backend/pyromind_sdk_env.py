@@ -24,6 +24,14 @@ from .portforward import parse_publish_spec
 from .runtime import parse_binds
 
 logger = logging.getLogger("docker_rt.pyromind_sdk")
+_client_singleton: SandboxClient | None = None
+
+
+def get_sandbox_client() -> SandboxClient:
+    global _client_singleton
+    if _client_singleton is None:
+        _client_singleton = SandboxClient()
+    return _client_singleton
 
 
 class _OneShotWs:
@@ -112,7 +120,7 @@ class PyromindSDK:
         obj.port_mappings = obj._json_ready(port_mappings)
         obj.created_at = obj._json_ready(created_at)
         obj.updated_at = obj._json_ready(updated_at)
-        obj._client = SandboxClient()
+        obj._client = get_sandbox_client()
         return obj
 
     def __init__(
@@ -160,7 +168,7 @@ class PyromindSDK:
             gpu=gpu,
             gpu_card=gpu_card,
         )
-        self._client = SandboxClient()
+        self._client = get_sandbox_client()
         self._create_sandbox(
             image=image,
             name=name,
@@ -256,7 +264,10 @@ class PyromindSDK:
         )
         try:
             response = self._client.create(request)
-        except Exception as exc:
+        except PyroMindAPIError as exc:
+            msg = f"{getattr(exc, 'message', '')} {getattr(exc, 'response', '')}"
+            if "INSTANCE_EXIST" not in msg and "already exists" not in msg.lower():
+                raise
             existing = self._find_existing(name)
             if existing is None:
                 raise

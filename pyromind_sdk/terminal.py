@@ -64,6 +64,17 @@ def _websocket_url(base_url: str, sandbox_id: str, api_key: str, cols: int, rows
     return f"{base}/sandboxes/{sandbox_id}/terminal?{qs}"
 
 
+def build_terminal_websocket_url(
+    base_url: str,
+    sandbox_id: str,
+    api_key: str = "",
+    cols: int = 80,
+    rows: int = 24,
+) -> str:
+    """Public helper used by docker-rt and the terminal CLI."""
+    return _websocket_url(base_url, sandbox_id, api_key, cols, rows)
+
+
 async def _run_session(url: str) -> None:
     """Pump bytes between the local TTY (already in raw mode) and the WebSocket.
 

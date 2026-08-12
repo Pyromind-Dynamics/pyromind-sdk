@@ -82,16 +82,14 @@ async def reconcile_pyromind_sandboxes(
     **kwargs: Any,
 ) -> dict[str, int]:
     """Adopt Running sandboxes from k8s_middleware into the local store."""
-    from pyromind_sdk.client.sandbox import SandboxClient
-
-    from .pyromind_sdk_env import PyromindSDK
+    from .pyromind_sdk_env import PyromindSDK, get_sandbox_client
 
     policy = (policy or os.getenv("DOCKER_RT_ORPHAN_POLICY", "adopt")).lower()
     if policy == "reap":
         return {"adopted": 0, "reaped": 0}
 
     try:
-        sandboxes = SandboxClient().list()
+        sandboxes = get_sandbox_client().list()
     except Exception as exc:
         logger.warning("PyromindSDK reconcile list failed: %s", exc)
         return {"adopted": 0, "reaped": 0}
