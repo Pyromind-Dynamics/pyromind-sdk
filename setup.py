@@ -26,7 +26,18 @@ setup(
         "pydantic>=2.0.0",
         "urllib3>=1.26.0",
         "aiohttp>=3.8.0",
+        "kubernetes>=29.0.0",
+        "fastapi>=0.110",
+        "uvicorn[standard]>=0.27",
     ],
+    entry_points={
+        "console_scripts": [
+            "pyromind=pyromind_sdk.cli:main",
+            "docker-rt=pyromind_sdk.docker_rt.server:main",
+            "docker-rt-context=pyromind_sdk.docker_rt.register_context:main",
+            "pyromind-docker-uninstall=pyromind_sdk.docker_rt.install_wrapper:uninstall_main",
+        ],
+    },
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
@@ -46,8 +57,8 @@ setup(
     },
     package_data={
         "pyromind_sdk": ["*.md"],
+        "pyromind_sdk.docker_rt": ["*.md", "requirements.txt", "requirements-dev.txt"],
         "pyromind_sdk.tests": ["nodes/*.yaml"],
     },
     include_package_data=True,
 )
-
