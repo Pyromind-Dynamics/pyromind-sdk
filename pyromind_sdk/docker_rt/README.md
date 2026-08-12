@@ -12,7 +12,7 @@
 | `docker build` | 本机 **buildctl** 构建并 push 到 registry |
 | `docker volume` / `network` | 命名卷 + 网络 stub（够 Compose 用） |
 | `docker run` / `create` / `start` | `run`=创建并启动；`create` 只建本地记录；`start` 才真正创建/启动 Pod |
-| `docker run -p` / `docker port` | server 本机 TCP 转发到 Pod IP（仅 TCP） |
+| `docker run -p` / `docker port` | kube 后端本机 TCP 转发；PyromindSDK 后端仅显示端口映射 |
 | `docker logs`（含 `-f`） | Pod logs |
 | `docker exec`（含 `-it`） | K8s exec + TCP Upgrade |
 | `docker stop` / `kill` / `rm` / `restart` / `rename` | 生命周期 |
@@ -98,15 +98,16 @@ docker kill sb2
 docker rm -f sb2
 ```
 
-`-p`：**不创建** Service/NodePort。docker-rt 在本机 `HostIp:HostPort` 监听，再转发到 Pod。
+`-p`：kube 后端在本机监听并转发；PyromindSDK 后端**不支持**本地端口转发，
+仅显示端口映射。
 
 转发后端（`DOCKER_RT_PORT_FORWARD_MODE`）：
 
 | 模式 | 行为 |
 |------|------|
-| `auto`（默认） | 探测本机能否路由到 Pod IP；通则 `direct`，否则 `api` |
-| `direct` | TCP 直连 `PodIP:containerPort`（需能访问 Pod CIDR） |
-| `api` | 经 Kubernetes APIServer port-forward 隧道（只需 kubeconfig） |
+| `auto`（默认） | 仅 kube 后端有效 |
+| `direct` | 仅 kube 后端有效 |
+| `api` | 仅 kube 后端有效；PyromindSDK 后端不适用 |
 
 仅 TCP；默认 `HostIp=0.0.0.0`（可用 `-p 127.0.0.1:8080:80` 限定本机）。`-P` / 空 `HostPort` 会分配随机高位端口。
 
@@ -281,4 +282,5 @@ pytest tests/ -q
 
 多 compose 项目同 namespace 同名 service 隔离、真实 Docker 网络隔离、UDP publish、`stats`/`pause`、VS Code Dev Containers、多进程共享 store、FastAPI `app.py` 同步。
 
-已支持：`attach` / `docker run -it`；`-v` → JuiceFS PVC `subPath`；`-p` → server TCP 转发到 Pod IP；受限 Compose（见上）。
+已支持：`attach` / `docker run -it`；`-v` → JuiceFS PVC `subPath`；
+`-p` → kube 后端 TCP 转发，PyromindSDK 后端仅显示映射；受限 Compose（见上）。

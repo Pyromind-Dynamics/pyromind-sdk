@@ -263,6 +263,8 @@ docker exec -w /workspace gpu-demo ls -la
 非交互式 exec 已支持；`docker exec -it <name>` 复用
 `/sandboxes/{id}/terminal`，进入 k8s_middleware 交互 shell。
 原有的 `pyromind terminal <sandbox-id>` 子命令保持原参数和逻辑不变。
+`--cluster` 和 `--api-key` 可用参数或环境变量二选一，不能同时缺失；
+`--base-url` 可选。
 
 #### `docker logs`
 
@@ -320,6 +322,8 @@ docker port gpu-demo
 ```
 
 端口来自 k8s_middleware 的 `port_mappings`。
+PyromindSDK 后端**不支持**本机端口转发，只展示端口映射；需要 adapter
+转换到 k8s_middleware port-forward / NodePort 才能本地访问，本期不实现。
 
 #### `docker events`
 
@@ -360,7 +364,7 @@ pyromind docker-rt
 ```
 
 该模式下 docker-rt 使用 `PyromindSDK` 适配器：先读取当前 sandbox，合并修改字段，
-再提交完整 sandbox 更新；本地端口访问继续保留 `PortForwarder`；
+再提交完整 sandbox 更新；PyromindSDK 后端本地端口转发暂不支持，
 `k8s_middleware` 只改 `name` 时会跳过 StatefulSet 滚动更新。
 
 ## 配置

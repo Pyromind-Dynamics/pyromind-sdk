@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -50,15 +51,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     terminal = subparsers.add_parser(
         "terminal",
+        add_help=False,
         help="Open an interactive terminal into a running custom sandbox",
     )
     terminal.add_argument("sandbox_id", type=str, help="Sandbox id, e.g. sb-xxxx")
     terminal.add_argument(
-        "--cluster", type=str, required=True,
+        "--cluster", type=str, required=False,
         help=(
             "Target cluster code, e.g. us-west-1, us-west-2. "
             "Append #env for non-prod: us-west-1#pre, us-west-1#pre2, us-west-1#dev. "
-            "Resolved to a per-cluster direct domain (required)."
+            "Defaults to $PYROMIND_CLUSTER."
         ),
     )
     terminal.add_argument(
@@ -71,6 +73,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Override the API base URL (defaults to resolving from --cluster via "
             "CLUSTER_RESOURCE; if unset, also reads $PYROMIND_BASE_URL)"
         ),
+    )
+    terminal.add_argument(
+        "-h", "--help",
+        action="help",
+        help="show this help message and exit",
     )
 
     docker_rt = subparsers.add_parser(
@@ -131,6 +138,14 @@ def _start_docker_rt_daemon(args: argparse.Namespace) -> int:
     child_env = os.environ.copy()
     child_env["PYROMIND_DOCKER_RT_SKIP_WRAPPER_PROMPT"] = "1"
     log_path = args.log_file or os.getenv("DOCKER_RT_LOG_FILE", "/tmp/docker-rt.log")
+    sock_path = args.sock or os.getenv("DOCKER_RT_SOCK", "/tmp/docker-rt.sock")
+    from pyromind_sdk.docker_rt.backend.socklock import assert_socket_available
+
+    try:
+        assert_socket_available(sock_path)
+    except RuntimeError as exc:
+        print(f"docker-rt failed to start: {exc}", file=sys.stderr)
+        return 1
     log_fh = open(log_path, "ab")
     proc = subprocess.Popen(
         cmd,
@@ -142,8 +157,32 @@ def _start_docker_rt_daemon(args: argparse.Namespace) -> int:
     )
     log_fh.close()
 
-    time.sleep(0.5)
-    if proc.poll() is not None:
+    deadline = time.monotonic() + 5.0
+    started = False
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            break
+        if os.path.exists(sock_path):
+            probe = None
+            try:
+                probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                probe.settimeout(0.2)
+                probe.connect(sock_path)
+                probe.close()
+                started = True
+                break
+            except OSError:
+                pass
+            finally:
+                if probe is not None:
+                    try:
+                        probe.close()
+                    except Exception:
+                        pass
+        time.sleep(0.1)
+    if not started and proc.poll() is None:
+        proc.terminate()
+    if not started:
         print(
             f"docker-rt failed to start (exit={proc.returncode}); see {log_path}",
             file=sys.stderr,
@@ -198,8 +237,23 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.command == "terminal":
         from pyromind_sdk.terminal import run_terminal
+        from pyromind_sdk.client.base import ENV_API_KEY, ENV_CLUSTER
 
-        return run_terminal(args.sandbox_id, cluster=args.cluster, api_key=args.api_key, base_url=args.base_url)
+        cluster = args.cluster or os.getenv(ENV_CLUSTER) or ""
+        api_key = args.api_key or os.getenv(ENV_API_KEY) or ""
+        if not cluster or not api_key:
+            print(
+                "Error: --cluster and --api-key are required, or set "
+                f"{ENV_CLUSTER} and {ENV_API_KEY}.",
+                file=sys.stderr,
+            )
+            return 1
+        return run_terminal(
+            args.sandbox_id,
+            cluster=cluster,
+            api_key=api_key,
+            base_url=args.base_url,
+        )
 
     if args.command == "python-to-yaml":
         python_file: Path = args.python_file

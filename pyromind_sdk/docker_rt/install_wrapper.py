@@ -14,21 +14,35 @@ PATH_LINE = 'export PATH="$HOME/.pyromind/bin:$PATH"'
 
 def find_real_docker() -> str:
     """Locate the real Docker CLI, never the wrapper itself."""
+    override = os.getenv("DOCKER_RT_DOCKER_BIN") or os.getenv("PYROMIND_DOCKER_BIN")
+    if override:
+        override_path = Path(override)
+        if override_path.is_file() and os.access(override_path, os.X_OK):
+            return str(override_path)
+        raise RuntimeError(f"Configured Docker CLI not executable: {override}")
+
     candidates: list[str] = []
-    for directory in os.environ.get("PATH", "").split(os.pathsep):
-        candidate = Path(directory) / "docker"
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            candidates.append(str(candidate))
     for fallback in (
         "/usr/local/bin/docker",
         "/opt/homebrew/bin/docker",
         "/opt/local/bin/docker",
     ):
-        if fallback not in candidates and Path(fallback).is_file():
+        if (
+            fallback != str(WRAPPER_PATH)
+            and Path(fallback).is_file()
+            and os.access(fallback, os.X_OK)
+        ):
             candidates.append(fallback)
-    for candidate in candidates:
-        if candidate != str(WRAPPER_PATH):
-            return candidate
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = Path(directory) / "docker"
+        if (
+            candidate != WRAPPER_PATH
+            and candidate.is_file()
+            and os.access(candidate, os.X_OK)
+        ):
+            candidates.append(str(candidate))
+    if candidates:
+        return candidates[0]
     raise RuntimeError(
         "Docker CLI not found; install Docker Desktop or the Docker CLI first"
     )
@@ -54,6 +68,16 @@ def install_wrapper() -> Path:
     WRAPPER_DIR.mkdir(parents=True, exist_ok=True)
     script = f"""#!/usr/bin/env bash
 REAL_DOCKER={real_docker!r}
+is_docker_rt() {{
+  if [[ -n "${{DOCKER_HOST:-}}" ]]; then
+    [[ "$DOCKER_HOST" == "unix:///tmp/docker-rt.sock" ]]
+    return
+  fi
+  [[ "$("$REAL_DOCKER" context show 2>/dev/null)" == "docker-rt" ]]
+}}
+if ! is_docker_rt; then
+  exec "$REAL_DOCKER" "$@"
+fi
 args=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -117,10 +141,19 @@ for line in sys.stdin:
 '
   exit $?
 fi
-if [[ "${{args[0]:-}}" == "build" || ( "${{args[0]:-}}" == "buildx" && "${{args[1]:-}}" == "build" ) ]]; then
+if [[ "${{args[0]:-}}" == "build" ]]; then
   echo "docker-rt does not support docker build / buildx build." >&2
   echo "Build the image with your normal Docker/BuildKit first, then use docker run." >&2
   exit 1
+fi
+if [[ "${{args[0]:-}}" == "buildx" ]]; then
+  for arg in "${{args[@]:1}}"; do
+    if [[ "$arg" == "build" ]]; then
+      echo "docker-rt does not support docker build / buildx build." >&2
+      echo "Build the image with your normal Docker/BuildKit first, then use docker run." >&2
+      exit 1
+    fi
+  done
 fi
 if [[ "${{args[0]:-}}" == "compose" ]]; then
   for arg in "${{args[@]:1}}"; do
@@ -193,7 +226,14 @@ def uninstall_wrapper() -> bool:
         if not rc_path.exists():
             continue
         lines = rc_path.read_text(encoding="utf-8").splitlines()
-        filtered = [line for line in lines if line.strip() != PATH_LINE]
+        filtered = [
+            line
+            for line in lines
+            if not (
+                line.strip().startswith("export PATH=")
+                and ".pyromind/bin" in line
+            )
+        ]
         if len(filtered) != len(lines):
             rc_path.write_text("\n".join(filtered) + "\n", encoding="utf-8")
             removed = True

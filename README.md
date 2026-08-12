@@ -257,6 +257,8 @@ Non-interactive exec is supported; `docker exec -it <name>` reuses the
 k8s_middleware `/sandboxes/{id}/terminal` WebSocket and opens an interactive
 shell. The original `pyromind terminal <sandbox-id>` subcommand keeps its
 existing parameters and logic.
+`--cluster` and `--api-key` can be supplied as flags or environment variables,
+but at least one source for each is required; `--base-url` is optional.
 
 #### `docker logs`
 
@@ -314,6 +316,9 @@ docker port gpu-demo
 ```
 
 Ports come from k8s_middleware `port_mappings`.
+With the PyromindSDK backend, docker-rt only shows port mappings; local access
+is not supported yet and would require an adapter to k8s_middleware
+port-forward / NodePort.
 
 #### `docker events`
 
@@ -355,8 +360,9 @@ pyromind docker-rt
 
 In this mode `docker-rt` uses the `PyromindSDK` adapter, which reads the
 current sandbox, merges changed fields, and submits the full sandbox update.
-`PortForwarder` is retained for local port access. `k8s_middleware` skips the
-StatefulSet rollout when only the sandbox `name` changes.
+Local port forwarding is not supported for the PyromindSDK backend yet.
+`k8s_middleware` skips the StatefulSet rollout when only the sandbox `name`
+changes.
 
 ## Configuration
 

@@ -9,7 +9,6 @@ import os
 import threading
 import time
 from datetime import datetime, timezone
-from urllib.parse import quote
 from typing import Any
 
 from aiohttp import web
@@ -149,11 +148,9 @@ async def _start_port_forward(record: Any) -> None:
         raise RuntimeError("cannot publish ports: pod not started")
 
     if isinstance(kube_env, PyromindSDK):
-        # Port mappings are created as k8s_middleware Service ports. Keep the
-        # Docker-facing mapping visible, but skip local TCP binding for now.
         logger.warning(
-            "PyromindSDK backend: port mappings are managed by k8s_middleware; "
-            "local PortForwarder is skipped for id=%s",
+            "PyromindSDK backend: only port mappings are exposed; local "
+            "PortForwarder requires k8s_middleware port-forward support id=%s",
             record.id[:12],
         )
         record.published_ports = published_to_network_settings(
@@ -1408,15 +1405,19 @@ async def rename_container(request: web.Request) -> web.Response:
         return _err(404, f"No such container: {cid}")
 
     old_name = record.name
-    if record.kube_env is not None and hasattr(record.kube_env, "rename"):
-        try:
-            await asyncio.to_thread(record.kube_env.rename, new_name)
-        except Exception as exc:
-            return _err(500, f"rename backend failed: {exc}")
     try:
         await store.rename(record, new_name)
     except KeyError as exc:
         return _err(409, str(exc))
+    if record.kube_env is not None and hasattr(record.kube_env, "rename"):
+        try:
+            await asyncio.to_thread(record.kube_env.rename, new_name)
+        except Exception as exc:
+            try:
+                await store.rename(record, old_name)
+            except Exception:
+                logger.exception("failed to rollback local rename")
+            return _err(500, f"rename backend failed: {exc}")
 
     if record.kube_env is not None and record.state == ContainerState.RUNNING:
         try:
@@ -2518,23 +2519,26 @@ async def _hijack_session(
 
 
 def _pyromind_terminal_url(kube_env: Any) -> str:
-    base_url = (
-        os.getenv("PYROMIND_BASE_URL", "").strip().rstrip("/")
-        or "https://api-portal.pyromind.ai/api/v1"
+    from pyromind_sdk.client.base import (
+        ENV_API_KEY,
+        ENV_BASE_URL,
+        ENV_CLUSTER,
+        resolve_base_url_from_cluster,
     )
-    for http_scheme, ws_scheme in (
-        ("https://", "wss://"),
-        ("http://", "ws://"),
-    ):
-        if base_url.startswith(http_scheme):
-            base_url = ws_scheme + base_url[len(http_scheme):]
-            break
-    sandbox_id = kube_env.sandbox_id or ""
-    api_key = quote(os.getenv("PYROMIND_API_KEY", ""), safe="")
-    qs = "cols=80&rows=24"
-    if api_key:
-        qs = f"token={api_key}&{qs}"
-    return f"{base_url}/sandboxes/{sandbox_id}/terminal?{qs}"
+    from pyromind_sdk.terminal import build_terminal_websocket_url
+
+    base_url = (os.getenv(ENV_BASE_URL) or "").strip()
+    cluster = (os.getenv(ENV_CLUSTER) or "").strip()
+    if not base_url and cluster:
+        base_url = resolve_base_url_from_cluster(cluster)
+    if not base_url:
+        base_url = "https://api-portal.pyromind.ai/api/v1"
+    api_key = (os.getenv(ENV_API_KEY) or "").strip()
+    return build_terminal_websocket_url(
+        base_url,
+        kube_env.sandbox_id or "",
+        api_key,
+    )
 
 
 async def _hijack_pyromind_terminal(
@@ -2564,11 +2568,19 @@ async def _hijack_pyromind_terminal(
                     f"terminal connection rejected (HTTP {exc.status})"
                 ) from exc
 
+            session_over = asyncio.Event()
+
             async def pump_out() -> None:
                 async for msg in ws:
+                    if session_over.is_set():
+                        break
                     if msg.type == aiohttp.WSMsgType.BINARY:
-                        await resp.write(msg.data)
-                        await resp.drain()
+                        try:
+                            await resp.write(msg.data)
+                            await resp.drain()
+                        except (ConnectionResetError, RuntimeError, ConnectionError):
+                            session_over.set()
+                            break
                     elif msg.type == aiohttp.WSMsgType.TEXT:
                         try:
                             obj = json.loads(msg.data)
@@ -2576,17 +2588,24 @@ async def _hijack_pyromind_terminal(
                                 continue
                         except (json.JSONDecodeError, TypeError):
                             pass
-                        await resp.write(msg.data.encode("utf-8", errors="replace"))
-                        await resp.drain()
+                        try:
+                            await resp.write(
+                                msg.data.encode("utf-8", errors="replace")
+                            )
+                            await resp.drain()
+                        except (ConnectionResetError, RuntimeError, ConnectionError):
+                            session_over.set()
+                            break
                     elif msg.type in (
                         aiohttp.WSMsgType.CLOSE,
                         aiohttp.WSMsgType.ERROR,
                     ):
+                        session_over.set()
                         break
 
             async def pump_in() -> None:
                 try:
-                    while True:
+                    while not session_over.is_set():
                         data = b""
                         tail = getattr(protocol, "_message_tail", b"") or b""
                         if tail:
@@ -2612,12 +2631,42 @@ async def _hijack_pyromind_terminal(
                             await asyncio.sleep(0.02)
                 except Exception as exc:
                     logger.debug("pyromind terminal stdin end: %s", exc)
+                finally:
+                    session_over.set()
 
-            await asyncio.gather(pump_out(), pump_in())
+            async def send_pings() -> None:
+                try:
+                    while not session_over.is_set():
+                        await asyncio.sleep(60)
+                        if not session_over.is_set():
+                            await ws.send_str(json.dumps({"type": "ping"}))
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+
+            out_task = asyncio.create_task(pump_out())
+            in_task = asyncio.create_task(pump_in())
+            ping_task = asyncio.create_task(send_pings())
             try:
-                await ws.close()
-            except Exception:
-                pass
+                await asyncio.wait(
+                    (out_task, in_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                session_over.set()
+                for task in (out_task, in_task, ping_task):
+                    task.cancel()
+                await asyncio.gather(
+                    out_task,
+                    in_task,
+                    ping_task,
+                    return_exceptions=True,
+                )
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
     except Exception:
         logger.exception("pyromind terminal hijack failed")
         raise
