@@ -6,11 +6,13 @@ import os
 import shlex
 import shutil
 import stat
+import sys
 from pathlib import Path
 
 WRAPPER_DIR = Path.home() / ".pyromind" / "bin"
 WRAPPER_PATH = WRAPPER_DIR / "docker"
 PATH_LINE = 'export PATH="$HOME/.pyromind/bin:$PATH"'
+WRAPPER_VERSION = "3"
 
 
 def find_real_docker() -> str:
@@ -50,7 +52,29 @@ def find_real_docker() -> str:
 
 
 def is_wrapper_installed() -> bool:
-    return WRAPPER_PATH.is_file() and os.access(WRAPPER_PATH, os.X_OK)
+    if not WRAPPER_PATH.is_file() or not os.access(WRAPPER_PATH, os.X_OK):
+        return False
+    try:
+        text = WRAPPER_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return f'WRAPPER_VERSION="{WRAPPER_VERSION}"' in text
+
+
+def wrapper_in_path() -> bool:
+    """Return True when the current shell already resolves ``docker`` to wrapper."""
+    current = shutil.which("docker")
+    return bool(current) and Path(current).resolve() == WRAPPER_PATH.resolve()
+
+
+def _warn_wrapper_not_in_path() -> None:
+    if wrapper_in_path():
+        return
+    print(
+        "Note: docker wrapper is installed but not active in this shell. "
+        "Run 'source ~/.bashrc' or open a new terminal.",
+        file=sys.stderr,
+    )
 
 
 def _shell_rc_path() -> Path:
@@ -69,6 +93,7 @@ def install_wrapper() -> Path:
     WRAPPER_DIR.mkdir(parents=True, exist_ok=True)
     script = f"""#!/usr/bin/env bash
 REAL_DOCKER={shlex.quote(real_docker)}
+WRAPPER_VERSION="{WRAPPER_VERSION}"
 is_docker_rt() {{
   local ctx="" host="" i
   for ((i=1; i<=$#; i++)); do
@@ -159,6 +184,72 @@ for line in sys.stdin:
 '
   exit $?
 fi
+if [[ "${{args[0]:-}}" == "rm" ]]; then
+  force=0
+  for arg in "${{args[@]:1}}"; do
+    if [[ "$arg" == "-f" || "$arg" == "--force" || "$arg" == "-f="* || "$arg" == "--force="* ]]; then
+      force=1
+    fi
+  done
+  if [[ $force -eq 0 ]]; then
+    running=()
+    for target in "${{args[@]:1}}"; do
+      if [[ "$target" == -* ]]; then
+        continue
+      fi
+      status="$("$REAL_DOCKER" inspect --format '{{{{.State.Status}}}}' "$target" 2>/dev/null)"
+      if [[ "$status" != "running" ]]; then
+        status="$("$REAL_DOCKER" inspect --format '{{{{.status}}}}' "$target" 2>/dev/null)"
+      fi
+      status_lower="$(printf '%s' "$status" | tr '[:upper:]' '[:lower:]')"
+      if [[ "$status_lower" == "running" ]]; then
+        running+=("$target")
+      fi
+    done
+    if [[ ${{#running[@]}} -gt 0 ]]; then
+      read -r -p "Container(s) ${{running[*]}} are running. Force remove? [y/N]: " ans
+      if [[ "$ans" =~ ^[yY] ]]; then
+        args+=(--force)
+      else
+        echo "Remove cancelled. Use 'docker rm -f ${{running[*]}}' to force remove." >&2
+        exit 1
+      fi
+    fi
+  fi
+fi
+if [[ "${{args[0]:-}}" == "run" ]]; then
+  foreground=1
+  for arg in "${{args[@]:1}}"; do
+    case "$arg" in
+      -d|--detach|--detach=true|--detach=1|-i|--interactive|-t|--tty|-it|-ti|-di|-dt|-dit|--help|-h)
+        foreground=0
+        ;;
+    esac
+  done
+  if [[ $foreground -eq 1 ]]; then
+    echo "docker-rt does not support foreground docker run without -d/-i/-t." >&2
+    echo "Use 'docker run -d' for background or 'docker run -it IMAGE bash' for interactive." >&2
+    exit 1
+  fi
+fi
+if [[ "${{args[0]:-}}" == "logs" ]]; then
+  target=""
+  for arg in "${{args[@]:1}}"; do
+    if [[ "$arg" == -* ]]; then
+      continue
+    fi
+    target="$arg"
+    break
+  done
+  echo "docker logs is not supported by k8s-middleware." >&2
+  echo "Use 'docker exec -it ${{target:-<container>}} bash' to view logs inside the container." >&2
+  exit 1
+fi
+if [[ "${{args[0]:-}}" == "events" ]]; then
+  echo "docker events is not supported by k8s-middleware." >&2
+  echo "Use 'docker ps' and 'docker inspect' to check container state." >&2
+  exit 1
+fi
 if [[ "${{args[0]:-}}" == "build" ]]; then
   echo "docker-rt does not support docker build / buildx build." >&2
   echo "Build the image with your normal Docker/BuildKit first, then use docker run." >&2
@@ -182,6 +273,48 @@ if [[ "${{args[0]:-}}" == "compose" ]]; then
     fi
   done
 fi
+if [[ "${{args[0]:-}}" == "cp" ]]; then
+  src="${{args[1]:-}}"
+  dst="${{args[2]:-}}"
+  if [[ -t 2 ]]; then
+    _cp_out="$(mktemp)"
+    _cp_err="$(mktemp)"
+    if command -v script >/dev/null 2>&1; then
+      script -q /dev/null "$REAL_DOCKER" "${{args[@]}}" >"$_cp_out" 2>"$_cp_err" &
+    else
+      "$REAL_DOCKER" "${{args[@]}}" >"$_cp_out" 2>"$_cp_err" &
+    fi
+    _cp_pid=$!
+    _spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    _i=0
+    printf '\\n' >&2
+    while kill -0 "$_cp_pid" 2>/dev/null; do
+      printf '\\r%s copying %s -> %s ...' "${{_spin[$_i]}}" "$src" "$dst" >&2
+      _i=$(( (_i + 1) % ${{#_spin[@]}} ))
+      sleep 0.1
+    done
+    wait "$_cp_pid"
+    _rc=$?
+    printf '\\r\\033[K' >&2
+    if [[ $_rc -eq 0 ]]; then
+      _clean_out="$(tr -d '\\000-\\010' < "$_cp_out")"
+      _success_line="$(printf '%s' "$_clean_out" | grep -a 'Successfully copied' | tail -n 1 | sed -E 's/^.*Successfully copied/Successfully copied/')"
+      if [[ -n "$_success_line" ]]; then
+        printf '%s\\n' "$_success_line" >&1
+      else
+        printf '%s\\n' "$_clean_out" >&1
+      fi
+      cat "$_cp_err" >&2
+    else
+      tr -d '\\000-\\010' < "$_cp_out" >&1
+      cat "$_cp_err" >&2
+    fi
+    rm -f "$_cp_out" "$_cp_err"
+    exit $_rc
+  else
+    echo "docker-rt: copying ${{src}} -> ${{dst}}, please wait..." >&2
+  fi
+fi
 exec "$REAL_DOCKER" "${{args[@]}}"
 """
     WRAPPER_PATH.write_text(script, encoding="utf-8")
@@ -200,26 +333,27 @@ exec "$REAL_DOCKER" "${{args[@]}}"
 
 
 def ensure_wrapper_installed(*, interactive: bool = True) -> bool:
-    """Prompt to install the wrapper before docker-rt can start."""
-    if not interactive:
+    """Ensure the docker wrapper is installed and up to date."""
+    if is_wrapper_installed():
+        _warn_wrapper_not_in_path()
         return True
-    print(
-        "\npyromind docker-rt needs a local docker wrapper to support "
-        "--gpu-card. If you skip it, docker-rt still starts; use "
-        "--label docker-rt.gpu-card or DOCKER_RT_GPU_CARD instead.\n"
-        "It will install ~/.pyromind/bin/docker and add it to your PATH."
-    )
-    try:
-        answer = input("Install now? [y/N]: ").strip().lower()
-    except EOFError:
-        answer = ""
-    if answer not in {"y", "yes"}:
+
+    if interactive:
         print(
-            "Wrapper install skipped; docker-rt will start without "
-            "--gpu-card shorthand."
+            "\npyromind docker-rt needs a local docker wrapper to support "
+            "--gpu-card and the docker-rt CLI experience. docker-rt will not "
+            "start without it.\n"
+            "It will install ~/.pyromind/bin/docker and add it to your PATH."
         )
-        return True
+        try:
+            answer = input("Install now? [y/N]: ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in {"y", "yes"}:
+            print("Wrapper install declined; docker-rt startup cancelled.")
+            return False
     path = install_wrapper()
+    _warn_wrapper_not_in_path()
     print(f"Installed docker wrapper: {path}")
     print("New terminals will use it automatically.")
     return True

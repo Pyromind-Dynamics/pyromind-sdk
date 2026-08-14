@@ -86,8 +86,8 @@ sandbox = client.sandboxes.create(
         name=f"example-sandbox-{int(time.time())}",
         sandbox_type=SandboxType.WINDOWS,
         resources=ResourceConfig(
-            cpu="4",
-            memory="8Gi",
+            cpu="1",
+            memory="2Gi",
             gpu=0
         ),
         configuration=SandboxConfiguration(
@@ -911,7 +911,7 @@ async def main():
             SandboxRequest(
                 name="my-sandbox",
                 sandbox_type=SandboxType.LINUX,
-                resources=ResourceConfig(cpu="2", memory="4Gi")
+                resources=ResourceConfig(cpu="1", memory="2Gi")
             )
         )
         

@@ -40,6 +40,7 @@ dependencies = [
 [project.scripts]
 pyromind = "pyromind_sdk.cli:main"
 docker-rt = "pyromind_sdk.docker_rt.server:main"
+docker_rt = "pyromind_sdk.docker_rt.server:main"
 docker-rt-context = "pyromind_sdk.docker_rt.register_context:main"
 pyromind-docker-uninstall = "pyromind_sdk.docker_rt.install_wrapper:uninstall_main"
 

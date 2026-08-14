@@ -67,6 +67,8 @@ class ContainerRecord:
     gpu_card: str | None = None
     # Runtime (set after start)
     kube_env: Any = None
+    sandbox_id: str | None = None
+    sandbox_status: str | None = None
     pod_name: str | None = None
     error: str | None = None
     started_at: float | None = None

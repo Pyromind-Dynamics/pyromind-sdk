@@ -4,12 +4,14 @@ EchoMind API Client
 This module provides a client for managing EchoMind instances via the PyroMind API.
 """
 
-from typing import List
+from typing import List, Optional
 from .base import PyroMindClient
 from .models import (
     EchoMindJobRequest,
     EchoMindJobResponse,
     EchoMindJobListAPIResponse,
+    EchoMindPage,
+    ListQuery,
     EchoMindJobAPIResponse,
     EchoMindJobCreateAPIResponse,
     InternalIPResponse,
@@ -24,28 +26,61 @@ class EchoMindClient(PyroMindClient):
     resuming, and deleting EchoMind instances.
     """
 
-    def list(self) -> List[EchoMindJobResponse]:
+    def list(
+        self,
+        query: Optional[ListQuery] = None,
+    ) -> List[EchoMindJobResponse]:
         """
         List all EchoMind instances
 
         Returns:
             List of EchoMindJobResponse objects
         """
-        response = self.get("/echomind")
+        query = query or ListQuery()
+        jobs: List[EchoMindJobResponse] = []
+        current_page = 1
+        page_size = query.page_size or 20
+        while True:
+            page = self.list_page(
+                query.model_copy(update={"page_size": page_size, "page_num": current_page})
+            )
+            jobs.extend(page.jobs)
+            if not page.jobs or current_page * page_size >= page.total:
+                break
+            current_page += 1
+        return jobs
+
+    def list_page(
+        self,
+        query: Optional[ListQuery] = None,
+    ) -> EchoMindPage:
+        """Fetch one page of EchoMind instances with the total count."""
+        query = query or ListQuery()
+        params = query.to_params(default_page_size=20)
+
+        response = self.get("/echomind", params=params)
         # API returns {success: True, data: {...}} format
         data = self._extract_data(response)
 
         # Handle different possible data structures
         if isinstance(data, dict):
-            # API returns {echomind_jobs: [], page: 0, ...} format
             api_response = EchoMindJobListAPIResponse(**data)
-            return api_response.echomind_jobs
+            jobs_data = api_response.echomind_jobs
         elif isinstance(data, list):
-            # Fallback: if data is directly a list
-            api_response = EchoMindJobListAPIResponse(echomind_jobs=data)
-            return api_response.echomind_jobs
+            jobs_data = data
         else:
-            return []
+            jobs_data = []
+
+        pagination = data.get("pagination") if isinstance(data, dict) else {}
+        pagination = pagination if isinstance(pagination, dict) else {}
+        total = int(pagination.get("total") or len(jobs_data) or 0)
+        jobs = [EchoMindJobResponse(**job) if isinstance(job, dict) else job for job in jobs_data]
+        return EchoMindPage(
+            jobs=jobs,
+            total=total,
+            page_size=int(pagination.get("pageSize") or query.page_size or 20),
+            page_num=int(pagination.get("pageNum") or query.page_num or 1),
+        )
 
     def create(self, request: EchoMindJobRequest) -> str:
         """

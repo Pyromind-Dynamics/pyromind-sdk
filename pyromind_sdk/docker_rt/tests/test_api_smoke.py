@@ -168,6 +168,54 @@ async def test_lifecycle_rename_restart_kill_events(aiohttp_client):
 
 
 @pytest.mark.asyncio
+async def test_start_after_stop_resumes_existing_kube_env(
+    aiohttp_client, fake_kube: FakeKubeEnv
+):
+    from ..aio_server import create_aio_app
+    from .. import aio_server as mod
+
+    app = create_aio_app(run_reconcile=False)
+    mod.start_kube_environment = lambda **kw: fake_kube  # type: ignore
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/containers/create?name=resume1",
+        json={"Image": "ubuntu:22.04", "Cmd": ["sleep", "2h"]},
+    )
+    cid = (await resp.json())["Id"]
+    assert (await client.post(f"/containers/{cid}/start")).status == 204
+    assert (await client.post(f"/containers/{cid}/stop")).status == 204
+
+    extra_starts = []
+    mod.start_kube_environment = lambda **kw: extra_starts.append(kw)  # type: ignore
+    assert (await client.post(f"/containers/{cid}/start")).status == 204
+    assert extra_starts == []
+    assert fake_kube.resumed is True
+
+
+@pytest.mark.asyncio
+async def test_delete_stopped_container_cleans_backend(
+    aiohttp_client, fake_kube: FakeKubeEnv
+):
+    from ..aio_server import create_aio_app
+    from .. import aio_server as mod
+
+    app = create_aio_app(run_reconcile=False)
+    mod.start_kube_environment = lambda **kw: fake_kube  # type: ignore
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/containers/create?name=rm-stopped",
+        json={"Image": "ubuntu:22.04", "Cmd": ["sleep", "2h"]},
+    )
+    cid = (await resp.json())["Id"]
+    assert (await client.post(f"/containers/{cid}/start")).status == 204
+    assert (await client.post(f"/containers/{cid}/stop")).status == 204
+    assert (await client.delete(f"/containers/{cid}")).status == 204
+    assert fake_kube.cleaned is True
+
+
+@pytest.mark.asyncio
 async def test_start_passes_user_command(aiohttp_client, fake_kube: FakeKubeEnv):
     from ..aio_server import create_aio_app
     from .. import aio_server as mod

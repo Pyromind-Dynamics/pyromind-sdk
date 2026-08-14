@@ -38,6 +38,8 @@ pip install -e .
 
 # 启动 daemon（可用 Docker Desktop 或任意可达集群）
 docker-rt
+# 下划线别名也可以
+# docker_rt
 # 也可用统一 SDK CLI 启动
 # pyromind docker-rt
 
@@ -52,11 +54,14 @@ pyromind docker-rt --daemon
 export PYROMIND_API_KEY=XXXXXXXXX
 export PYROMIND_BASE_URL=https://pre-api.pyromind.ai/api/v1
 export PYROMIND_CLUSTER='us-west-1#pre'
-export DOCKER_RT_BACKEND=k8s-middleware
 pyromind docker-rt --daemon
 
 # 把 Docker CLI 指向 docker-rt
 docker-rt-context
+# docker-rt 启动前自动备份当前 Docker context 并切换到 docker-rt；
+# 退出（包括 kill -9）时由 watcher 从备份恢复，watcher 恢复完成后自己退出
+# 需要手动恢复时：
+docker-rt-context --restore
 
 docker version
 docker run -d --name demo busybox:1.36 sleep 300
@@ -64,14 +69,31 @@ docker ps
 docker exec demo echo hello
 ```
 
+启动 `docker-rt` 前必须先安装 Docker CLI；未检测到 Docker 时 daemon 会拒绝
+启动并给出提示。Linux 可安装静态二进制：
+
+```bash
+curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz \
+  | tar -xz -C /tmp
+sudo mv /tmp/docker/docker /usr/local/bin/docker
+chmod +x /usr/local/bin/docker
+```
+
+其他系统请查看：<https://docs.docker.com/desktop/>
+
+`docker-rt` 启动时会检查本地 `~/.pyromind/bin/docker` wrapper：缺失时交互式询问
+是否安装（非交互环境自动安装），不同意则停止启动；SDK 版本升级时会自动更新
+wrapper。需要清理时执行 `pyromind-docker-uninstall` 删除 wrapper 和 PATH 配置。
+
 ### `pyromind docker-rt` 参数
 
 | 参数 | 含义 | 默认值 |
 |------|------|--------|
 | `--sock SOCK` | 暴露给 Docker CLI 的 Unix socket 路径 | `$DOCKER_RT_SOCK` 或 `/tmp/docker-rt.sock` |
 | `--daemon` | 后台启动 docker-rt，命令立即返回 | 关闭 |
+| `--stop` | 停止后台 docker-rt 并恢复之前的 Docker context | 关闭 |
 | `--log-file FILE` | `--daemon` 模式使用的日志文件 | `$DOCKER_RT_LOG_FILE` 或 `/tmp/docker-rt.log` |
-| `--pid-file FILE` | 把后台进程 PID 写入 `FILE` | 不写 |
+| `--pid-file FILE` | 写入/读取后台进程 PID | `/tmp/docker-rt.pid` |
 | `-h`, `--help` | 显示帮助并退出 | - |
 
 ```bash
@@ -93,7 +115,6 @@ pyromind docker-rt \
 | `DOCKER_RT_KUBE_CONTEXT` | `docker-desktop` | Kubernetes context 名 |
 | `DOCKER_RT_NAMESPACE` | `default` | 目标 Kubernetes namespace |
 | `DOCKER_RT_NODE_SELECTOR` | `none` | Pod `nodeSelector`（`key=val,...`；`none` 关闭） |
-| `DOCKER_RT_BACKEND` | `kube` | 后端：`kube` 或 `k8s-middleware` |
 | `DOCKER_RT_GPU_CARD` | 空 | k8s-middleware 后端配合 `docker run --gpus` 时指定 GPU 卡型号 |
 | `DOCKER_RT_INSPECT_MODE` | `sandbox` | `docker inspect` 返回结构：`sandbox` 或 `standard` |
 | `DOCKER_RT_DEFAULT_IMAGE` | SWE-bench 默认镜像 | `docker images` 默认条目 |
@@ -105,11 +126,38 @@ pyromind docker-rt \
 | `DOCKER_RT_SERVICE_DNS` | `true` | 创建 ClusterIP Service 支持 Compose 服务名 DNS |
 | `DOCKER_RT_ORPHAN_POLICY` | `adopt` | `adopt` 恢复受管 Pod；`reap` 启动时删除 |
 | `DOCKER_RT_CLEANUP_ON_EXIT` | `false` | `true` 时退出删除受管 Pod |
+| `DOCKER_RT_CONTEXT_KEEP` | `true` | daemon 运行期间保持 Docker context 为 `docker-rt` |
+| `DOCKER_RT_CONTEXT_KEEP_INTERVAL` | `5` | context keeper 校验间隔（秒） |
 | `DOCKER_RT_JUICEFS_UID` | 从 namespace 推导 | JuiceFS subPath 用户 ID |
 | `DOCKER_RT_JUICEFS_PVC` | 自动发现 | JuiceFS PVC 名 |
 | `DOCKER_RT_JUICEFS_HOST_PREFIXES` | 空 | 宿主机路径到 JuiceFS subPath 的额外映射 |
 | `DOCKER_RT_CONTEXT` | `docker-rt` | `docker-rt-context` 使用的 Docker context 名 |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
+
+默认 `k8s-middleware` 后端会检查 `PYROMIND_API_KEY` 和 `PYROMIND_CLUSTER`，
+缺失时逐个提示输入。连接成功后会用彩色打印当前参数，并在启动时同步一次
+sandbox。
+
+### 支持的 Docker 命令
+
+| 命令 | 说明 | 支持参数 |
+|------|------|----------|
+| `docker version` / `docker info` | 版本和 daemon 信息 | 无 |
+| `docker ps` / `docker ps -a` | 容器列表；默认只显示 CUSTOM | `-a`、`--filter name/id/status/ancestor/label`、`--no-trunc`、`--format` |
+| `docker inspect` | 查看容器详情 | `--format`、`DOCKER_RT_INSPECT_MODE` |
+| `docker images` / `docker pull` | 镜像列表；pull 为 stub | 镜像引用 |
+| `docker run` | 创建并启动 sandbox | `-d`、`-it`、`--name`、`--cpus`、`--memory`、`--gpus`、`--gpu-card` / `--gpu_card`、`--label docker-rt.gpu-card=`、`-p` / `--publish`、`-v` / `--volume`、`-e` / `--env`、`-w` / `--workdir`、`--tmpfs` |
+| `docker create` | 只创建本地记录 | `--name`、`--cpus`、`--memory`、`--gpus`、`--gpu-card` / `--gpu_card`、`--label docker-rt.gpu-card=`、`-p`、`-v`、`-e`、`-w`、`--tmpfs` |
+| `docker start` | 真正创建/启动 Pod | 无 |
+| `docker exec` | 执行命令或进入终端 | `-it`、`-w` / `--workdir` |
+| `docker cp` | 复制文件 | `CONTAINER:PATH <-> LOCAL_PATH` |
+| `docker stop` / `docker kill` | 停止或杀掉容器 | 无 |
+| `docker restart` | 重启容器 | 无 |
+| `docker rename` | 重命名容器 | 无 |
+| `docker rm` | 删除容器 | `-f` / `--force`；running 且未加 `-f` 时 wrapper 会先询问 |
+| `docker port` | 查看端口映射 | 无 |
+| `docker volume` / `docker network` | 卷和网络 stub | 基础 `create` / `inspect` / `ls` / `rm` |
+| `docker compose up` | 受限的 Compose 支持 | 基础 `up` / `down` |
 
 #### `docker inspect` 返回结构
 
@@ -145,7 +193,7 @@ docker create \
   --memory 8g \
   --gpus 1 \
   --label docker-rt.gpu-card=L40S \
-  busybox:1.36 sleep 300
+  swebench/swesmith.x86_64.oauthlib_1776_oauthlib.1fd52536
 ```
 
 如果希望直接写 `--gpu-card L40S`，每次运行 `pyromind docker-rt` 都会询问是否
@@ -184,6 +232,26 @@ docker create \
 
 默认 `docker ps` 只显示 Running 的 sandbox；Stopped 的 sandbox 用
 `docker ps -a` 查看。
+`docker ps` 默认只展示 CUSTOM 类型。要看 OSWorld 实例，使用：
+
+```bash
+docker ps --filter label=docker-rt.type=osworld
+```
+
+标准 Docker filter 会传给 docker-rt 服务端并在服务端过滤：
+
+```bash
+docker ps --filter name=test-sdk-1
+docker ps --filter id=sb-94d290
+docker ps --filter status=running
+docker ps --filter ancestor=swebench
+docker ps --filter label=docker-rt.type=custom
+```
+
+这才是服务端搜索的正确方式。`docker ps | grep XXXX` 属于客户端过滤：
+`grep` 在 daemon 返回输出之后才执行，docker-rt 服务端根本拿不到 `XXXX`。
+标准 Docker 协议没有“跨字段任意子串搜索”参数，所以需要明确字段后使用
+`name` / `id` / `status` / `ancestor` / `label` filter。
 
 docker wrapper 生效后，`docker ps` 表头会变成：
 `ID / NAME / STATUS / PORTS / IMAGE`。
@@ -200,8 +268,8 @@ docker wrapper 生效后，`docker ps` 表头会变成：
 |------|------|------|
 | `--name` | sandbox 名称 | `--name gpu-demo` |
 | 镜像 | 容器镜像 | `busybox:1.36` |
-| `--cpus` | CPU 数量 | `--cpus 4` |
-| `--memory` | 内存大小 | `--memory 8g` |
+| `--cpus` | CPU 数量（默认 `1`） | `--cpus 4` |
+| `--memory` | 内存大小（默认 `2Gi`） | `--memory 8g` |
 | `--gpus` | GPU 数量 | `--gpus 1` |
 | `--gpu-card` / `--gpu_card` | GPU 卡型号，需要 wrapper | `--gpu-card L40S` |
 | `--label docker-rt.gpu-card=L40S` | GPU 卡型号，不需要 wrapper | `--label docker-rt.gpu-card=L40S` |
@@ -227,6 +295,30 @@ docker create \
 
 docker start gpu-demo
 ```
+
+最小化的创建 / 启动 / 删除示例：
+
+```bash
+docker create --name test-sdk-1 swebench/swesmith.x86_64.oauthlib_1776_oauthlib.1fd52536
+docker start test-sdk-1
+docker ps
+docker exec -it test-sdk-1 bash
+docker rm -f test-sdk-1
+```
+
+自定义名称必须用 `--name`。`docker create test-sdk-1 IMAGE` 会把
+`test-sdk-1` 当作镜像名。使用 `--name` 创建后，`docker start test-sdk-1` 和
+`docker rm -f test-sdk-1` 都可以直接用名称操作。
+非 running 容器可以直接 `docker rm NAME` 删除；running 容器需要 `-f` /
+`--force`。使用 docker-rt wrapper 时，running 容器不带 `-f` 的 `docker rm`
+会先询问确认。如果提示 `No such container: NAME`，用 `docker ps -a` 查看
+实际容器名，只有创建时用了 `--name` 才会注册该名称。
+k8s-middleware 后端下，`docker run IMAGE` 不带 `-d` / `-it` 时，会在
+sandbox Running 后直接返回并给出提示，因为前台 attach 暂不支持。需要后台
+运行用 `docker run -d`，需要交互式终端用 `docker run -it IMAGE bash`。
+
+k8s-middleware 后端不传 `--cpus`、`--memory`、`--gpus` 时，默认使用
+`1 CPU / 2Gi 内存`，且不带 GPU。
 
 #### `docker ps` / `docker ps -a`
 
@@ -327,11 +419,8 @@ PyromindSDK 后端**不支持**本机端口转发，只展示端口映射；需�
 
 #### `docker events`
 
-```bash
-docker events --since 0s
-```
-
-当前为进程内事件流，重启 daemon 后历史事件不保留。
+`docker events` 在 `k8s-middleware` 后端不支持，请使用
+`docker ps` 和 `docker inspect` 查看容器状态。
 
 #### 不支持的 Docker 命令
 
@@ -342,11 +431,14 @@ docker build
 docker buildx build
 docker compose build
 docker compose up --build
+docker logs
+docker events
 ```
 
 这些命令依赖真实 Docker daemon / BuildKit 容器生命周期，docker-rt 不提供假实现。
 建议先用正常 Docker/BuildKit 构建镜像并推送到 registry，再通过
-`docker run` 使用该镜像。
+`docker run` 使用该镜像。`docker logs` 在 `k8s-middleware` 后端不支持，
+请使用 `docker exec -it <container> bash` 进入容器查看日志。
 
 链路：`Docker CLI -> docker-rt daemon -> KubeEnvironment -> Kubernetes API`。
 当前实现由 `KubeEnvironment` 直接通过官方 Kubernetes Python SDK 调用集群；
@@ -356,7 +448,6 @@ docker compose up --build
 通过 `k8s_middleware` OpenAPI 运行：
 
 ```bash
-DOCKER_RT_BACKEND=k8s-middleware \
 PYROMIND_API_KEY=your-key \
 PYROMIND_BASE_URL=https://api.pyromind.ai/api/v1 \
 PYROMIND_CLUSTER=us-west-2 \
@@ -364,8 +455,20 @@ pyromind docker-rt
 ```
 
 该模式下 docker-rt 使用 `PyromindSDK` 适配器：先读取当前 sandbox，合并修改字段，
-再提交完整 sandbox 更新；PyromindSDK 后端本地端口转发暂不支持，
+再提交完整 sandbox 更新；后端固定为 `k8s-middleware`。
+PyromindSDK 后端本地端口转发暂不支持，
 `k8s_middleware` 只改 `name` 时会跳过 StatefulSet 滚动更新。
+
+### 常见问题
+
+| 现象 | 原因 | 处理方式 |
+|------|------|----------|
+| `docker ps` 还是标准 `CONTAINER ID ...` 表头 | wrapper 已安装，但当前 shell 的 PATH 是旧的 | 执行 `source ~/.bashrc`，或重新打开终端 |
+| `docker` 命令连到 `~/.docker/run/docker.sock` | Docker context 不是 `docker-rt` | 执行 `docker-rt-context`，或使用 `DOCKER_HOST=unix:///tmp/docker-rt.sock` |
+| `docker logs` / `docker events` 一直等待或不支持 | k8s-middleware 后端不支持这两个命令 | 使用 `docker exec -it <container> bash`、`docker ps`、`docker inspect` |
+| `docker cp` 完成但没有 `Successfully copied` 文案 | 旧 wrapper 重定向了 Docker 输出，Docker CLI 检测到非 TTY 后不打印成功文案 | 升级 SDK/wrapper 并重启 docker-rt |
+| `docker rm <sb-...>` 会询问，`docker rm <本地ID>` 直接报错 | wrapper 只能识别当前 daemon 还知道的 ID | 使用 `sb-...` sandbox ID，或重启 docker-rt 刷新本地记录 |
+| API 错误没有 `trace_id` | 该操作没有真正请求到 k8s-middleware（本地校验直接返回） | 只有带 `x-trace-id` 响应头的后端请求错误才会显示 `trace_id=` |
 
 ## 配置
 

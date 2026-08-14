@@ -374,131 +374,37 @@ def start_kube_environment(
     gpu: str | None = None,
     gpu_card: str | None = None,
 ) -> KubeEnvironment:
-    """Create and start a Pod via KubeEnvironment (blocks until Ready/terminal)."""
-    backend = os.getenv("DOCKER_RT_BACKEND", "kube").lower().replace("-", "_")
-    if backend in {"k8s_middleware", "pyromind_sdk", "pyromind"}:
-        from .pyromind_sdk_env import PyromindSDK
-
-        logger.info(
-            "Starting PyromindSDK backend image=%s name=%s namespace=%s "
-            "cmd=%s memory=%s cpu=%s",
-            image,
-            container_name or hostname or "-",
-            namespace,
-            list(command or []),
-            memory_limit or "-",
-            cpu_limit or "-",
-        )
-        return PyromindSDK(
-            image=image,
-            name=container_name or hostname,
-            namespace=namespace,
-            env=env,
-            working_dir=working_dir,
-            command=list(command or []),
-            binds=binds,
-            mounts=mounts,
-            tmpfs=tmpfs,
-            port_bindings=port_bindings,
-            exposed_ports=exposed_ports,
-            publish_all_ports=publish_all_ports,
-            memory_limit=memory_limit,
-            cpu_limit=cpu_limit,
-            gpu=gpu,
-            gpu_card=gpu_card,
-        )
-
-    from .juicefs import discover_juicefs_pvc, resolve_juicefs_uid
-    from .mounts import classify_container_mounts
-
-    kubeconfig = kubeconfig or resolve_kubeconfig()
-    juicefs_pvc: str | None = None
-    juicefs_binds: list[dict[str, Any]] = []
-    emptydir_mounts: list[dict[str, Any]] = []
-
-    has_mounts = bool(binds) or bool(mounts) or bool(tmpfs)
-    if has_mounts:
-        try:
-            uid = resolve_juicefs_uid(namespace)
-        except RuntimeError:
-            # tmpfs / emptyDir-only stacks may not need JuiceFS
-            uid = "0"
-        plan = classify_container_mounts(
-            binds=binds,
-            mounts=mounts,
-            tmpfs=tmpfs,
-            volume_store=volume_store,
-            uid=uid,
-        )
-        juicefs_binds = list(plan.get("juicefs_binds") or [])
-        emptydir_mounts = list(plan.get("emptydir_mounts") or [])
-        if juicefs_binds:
-            if uid == "0":
-                uid = resolve_juicefs_uid(namespace)
-            juicefs_pvc, _ = discover_juicefs_pvc(
-                namespace,
-                kubeconfig=kubeconfig,
-                kube_context=kube_context,
-                preferred_uid=uid,
-            )
-
-    cmd = list(command or [])
-    kwargs: dict[str, Any] = {
-        "image": image,
-        "namespace": namespace,
-        "env": env,
-        "cwd": working_dir or "/",
-        "ready_timeout": ready_timeout,
-        "pod_timeout": pod_timeout,
-        "image_pull_secrets": image_pull_secrets or [],
-        "juicefs_pvc": juicefs_pvc,
-        "juicefs_binds": juicefs_binds,
-        "emptydir_mounts": emptydir_mounts,
-        "command": cmd,
-        "tty": bool(tty),
-        "stdin": bool(stdin),
-    }
-    if hostname:
-        kwargs["hostname"] = hostname
-    if memory_limit:
-        kwargs["memory_limit"] = memory_limit
-    if memory_request:
-        kwargs["memory_request"] = memory_request
-    if cpu_limit:
-        kwargs["cpu_limit"] = cpu_limit
-    if cpu_request:
-        kwargs["cpu_request"] = cpu_request
-    if container_id and container_name:
-        labels, annotations = docker_rt_pod_meta(
-            container_id=container_id,
-            name=container_name,
-            port_bindings=port_bindings,
-            exposed_ports=exposed_ports,
-            publish_all_ports=publish_all_ports,
-        )
-        kwargs["pod_labels"] = labels
-        kwargs["pod_annotations"] = annotations
-    if kubeconfig:
-        kwargs["kubeconfig"] = kubeconfig
-    if kube_context:
-        kwargs["context"] = kube_context
+    """Start a sandbox through the k8s-middleware PyromindSDK backend."""
+    from .pyromind_sdk_env import PyromindSDK
 
     logger.info(
-        "Starting KubeEnvironment image=%s namespace=%s cmd=%s juicefs_pvc=%s "
-        "jfs_binds=%d emptydir=%d hostname=%s memory=%s/%s cpu=%s/%s",
+        "Starting k8s-middleware sandbox image=%s name=%s namespace=%s "
+        "cmd=%s memory=%s cpu=%s",
         image,
+        container_name or hostname or "-",
         namespace,
-        cmd or ["sleep", pod_timeout],
-        juicefs_pvc or "-",
-        len(juicefs_binds),
-        len(emptydir_mounts),
-        hostname or "-",
-        memory_request or "-",
+        list(command or []),
         memory_limit or "-",
-        cpu_request or "-",
         cpu_limit or "-",
     )
-    return KubeEnvironment(**kwargs)
+    return PyromindSDK(
+        image=image,
+        name=container_name or hostname,
+        namespace=namespace,
+        env=env,
+        working_dir=working_dir,
+        command=list(command or []),
+        binds=binds,
+        mounts=mounts,
+        tmpfs=tmpfs,
+        port_bindings=port_bindings,
+        exposed_ports=exposed_ports,
+        publish_all_ports=publish_all_ports,
+        memory_limit=memory_limit,
+        cpu_limit=cpu_limit,
+        gpu=gpu,
+        gpu_card=gpu_card,
+    )
 
 
 def attach_kube_environment(

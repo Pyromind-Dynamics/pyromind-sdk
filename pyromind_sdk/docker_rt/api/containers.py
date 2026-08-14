@@ -12,6 +12,8 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from pyromind_sdk.client.base import format_exception_message
+
 from ..backend.runtime import (
     DEFAULT_NAMESPACE,
     parse_env_list,
@@ -19,6 +21,7 @@ from ..backend.runtime import (
 )
 from ..backend.store import ContainerState, ContainerStore
 from ..backend.stream_framing import frame_stdout
+from ..backend.pyromind_sdk_env import PyromindSDK
 
 logger = logging.getLogger("docker_rt.containers")
 
@@ -275,7 +278,10 @@ async def create_container(
             binds=list(host_config.get("Binds") or []),
         )
     except KeyError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=409,
+            detail=format_exception_message(exc),
+        ) from exc
 
     return JSONResponse(
         content={"Id": record.id, "Warnings": []},
@@ -320,9 +326,12 @@ async def start_container(request: Request, id: str) -> Response:
             )
         except Exception as exc:
             record.state = ContainerState.DEAD
-            record.error = str(exc)
+            record.error = format_exception_message(exc)
             logger.exception("Failed to start container %s", record.id)
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=500,
+                detail=format_exception_message(exc),
+            ) from exc
 
         record.kube_env = kube_env
         record.pod_name = kube_env.pod_name
@@ -371,6 +380,16 @@ async def kill_container(
     if record is None:
         raise HTTPException(status_code=404, detail=f"No such container: {id}")
 
+    if record.kube_env is not None and hasattr(record.kube_env, "refresh_phase"):
+        try:
+            phase = await asyncio.to_thread(record.kube_env.refresh_phase)
+            if phase == "NotFound":
+                record.state = ContainerState.EXITED
+                record.finished_at = time.time()
+                record.pod_name = None
+        except Exception:
+            logger.debug("kill refresh failed id=%s", id, exc_info=True)
+
     sig_name = signal.upper()
     if not sig_name.startswith("SIG") and not sig_name.isdigit():
         sig_name = f"SIG{sig_name}"
@@ -381,7 +400,13 @@ async def kill_container(
                 status_code=409, detail=f"Container {id} is not running"
             )
         if record.kube_env is not None:
-            await asyncio.to_thread(record.kube_env.cleanup)
+            try:
+                await asyncio.to_thread(record.kube_env.cleanup)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=format_exception_message(exc),
+                ) from exc
             record.kube_env = None
         record.pod_name = None
         record.state = ContainerState.EXITED
@@ -463,7 +488,7 @@ async def delete_container(
             if not force:
                 raise HTTPException(
                     status_code=409,
-                    detail="container is running: stop or use force=true",
+                    detail=f"container {id} is running: docker rm -f {id}",
                 )
             if record.kube_env is not None:
                 await asyncio.to_thread(record.kube_env.cleanup)
@@ -502,6 +527,14 @@ async def container_logs(
     record = store.get(id)
     if record is None:
         raise HTTPException(status_code=404, detail=f"No such container: {id}")
+    if isinstance(record.kube_env, PyromindSDK):
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "docker logs is not supported by k8s-middleware; "
+                f"use 'docker exec -it {id} bash' to view logs inside the container"
+            ),
+        )
     if record.kube_env is None or record.state != ContainerState.RUNNING:
         raise HTTPException(
             status_code=404, detail="container not running / no logs"

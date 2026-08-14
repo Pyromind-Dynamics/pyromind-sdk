@@ -26,6 +26,7 @@ from pyromind_sdk import PyroMindAPIClient, PyroMindAPIError
 from pyromind_sdk.client.models import (
     JupyterRequest,
     JupyterResponse,
+    ListQuery,
     ResourceConfig,
 )
 
@@ -238,6 +239,22 @@ class TestListJupyterInstances:
             assert isinstance(instances, list)
         finally:
             _pause_and_delete(client, instance.id)
+
+    def test_list_jupyter_with_page(self, client):
+        page = client.jupyter.list_page(
+            ListQuery(page_size=2, page_num=1)
+        )
+        assert page.total >= 0
+        assert len(page.instances) <= 2
+        assert page.page_size == 2
+
+    def test_list_jupyter_with_status_filter(self, client):
+        instances = client.jupyter.list(
+            ListQuery(status="running")
+        )
+        assert isinstance(instances, list)
+        for instance in instances:
+            assert instance.status.lower() == "running"
 
 
 class TestCreateJupyterInstance:

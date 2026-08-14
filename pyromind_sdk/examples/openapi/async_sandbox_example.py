@@ -293,10 +293,10 @@ async def create_osworld_sandbox_example(system_image_path: str = DEFAULT_OSWORL
             SandboxRequest(
                 name=f"osworld-sandbox-{int(time.time())}",
                 sandbox_type=SandboxType.OSWORLD,
-                # OSWorld template defaults to higher resources (CPU 8 / 16Gi)
+                # Default to 1 CPU / 2Gi; resources can be adjusted upward.
                 resources=ResourceConfig(
-                    cpu="8",
-                    memory="16Gi",
+                    cpu="1",
+                    memory="2Gi",
                     gpu=0,
                 ),
                 configuration=SandboxConfiguration(

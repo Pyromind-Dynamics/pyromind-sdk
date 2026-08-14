@@ -150,6 +150,9 @@ def _pod_exec_stream(
 def iter_archive_chunks(kube_env: Any, path: str) -> Iterator[bytes]:
     """Yield tar bytes of ``path`` inside the Pod (no full-buffer)."""
     assert kube_env.pod_name
+    if hasattr(kube_env, "iter_archive_chunks"):
+        yield from kube_env.iter_archive_chunks(path)
+        return
     target = _normalize_path(path)
     parent = target.rsplit("/", 1)[0] or "/"
     base = target.rsplit("/", 1)[-1]
@@ -222,6 +225,8 @@ def get_archive(kube_env: Any, path: str) -> tuple[bytes, dict[str, Any]]:
 def path_stat(kube_env: Any, path: str) -> dict[str, Any] | None:
     """Return Docker-style path-stat for ``path``, or ``None`` if missing."""
     assert kube_env.pod_name
+    if hasattr(kube_env, "archive_path_stat"):
+        return kube_env.archive_path_stat(path)
     target = _normalize_path(path)
     script = (
         f"target={shlex.quote(target)}; "
@@ -365,6 +370,9 @@ def put_archive_stream(kube_env: Any, dest_path: str, chunks: Iterable[bytes]) -
 
 def put_archive(kube_env: Any, dest_path: str, tar_bytes: bytes) -> None:
     """Extract ``tar_bytes`` into ``dest_path`` (exec preferred, stream fallback)."""
+    if hasattr(kube_env, "put_archive"):
+        kube_env.put_archive(dest_path, tar_bytes)
+        return
     if len(tar_bytes) <= _EMBED_MAX and callable(getattr(kube_env, "execute", None)):
         try:
             put_archive_via_exec(kube_env, dest_path, tar_bytes)

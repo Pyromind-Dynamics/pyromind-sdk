@@ -314,6 +314,42 @@ class SandboxListAPIResponse(BaseModel):
     sandboxes: List[SandboxResponse]
 
 
+class SandboxPage(BaseModel):
+    """Paginated sandbox list with total count."""
+
+    sandboxes: List[SandboxResponse] = []
+    total: int = 0
+    page_size: int = 200
+    page_num: int = 1
+
+
+class ListQuery(BaseModel):
+    """Common filters and pagination options for list APIs."""
+
+    page_size: Optional[int] = Field(default=None, ge=1)
+    page_num: Optional[int] = Field(default=None, ge=1)
+    name: Optional[str] = None
+    instance_id: Optional[str] = None
+    status: Optional[str] = None
+
+    def to_params(
+        self,
+        default_page_size: int = 20,
+        default_page_num: int = 1,
+    ) -> dict:
+        params = {
+            "page_size": self.page_size or default_page_size,
+            "page_num": self.page_num or default_page_num,
+        }
+        if self.name:
+            params["name"] = self.name
+        if self.instance_id:
+            params["instance_id"] = self.instance_id
+        if self.status:
+            params["status"] = self.status
+        return params
+
+
 class SandboxAPIResponse(BaseModel):
     """Single sandbox API response"""
     sandbox: SandboxResponse
@@ -479,6 +515,15 @@ class JupyterListAPIResponse(BaseModel):
     instances: List[JupyterResponse]
 
 
+class JupyterPage(BaseModel):
+    """Paginated Jupyter list with total count."""
+
+    instances: List[JupyterResponse] = []
+    total: int = 0
+    page_size: int = 20
+    page_num: int = 1
+
+
 class JupyterAPIResponse(BaseModel):
     """Single Jupyter instance API response"""
     instance: JupyterResponse
@@ -585,6 +630,15 @@ class InferenceJobListAPIResponse(BaseModel):
     page_size: Optional[int] = None
     total: Optional[int] = None
     has_more: Optional[bool] = None
+
+
+class InferencePage(BaseModel):
+    """Paginated inference list with total count."""
+
+    jobs: List[InferenceJobResponse] = []
+    total: int = 0
+    page_size: int = 20
+    page_num: int = 1
 
 
 class InferenceJobAPIResponse(BaseModel):
@@ -987,6 +1041,15 @@ class EchoMindJobListAPIResponse(BaseModel):
     """List EchoMind instances API response"""
     echomind_jobs: List[EchoMindJobResponse] = Field(default_factory=list)
     pagination: Optional[Dict[str, Any]] = None
+
+
+class EchoMindPage(BaseModel):
+    """Paginated EchoMind list with total count."""
+
+    jobs: List[EchoMindJobResponse] = []
+    total: int = 0
+    page_size: int = 20
+    page_num: int = 1
 
 
 class EchoMindJobAPIResponse(BaseModel):

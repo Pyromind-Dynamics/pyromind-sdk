@@ -12,6 +12,8 @@ from typing import Any
 from kubernetes import client
 from kubernetes.client.rest import ApiException
 
+from pyromind_sdk.client.models import SandboxType
+
 from .runtime import (
     attach_kube_environment,
     build_core_v1_api,
@@ -112,6 +114,8 @@ async def reconcile_pyromind_sandboxes(
         sandbox_id = sandbox.id
         name = sandbox.name or sandbox_id
         image = sandbox.image or ""
+        if not image and getattr(sandbox, "type", None) == SandboxType.OSWORLD:
+            image = "osworld"
         cid = hashlib.sha256(sandbox_id.encode()).hexdigest()
         status = (sandbox.status or "").lower()
         state = (
@@ -124,6 +128,7 @@ async def reconcile_pyromind_sandboxes(
                 sandbox_id,
                 name=name,
                 image=image,
+                sandbox_type=sandbox.type,
                 resources=sandbox.resources,
                 status=sandbox.status,
                 configuration=sandbox.configuration,
@@ -152,10 +157,11 @@ async def reconcile_pyromind_sandboxes(
                 adopted_record.published_ports = _published_ports(sandbox)
             adopted += 1
             logger.info(
-                "synced k8s_middleware sandbox %s as %s (%s)",
+                "synced k8s_middleware sandbox %s as %s (%s, type=%s)",
                 sandbox_id,
                 name,
                 status,
+                getattr(sandbox, "type", ""),
             )
         except Exception as exc:
             logger.warning("adopt sandbox %s failed: %s", sandbox_id, exc)

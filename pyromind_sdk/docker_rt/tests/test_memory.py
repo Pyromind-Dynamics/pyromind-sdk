@@ -118,12 +118,28 @@ async def test_stream_ws_oneshot_backpressure_no_queue_full():
         )
     finally:
         loop.set_exception_handler(prev)
-
     assert code == 0
     assert not any(isinstance(e, asyncio.QueueFull) for e in errors), errors
     assert len(written) == 80
     assert b"line-0\n" in written[0]
     assert b"line-79\n" in written[-1]
+
+
+@pytest.mark.asyncio
+async def test_store_resolves_container_by_name():
+    store = ContainerStore()
+    record = await store.create_container(
+        name="test-sdk-1",
+        image="swebench/swesmith.x86_64.oauthlib_1776_oauthlib.1fd52536",
+        env={},
+        cmd=[],
+        working_dir="/",
+        namespace="",
+    )
+
+    assert store.get("test-sdk-1").id == record.id
+    await store.remove(record)
+    assert store.get("test-sdk-1") is None
 
 
 def test_prune_execs_by_age_and_cap():

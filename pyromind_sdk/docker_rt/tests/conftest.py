@@ -24,3 +24,14 @@ os.environ.setdefault("DOCKER_RT_INSPECT_MODE", "standard")
 @pytest.fixture
 def fake_kube() -> FakeKubeEnv:
     return FakeKubeEnv()
+
+
+@pytest.fixture(autouse=True)
+def _disable_pyromind_reconcile(monkeypatch):
+    """API unit tests use FakeKubeEnv; avoid real k8s-middleware calls."""
+    from .. import aio_server as mod
+
+    async def _noop(*args, **kwargs):
+        return {"adopted": 0, "reaped": 0}
+
+    monkeypatch.setattr(mod, "reconcile_pyromind_sandboxes", _noop)

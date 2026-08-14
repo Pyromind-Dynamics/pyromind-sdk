@@ -28,6 +28,7 @@ from pyromind_sdk.client.models import (
     SandboxResponse,
     SandboxConfiguration,
     SandboxType,
+    ListQuery,
     ResourceConfig,
     ScreenResolution,
     SandboxExecResponse,
@@ -283,6 +284,26 @@ OSWORLD_BOOT_TIMEOUT = 600
 
 # OSWorld 自定义系统镜像默认值（juicefs subPath）。与示例保持一致。
 OSWORLD_SYSTEM_IMAGE_PATH = "template/Ubuntu.qcow2"
+
+
+class TestListSandboxes:
+    """Real list tests with pagination and filter parameters."""
+
+    def test_list_sandboxes_with_page(self, client):
+        page = client.sandboxes.list_page(
+            ListQuery(page_size=1, page_num=1)
+        )
+        assert page.total >= 0
+        assert len(page.sandboxes) <= 1
+        assert page.page_size == 1
+
+    def test_list_sandboxes_with_name_and_status(self, client):
+        sandboxes = client.sandboxes.list(
+            ListQuery(status="running")
+        )
+        assert isinstance(sandboxes, list)
+        for sandbox in sandboxes:
+            assert sandbox.status.lower() == "running"
 
 
 class TestCreateOSWorldSandbox:
