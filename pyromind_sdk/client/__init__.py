@@ -26,7 +26,14 @@ from .async_inference import AsyncInferenceClient
 from .async_studio import AsyncStudioClient
 from .async_echomind import AsyncEchoMindClient
 from .async_client import PyroMindAsyncAPIClient, PyroMindAsyncClient
-from .models import InternalIPResponse
+from .models import (
+    EchoMindPage,
+    InferencePage,
+    InternalIPResponse,
+    JupyterPage,
+    ListQuery,
+    SandboxPage,
+)
 
 __all__ = [
     # Sync clients
@@ -52,4 +59,9 @@ __all__ = [
     "AsyncEchoMindClient",
     "PyroMindAsyncAPIClient",
     "InternalIPResponse",
+    "SandboxPage",
+    "JupyterPage",
+    "InferencePage",
+    "EchoMindPage",
+    "ListQuery",
 ]

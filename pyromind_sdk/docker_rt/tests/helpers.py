@@ -27,6 +27,11 @@ class FakeKubeEnv:
         self.exit_code = 0
         self._phase = "Running"
         self.pod_ip: str | None = "10.0.0.9"
+        self.resumed = False
+
+    def resume(self) -> None:
+        self.resumed = True
+        self._phase = "Running"
 
     def cleanup(self) -> None:
         self.cleaned = True

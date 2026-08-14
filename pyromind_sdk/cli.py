@@ -13,10 +13,7 @@ from __future__ import annotations
 
 import argparse
 import os
-import socket
-import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -111,6 +108,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--sock", default=None,
         help="Unix socket path (defaults to $DOCKER_RT_SOCK or /tmp/docker-rt.sock)",
     )
+    docker_rt_context.add_argument(
+        "--restore",
+        action="store_true",
+        help="Switch back to the Docker context that was active before docker-rt",
+    )
 
     docker_install = subparsers.add_parser(
         "docker-install",
@@ -131,89 +133,39 @@ def _dump_yaml(config: Dict[str, Any]) -> str:
 
 
 def _start_docker_rt_daemon(args: argparse.Namespace) -> int:
-    cmd = [sys.executable, "-m", "pyromind_sdk.cli", "docker-rt"]
-    if args.sock:
-        cmd += ["--sock", args.sock]
+    from pyromind_sdk.docker_rt.daemon import start_daemon
 
-    child_env = os.environ.copy()
-    child_env["PYROMIND_DOCKER_RT_SKIP_WRAPPER_PROMPT"] = "1"
-    log_path = args.log_file or os.getenv("DOCKER_RT_LOG_FILE", "/tmp/docker-rt.log")
-    sock_path = args.sock or os.getenv("DOCKER_RT_SOCK", "/tmp/docker-rt.sock")
-    tcp_host = os.getenv("DOCKER_RT_HOST", "").strip()
-    tcp_port = int(os.getenv("DOCKER_RT_PORT", os.getenv("PORT", "2375")))
-    if not tcp_host:
-        from pyromind_sdk.docker_rt.backend.socklock import assert_socket_available
-
-        try:
-            assert_socket_available(sock_path)
-        except RuntimeError as exc:
-            print(f"docker-rt failed to start: {exc}", file=sys.stderr)
-            return 1
-    log_fh = open(log_path, "ab")
-    proc = subprocess.Popen(
-        cmd,
-        env=child_env,
-        stdin=subprocess.DEVNULL,
-        stdout=log_fh,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
+    return start_daemon(
+        sock=args.sock,
+        log_file=args.log_file,
+        pid_file=args.pid_file,
+        child_cmd=[sys.executable, "-m", "pyromind_sdk.cli", "docker-rt"],
     )
-    log_fh.close()
 
-    deadline = time.monotonic() + 5.0
-    started = False
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            break
-        if tcp_host:
-            probe = None
-            try:
-                probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                probe.settimeout(0.2)
-                probe.connect((tcp_host, tcp_port))
-                probe.close()
-                started = True
-                break
-            except OSError:
-                pass
-            finally:
-                if probe is not None:
-                    try:
-                        probe.close()
-                    except Exception:
-                        pass
-        elif os.path.exists(sock_path):
-            probe = None
-            try:
-                probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                probe.settimeout(0.2)
-                probe.connect(sock_path)
-                probe.close()
-                started = True
-                break
-            except OSError:
-                pass
-            finally:
-                if probe is not None:
-                    try:
-                        probe.close()
-                    except Exception:
-                        pass
-        time.sleep(0.1)
-    if not started and proc.poll() is None:
-        proc.terminate()
-    if not started:
-        print(
-            f"docker-rt failed to start (exit={proc.returncode}); see {log_path}",
-            file=sys.stderr,
-        )
+
+def _prepare_docker_rt_daemon_env() -> int:
+    from pyromind_sdk.docker_rt.bootstrap import check_docker_cli, prepare_env
+    from pyromind_sdk.docker_rt.register_context import (
+        activate_docker_rt_context,
+        save_previous_context,
+    )
+
+    try:
+        if not check_docker_cli():
+            return 1
+        prepare_env()
+        save_previous_context()
+        if activate_docker_rt_context() != 0:
+            print("docker-rt failed to switch Docker context.", file=sys.stderr)
+            return 1
+        os.environ["PYROMIND_DOCKER_RT_BOOTSTRAPPED"] = "1"
+        return 0
+    except KeyboardInterrupt:
+        print("docker-rt setup cancelled.", file=sys.stderr)
         return 1
-
-    if args.pid_file:
-        Path(args.pid_file).write_text(str(proc.pid), encoding="utf-8")
-
-    print(f"docker-rt started pid={proc.pid} log={log_path}")
-    return 0
+    except Exception as exc:
+        print(f"docker-rt setup failed: {exc}", file=sys.stderr)
+        return 1
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -243,6 +195,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.sock:
             os.environ["DOCKER_RT_SOCK"] = args.sock
         if args.daemon:
+            rc = _prepare_docker_rt_daemon_env()
+            if rc != 0:
+                return rc
             return _start_docker_rt_daemon(args)
         from pyromind_sdk.docker_rt.server import main as docker_rt_main
 
@@ -251,9 +206,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command in {"docker-rt-context", "docker_rt_context"}:
         if args.sock:
             os.environ["DOCKER_RT_SOCK"] = args.sock
+        if args.restore:
+            from pyromind_sdk.docker_rt.register_context import restore_main
+
+            return restore_main()
         from pyromind_sdk.docker_rt.register_context import main as docker_rt_context_main
 
-        return docker_rt_context_main()
+        return docker_rt_context_main([])
 
     if args.command == "terminal":
         from pyromind_sdk.terminal import run_terminal

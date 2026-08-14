@@ -39,6 +39,8 @@ pip install -e .
 
 # start the daemon (Docker Desktop / any reachable cluster)
 docker-rt
+# underscore alias also works
+# docker_rt
 # same daemon, via the unified SDK CLI
 # pyromind docker-rt
 
@@ -51,6 +53,10 @@ pyromind docker-rt --daemon
 
 # point the Docker CLI at it
 docker-rt-context
+# docker-rt backs up the current Docker context, switches to docker-rt, and
+# on exit (including kill -9) a watcher restores the backup, then exits
+# manual fallback if needed:
+docker-rt-context --restore
 
 docker version
 docker run -d --name demo busybox:1.36 sleep 300
@@ -58,14 +64,33 @@ docker ps
 docker exec demo echo hello
 ```
 
+Docker CLI is required before starting `docker-rt`; if it is missing the
+daemon refuses to start. On Linux you can install the static binary:
+
+```bash
+curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz \
+  | tar -xz -C /tmp
+sudo mv /tmp/docker/docker /usr/local/bin/docker
+chmod +x /usr/local/bin/docker
+```
+
+For other systems, see: <https://docs.docker.com/desktop/>
+
+`docker-rt` checks the local `~/.pyromind/bin/docker` wrapper at startup. If it
+is missing it asks to install it (or installs automatically in non-interactive
+shells), and it refreshes the wrapper when the SDK version changes. Declining
+the install stops docker-rt from starting. Run `pyromind-docker-uninstall` to
+remove the wrapper and its PATH entry.
+
 ### `pyromind docker-rt` parameters
 
 | Argument | Meaning | Default |
 |----------|---------|---------|
 | `--sock SOCK` | Unix socket path exposed to the Docker CLI | `$DOCKER_RT_SOCK` or `/tmp/docker-rt.sock` |
 | `--daemon` | Start docker-rt in the background and return immediately | disabled |
+| `--stop` | Stop a background docker-rt daemon and restore the previous Docker context | disabled |
 | `--log-file FILE` | Log file used by `--daemon` | `$DOCKER_RT_LOG_FILE` or `/tmp/docker-rt.log` |
-| `--pid-file FILE` | Write the daemon PID to `FILE` | not written |
+| `--pid-file FILE` | Write/read the daemon PID file | `/tmp/docker-rt.pid` |
 | `-h`, `--help` | Show help and exit | - |
 
 ```bash
@@ -87,7 +112,6 @@ pyromind docker-rt \
 | `DOCKER_RT_KUBE_CONTEXT` | `docker-desktop` | Kubernetes context name |
 | `DOCKER_RT_NAMESPACE` | `default` | Target Kubernetes namespace |
 | `DOCKER_RT_NODE_SELECTOR` | `none` | Pod `nodeSelector` (`key=val,...`; `none` disables) |
-| `DOCKER_RT_BACKEND` | `kube` | Backend: `kube` or `k8s-middleware` |
 | `DOCKER_RT_GPU_CARD` | empty | GPU card name when using `docker run --gpus` with the k8s-middleware backend |
 | `DOCKER_RT_INSPECT_MODE` | `sandbox` | `docker inspect` structure: `sandbox` or `standard` |
 | `DOCKER_RT_DEFAULT_IMAGE` | SWE-bench default image | `docker images` default entry |
@@ -99,11 +123,39 @@ pyromind docker-rt \
 | `DOCKER_RT_SERVICE_DNS` | `true` | Create ClusterIP Service for Compose service DNS |
 | `DOCKER_RT_ORPHAN_POLICY` | `adopt` | `adopt` restores managed Pods; `reap` deletes them on startup |
 | `DOCKER_RT_CLEANUP_ON_EXIT` | `false` | Delete managed Pods on SIGINT/SIGTERM when `true` |
+| `DOCKER_RT_CONTEXT_KEEP` | `true` | Keep Docker context switched to `docker-rt` while the daemon runs |
+| `DOCKER_RT_CONTEXT_KEEP_INTERVAL` | `5` | Seconds between context keeper checks |
 | `DOCKER_RT_JUICEFS_UID` | derived from namespace | JuiceFS subPath user id |
 | `DOCKER_RT_JUICEFS_PVC` | auto-discovered | JuiceFS PVC name |
 | `DOCKER_RT_JUICEFS_HOST_PREFIXES` | empty | Extra host path to JuiceFS subPath mappings |
 | `DOCKER_RT_CONTEXT` | `docker-rt` | Docker context name used by `docker-rt-context` |
 | `LOG_LEVEL` | `INFO` | Log level |
+
+For the default `k8s-middleware` backend, `docker-rt` checks
+`PYROMIND_API_KEY` and `PYROMIND_CLUSTER`; missing values are prompted one by
+one. After a successful connection it prints the active parameters in color
+and syncs the sandbox list once during startup.
+
+### Supported Docker commands
+
+| Command | Description | Supported parameters |
+|---------|-------------|----------------------|
+| `docker version` / `docker info` | Version and daemon info | none |
+| `docker ps` / `docker ps -a` | Container list; CUSTOM only by default | `-a`, `--filter name/id/status/ancestor/label`, `--no-trunc`, `--format` |
+| `docker inspect` | Container details | `--format`, `DOCKER_RT_INSPECT_MODE` |
+| `docker images` / `docker pull` | Image list; pull is a stub | image reference |
+| `docker run` | Create and start a sandbox | `-d`, `-it`, `--name`, `--cpus`, `--memory`, `--gpus`, `--gpu-card` / `--gpu_card`, `--label docker-rt.gpu-card=`, `-p` / `--publish`, `-v` / `--volume`, `-e` / `--env`, `-w` / `--workdir`, `--tmpfs` |
+| `docker create` | Create a local record | `--name`, `--cpus`, `--memory`, `--gpus`, `--gpu-card` / `--gpu_card`, `--label docker-rt.gpu-card=`, `-p`, `-v`, `-e`, `-w`, `--tmpfs` |
+| `docker start` | Create/start the Pod | none |
+| `docker exec` | Run a command or open a terminal | `-it`, `-w` / `--workdir` |
+| `docker cp` | Copy files | `CONTAINER:PATH <-> LOCAL_PATH` |
+| `docker stop` / `docker kill` | Stop or kill a container | none |
+| `docker restart` | Restart a container | none |
+| `docker rename` | Rename a container | none |
+| `docker rm` | Remove a container | `-f` / `--force`; wrapper prompts when running without `-f` |
+| `docker port` | Show port mappings | none |
+| `docker volume` / `docker network` | Volume and network stubs | basic `create` / `inspect` / `ls` / `rm` |
+| `docker compose up` | Limited Compose support | basic `up` / `down` |
 
 #### `docker inspect` output
 
@@ -140,7 +192,7 @@ docker create \
   --memory 8g \
   --gpus 1 \
   --label docker-rt.gpu-card=L40S \
-  busybox:1.36 sleep 300
+  swebench/swesmith.x86_64.oauthlib_1776_oauthlib.1fd52536
 ```
 
 To use the shorter `--gpu-card L40S` syntax, run `pyromind docker-rt` once.
@@ -177,6 +229,27 @@ docker create \
 
 `docker ps` only shows Running sandboxes by default; use `docker ps -a` to see
 Stopped sandboxes too.
+`docker ps` shows CUSTOM sandboxes only. To include OSWorld instances, use:
+
+```bash
+docker ps --filter label=docker-rt.type=osworld
+```
+
+Standard Docker filters are passed to the docker-rt server and applied there:
+
+```bash
+docker ps --filter name=test-sdk-1
+docker ps --filter id=sb-94d290
+docker ps --filter status=running
+docker ps --filter ancestor=swebench
+docker ps --filter label=docker-rt.type=custom
+```
+
+This is the correct way to search on the server side. `docker ps | grep XXXX`
+is client-side filtering: `grep` runs after the daemon has returned output, so
+the docker-rt server never receives `XXXX`. Standard Docker protocol does not
+provide a cross-field substring filter; use the explicit filter that matches
+the field you know (`name`, `id`, `status`, `ancestor`, or `label`).
 
 When the docker wrapper is active, `docker ps` uses the custom header:
 `ID / NAME / STATUS / PORTS / IMAGE`.
@@ -193,8 +266,8 @@ record; `docker start` actually creates/starts the sandbox
 |-----------|-------------|---------|
 | `--name` | sandbox name | `--name gpu-demo` |
 | image | container image | `busybox:1.36` |
-| `--cpus` | CPU count | `--cpus 4` |
-| `--memory` | memory size | `--memory 8g` |
+| `--cpus` | CPU count (default `1`) | `--cpus 4` |
+| `--memory` | memory size (default `2Gi`) | `--memory 8g` |
 | `--gpus` | GPU count | `--gpus 1` |
 | `--gpu-card` / `--gpu_card` | GPU card model, requires wrapper | `--gpu-card L40S` |
 | `--label docker-rt.gpu-card=L40S` | GPU card model, no wrapper needed | `--label docker-rt.gpu-card=L40S` |
@@ -220,6 +293,33 @@ docker create \
 
 docker start gpu-demo
 ```
+
+Minimal create / run / remove example:
+
+```bash
+docker create --name test-sdk-1 swebench/swesmith.x86_64.oauthlib_1776_oauthlib.1fd52536
+docker start test-sdk-1
+docker ps
+docker exec -it test-sdk-1 bash
+docker rm -f test-sdk-1
+```
+
+`--name` is required when you want to use a custom name. Without it,
+`docker create test-sdk-1 IMAGE` treats `test-sdk-1` as the image name.
+After creating with `--name`, `docker start test-sdk-1` and
+`docker rm -f test-sdk-1` work by name.
+Non-running containers can be removed directly with `docker rm NAME`; running
+containers need `-f` / `--force`. When using the docker-rt wrapper, a running
+`docker rm` without `-f` asks for confirmation first. If you see
+`No such container: NAME`, run `docker ps -a` to check the actual container
+name — it is only registered when create used `--name`.
+With the k8s-middleware backend, `docker run IMAGE` without `-d` or `-it`
+returns after the sandbox is Running with a hint, because foreground attach is
+not supported yet. Use `docker run -d` for a background sandbox or
+`docker run -it IMAGE bash` for an interactive terminal.
+
+For the k8s-middleware backend, omitting `--cpus`, `--memory` and `--gpus`
+uses `1 CPU / 2Gi memory` and no GPU.
 
 #### `docker ps` / `docker ps -a`
 
@@ -322,12 +422,8 @@ port-forward / NodePort.
 
 #### `docker events`
 
-```bash
-docker events --since 0s
-```
-
-Currently this is an in-process event stream; history is lost after daemon
-restart.
+`docker events` is not supported by the `k8s-middleware` backend. Use
+`docker ps` and `docker inspect` to check container state.
 
 #### Unsupported Docker commands
 
@@ -338,11 +434,15 @@ docker build
 docker buildx build
 docker compose build
 docker compose up --build
+docker logs
+docker events
 ```
 
 They depend on a real Docker daemon / BuildKit container lifecycle. Build the
 image with normal Docker/BuildKit first and push it to a registry, then use
-`docker run` with that image.
+`docker run` with that image. `docker logs` is not supported by the
+`k8s-middleware` backend; use `docker exec -it <container> bash` to view logs
+inside the container.
 
 Chain: `Docker CLI -> docker-rt daemon -> KubeEnvironment -> Kubernetes API`.
 The current implementation uses the official Kubernetes Python SDK directly; a
@@ -351,7 +451,6 @@ future adapter can replace that hop with the `k8s_middleware` HTTP API.
 To run through `k8s_middleware` OpenAPI instead:
 
 ```bash
-DOCKER_RT_BACKEND=k8s-middleware \
 PYROMIND_API_KEY=your-key \
 PYROMIND_BASE_URL=https://api.pyromind.ai/api/v1 \
 PYROMIND_CLUSTER=us-west-2 \
@@ -360,9 +459,21 @@ pyromind docker-rt
 
 In this mode `docker-rt` uses the `PyromindSDK` adapter, which reads the
 current sandbox, merges changed fields, and submits the full sandbox update.
+The backend is fixed to `k8s-middleware`.
 Local port forwarding is not supported for the PyromindSDK backend yet.
 `k8s_middleware` skips the StatefulSet rollout when only the sandbox `name`
 changes.
+
+### Common issues
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `docker ps` still shows the standard `CONTAINER ID ...` header | The wrapper is installed but the current shell has an old `PATH` | Run `source ~/.bashrc` or open a new terminal |
+| `docker` commands connect to `~/.docker/run/docker.sock` | Docker context is `desktop-linux` / `default` instead of `docker-rt` | Run `docker-rt-context`, or use `DOCKER_HOST=unix:///tmp/docker-rt.sock` |
+| `docker logs` / `docker events` wait forever or return unsupported | These commands are not supported by the `k8s-middleware` backend | Use `docker exec -it <container> bash`, `docker ps`, and `docker inspect` |
+| `docker cp` finishes but no `Successfully copied` message | An old wrapper redirected Docker output, and Docker CLI suppressed the message when stdout/stderr was not a TTY | Update the SDK/wrapper and restart docker-rt |
+| `docker rm <sb-...>` asks for confirmation but `docker rm <local-id>` returns an error | The wrapper can only inspect IDs that the current daemon still knows | Use the `sb-...` sandbox ID, or restart docker-rt to refresh local records |
+| An API error has no `trace_id` | The operation did not reach k8s-middleware (local validation only) | Only backend responses carrying `x-trace-id` will include `trace_id=` |
 
 ## Configuration
 

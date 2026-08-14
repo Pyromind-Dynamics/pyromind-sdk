@@ -10,6 +10,8 @@ import logging
 import aiohttp
 from typing import Optional, Dict, Any
 
+from .base import append_trace_id, extract_trace_id
+
 
 # Constants
 DEFAULT_API_BASE_URL = "https://api-portal.pyromind.ai/api/v1"
@@ -48,10 +50,11 @@ logger.addHandler(_handler)
 class PyroMindAsyncAPIError(Exception):
     """Base exception for PyroMind Async API errors"""
     def __init__(self, message: str, status_code: Optional[int] = None, response: Optional[Dict] = None, headers: Optional[Dict] = None):
-        self.message = message
+        self.message = append_trace_id(message, headers)
         self.status_code = status_code
         self.response = response
         self.headers = headers
+        self.trace_id = extract_trace_id(headers)
         super().__init__(self.message)
 
 

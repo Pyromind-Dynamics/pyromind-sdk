@@ -13,6 +13,8 @@ from .base import PyroMindClient
 from .models import (
     SandboxRequest,
     SandboxResponse,
+    SandboxPage,
+    ListQuery,
     InternalIPResponse,
     SandboxExecRequest,
     SandboxExecResponse,
@@ -80,14 +82,48 @@ class SandboxClient(PyroMindClient):
         }
         return converted_sandbox
     
-    def list(self) -> List[SandboxResponse]:
+    def list(
+        self,
+        query: Optional[ListQuery] = None,
+    ) -> List[SandboxResponse]:
         """
-        List all sandboxes
+        List sandboxes.
+
+        Automatically pages through all results matching ``query``.
         
         Returns:
             List of SandboxResponse objects
         """
-        response = self.get("/sandboxes")
+        query = query or ListQuery()
+        sandboxes: List[SandboxResponse] = []
+        current_page = 1
+        page_size = query.page_size or 200
+        while True:
+            page = self.list_page(
+                query.model_copy(update={"page_size": page_size, "page_num": current_page})
+            )
+            sandboxes.extend(page.sandboxes)
+            if not page.sandboxes or current_page * page_size >= page.total:
+                break
+            current_page += 1
+        return sandboxes
+
+    def list_page(
+        self,
+        query: Optional[ListQuery] = None,
+    ) -> SandboxPage:
+        """
+        Fetch one page of sandboxes with the total count.
+
+        Args:
+            query: Filters and pagination options.
+
+        Returns:
+            :class:`SandboxPage` with ``sandboxes`` and ``total``.
+        """
+        query = query or ListQuery()
+        params = query.to_params(default_page_size=200)
+        response = self.get("/sandboxes", params=params)
         # API returns {success: True, data: {...}} format
         data = self._extract_data(response)
         
@@ -102,14 +138,22 @@ class SandboxClient(PyroMindClient):
         else:
             sandboxes_data = []
         
-        # Convert API response format to SDK format
+        pagination = data.get("pagination") if isinstance(data, dict) else {}
+        pagination = pagination if isinstance(pagination, dict) else {}
+        total = int(pagination.get("total") or len(sandboxes_data) or 0)
+
         converted_sandboxes = []
         for sandbox in sandboxes_data if isinstance(sandboxes_data, list) else []:
             if isinstance(sandbox, dict):
                 converted_sandbox = self._convert_sandbox_data(sandbox)
                 converted_sandboxes.append(SandboxResponse(**converted_sandbox))
-        
-        return converted_sandboxes
+
+        return SandboxPage(
+            sandboxes=converted_sandboxes,
+            total=total,
+            page_size=int(pagination.get("pageSize") or query.page_size or 200),
+            page_num=int(pagination.get("pageNum") or query.page_num or 1),
+        )
     
     def create(self, request: SandboxRequest) -> SandboxResponse:
         """

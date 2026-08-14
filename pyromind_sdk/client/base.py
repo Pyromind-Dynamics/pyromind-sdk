@@ -86,6 +86,54 @@ def resolve_base_url_from_cluster(cluster: str) -> str:
     return base.rstrip("/") + "/api/v1"
 
 ERROR_MESSAGE_MAX_LENGTH = 500
+_TRACE_ID_HEADER_KEYS = {
+    "x-trace-id",
+}
+
+
+def extract_trace_id(headers: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return the API trace id from the ``x-trace-id`` response header."""
+    for key, value in (headers or {}).items():
+        normalized = str(key).lower().replace("_", "-")
+        if normalized in _TRACE_ID_HEADER_KEYS:
+            trace_id = str(value).strip()
+            if trace_id:
+                return trace_id
+    return None
+
+
+def append_trace_id(message: str, headers: Optional[Dict[str, Any]]) -> str:
+    """Append ``(trace_id=...)`` to an API error message when available."""
+    trace_id = extract_trace_id(headers)
+    if trace_id and f"trace_id={trace_id}" not in message:
+        return f"{message} (trace_id={trace_id})"
+    return message
+
+
+def trace_id_from_exception(exc: BaseException) -> Optional[str]:
+    """Find a trace id on an exception or its cause chain."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        trace_id = getattr(current, "trace_id", None) or extract_trace_id(
+            getattr(current, "headers", None)
+        )
+        if trace_id:
+            return str(trace_id)
+        current = getattr(current, "__cause__", None) or getattr(
+            current, "__context__", None
+        )
+    return None
+
+
+def format_exception_message(exc: BaseException) -> str:
+    """Format any exception, appending a trace id from the cause chain."""
+    message = str(exc)
+    trace_id = trace_id_from_exception(exc)
+    if trace_id:
+        return append_trace_id(message, {"x-trace-id": trace_id})
+    return message
 
 # Default log format and level
 DEFAULT_LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -110,10 +158,11 @@ logger.addHandler(_handler)
 class PyroMindAPIError(Exception):
     """Base exception for PyroMind API errors"""
     def __init__(self, message: str, status_code: Optional[int] = None, response: Optional[Dict] = None, headers: Optional[Dict] = None):
-        self.message = message
+        self.message = append_trace_id(message, headers)
         self.status_code = status_code
         self.response = response
         self.headers = headers
+        self.trace_id = extract_trace_id(headers)
         super().__init__(self.message)
 
 
@@ -217,14 +266,7 @@ class PyroMindClient:
         """
         if isinstance(response, dict):
             if "data" in response:
-                data = response["data"]
-                if (
-                    isinstance(data, dict)
-                    and "sandboxes" in data
-                    and isinstance(data["sandboxes"], list)
-                ):
-                    return data["sandboxes"]
-                return data
+                return response["data"]
             return response
         return response
     

@@ -26,6 +26,7 @@ import pytest
 from pyromind_sdk import PyroMindAPIClient, PyroMindAPIError
 from pyromind_sdk.client.models import (
     EchoMindJobRequest,
+    ListQuery,
     ResourceConfig,
 )
 
@@ -263,6 +264,22 @@ class TestListEchoMindInstances:
         """Test the list_echomind_example function"""
         instances = list_echomind_example()
         assert isinstance(instances, list)
+
+    def test_list_echomind_with_page(self, client):
+        page = client.echomind.list_page(
+            ListQuery(page_size=2, page_num=1)
+        )
+        assert page.total >= 0
+        assert len(page.jobs) <= 2
+        assert page.page_size == 2
+
+    def test_list_echomind_with_status_filter(self, client):
+        instances = client.echomind.list(
+            ListQuery(status="running")
+        )
+        assert isinstance(instances, list)
+        for instance in instances:
+            assert instance.status.lower() == "running"
 
 
 class TestCreateEchoMindInstance:

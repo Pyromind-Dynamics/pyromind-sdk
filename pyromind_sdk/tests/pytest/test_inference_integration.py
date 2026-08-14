@@ -24,6 +24,7 @@ import pytest
 from pyromind_sdk import PyroMindAPIClient, PyroMindAPIError
 from pyromind_sdk.client.models import (
     InferenceJobRequest,
+    ListQuery,
     ResourceConfig,
 )
 
@@ -267,6 +268,22 @@ class TestListInferenceJobs:
         """Test the list_inference_jobs_example function"""
         jobs = list_inference_jobs_example()
         assert isinstance(jobs, list)
+
+    def test_list_inference_with_page(self, client):
+        page = client.inference.list_page(
+            ListQuery(page_size=2, page_num=1)
+        )
+        assert page.total >= 0
+        assert len(page.jobs) <= 2
+        assert page.page_size == 2
+
+    def test_list_inference_with_status_filter(self, client):
+        jobs = client.inference.list(
+            ListQuery(status="running")
+        )
+        assert isinstance(jobs, list)
+        for job in jobs:
+            assert job.status.lower() == "running"
 
 
 class TestCreateInferenceJob:

@@ -13,14 +13,45 @@
 | `docker volume` / `network` | 命名卷 + 网络 stub（够 Compose 用） |
 | `docker run` / `create` / `start` | `run`=创建并启动；`create` 只建本地记录；`start` 才真正创建/启动 Pod |
 | `docker run -p` / `docker port` | kube 后端本机 TCP 转发；PyromindSDK 后端仅显示端口映射 |
-| `docker logs`（含 `-f`） | Pod logs |
 | `docker exec`（含 `-it`） | K8s exec + TCP Upgrade |
 | `docker stop` / `kill` / `rm` / `restart` / `rename` | 生命周期 |
 | `docker cp` | tar via pod exec（**流式**，不整包进内存） |
-| `docker events` | 进程内事件流 |
 | `docker compose up`（受限） | 见下方「Compose（OSM-style）」 |
 
-**语义：** `docker run IMAGE CMD` 会把 `CMD` 作为 Pod 主进程；短命令结束后容器为 `exited`，仍可用 `docker logs`。
+**语义：** `docker run IMAGE CMD` 会把 `CMD` 作为 Pod 主进程；短命令结束后容器为 `exited`。
+
+`docker logs` 在 k8s-middleware 后端不支持，已禁用；查看容器内日志请使用
+`docker exec -it <container> bash`。
+`docker events` 同样不支持；查看容器状态请使用 `docker ps` / `docker inspect`。
+
+**最简示例（必须用 `--name`）：**
+
+```bash
+docker create --name test-sdk-1 swebench/swesmith.x86_64.oauthlib_1776_oauthlib.1fd52536
+docker start test-sdk-1
+docker ps
+docker exec -it test-sdk-1 bash
+docker rm -f test-sdk-1
+```
+
+`docker create test-sdk-1 IMAGE` 会把 `test-sdk-1` 当成镜像名；要按名称
+start/rm，必须先 `--name`。
+非 running 容器可直接 `docker rm NAME`；running 容器需要 `-f`，wrapper 会
+在缺少 `-f` 时先询问确认。
+k8s-middleware 后端下，`docker run IMAGE` 不带 `-d` / `-it` 时，sandbox
+Running 后会直接返回并提示，因为前台 attach 暂不支持；需要后台运行用
+`docker run -d`，需要交互终端用 `docker run -it IMAGE bash`。
+
+## 常见问题
+
+| 现象 | 原因 | 处理方式 |
+|------|------|----------|
+| `docker ps` 还是标准表头 | wrapper 已安装但当前 shell PATH 未刷新 | `source ~/.bashrc` 或重开终端 |
+| 命令连到 Docker Desktop socket | context 不是 `docker-rt` | `docker-rt-context` 或 `DOCKER_HOST=unix:///tmp/docker-rt.sock` |
+| `docker logs` / `docker events` 等待或不支持 | k8s-middleware 不支持 | 用 `docker exec -it` / `docker ps` / `docker inspect` |
+| `docker cp` 无成功文案 | 旧 wrapper 重定向输出导致 Docker 不打印 | 升级 SDK/wrapper 并重启 docker-rt |
+| `docker rm <本地ID>` 行为不一致 | daemon 已不认识该本地 ID | 使用 `sb-...` ID 或重启 daemon |
+| API 错误无 trace_id | 未请求到 k8s-middleware | 只有带 `x-trace-id` 的后端响应会显示 |
 
 ## 架构
 
@@ -40,17 +71,35 @@ Docker CLI  --(context / DOCKER_HOST)-->  unix:///tmp/docker-rt.sock
 已集成进 `pyromind-sdk`，可直接用：
 
 ```bash
-pyromind docker-rt                # 前台
+pyromind docker-rt                # 前台（后端固定 k8s-middleware）
 pyromind docker-rt --daemon       # 后台
+docker-rt --stop                  # 停止后台 daemon 并恢复 context
+docker_rt                         # 与 docker-rt 等价的直接启动命令
 ```
+
+默认 `k8s-middleware` 后端会检查 `PYROMIND_API_KEY` / `PYROMIND_CLUSTER`，
+缺失时逐个提示输入；连接成功后彩色打印参数，并同步一次 sandbox。
 
 ## 前置条件
 
 - Python 3.10+
 - 可访问目标集群的 kubeconfig（默认本目录 [`.kube.yaml`](.kube.yaml)；可用 `DOCKER_RT_KUBECONFIG` / `KUBECONFIG` 覆盖）
 - 对目标 namespace 有 create/get/delete/patch Pod、`pods/exec`、`pods/log` 权限
-- 本机安装 Docker CLI（只需 CLI，不必跑真实 Docker daemon）。Ubuntu 上请参考官方文档安装：  
-  [Install Docker Engine on Ubuntu](https://docs.docker.com/engine/install/ubuntu/)
+- 本机必须先安装 Docker CLI（只需 CLI，不必跑真实 Docker daemon）。未检测到
+  Docker 时 docker-rt 会拒绝启动并提示。Linux 可安装静态二进制：
+
+  ```bash
+  curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz \
+    | tar -xz -C /tmp
+  sudo mv /tmp/docker/docker /usr/local/bin/docker
+  chmod +x /usr/local/bin/docker
+  ```
+
+  其他系统请查看：<https://docs.docker.com/desktop/>
+
+  `docker-rt` 启动时会自动检查/安装/更新 `~/.pyromind/bin/docker` wrapper；
+  交互式确认时不同意会停止启动。卸载 wrapper 使用 `pyromind-docker-uninstall`。
+
 - Compose / `docker build`：本机 `buildctl` + 可连的 buildkitd；集群可 pull 的 registry；对 namespace 有 Service create/delete 权限
 
 ## 安装与启动
@@ -73,6 +122,11 @@ python server.py   # 默认 /tmp/docker-rt.sock，自动用 .kube.yaml
 ```bash
 chmod +x scripts/register_context.sh
 DOCKER_RT_SOCK=/tmp/docker-rt.sock ./scripts/register_context.sh
+
+# docker-rt 启动前自动备份当前 Docker context 并切换到 docker-rt；
+# 退出（包括 kill -9）时由 watcher 从备份恢复，watcher 恢复完成后自己退出；
+# 需要手动恢复时：
+docker-rt-context --restore
 ```
 
 ## 冒烟
@@ -93,7 +147,6 @@ curl -sS http://127.0.0.1:8080/ | head
 docker run -it --name sb3 -v /workspace:/workspace -w /workspace ubuntu:22.04 bash
 docker rm -f sb3 web
 docker cp sb2:/etc/os-release /tmp/os-release
-docker events --since 0s &
 docker kill sb2
 docker rm -f sb2
 ```
@@ -154,7 +207,8 @@ docker run -it -v "$PWD:/workspace" -w /workspace ubuntu:22.04 bash
 
 内存也可通过 Docker 原生参数：`docker run -m 8g`（`HostConfig.Memory`，单位字节）。  
 CPU 也可通过：`docker run --cpus=2`（`HostConfig.NanoCpus`）或 `CpuQuota`/`CpuPeriod`。  
-未设置时仍由 namespace LimitRanger 填默认值。
+k8s-middleware 后端不传 `--cpus` / `--memory` / `--gpus` 时，默认使用
+`1 CPU / 2Gi 内存`，且不带 GPU。
 
 ## 重启恢复（adopt）
 
@@ -172,6 +226,8 @@ docker ps   # 仍能看到 sb1
 |------|------|------|
 | `DOCKER_RT_ORPHAN_POLICY` | `adopt` | `adopt` 恢复；`reap` 启动时删孤儿 |
 | `DOCKER_RT_CLEANUP_ON_EXIT` | `false` | `true` 时 SIGINT/TERM 删受管 Pod |
+| `DOCKER_RT_CONTEXT_KEEP` | `true` | 运行期间保持 Docker context 为 `docker-rt` |
+| `DOCKER_RT_CONTEXT_KEEP_INTERVAL` | `5` | context keeper 校验间隔（秒） |
 
 `kill -9` 后依赖下次启动 adopt/reap。
 
@@ -184,7 +240,6 @@ docker ps   # 仍能看到 sb1
 | `DOCKER_RT_KUBECONFIG` / `KUBECONFIG` | `.kube.yaml`（若存在） | kubeconfig 路径 |
 | `DOCKER_RT_KUBE_CONTEXT` | `docker-desktop` | Kubernetes context 名 |
 | `DOCKER_RT_NAMESPACE` | `default` | 目标 namespace |
-| `DOCKER_RT_BACKEND` | `kube` | 后端：`kube` / `k8s-middleware` |
 | `DOCKER_RT_GPU_CARD` | （空） | k8s-middleware 后端 `--gpus` 对应的 GPU 卡型号 |
 | `DOCKER_RT_INSPECT_MODE` | `sandbox` | `docker inspect` 结构：`sandbox` / `standard` |
 | `DOCKER_RT_DEFAULT_IMAGE` | `backend.kube` DEFAULT | `docker images` 默认条目 |
@@ -237,6 +292,19 @@ docker create \
 卸载前执行 `pyromind docker-uninstall` 清理 wrapper 和 PATH。
 
 默认 `docker ps` 只显示 Running；Stopped 用 `docker ps -a` 查看。
+默认只展示 CUSTOM sandbox；OSWorld 用 filter 查看：
+`docker ps --filter label=docker-rt.type=osworld`。
+标准 filter 由服务端处理：
+
+```bash
+docker ps --filter name=test-sdk-1
+docker ps --filter id=sb-94d290
+docker ps --filter status=running
+docker ps --filter ancestor=swebench
+```
+
+`docker ps | grep XXXX` 是客户端过滤，daemon 收不到 `XXXX`；标准 Docker
+协议没有跨字段全文搜索，请明确字段后用标准 filter。
 docker wrapper 生效后，`docker ps` 表头为 `ID / NAME / STATUS / PORTS / IMAGE`。
 
 不支持：`docker build`、`docker buildx build`、`docker compose build`、

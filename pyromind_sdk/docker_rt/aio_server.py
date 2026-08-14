@@ -74,9 +74,29 @@ from .backend.resources import (  # noqa: E402
     resolve_memory_resources,
 )
 from .backend.pyromind_sdk_env import PyromindSDK  # noqa: E402
+from .bootstrap import check_connection, print_connected  # noqa: E402
+from .register_context import (  # noqa: E402
+    ensure_docker_rt_context,
+    restore_main as restore_docker_context,
+)
 from .api import images as images_mod  # noqa: E402
+from pyromind_sdk.client.base import format_exception_message  # noqa: E402
 
 logger = logging.getLogger("docker_rt")
+
+
+async def _keep_docker_rt_context(app: web.Application) -> None:
+    """Periodically make sure the Docker CLI still points at docker-rt."""
+    interval = float(os.getenv("DOCKER_RT_CONTEXT_KEEP_INTERVAL", "5"))
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(ensure_docker_rt_context)
+        except Exception:
+            logger.warning(
+                "docker-rt context keeper failed",
+                exc_info=True,
+            )
 
 
 def _ws_returncode(ws: Any) -> int:
@@ -140,7 +160,7 @@ async def _start_port_forward(record: Any) -> None:
             publish_all_ports=bool(getattr(record, "publish_all_ports", False)),
         )
     except ValueError as exc:
-        raise RuntimeError(str(exc)) from exc
+        raise RuntimeError(format_exception_message(exc)) from exc
     if not mappings:
         return
     kube_env = record.kube_env
@@ -549,11 +569,11 @@ def _status_text(state: ContainerState) -> str:
 def _sandbox_identity(c: Any) -> tuple[str | None, str | None]:
     """Return (sandbox_id, sandbox_status) for PyromindSDK-backed records."""
     kube_env = getattr(c, "kube_env", None)
-    if kube_env is None or not hasattr(kube_env, "sandbox_id"):
-        return None, None
     return (
-        getattr(kube_env, "sandbox_id", None),
-        getattr(kube_env, "sandbox_status", None),
+        getattr(kube_env, "sandbox_id", None)
+        or getattr(c, "sandbox_id", None),
+        getattr(kube_env, "sandbox_status", None)
+        or getattr(c, "sandbox_status", None),
     )
 
 
@@ -594,6 +614,7 @@ def _to_list_item(c: Any) -> dict[str, Any]:
     sandbox_id, sandbox_status = _sandbox_identity(c)
     display_id = sandbox_id or c.id
     labels: dict[str, Any] = {"com.docker-rt.pod": c.pod_name or ""}
+    labels["docker-rt.type"] = _container_type(c)
     kube_env = getattr(c, "kube_env", None)
     if kube_env is not None:
         resources = getattr(kube_env, "resources", None) or {}
@@ -645,6 +666,80 @@ def _to_list_item(c: Any) -> dict[str, Any]:
         "Mounts": [],
     }
     return result
+
+
+def _container_type(c: Any) -> str:
+    kube_env = getattr(c, "kube_env", None)
+    sandbox_type = getattr(kube_env, "sandbox_type", None)
+    if sandbox_type:
+        return str(sandbox_type).lower()
+    return "custom"
+
+
+def _parse_filters(filters: str | None) -> dict[str, list[str]]:
+    if not filters:
+        return {}
+    try:
+        data = json.loads(filters)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    parsed: dict[str, list[str]] = {}
+    for key, values in data.items():
+        if isinstance(values, dict):
+            parsed[str(key)] = [str(v) for v in values.keys()]
+        elif isinstance(values, list):
+            parsed[str(key)] = [str(v) for v in values]
+    return parsed
+
+
+def _has_type_filter(filters: dict[str, list[str]]) -> bool:
+    for item in filters.get("label") or []:
+        key, _, _ = item.partition("=")
+        if key in ("docker-rt.type", "type"):
+            return True
+    return False
+
+
+def _matches_filters(c: Any, filters: dict[str, list[str]]) -> bool:
+    if not filters:
+        return True
+    display_id = c.id
+    sandbox_id, sandbox_status = _sandbox_identity(c)
+    if sandbox_id:
+        display_id = sandbox_id
+    state = (sandbox_status or c.state.value).lower()
+    labels = _to_list_item(c).get("Labels", {})
+
+    for key, values in filters.items():
+        if key == "name":
+            if not any(
+                value.lstrip("/") in c.name or value.lstrip("/") in display_id
+                for value in values
+            ):
+                return False
+        elif key == "id":
+            if not any(display_id.startswith(value) for value in values):
+                return False
+        elif key == "status":
+            if not any(value.lower() == state for value in values):
+                return False
+        elif key == "ancestor":
+            if not any(
+                value.lower() in str(c.image or "").lower()
+                for value in values
+            ):
+                return False
+        elif key == "label":
+            for item in values:
+                label_key, sep, label_value = item.partition("=")
+                if not sep:
+                    if label_key not in labels:
+                        return False
+                elif labels.get(label_key) != label_value:
+                    return False
+    return True
 
 
 def _to_inspect(c: Any) -> dict[str, Any]:
@@ -867,11 +962,16 @@ def _to_inspect(c: Any) -> dict[str, Any]:
 
 async def list_containers(request: web.Request) -> web.Response:
     store: ContainerStore = request.app["store"]
-    backend = os.getenv("DOCKER_RT_BACKEND", "kube").lower().replace("-", "_")
-    if backend in {"k8s_middleware", "pyromind_sdk", "pyromind"}:
-        await reconcile_pyromind_sandboxes(store)
+    await reconcile_pyromind_sandboxes(store)
     all_flag = request.rel_url.query.get("all", "0") in {"1", "true", "True"}
-    return _json([_to_list_item(c) for c in store.list(all_containers=all_flag)])
+    records = store.list(all_containers=all_flag)
+    filters = _parse_filters(request.rel_url.query.get("filters"))
+    if not _has_type_filter(filters):
+        records = [
+            c for c in records if _container_type(c) != "osworld"
+        ]
+    records = [c for c in records if _matches_filters(c, filters)]
+    return _json([_to_list_item(c) for c in records])
 
 
 async def create_container(request: web.Request) -> web.Response:
@@ -963,9 +1063,9 @@ async def create_container(request: web.Request) -> web.Response:
             gpu_card=gpu_card,
         )
     except ValueError as exc:
-        return _err(400, str(exc))
+        return _err(400, format_exception_message(exc))
     except KeyError as exc:
-        return _err(409, str(exc))
+        return _err(409, format_exception_message(exc))
 
     # Record compose network endpoints (stub)
     endpoints = networking_config.get("EndpointsConfig") or {}
@@ -1001,6 +1101,39 @@ async def start_container(request: web.Request) -> web.Response:
     async with record.lock:
         if record.state == ContainerState.RUNNING:
             return _empty(304)
+        if record.kube_env is not None and hasattr(record.kube_env, "resume"):
+            try:
+                await asyncio.to_thread(record.kube_env.resume)
+            except Exception as exc:
+                record.state = ContainerState.DEAD
+                record.error = format_exception_message(exc)
+                logger.exception("resume failed")
+                return _err(500, format_exception_message(exc))
+            record.state = ContainerState.RUNNING
+            record.error = None
+            record.finished_at = None
+            record.started_at = time.time()
+            record.pod_name = getattr(record.kube_env, "sandbox_id", None)
+            record.sandbox_id = getattr(record.kube_env, "sandbox_id", None)
+            record.sandbox_status = getattr(
+                record.kube_env, "sandbox_status", "Running"
+            )
+            try:
+                await _start_port_forward(record)
+            except Exception as exc:
+                try:
+                    await asyncio.to_thread(record.kube_env.cleanup)
+                except Exception:
+                    logger.exception("resume cleanup failed")
+                record.kube_env = None
+                record.pod_name = None
+                record.state = ContainerState.DEAD
+                record.error = format_exception_message(exc)
+                logger.exception("port publish failed")
+                return _err(500, format_exception_message(exc))
+            _spawn_pod_watch(request.app, record.id)
+            await _emit(request, action="start", record=record)
+            return _empty(204)
         pull_image = store.resolve_image(record.image)
         hostname = resolve_service_name(
             labels=getattr(record, "labels", None) or {},
@@ -1043,11 +1176,13 @@ async def start_container(request: web.Request) -> web.Response:
             )
         except Exception as exc:
             record.state = ContainerState.DEAD
-            record.error = str(exc)
+            record.error = format_exception_message(exc)
             logger.exception("start failed")
-            return _err(500, str(exc))
+            return _err(500, format_exception_message(exc))
 
         record.kube_env = kube_env
+        record.sandbox_id = getattr(kube_env, "sandbox_id", None)
+        record.sandbox_status = getattr(kube_env, "sandbox_status", None)
         record.pod_name = kube_env.pod_name
         record.started_at = time.time()
         record.error = None
@@ -1067,9 +1202,9 @@ async def start_container(request: web.Request) -> web.Response:
                 record.kube_env = None
                 record.pod_name = None
                 record.state = ContainerState.DEAD
-                record.error = str(exc)
+                record.error = format_exception_message(exc)
                 logger.exception("port publish failed")
-                return _err(500, str(exc))
+                return _err(500, format_exception_message(exc))
             # ClusterIP Service for compose DNS (ownerRef → Pod)
             if (
                 not isinstance(kube_env, PyromindSDK)
@@ -1206,8 +1341,14 @@ async def stop_container(request: web.Request) -> web.Response:
                 await asyncio.to_thread(stop)
             else:
                 await asyncio.to_thread(record.kube_env.cleanup)
-            record.kube_env = None
-        record.pod_name = None
+            record.sandbox_status = getattr(
+                record.kube_env, "sandbox_status", "Stopped"
+            )
+        record.pod_name = (
+            getattr(record.kube_env, "sandbox_id", None)
+            if record.kube_env is not None
+            else None
+        )
         record.state = ContainerState.EXITED
         record.exit_code = 0
         record.finished_at = time.time()
@@ -1232,12 +1373,26 @@ async def kill_container(request: web.Request) -> web.Response:
     if record is None:
         return _err(404, f"No such container: {cid}")
 
+    if record.kube_env is not None and hasattr(record.kube_env, "refresh_phase"):
+        try:
+            phase = await asyncio.to_thread(record.kube_env.refresh_phase)
+            if phase == "NotFound":
+                record.state = ContainerState.EXITED
+                record.finished_at = time.time()
+                record.pod_name = None
+        except Exception:
+            logger.debug("kill refresh failed id=%s", cid[:12], exc_info=True)
+
     async with record.lock:
         if record.state != ContainerState.RUNNING:
             return _err(409, f"Container {cid} is not running")
         await _stop_port_forward(record)
         if record.kube_env is not None:
-            await asyncio.to_thread(record.kube_env.cleanup)
+            try:
+                await asyncio.to_thread(record.kube_env.cleanup)
+            except Exception as exc:
+                record.error = format_exception_message(exc)
+                return _err(500, format_exception_message(exc))
             record.kube_env = None
         record.pod_name = None
         record.state = ContainerState.EXITED
@@ -1263,7 +1418,10 @@ async def restart_container(request: web.Request) -> web.Response:
         try:
             await asyncio.to_thread(record.kube_env.restart)
         except Exception as exc:
-            return _err(500, f"restart backend failed: {exc}")
+            return _err(
+                500,
+                f"restart backend failed: {format_exception_message(exc)}",
+            )
         record.state = ContainerState.RUNNING
         record.error = None
         record.finished_at = None
@@ -1324,9 +1482,9 @@ async def restart_container(request: web.Request) -> web.Response:
             )
         except Exception as exc:
             record.state = ContainerState.DEAD
-            record.error = str(exc)
+            record.error = format_exception_message(exc)
             logger.exception("restart failed")
-            return _err(500, str(exc))
+            return _err(500, format_exception_message(exc))
         record.kube_env = kube_env
         record.pod_name = kube_env.pod_name
         record.started_at = time.time()
@@ -1346,9 +1504,9 @@ async def restart_container(request: web.Request) -> web.Response:
                 record.kube_env = None
                 record.pod_name = None
                 record.state = ContainerState.DEAD
-                record.error = str(exc)
+                record.error = format_exception_message(exc)
                 logger.exception("port publish failed on restart")
-                return _err(500, str(exc))
+                return _err(500, format_exception_message(exc))
             if (
                 not isinstance(kube_env, PyromindSDK)
                 and os.getenv("DOCKER_RT_SERVICE_DNS", "true").lower() not in {
@@ -1408,7 +1566,7 @@ async def rename_container(request: web.Request) -> web.Response:
     try:
         await store.rename(record, new_name)
     except KeyError as exc:
-        return _err(409, str(exc))
+        return _err(409, format_exception_message(exc))
     if record.kube_env is not None and hasattr(record.kube_env, "rename"):
         try:
             await asyncio.to_thread(record.kube_env.rename, new_name)
@@ -1417,7 +1575,10 @@ async def rename_container(request: web.Request) -> web.Response:
                 await store.rename(record, old_name)
             except Exception:
                 logger.exception("failed to rollback local rename")
-            return _err(500, f"rename backend failed: {exc}")
+            return _err(
+                500,
+                f"rename backend failed: {format_exception_message(exc)}",
+            )
 
     if record.kube_env is not None and record.state == ContainerState.RUNNING:
         try:
@@ -1516,11 +1677,19 @@ async def delete_container(request: web.Request) -> web.Response:
     async with record.lock:
         if record.state == ContainerState.RUNNING:
             if not force:
-                return _err(409, "container is running: stop or use force=true")
+                return _err(
+                    409,
+                    f"container {cid} is running: docker rm -f {cid}",
+                )
+        if record.kube_env is not None:
             await _stop_port_forward(record)
-            if record.kube_env is not None:
+            try:
                 await asyncio.to_thread(record.kube_env.cleanup)
-                record.kube_env = None
+            except Exception:
+                logger.exception("container cleanup failed")
+            record.kube_env = None
+            record.sandbox_id = None
+            record.sandbox_status = None
             record.pod_name = None
             record.state = ContainerState.EXITED
             record.exit_code = 0
@@ -1541,12 +1710,19 @@ async def inspect_container(request: web.Request) -> web.Response:
     cid = request.match_info["id"]
     record = store.get(cid)
     if record is None:
-        backend = os.getenv("DOCKER_RT_BACKEND", "kube").lower().replace("-", "_")
-        if backend in {"k8s_middleware", "pyromind_sdk", "pyromind"}:
-            await reconcile_pyromind_sandboxes(store, force=True)
-            record = store.get(cid)
+        await reconcile_pyromind_sandboxes(store, force=True)
+        record = store.get(cid)
     if record is None:
         return _err(404, f"No such container: {cid}")
+    if record.kube_env is not None and hasattr(record.kube_env, "refresh_phase"):
+        try:
+            phase = await asyncio.to_thread(record.kube_env.refresh_phase)
+            if phase == "NotFound" and record.state == ContainerState.RUNNING:
+                record.state = ContainerState.EXITED
+                record.finished_at = time.time()
+                record.pod_name = None
+        except Exception:
+            logger.debug("inspect refresh failed id=%s", cid[:12], exc_info=True)
     return _json(_to_inspect(record))
 
 
@@ -1556,6 +1732,12 @@ async def container_logs(request: web.Request) -> web.StreamResponse:
     record = store.get(cid)
     if record is None:
         return _err(404, f"No such container: {cid}")
+    if isinstance(record.kube_env, PyromindSDK):
+        return _err(
+            501,
+            f"docker logs is not supported by k8s-middleware; "
+            f"use 'docker exec -it {cid} bash' to view logs inside the container",
+        )
     # Keep logs readable after the main process exits (pod retained until rm).
     if record.kube_env is None or record.state not in {
         ContainerState.RUNNING,
@@ -1703,6 +1885,11 @@ async def delete_image(request: web.Request) -> web.Response:
 
 async def stream_events(request: web.Request) -> web.StreamResponse:
     """GET /events — long-lived JSON event stream."""
+    return _err(
+        501,
+        "docker events is not supported by k8s-middleware; "
+        "use 'docker ps' and 'docker inspect' to check container state",
+    )
     bus: EventBus = request.app["events"]
     since_raw = request.rel_url.query.get("since", "0")
     try:
@@ -1762,7 +1949,7 @@ async def get_container_archive(request: web.Request) -> web.StreamResponse | we
     try:
         stat = await asyncio.to_thread(path_stat, record.kube_env, path)
     except Exception as exc:
-        return _err(500, str(exc))
+        return _err(500, format_exception_message(exc))
     if stat is None:
         return _err(404, f"Could not find the file {path} in container {cid}")
 
@@ -1836,7 +2023,7 @@ async def head_container_archive(request: web.Request) -> web.Response:
     try:
         stat = await asyncio.to_thread(path_stat, record.kube_env, path)
     except Exception as exc:
-        return _err(500, str(exc))
+        return _err(500, format_exception_message(exc))
     if stat is None:
         return _err(404, f"Could not find the file {path} in container {cid}")
 
@@ -1875,7 +2062,7 @@ async def put_container_archive(request: web.Request) -> web.Response:
         await asyncio.to_thread(put_archive, record.kube_env, path, data)
     except Exception as exc:
         logger.exception("archive put failed id=%s", cid[:12])
-        return _err(500, str(exc))
+        return _err(500, format_exception_message(exc))
     return _empty(200)
 
 
@@ -2370,6 +2557,23 @@ async def _hijack_session(
         return resp
 
     if isinstance(kube_env, PyromindSDK):
+        if cmd is None and not stdin and not tty:
+            # k8s-middleware has no main-process log stream yet. Close the
+            # non-interactive foreground attach after the sandbox is Running
+            # instead of hanging like a terminal websocket.
+            message = (
+                b"docker-rt: foreground attach is not supported by "
+                b"k8s-middleware; use -d or -it.\r\n"
+            )
+            try:
+                await resp.write(frame_stdout(message))
+                await resp.drain()
+            except (ConnectionResetError, RuntimeError, ConnectionError):
+                pass
+            session.running = False
+            session.exit_code = 0
+            _force_close_hijack(request, resp)
+            return resp
         return await _hijack_pyromind_terminal(
             request,
             resp,
@@ -2746,8 +2950,9 @@ async def build_image(request: web.Request) -> web.StreamResponse:
             await resp.drain()
     except Exception as exc:
         failed = True
+        message = format_exception_message(exc)
         await resp.write(
-            (json.dumps({"error": str(exc), "errorDetail": {"message": str(exc)}}) + "\n").encode()
+            (json.dumps({"error": message, "errorDetail": {"message": message}}) + "\n").encode()
         )
         await resp.drain()
 
@@ -2793,7 +2998,7 @@ async def create_volume(request: web.Request) -> web.Response:
             options=body.get("DriverOpts") or {},
         )
     except KeyError as exc:
-        return _err(409, str(exc))
+        return _err(409, format_exception_message(exc))
     await _events(request).emit(
         type="volume",
         action="create",
@@ -2851,9 +3056,9 @@ async def create_network(request: web.Request) -> web.Response:
             check_duplicate=bool(body.get("CheckDuplicate", True)),
         )
     except KeyError as exc:
-        return _err(409, str(exc))
+        return _err(409, format_exception_message(exc))
     except ValueError as exc:
-        return _err(400, str(exc))
+        return _err(400, format_exception_message(exc))
     await _events(request).emit(
         type="network",
         action="create",
@@ -2880,7 +3085,7 @@ async def delete_network(request: web.Request) -> web.Response:
     except KeyError:
         return _err(404, f"network {nid} not found")
     except ValueError as exc:
-        return _err(403, str(exc))
+        return _err(403, format_exception_message(exc))
     await _events(request).emit(
         type="network",
         action="destroy",
@@ -2988,57 +3193,53 @@ async def on_startup(app: web.Application) -> None:
     loop.set_exception_handler(_loop_exception_handler)
     app["watch_tasks"] = set()
 
+    if os.getenv("DOCKER_RT_CONTEXT_KEEP", "true").lower() not in {
+        "0",
+        "false",
+        "no",
+    }:
+        task = asyncio.create_task(
+            _keep_docker_rt_context(app),
+            name="docker-rt-context-keeper",
+        )
+        app["watch_tasks"].add(task)
+
+        def _keeper_done(done: asyncio.Task[Any]) -> None:
+            app["watch_tasks"].discard(done)
+            try:
+                done.exception()
+            except asyncio.CancelledError:
+                pass
+
+        task.add_done_callback(_keeper_done)
+
     store: ContainerStore = app["store"]
-    namespace = app["namespace"]
-    kubeconfig = app.get("kubeconfig")
-    kube_context = app.get("kube_context")
-    backend = os.getenv("DOCKER_RT_BACKEND", "kube").lower().replace("-", "_")
-    is_pyromind = backend in {"k8s_middleware", "pyromind_sdk", "pyromind"}
-    if not is_pyromind:
-        try:
-            await asyncio.to_thread(
-                probe_kube_auth,
-                namespace,
-                kubeconfig=kubeconfig,
-                kube_context=kube_context,
-            )
-        except Exception:
-            logger.exception(
-                "Kubernetes auth probe failed — check .kube.yaml token "
-                "(system:anonymous means credentials were not sent)"
-            )
-            # Continue: reconcile will no-op; create/start will surface the same error.
+    await asyncio.to_thread(
+        check_connection,
+        api_key=os.getenv("PYROMIND_API_KEY"),
+        cluster=os.getenv("PYROMIND_CLUSTER"),
+    )
     try:
-        if is_pyromind:
-            stats = await reconcile_pyromind_sandboxes(store, force=True)
-        else:
-            stats = await reconcile_on_startup(
-                store,
-                namespace=namespace,
-                kubeconfig=kubeconfig,
-                kube_context=kube_context,
-            )
+        stats = await reconcile_pyromind_sandboxes(store, force=True)
         logger.info(
             "reconcile done adopted=%s reaped=%s policy=%s",
             stats["adopted"],
             stats["reaped"],
             os.getenv("DOCKER_RT_ORPHAN_POLICY", "adopt"),
         )
+        visible = store.list(all_containers=True)
+        custom_count = sum(
+            1 for record in visible if _container_type(record) != "osworld"
+        )
+        osworld_count = len(visible) - custom_count
+        print_connected(
+            os.getenv("PYROMIND_API_KEY") or "",
+            os.getenv("PYROMIND_CLUSTER") or "",
+            custom_count,
+            osworld_count=osworld_count,
+        )
     except Exception:
         logger.exception("reconcile_on_startup failed (continuing with empty store)")
-
-    if not is_pyromind:
-        try:
-            orphan_svcs = await asyncio.to_thread(
-                reap_orphan_services,
-                namespace=namespace,
-                kubeconfig=kubeconfig,
-                kube_context=kube_context,
-            )
-            if orphan_svcs:
-                logger.info("reaped %s orphan Service(s)", orphan_svcs)
-        except Exception:
-            logger.exception("orphan Service GC failed")
 
     # Rebuild TCP publishes for adopted Running containers.
     for record in store.list(all_containers=False):
@@ -3054,11 +3255,17 @@ async def on_startup(app: web.Application) -> None:
 
 async def on_cleanup(app: web.Application) -> None:
     store: ContainerStore = app["store"]
+    for task in list(app.get("watch_tasks", set())):
+        task.cancel()
     for record in list(store.list(all_containers=True)):
         try:
             await _stop_port_forward(record)
         except Exception:
             pass
+    try:
+        restore_docker_context()
+    except Exception:
+        logger.warning("failed to restore Docker context", exc_info=True)
     cleanup = os.getenv("DOCKER_RT_CLEANUP_ON_EXIT", "false").lower() in {
         "1",
         "true",
@@ -3113,19 +3320,6 @@ def main() -> None:
     host = os.getenv("DOCKER_RT_HOST", "")
     port = int(os.getenv("DOCKER_RT_PORT", os.getenv("PORT", "2375")))
     app = create_aio_app()
-
-    def _on_signal(signum: int, _frame: Any) -> None:
-        try:
-            name = signal.Signals(signum).name
-        except ValueError:
-            name = str(signum)
-        logger.warning("received %s — shutting down docker-rt", name)
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            signal.signal(sig, _on_signal)
-        except Exception:
-            pass
 
     try:
         if host:

@@ -7,7 +7,12 @@ This adapter exposes the same methods docker-rt expects from
 
 from __future__ import annotations
 
+import base64
+import io
 import logging
+import posixpath
+import shlex
+import tarfile
 from typing import Any
 
 from pyromind_sdk.client.base import PyroMindAPIError
@@ -25,6 +30,9 @@ from .runtime import parse_binds
 
 logger = logging.getLogger("docker_rt.pyromind_sdk")
 _client_singleton: SandboxClient | None = None
+
+DEFAULT_CPU = "1"
+DEFAULT_MEMORY = "2Gi"
 
 
 def get_sandbox_client() -> SandboxClient:
@@ -91,6 +99,7 @@ class PyromindSDK:
         *,
         name: str | None = None,
         image: str | None = None,
+        sandbox_type: Any = None,
         resources: ResourceConfig | None = None,
         status: str | None = None,
         configuration: Any | None = None,
@@ -106,6 +115,9 @@ class PyromindSDK:
         obj.pod_name = sandbox_id
         obj.name = name
         obj.image = image or ""
+        obj.sandbox_type = (
+            getattr(sandbox_type, "value", sandbox_type) or ""
+        )
         obj.namespace = None
         obj.env = {}
         obj.working_dir = "/"
@@ -113,7 +125,10 @@ class PyromindSDK:
         obj.sandbox_status = status or "Unknown"
         obj._terminal_phase = None
         obj._exit_code = 0
-        obj._resources = resources or ResourceConfig(cpu="4", memory="8Gi")
+        obj._resources = resources or ResourceConfig(
+            cpu=DEFAULT_CPU,
+            memory=DEFAULT_MEMORY,
+        )
         obj.resources = obj._json_ready(obj._resources)
         obj.configuration = obj._json_ready(configuration)
         obj.volume_mounts = obj._json_ready(volume_mounts)
@@ -163,8 +178,8 @@ class PyromindSDK:
         self._terminal_phase: str | None = None
         self._exit_code = 0
         self._resources = ResourceConfig(
-            cpu=cpu_limit or "4",
-            memory=memory_limit or "8Gi",
+            cpu=cpu_limit or DEFAULT_CPU,
+            memory=memory_limit or DEFAULT_MEMORY,
             gpu=gpu,
             gpu_card=gpu_card,
         )
@@ -225,8 +240,8 @@ class PyromindSDK:
             name=name,
             image=image,
             resources=ResourceConfig(
-                cpu=cpu_limit or "4",
-                memory=memory_limit or "8Gi",
+                cpu=cpu_limit or DEFAULT_CPU,
+                memory=memory_limit or DEFAULT_MEMORY,
                 gpu=gpu,
                 gpu_card=gpu_card,
             ),
@@ -243,7 +258,9 @@ class PyromindSDK:
             msg = f"{getattr(exc, 'message', '')} {getattr(exc, 'response', '')}"
             if "INSTANCE_EXIST" not in msg and "already exists" not in msg.lower():
                 raise
-            raise RuntimeError(f"Sandbox {name!r} already exists") from exc
+            trace_id = getattr(exc, "trace_id", None)
+            detail = f" (trace_id={trace_id})" if trace_id else ""
+            raise RuntimeError(f"Sandbox {name!r} already exists{detail}") from exc
         self._bind_response(response)
 
     @staticmethod
@@ -375,6 +392,7 @@ class PyromindSDK:
         except PyroMindAPIError as exc:
             if exc.status_code == 404:
                 self._terminal_phase = "NotFound"
+                self.sandbox_status = "NotFound"
                 return "NotFound"
             logger.debug("refresh_phase failed: %s", exc)
             return "Unknown"
@@ -398,7 +416,11 @@ class PyromindSDK:
             self._client.pause(self.sandbox_id)
         except PyroMindAPIError as exc:
             self.logger.debug("pause before delete skipped: %s", exc)
-        self._client.delete(self.sandbox_id)
+        try:
+            self._client.delete(self.sandbox_id)
+        except PyroMindAPIError as exc:
+            if exc.status_code != 404:
+                raise
         self.sandbox_id = None
         self._terminal_phase = "NotFound"
 
@@ -407,6 +429,110 @@ class PyromindSDK:
             return
         self._client.pause(self.sandbox_id)
         self.sandbox_status = "Stopped"
+
+    def resume(self) -> None:
+        if not self.sandbox_id:
+            raise RuntimeError("sandbox is not started")
+        response = self._client.resume(self.sandbox_id)
+        self._bind_response(response)
+        self._terminal_phase = None
+
+    def archive_path_stat(self, path: str) -> dict[str, Any] | None:
+        """Docker-style path stat for k8s-middleware via shell exec."""
+        target = path if path.startswith("/") else f"/{path}"
+        script = (
+            f"target={shlex.quote(target)}; "
+            f'if [ ! -e "$target" ]; then exit 2; fi; '
+            f'if [ -d "$target" ]; then kind=dir; else kind=file; fi; '
+            f'size=$(wc -c < "$target" 2>/dev/null || echo 0); '
+            f'mode=$(stat -c %a "$target" 2>/dev/null '
+            f'|| stat -f %Lp "$target" 2>/dev/null || echo 644); '
+            f'name=$(basename "$target"); '
+            f'printf "%s|%s|%s|%s\\n" "$kind" "$size" "$mode" "$name"'
+        )
+        result = self.execute({"command": script}, cwd="/")
+        code = int(result.get("returncode", 0) or 0)
+        if code != 0:
+            return None
+        text = str(result.get("output") or "").strip()
+        parts = text.split("|", 3)
+        if len(parts) < 4:
+            return None
+        kind, size_s, mode_s, name = parts[0], parts[1], parts[2], parts[3]
+        try:
+            size = int(str(size_s).strip() or "0")
+        except ValueError:
+            size = 0
+        try:
+            mode_num = int(str(mode_s).strip() or "644", 8)
+        except ValueError:
+            mode_num = 0o644
+        if kind.strip() == "dir":
+            mode_num |= 0o040000
+        return {
+            "name": name.strip() or (target.rsplit("/", 1)[-1] or "/"),
+            "size": size,
+            "mode": mode_num,
+            "mtime": "1970-01-01T00:00:00Z",
+            "linkTarget": "",
+        }
+
+    def iter_archive_chunks(self, path: str):
+        """Yield tar bytes for ``docker cp`` from a k8s-middleware sandbox."""
+        target = path if path.startswith("/") else f"/{path}"
+        parent = target.rsplit("/", 1)[0] or "/"
+        base = target.rsplit("/", 1)[-1]
+        stat = self.archive_path_stat(target)
+        if stat is None:
+            raise FileNotFoundError(target)
+
+        if stat["mode"] & 0o040000:
+            script = (
+                f"tar -C {shlex.quote(parent)} -cf - {shlex.quote(base)} "
+                "| base64 -w0"
+            )
+            result = self.execute({"command": script}, cwd="/")
+            code = int(result.get("returncode", 0) or 0)
+            if code != 0:
+                raise RuntimeError(
+                    result.get("exception_info")
+                    or result.get("output")
+                    or f"tar failed for {target}"
+                )
+            raw = base64.b64decode(str(result.get("output") or ""))
+            yield raw
+            return
+
+        data = self._client.read_file(self.sandbox_id, target)
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            info = tarfile.TarInfo(name=base or "/")
+            info.size = len(data)
+            info.mode = stat["mode"] & 0o777
+            tar.addfile(info, io.BytesIO(data))
+        yield buf.getvalue()
+
+    def put_archive(self, dest_path: str, tar_bytes: bytes) -> None:
+        """Extract ``docker cp`` tar bytes into a k8s-middleware sandbox."""
+        dest = dest_path or "/"
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r") as tar:
+            for member in tar.getmembers():
+                name = member.name.lstrip("/")
+                if member.isdir():
+                    target = posixpath.join(dest, name)
+                    self.execute(
+                        {"command": f"mkdir -p {shlex.quote(target)}"},
+                        cwd="/",
+                    )
+                    continue
+                if not member.isfile():
+                    continue
+                content = tar.extractfile(member)
+                data = content.read() if content is not None else b""
+                target = posixpath.join(dest, name)
+                if not dest.endswith("/") and name == posixpath.basename(dest):
+                    target = dest
+                self._client.write_file(self.sandbox_id, target, data)
 
     def patch_pod_metadata(self, **kwargs: Any) -> None:
         return None
@@ -438,8 +564,8 @@ class PyromindSDK:
     def restart(self) -> None:
         if not self.sandbox_id:
             raise RuntimeError("sandbox is not started")
-        self._client.pause(self.sandbox_id)
-        self._client.resume(self.sandbox_id)
+        self.stop()
+        self.resume()
 
 
 __all__ = ["PyromindSDK"]

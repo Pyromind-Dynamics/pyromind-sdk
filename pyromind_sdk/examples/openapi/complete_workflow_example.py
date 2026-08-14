@@ -48,7 +48,7 @@ def complete_workflow():
                     type=SandboxType.WINDOWS,
                     configuration=SandboxConfiguration(
                         image="ubuntu:22.04",
-                        resources=ResourceConfig(cpu="2", memory="4Gi")
+                        resources=ResourceConfig(cpu="1", memory="2Gi")
                     )
                 )
             )

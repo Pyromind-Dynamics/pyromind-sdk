@@ -9,6 +9,8 @@ from .base import PyroMindClient
 from .models import (
     JupyterRequest,
     JupyterResponse,
+    JupyterPage,
+    ListQuery,
     InternalIPResponse,
 )
 
@@ -56,14 +58,39 @@ class JupyterLabClient(PyroMindClient):
         }
         return converted_instance
     
-    def list(self) -> List[JupyterResponse]:
+    def list(
+        self,
+        query: Optional[ListQuery] = None,
+    ) -> List[JupyterResponse]:
         """
         List all Jupyter instances
         
         Returns:
             List of JupyterResponse objects
         """
-        response = self.get("/jupyterlab")
+        query = query or ListQuery()
+        instances: List[JupyterResponse] = []
+        current_page = 1
+        page_size = query.page_size or 20
+        while True:
+            page = self.list_page(
+                query.model_copy(update={"page_size": page_size, "page_num": current_page})
+            )
+            instances.extend(page.instances)
+            if not page.instances or current_page * page_size >= page.total:
+                break
+            current_page += 1
+        return instances
+
+    def list_page(
+        self,
+        query: Optional[ListQuery] = None,
+    ) -> JupyterPage:
+        """Fetch one page of Jupyter instances with the total count."""
+        query = query or ListQuery()
+        params = query.to_params(default_page_size=20)
+
+        response = self.get("/jupyterlab", params=params)
         # API returns {success: True, data: {...}} format
         data = self._extract_data(response)
         
@@ -81,14 +108,22 @@ class JupyterLabClient(PyroMindClient):
         else:
             instances_data = []
         
-        # Convert API response format to SDK format
+        pagination = data.get("pagination") if isinstance(data, dict) else {}
+        pagination = pagination if isinstance(pagination, dict) else {}
+        total = int(pagination.get("total") or len(instances_data) or 0)
+
         converted_instances = []
         for instance in instances_data if isinstance(instances_data, list) else []:
             if isinstance(instance, dict):
                 converted_instance = self._convert_instance_data(instance)
                 converted_instances.append(JupyterResponse(**converted_instance))
         
-        return converted_instances
+        return JupyterPage(
+            instances=converted_instances,
+            total=total,
+            page_size=int(pagination.get("pageSize") or query.page_size or 20),
+            page_num=int(pagination.get("pageNum") or query.page_num or 1),
+        )
     
     def create(self, request: JupyterRequest) -> JupyterResponse:
         """
