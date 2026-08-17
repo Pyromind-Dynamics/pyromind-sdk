@@ -307,6 +307,14 @@ def test_type_filter_osworld_custom_matches_both_types() -> None:
     assert _matches_filters(_record("k8s"), filters) is False
 
 
+def test_type_filter_all_matches_every_type() -> None:
+    filters = _parse_filters(json.dumps({"label.type": ["all"]}))
+
+    assert _has_type_filter(filters) is True
+    assert _matches_filters(_record("osworld"), filters) is True
+    assert _matches_filters(_record("custom"), filters) is True
+    assert _matches_filters(_record("k8s"), filters) is True
+
 def test_legacy_docker_rt_type_label_filter_still_works() -> None:
     filters = _parse_filters(json.dumps({"label": ["docker-rt.type=osworld"]}))
 

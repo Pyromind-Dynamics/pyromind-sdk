@@ -307,6 +307,15 @@ docker create \
 默认 `docker ps` 只显示 Running；Stopped 用 `docker ps -a` 查看。
 默认只展示 CUSTOM sandbox；OSWorld 用 filter 查看：
 `docker ps --filter label=docker-rt.type=osworld`。
+按类型过滤（新的短写法）：
+
+```bash
+docker ps --filter label.type=osworld
+docker ps --filter label.type=custom
+docker ps --filter label.type=all        # osworld + custom 两种都要
+```
+
+旧的 `label=docker-rt.type=osworld` 写法仍兼容。
 标准 filter 由服务端处理：
 
 ```bash
@@ -314,6 +323,7 @@ docker ps --filter name=test-sdk-1
 docker ps --filter id=sb-94d290
 docker ps --filter status=running
 docker ps --filter ancestor=swebench
+docker ps --filter label.type=custom
 ```
 
 `docker ps | grep XXXX` 是客户端过滤，daemon 收不到 `XXXX`；标准 Docker

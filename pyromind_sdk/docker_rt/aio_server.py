@@ -740,7 +740,8 @@ def _matches_filters(c: Any, filters: dict[str, list[str]]) -> bool:
     def type_matches(values: list[str]) -> bool:
         container_type = _container_type(c).lower()
         for value in values:
-            if container_type in [alt.lower() for alt in value.split("/")]:
+            alts = [alt.lower() for alt in value.split("/")]
+            if "all" in alts or container_type in alts:
                 return True
         return False
 
