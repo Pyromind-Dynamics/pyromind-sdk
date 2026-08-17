@@ -25,6 +25,7 @@ setup(
         "requests>=2.28.0",
         "pydantic>=2.0.0",
         "urllib3>=1.26.0",
+        "minio>=7.0.0",
         "aiohttp>=3.8.0",
         "kubernetes>=29.0.0",
         "fastapi>=0.110",

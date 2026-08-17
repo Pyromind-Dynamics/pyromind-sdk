@@ -93,7 +93,7 @@ wrapper。需要清理时执行 `pyromind-docker-uninstall` 删除 wrapper 和 P
 | `--daemon` | 后台启动 docker-rt，命令立即返回 | 关闭 |
 | `--stop` | 停止后台 docker-rt 并恢复之前的 Docker context | 关闭 |
 | `--log-file FILE` | `--daemon` 模式使用的日志文件 | `$DOCKER_RT_LOG_FILE` 或 `/tmp/docker-rt.log` |
-| `--pid-file FILE` | 写入/读取后台进程 PID | `/tmp/docker-rt.pid` |
+| `--pid-file FILE` | 写入/读取后台进程 PID | `$DOCKER_RT_PID_FILE` 或 `/tmp/docker-rt-<sock>.pid` |
 | `-h`, `--help` | 显示帮助并退出 | - |
 
 ```bash
@@ -128,6 +128,7 @@ pyromind docker-rt \
 | `DOCKER_RT_CLEANUP_ON_EXIT` | `false` | `true` 时退出删除受管 Pod |
 | `DOCKER_RT_CONTEXT_KEEP` | `true` | daemon 运行期间保持 Docker context 为 `docker-rt` |
 | `DOCKER_RT_CONTEXT_KEEP_INTERVAL` | `5` | context keeper 校验间隔（秒） |
+| `DOCKER_RT_SHOW_API_KEY` | `false` | `true` 时连接横幅显示完整 API Key |
 | `DOCKER_RT_JUICEFS_UID` | 从 namespace 推导 | JuiceFS subPath 用户 ID |
 | `DOCKER_RT_JUICEFS_PVC` | 自动发现 | JuiceFS PVC 名 |
 | `DOCKER_RT_JUICEFS_HOST_PREFIXES` | 空 | 宿主机路径到 JuiceFS subPath 的额外映射 |

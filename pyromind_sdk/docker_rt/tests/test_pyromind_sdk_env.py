@@ -157,6 +157,23 @@ def test_put_archive_writes_files_into_sandbox() -> None:
     assert args[2] == b"hello"
 
 
+def test_put_archive_rejects_path_traversal() -> None:
+    adapter, client = _adapter_with_fake_client()
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(name="../../etc/passwd")
+        info.size = 1
+        tar.addfile(info, io.BytesIO(b"x"))
+
+    try:
+        adapter.put_archive("/var", buf.getvalue())
+    except ValueError as exc:
+        assert "unsafe path" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+    client.write_file.assert_not_called()
+
+
 def test_create_defaults_to_1c2g_without_gpu(monkeypatch: MonkeyPatch) -> None:
     import pyromind_sdk.docker_rt.backend.pyromind_sdk_env as env_mod
 

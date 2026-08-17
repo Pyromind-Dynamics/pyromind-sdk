@@ -42,6 +42,9 @@ k8s-middleware 后端下，`docker run IMAGE` 不带 `-d` / `-it` 时，sandbox
 Running 后会直接返回并提示，因为前台 attach 暂不支持；需要后台运行用
 `docker run -d`，需要交互终端用 `docker run -it IMAGE bash`。
 
+本地 container ID 到 sandbox ID 的映射持久化在
+`~/.pyromind/docker-rt-container-map.json`，daemon 重启后旧 ID 仍可用。
+
 ## 常见问题
 
 | 现象 | 原因 | 处理方式 |
@@ -228,6 +231,7 @@ docker ps   # 仍能看到 sb1
 | `DOCKER_RT_CLEANUP_ON_EXIT` | `false` | `true` 时 SIGINT/TERM 删受管 Pod |
 | `DOCKER_RT_CONTEXT_KEEP` | `true` | 运行期间保持 Docker context 为 `docker-rt` |
 | `DOCKER_RT_CONTEXT_KEEP_INTERVAL` | `5` | context keeper 校验间隔（秒） |
+| `DOCKER_RT_SHOW_API_KEY` | `false` | `true` 时连接横幅显示完整 API Key |
 
 `kill -9` 后依赖下次启动 adopt/reap。
 

@@ -90,7 +90,7 @@ remove the wrapper and its PATH entry.
 | `--daemon` | Start docker-rt in the background and return immediately | disabled |
 | `--stop` | Stop a background docker-rt daemon and restore the previous Docker context | disabled |
 | `--log-file FILE` | Log file used by `--daemon` | `$DOCKER_RT_LOG_FILE` or `/tmp/docker-rt.log` |
-| `--pid-file FILE` | Write/read the daemon PID file | `/tmp/docker-rt.pid` |
+| `--pid-file FILE` | Write/read the daemon PID file | `$DOCKER_RT_PID_FILE` or `/tmp/docker-rt-<sock>.pid` |
 | `-h`, `--help` | Show help and exit | - |
 
 ```bash
@@ -125,6 +125,7 @@ pyromind docker-rt \
 | `DOCKER_RT_CLEANUP_ON_EXIT` | `false` | Delete managed Pods on SIGINT/SIGTERM when `true` |
 | `DOCKER_RT_CONTEXT_KEEP` | `true` | Keep Docker context switched to `docker-rt` while the daemon runs |
 | `DOCKER_RT_CONTEXT_KEEP_INTERVAL` | `5` | Seconds between context keeper checks |
+| `DOCKER_RT_SHOW_API_KEY` | `false` | Print the full API key in the connection banner when `true` |
 | `DOCKER_RT_JUICEFS_UID` | derived from namespace | JuiceFS subPath user id |
 | `DOCKER_RT_JUICEFS_PVC` | auto-discovered | JuiceFS PVC name |
 | `DOCKER_RT_JUICEFS_HOST_PREFIXES` | empty | Extra host path to JuiceFS subPath mappings |

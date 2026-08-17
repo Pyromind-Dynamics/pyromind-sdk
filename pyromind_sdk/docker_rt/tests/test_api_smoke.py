@@ -216,6 +216,37 @@ async def test_delete_stopped_container_cleans_backend(
 
 
 @pytest.mark.asyncio
+async def test_delete_running_container_returns_error_on_cleanup_failure(
+    aiohttp_client,
+):
+    from ..aio_server import create_aio_app
+    from .. import aio_server as mod
+
+    class FailingKube(FakeKubeEnv):
+        def cleanup(self):
+            raise RuntimeError("delete failed")
+
+    failing = FailingKube()
+    app = create_aio_app(run_reconcile=False)
+    mod.start_kube_environment = lambda **kw: failing  # type: ignore
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/containers/create?name=rm-fail",
+        json={"Image": "ubuntu:22.04", "Cmd": ["sleep", "2h"]},
+    )
+    cid = (await resp.json())["Id"]
+    assert (await client.post(f"/containers/{cid}/start")).status == 204
+
+    resp = await client.delete(f"/containers/{cid}?force=true")
+
+    assert resp.status == 500
+    body = await resp.json()
+    assert "delete failed" in body["message"]
+    assert (await client.get(f"/containers/{cid}/json")).status == 200
+
+
+@pytest.mark.asyncio
 async def test_start_passes_user_command(aiohttp_client, fake_kube: FakeKubeEnv):
     from ..aio_server import create_aio_app
     from .. import aio_server as mod

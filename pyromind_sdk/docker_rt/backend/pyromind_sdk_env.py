@@ -518,6 +518,13 @@ class PyromindSDK:
         with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r") as tar:
             for member in tar.getmembers():
                 name = member.name.lstrip("/")
+                normalized = posixpath.normpath(name)
+                if (
+                    normalized == ".."
+                    or normalized.startswith("../")
+                    or posixpath.isabs(normalized)
+                ):
+                    raise ValueError(f"unsafe path in tar archive: {member.name!r}")
                 if member.isdir():
                     target = posixpath.join(dest, name)
                     self.execute(
