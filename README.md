@@ -91,6 +91,8 @@ remove the wrapper and its PATH entry.
 | `--stop` | Stop a background docker-rt daemon and restore the previous Docker context | disabled |
 | `--log-file FILE` | Log file used by `--daemon` | `$DOCKER_RT_LOG_FILE` or `/tmp/docker-rt.log` |
 | `--pid-file FILE` | Write/read the daemon PID file | `$DOCKER_RT_PID_FILE` or `/tmp/docker-rt-<sock>.pid` |
+| `--apikey KEY` (`--api-key KEY`) | PyroMind API key | `$PYROMIND_API_KEY` |
+| `--cluster CLUSTER` | Target cluster, e.g. `us-west-1#pre` | `$PYROMIND_CLUSTER` |
 | `-h`, `--help` | Show help and exit | - |
 
 ```bash
@@ -99,6 +101,18 @@ pyromind docker-rt \
   --sock /tmp/docker-rt.sock \
   --log-file /tmp/docker-rt.log \
   --pid-file /tmp/docker-rt.pid
+```
+
+Use environment variables, or pass credentials directly:
+
+```bash
+export PYROMIND_API_KEY=XXXXXXXXX
+export PYROMIND_BASE_URL=https://pre-api.pyromind.ai/api/v1
+export PYROMIND_CLUSTER='us-west-1#pre'
+pyromind docker-rt --daemon
+
+# or
+pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 ```
 
 #### docker-rt environment variables

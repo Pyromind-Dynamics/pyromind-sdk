@@ -94,6 +94,8 @@ wrapper。需要清理时执行 `pyromind-docker-uninstall` 删除 wrapper 和 P
 | `--stop` | 停止后台 docker-rt 并恢复之前的 Docker context | 关闭 |
 | `--log-file FILE` | `--daemon` 模式使用的日志文件 | `$DOCKER_RT_LOG_FILE` 或 `/tmp/docker-rt.log` |
 | `--pid-file FILE` | 写入/读取后台进程 PID | `$DOCKER_RT_PID_FILE` 或 `/tmp/docker-rt-<sock>.pid` |
+| `--apikey KEY`（别名 `--api-key KEY`） | PyroMind API Key | `$PYROMIND_API_KEY` |
+| `--cluster CLUSTER` | 目标集群，如 `us-west-1#pre` | `$PYROMIND_CLUSTER` |
 | `-h`, `--help` | 显示帮助并退出 | - |
 
 ```bash
@@ -102,6 +104,18 @@ pyromind docker-rt \
   --sock /tmp/docker-rt.sock \
   --log-file /tmp/docker-rt.log \
   --pid-file /tmp/docker-rt.pid
+```
+
+也可以使用环境变量，或直接在命令行传凭据：
+
+```bash
+export PYROMIND_API_KEY=XXXXXXXXX
+export PYROMIND_BASE_URL=https://pre-api.pyromind.ai/api/v1
+export PYROMIND_CLUSTER='us-west-1#pre'
+pyromind docker-rt --daemon
+
+# 或
+pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 ```
 
 #### docker-rt 环境变量

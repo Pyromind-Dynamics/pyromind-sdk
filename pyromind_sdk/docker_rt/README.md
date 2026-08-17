@@ -83,6 +83,12 @@ docker-rt --stop                  # 停止后台 daemon 并恢复 context
 docker_rt                         # 与 docker-rt 等价的直接启动命令
 ```
 
+也可以直接传凭据启动：
+
+```bash
+pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
+```
+
 默认 `k8s-middleware` 后端会检查 `PYROMIND_API_KEY` / `PYROMIND_CLUSTER`，
 缺失时逐个提示输入；连接成功后彩色打印参数，并同步一次 sandbox。
 

@@ -44,7 +44,10 @@ def main(argv: list[str] | None = None) -> int:
     bootstrapped = os.getenv("PYROMIND_DOCKER_RT_BOOTSTRAPPED") == "1"
     if not bootstrapped:
         try:
-            prepare_env()
+            prepare_env(
+                api_key=args.api_key,
+                cluster=args.cluster,
+            )
             check_connection()
             os.environ["PYROMIND_DOCKER_RT_BOOTSTRAPPED"] = "1"
         except KeyboardInterrupt:

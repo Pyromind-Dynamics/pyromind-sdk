@@ -34,6 +34,19 @@ def test_server_parser_accepts_stop_flag() -> None:
     assert args.stop is True
 
 
+def test_server_parser_accepts_credentials_flags() -> None:
+    from ..daemon import prepare_server_parser
+
+    args = prepare_server_parser().parse_args(
+        ["--apikey", "key123", "--cluster", "us-west-1#pre"]
+    )
+    assert args.api_key == "key123"
+    assert args.cluster == "us-west-1#pre"
+
+    alias = prepare_server_parser().parse_args(["--api-key", "key456"])
+    assert alias.api_key == "key456"
+
+
 def test_stop_daemon_kills_pid_and_removes_pid_file(
     monkeypatch: MonkeyPatch,
     tmp_path,

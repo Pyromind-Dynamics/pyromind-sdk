@@ -12,7 +12,22 @@ from pathlib import Path
 WRAPPER_DIR = Path.home() / ".pyromind" / "bin"
 WRAPPER_PATH = WRAPPER_DIR / "docker"
 PATH_LINE = 'export PATH="$HOME/.pyromind/bin:$PATH"'
-WRAPPER_VERSION = "4"
+WRAPPER_VERSION = "6"
+
+
+def _wrapper_version() -> str | None:
+    """Return the installed wrapper version, or None when unreadable/absent."""
+    if not WRAPPER_PATH.is_file() or not os.access(WRAPPER_PATH, os.X_OK):
+        return None
+    try:
+        text = WRAPPER_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    marker = "WRAPPER_VERSION=\""
+    for line in text.splitlines():
+        if line.strip().startswith(marker):
+            return line.split('"', 2)[1] if line.count('"') >= 2 else ""
+    return None
 
 
 def find_real_docker() -> str:
@@ -52,13 +67,7 @@ def find_real_docker() -> str:
 
 
 def is_wrapper_installed() -> bool:
-    if not WRAPPER_PATH.is_file() or not os.access(WRAPPER_PATH, os.X_OK):
-        return False
-    try:
-        text = WRAPPER_PATH.read_text(encoding="utf-8")
-    except OSError:
-        return False
-    return f'WRAPPER_VERSION="{WRAPPER_VERSION}"' in text
+    return _wrapper_version() == WRAPPER_VERSION
 
 
 def wrapper_in_path() -> bool:
@@ -138,7 +147,16 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
-if [[ "${{args[0]:-}}" == "ps" ]]; then
+quiet=0
+custom_format=0
+for arg in "${{args[@]:1}}"; do
+  case "$arg" in
+    --quiet|--quiet=*) quiet=1 ;;
+    --format|--format=*) custom_format=1 ;;
+    -*) if [[ "$arg" == *q* ]]; then quiet=1; fi ;;
+  esac
+done
+if [[ "${{args[0]:-}}" == "ps" && $quiet -eq 0 && $custom_format -eq 0 ]]; then
   "$REAL_DOCKER" "${{args[@]}}" --no-trunc --format '{{{{.ID}}}}\\t{{{{.Names}}}}\\t{{{{.Status}}}}\\t{{{{.Label "docker-rt.resources"}}}}\\t{{{{.Ports}}}}\\t{{{{.Label "docker-rt.volumes"}}}}\\t{{{{.Image}}}}' | python3 -c '
 import sys
 import unicodedata
@@ -184,19 +202,34 @@ for line in sys.stdin:
 '
   exit $?
 fi
+if [[ "${{args[0]:-}}" == "ps" && $quiet -eq 1 ]]; then
+  args+=(--no-trunc)
+fi
 if [[ "${{args[0]:-}}" == "rm" ]]; then
+  rm_opts=()
+  rm_targets=()
   force=0
   for arg in "${{args[@]:1}}"; do
-    if [[ "$arg" == "-f" || "$arg" == "--force" || "$arg" == "-f="* || "$arg" == "--force="* ]]; then
-      force=1
-    fi
+    case "$arg" in
+      -f|--force|-f=*|--force=*)
+        force=1
+        rm_opts+=("$arg")
+        ;;
+      -*)
+        rm_opts+=("$arg")
+        ;;
+      *)
+        rm_targets+=("$arg")
+        ;;
+    esac
   done
+  if [[ ${{#rm_targets[@]}} -eq 0 ]]; then
+    "$REAL_DOCKER" "${{args[@]}}"
+    exit $?
+  fi
   if [[ $force -eq 0 ]]; then
     running=()
-    for target in "${{args[@]:1}}"; do
-      if [[ "$target" == -* ]]; then
-        continue
-      fi
+    for target in "${{rm_targets[@]}}"; do
       status="$("$REAL_DOCKER" inspect --format '{{{{.State.Status}}}}' "$target" 2>/dev/null)"
       if [[ "$status" != "running" ]]; then
         status="$("$REAL_DOCKER" inspect --format '{{{{.status}}}}' "$target" 2>/dev/null)"
@@ -209,13 +242,32 @@ if [[ "${{args[0]:-}}" == "rm" ]]; then
     if [[ ${{#running[@]}} -gt 0 ]]; then
       read -r -p "Container(s) ${{running[*]}} are running. Force remove? [y/N]: " ans
       if [[ "$ans" =~ ^[yY] ]]; then
-        args+=(--force)
+        rm_opts+=(--force)
       else
         echo "Remove cancelled. Use 'docker rm -f ${{running[*]}}' to force remove." >&2
         exit 1
       fi
     fi
   fi
+  rm_rc=0
+  for target in "${{rm_targets[@]}}"; do
+    _rm_out="$(mktemp)"
+    _rm_err="$(mktemp)"
+    "$REAL_DOCKER" rm "${{rm_opts[@]}}" "$target" >"$_rm_out" 2>"$_rm_err"
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
+      printf '%s deleted\\n' "$target"
+      cat "$_rm_err" >&2
+    else
+      cat "$_rm_out" >&2
+      cat "$_rm_err" >&2
+    fi
+    rm -f "$_rm_out" "$_rm_err"
+    if [[ $rc -ne 0 ]]; then
+      rm_rc=$rc
+    fi
+  done
+  exit $rm_rc
 fi
 if [[ "${{args[0]:-}}" == "run" ]]; then
   detach=0
@@ -377,11 +429,31 @@ exec "$REAL_DOCKER" "${{args[@]}}"
 
 def ensure_wrapper_installed(*, interactive: bool = True) -> bool:
     """Ensure the docker wrapper is installed and up to date."""
-    if is_wrapper_installed():
+    try:
+        find_real_docker()
+    except RuntimeError as exc:
+        print(f"docker-rt startup cancelled: {exc}", file=sys.stderr)
+        return False
+
+    installed_version = _wrapper_version()
+    if installed_version == WRAPPER_VERSION:
         _warn_wrapper_not_in_path()
         return True
 
-    if interactive:
+    is_update = installed_version is not None or WRAPPER_PATH.exists()
+    if interactive and installed_version is not None:
+        print(
+            "\nA newer version of the docker wrapper is required "
+            f"(current version: {installed_version}, required version: {WRAPPER_VERSION})."
+        )
+        try:
+            answer = input("Update now? [y/N]: ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in {"y", "yes"}:
+            print("Wrapper update declined; docker-rt startup cancelled.")
+            return False
+    elif interactive and not is_update:
         print(
             "\npyromind docker-rt needs a local docker wrapper to support "
             "--gpu-card and the docker-rt CLI experience. docker-rt will not "
@@ -395,9 +467,11 @@ def ensure_wrapper_installed(*, interactive: bool = True) -> bool:
         if answer not in {"y", "yes"}:
             print("Wrapper install declined; docker-rt startup cancelled.")
             return False
+
     path = install_wrapper()
     _warn_wrapper_not_in_path()
-    print(f"Installed docker wrapper: {path}")
+    action = "Updated" if is_update else "Installed"
+    print(f"{action} docker wrapper: {path}")
     print("New terminals will use it automatically.")
     return True
 

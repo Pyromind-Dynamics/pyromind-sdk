@@ -9,7 +9,6 @@ active parameters with ANSI colors after a successful connection.
 from __future__ import annotations
 
 import os
-import shutil
 import sys
 try:
     import readline  # noqa: F401 - enables line editing for input()
@@ -19,7 +18,7 @@ from typing import Any
 
 DOCKER_LINUX_INSTALL_HINT = """\
 Docker CLI is required but was not found.
-On Linux, install it with:
+On Linux or macOS, install it with:
 
   curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz \\
     | tar -xz -C /tmp
@@ -38,12 +37,16 @@ _RESET = "\033[0m"
 
 def check_docker_cli(*, stderr: Any | None = None) -> bool:
     """Return True when a Docker CLI binary is available on PATH."""
-    if shutil.which("docker"):
-        return True
-    stream = stderr or sys.stderr
-    stream.write(DOCKER_LINUX_INSTALL_HINT)
-    stream.flush()
-    return False
+    from .install_wrapper import find_real_docker
+
+    try:
+        find_real_docker()
+    except RuntimeError:
+        stream = stderr or sys.stderr
+        stream.write(DOCKER_LINUX_INSTALL_HINT)
+        stream.flush()
+        return False
+    return True
 
 
 def _prompt(
@@ -65,6 +68,8 @@ def _prompt(
 
 def prepare_env(
     *,
+    api_key: str | None = None,
+    cluster: str | None = None,
     interactive: bool = True,
     stdin: Any | None = None,
     stdout: Any | None = None,
@@ -73,8 +78,14 @@ def prepare_env(
     """Ensure docker-rt backend and PyroMind credentials are available."""
     result = {"api_key": None, "cluster": None}
 
-    api_key = (os.getenv("PYROMIND_API_KEY") or "").strip()
-    cluster = (os.getenv("PYROMIND_CLUSTER") or "").strip()
+    provided_api = api_key.strip() if api_key is not None else None
+    provided_cluster = cluster.strip() if cluster is not None else None
+    api_key = provided_api or (os.getenv("PYROMIND_API_KEY") or "").strip()
+    cluster = provided_cluster or (os.getenv("PYROMIND_CLUSTER") or "").strip()
+    if provided_api:
+        os.environ["PYROMIND_API_KEY"] = provided_api
+    if provided_cluster:
+        os.environ["PYROMIND_CLUSTER"] = provided_cluster
     missing = []
     if not api_key:
         missing.append("PYROMIND_API_KEY")

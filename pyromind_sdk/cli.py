@@ -98,6 +98,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--pid-file", default=None,
         help="Write the daemon PID to this file",
     )
+    docker_rt.add_argument(
+        "--apikey",
+        "--api-key",
+        dest="api_key",
+        default=None,
+        help="PyroMind API key (defaults to $PYROMIND_API_KEY)",
+    )
+    docker_rt.add_argument(
+        "--cluster",
+        default=None,
+        help="Target cluster, e.g. us-west-1, us-west-1#pre (defaults to $PYROMIND_CLUSTER)",
+    )
 
     docker_rt_context = subparsers.add_parser(
         "docker-rt-context",
@@ -143,7 +155,7 @@ def _start_docker_rt_daemon(args: argparse.Namespace) -> int:
     )
 
 
-def _prepare_docker_rt_daemon_env() -> int:
+def _prepare_docker_rt_daemon_env(args: argparse.Namespace) -> int:
     from pyromind_sdk.docker_rt.bootstrap import check_docker_cli, prepare_env
     from pyromind_sdk.docker_rt.register_context import (
         activate_docker_rt_context,
@@ -153,7 +165,10 @@ def _prepare_docker_rt_daemon_env() -> int:
     try:
         if not check_docker_cli():
             return 1
-        prepare_env()
+        prepare_env(
+            api_key=args.api_key,
+            cluster=args.cluster,
+        )
         save_previous_context()
         if activate_docker_rt_context() != 0:
             print("docker-rt failed to switch Docker context.", file=sys.stderr)
@@ -173,6 +188,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command in {"docker-install", "docker_install"}:
+        from pyromind_sdk.docker_rt.bootstrap import check_docker_cli
+
+        if not check_docker_cli():
+            return 1
         from pyromind_sdk.docker_rt.install_wrapper import install_wrapper
 
         path = install_wrapper()
@@ -186,6 +205,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return uninstall_main()
 
     if args.command in {"docker-rt", "docker_rt"}:
+        from pyromind_sdk.docker_rt.bootstrap import check_docker_cli
+
+        if not check_docker_cli():
+            return 1
         from pyromind_sdk.docker_rt.install_wrapper import ensure_wrapper_installed
 
         if os.getenv("PYROMIND_DOCKER_RT_SKIP_WRAPPER_PROMPT") != "1" and (
@@ -195,13 +218,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.sock:
             os.environ["DOCKER_RT_SOCK"] = args.sock
         if args.daemon:
-            rc = _prepare_docker_rt_daemon_env()
+            rc = _prepare_docker_rt_daemon_env(args)
             if rc != 0:
                 return rc
             return _start_docker_rt_daemon(args)
         from pyromind_sdk.docker_rt.server import main as docker_rt_main
 
-        return docker_rt_main()
+        server_argv: list[str] = []
+        if args.sock:
+            server_argv += ["--sock", args.sock]
+        if args.api_key:
+            server_argv += ["--apikey", args.api_key]
+        if args.cluster:
+            server_argv += ["--cluster", args.cluster]
+        if args.log_file:
+            server_argv += ["--log-file", args.log_file]
+        if args.pid_file:
+            server_argv += ["--pid-file", args.pid_file]
+        return docker_rt_main(server_argv)
 
     if args.command in {"docker-rt-context", "docker_rt_context"}:
         if args.sock:

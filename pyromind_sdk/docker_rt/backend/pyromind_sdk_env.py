@@ -412,10 +412,13 @@ class PyromindSDK:
     def cleanup(self) -> None:
         if not self.sandbox_id:
             return
-        try:
-            self._client.pause(self.sandbox_id)
-        except PyroMindAPIError as exc:
-            self.logger.debug("pause before delete skipped: %s", exc)
+        # Only pause an active instance; stopped sandboxes must be deleted directly.
+        status = (self.sandbox_status or "").lower()
+        if status in {"running", "pending", "unknown"}:
+            try:
+                self._client.pause(self.sandbox_id)
+            except PyroMindAPIError as exc:
+                self.logger.debug("pause before delete skipped: %s", exc)
         try:
             self._client.delete(self.sandbox_id)
         except PyroMindAPIError as exc:

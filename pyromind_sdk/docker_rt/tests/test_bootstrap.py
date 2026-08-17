@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 import os
-import shutil
 
 from pytest import MonkeyPatch
 
@@ -40,6 +39,23 @@ def test_prepare_env_uses_existing_environment(monkeypatch: MonkeyPatch) -> None
     assert info["cluster"] == "us-west-2"
 
 
+def test_prepare_env_uses_cli_parameters(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.delenv("PYROMIND_API_KEY", raising=False)
+    monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
+
+    info = prepare_env(
+        api_key="cli-key",
+        cluster="us-west-1#pre",
+        stdin=io.StringIO("should-not-be-read\n"),
+        stdout=io.StringIO(),
+    )
+
+    assert info["api_key"] == "cli-key"
+    assert info["cluster"] == "us-west-1#pre"
+    assert os.environ["PYROMIND_API_KEY"] == "cli-key"
+    assert os.environ["PYROMIND_CLUSTER"] == "us-west-1#pre"
+
+
 def test_prepare_env_prompts_single_missing_value(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -68,7 +84,11 @@ def test_prepare_env_does_not_create_backend_env(monkeypatch: MonkeyPatch) -> No
 
 
 def test_check_docker_cli_missing_prints_hint(monkeypatch: MonkeyPatch) -> None:
-    monkeypatch.setattr(shutil, "which", lambda name: None)
+    from pyromind_sdk.docker_rt import install_wrapper as install_mod
+    def missing_real_docker() -> str:
+        raise RuntimeError("Docker CLI not found")
+
+    monkeypatch.setattr(install_mod, "find_real_docker", missing_real_docker)
     stderr = io.StringIO()
 
     assert check_docker_cli(stderr=stderr) is False
@@ -79,7 +99,8 @@ def test_check_docker_cli_missing_prints_hint(monkeypatch: MonkeyPatch) -> None:
 
 
 def test_check_docker_cli_found(monkeypatch: MonkeyPatch) -> None:
-    monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/docker")
+    from pyromind_sdk.docker_rt import install_wrapper as install_mod
+    monkeypatch.setattr(install_mod, "find_real_docker", lambda: "/usr/local/bin/docker")
 
     assert check_docker_cli() is True
 

@@ -736,7 +736,7 @@ def _matches_filters(c: Any, filters: dict[str, list[str]]) -> bool:
     for key, values in filters.items():
         if key == "name":
             if not any(
-                value.lstrip("/") in c.name or value.lstrip("/") in display_id
+                value.lstrip("/") in c.name
                 for value in values
             ):
                 return False

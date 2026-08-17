@@ -285,4 +285,16 @@ def prepare_server_parser() -> Any:
         default=None,
         help="Write the daemon PID to this file",
     )
+    parser.add_argument(
+        "--apikey",
+        "--api-key",
+        dest="api_key",
+        default=None,
+        help="PyroMind API key (defaults to $PYROMIND_API_KEY)",
+    )
+    parser.add_argument(
+        "--cluster",
+        default=None,
+        help="Target cluster, e.g. us-west-1, us-west-1#pre (defaults to $PYROMIND_CLUSTER)",
+    )
     return parser
