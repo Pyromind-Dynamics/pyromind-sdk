@@ -279,9 +279,11 @@ if [[ "${{args[0]:-}}" == "cp" ]]; then
   if [[ -t 2 ]]; then
     _cp_out="$(mktemp)"
     _cp_err="$(mktemp)"
+    _cp_no_script=0
     if command -v script >/dev/null 2>&1; then
       script -q /dev/null "$REAL_DOCKER" "${{args[@]}}" >"$_cp_out" 2>"$_cp_err" &
     else
+      _cp_no_script=1
       "$REAL_DOCKER" "${{args[@]}}" >"$_cp_out" 2>"$_cp_err" &
     fi
     _cp_pid=$!
@@ -301,6 +303,8 @@ if [[ "${{args[0]:-}}" == "cp" ]]; then
       _success_line="$(printf '%s' "$_clean_out" | grep -a 'Successfully copied' | tail -n 1 | sed -E 's/^.*Successfully copied/Successfully copied/')"
       if [[ -n "$_success_line" ]]; then
         printf '%s\\n' "$_success_line" >&1
+      elif [[ $_cp_no_script -eq 1 ]]; then
+        printf 'Successfully copied %s -> %s\\n' "${{src}}" "${{dst}}" >&1
       else
         printf '%s\\n' "$_clean_out" >&1
       fi

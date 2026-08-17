@@ -41,6 +41,7 @@ from .backend.runtime import (  # noqa: E402
 )
 from .backend.socklock import assert_socket_available  # noqa: E402
 from .backend.store import ContainerState, ContainerStore  # noqa: E402
+from .backend.container_map import remove_mapping, set_mapping  # noqa: E402
 from .backend.stream_framing import frame_stderr, frame_stdout  # noqa: E402
 from .backend.portforward import (  # noqa: E402
     PortForwarder,
@@ -1118,6 +1119,8 @@ async def start_container(request: web.Request) -> web.Response:
             record.sandbox_status = getattr(
                 record.kube_env, "sandbox_status", "Running"
             )
+            if record.sandbox_id:
+                set_mapping(record.id, record.sandbox_id)
             try:
                 await _start_port_forward(record)
             except Exception as exc:
@@ -1183,6 +1186,8 @@ async def start_container(request: web.Request) -> web.Response:
         record.kube_env = kube_env
         record.sandbox_id = getattr(kube_env, "sandbox_id", None)
         record.sandbox_status = getattr(kube_env, "sandbox_status", None)
+        if record.sandbox_id:
+            set_mapping(record.id, record.sandbox_id)
         record.pod_name = kube_env.pod_name
         record.started_at = time.time()
         record.error = None
@@ -1685,8 +1690,10 @@ async def delete_container(request: web.Request) -> web.Response:
             await _stop_port_forward(record)
             try:
                 await asyncio.to_thread(record.kube_env.cleanup)
-            except Exception:
+            except Exception as exc:
+                record.error = format_exception_message(exc)
                 logger.exception("container cleanup failed")
+                return _err(500, format_exception_message(exc))
             record.kube_env = None
             record.sandbox_id = None
             record.sandbox_status = None
@@ -1700,6 +1707,7 @@ async def delete_container(request: web.Request) -> web.Response:
     await _release_service(record, request.app)
     networks: NetworkStore = request.app["networks"]
     networks.disconnect_container(record.id)
+    remove_mapping(record.id, record.sandbox_id)
     await store.remove(record)
     await _emit(request, action="destroy", record=record)
     return _empty(204)
@@ -1890,45 +1898,6 @@ async def stream_events(request: web.Request) -> web.StreamResponse:
         "docker events is not supported by k8s-middleware; "
         "use 'docker ps' and 'docker inspect' to check container state",
     )
-    bus: EventBus = request.app["events"]
-    since_raw = request.rel_url.query.get("since", "0")
-    try:
-        since_ts = float(since_raw)
-    except ValueError:
-        since_ts = 0.0
-
-    resp = web.StreamResponse(
-        status=200,
-        headers={
-            "Api-Version": API_VERSION,
-            "Content-Type": "application/json",
-            "Cache-Control": "no-cache",
-        },
-    )
-    await resp.prepare(request)
-
-    for event in bus.since(since_ts):
-        await resp.write((json.dumps(event.to_docker_json()) + "\n").encode())
-        await resp.drain()
-
-    q = await bus.subscribe()
-    try:
-        while True:
-            try:
-                event = await asyncio.wait_for(q.get(), timeout=30.0)
-            except asyncio.TimeoutError:
-                if request.transport is None or request.transport.is_closing():
-                    break
-                continue
-            if event is None:
-                break
-            await resp.write((json.dumps(event.to_docker_json()) + "\n").encode())
-            await resp.drain()
-    except (ConnectionResetError, asyncio.CancelledError, RuntimeError):
-        pass
-    finally:
-        await bus.unsubscribe(q)
-    return resp
 
 
 async def get_container_archive(request: web.Request) -> web.StreamResponse | web.Response:

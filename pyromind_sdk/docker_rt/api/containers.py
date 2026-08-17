@@ -491,7 +491,13 @@ async def delete_container(
                     detail=f"container {id} is running: docker rm -f {id}",
                 )
             if record.kube_env is not None:
-                await asyncio.to_thread(record.kube_env.cleanup)
+                try:
+                    await asyncio.to_thread(record.kube_env.cleanup)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=format_exception_message(exc),
+                    ) from exc
                 record.kube_env = None
             record.pod_name = None
             record.state = ContainerState.EXITED

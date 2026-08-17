@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import time
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,56 @@ def spawn_watcher(
     )
     if log_fh is not None:
         log_fh.close()
+
+
+def default_pid_file(sock: str | None = None) -> Path:
+    """PID file path, namespaced by socket so multiple daemons don't collide."""
+    sock_path = sock or os.getenv("DOCKER_RT_SOCK") or "/tmp/docker-rt.sock"
+    digest = hashlib.sha256(sock_path.encode()).hexdigest()[:12]
+    return Path(os.getenv("DOCKER_RT_PID_FILE") or f"/tmp/docker-rt-{digest}.pid")
+
+
+def _daemon_pids(sock_path: str) -> list[int]:
+    """Find docker-rt daemon PIDs, preferring those bound to ``sock_path``."""
+    probe = subprocess.run(
+        ["pgrep", "-f", "pyromind_sdk.docker_rt.server"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    pids = [int(p) for p in probe.stdout.split() if p.strip().isdigit()]
+    if not pids:
+        return []
+
+    matched: list[int] = []
+    inspected_any = False
+    for pid in pids:
+        env_text = ""
+        environ = Path(f"/proc/{pid}/environ")
+        if environ.exists():
+            inspected_any = True
+            try:
+                env_text = environ.read_bytes().decode("utf-8", errors="replace")
+            except OSError:
+                env_text = ""
+        if not env_text:
+            ps_probe = subprocess.run(
+                ["ps", "e", "-ww", "-p", str(pid)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if ps_probe.stdout:
+                inspected_any = True
+                env_text = ps_probe.stdout
+        if f"DOCKER_RT_SOCK={sock_path}" in env_text:
+            matched.append(pid)
+
+    if matched:
+        return matched
+    # Cannot inspect process env on this platform: keep old behavior to avoid
+    # leaving a running daemon behind, but only when we found no evidence.
+    return [] if inspected_any else pids
 
 
 def start_daemon(
@@ -145,7 +196,7 @@ def start_daemon(
         )
         return 1
 
-    pid_path = pid_file or os.getenv("DOCKER_RT_PID_FILE") or "/tmp/docker-rt.pid"
+    pid_path = Path(pid_file) if pid_file else default_pid_file(sock_path)
     Path(pid_path).write_text(str(proc.pid), encoding="utf-8")
 
     print(f"docker-rt started pid={proc.pid} log={log_path}")
@@ -158,10 +209,8 @@ def stop_daemon(
     pid_file: str | None = None,
 ) -> int:
     """Stop a background docker-rt daemon by PID file and restore context."""
-    pid_path = Path(
-        pid_file or os.getenv("DOCKER_RT_PID_FILE") or "/tmp/docker-rt.pid"
-    )
     sock_path = sock or os.getenv("DOCKER_RT_SOCK") or "/tmp/docker-rt.sock"
+    pid_path = Path(pid_file) if pid_file else default_pid_file(sock_path)
     pids: list[int] = []
     if pid_path.exists():
         try:
@@ -170,13 +219,7 @@ def stop_daemon(
             pids = []
 
     if not pids:
-        probe = subprocess.run(
-            ["pgrep", "-f", "pyromind_sdk.docker_rt.server"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        pids = [int(p) for p in probe.stdout.split() if p.strip().isdigit()]
+        pids = _daemon_pids(sock_path)
 
     if not pids:
         print("docker-rt is not running", file=sys.stderr)

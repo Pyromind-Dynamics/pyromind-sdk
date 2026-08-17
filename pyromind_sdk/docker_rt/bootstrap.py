@@ -158,6 +158,12 @@ def check_connection(
         client.close()
 
 
+def _mask_key(api_key: str) -> str:
+    if len(api_key) <= 8:
+        return "***"
+    return f"{api_key[:4]}***{api_key[-4:]}"
+
+
 def print_connected(
     api_key: str,
     cluster: str,
@@ -183,7 +189,13 @@ def print_connected(
         value = "%s"
 
     stdout.write(f"\n{title}\n")
-    stdout.write(f"  {key_label}  = {value % api_key}\n")
+    show_full = os.getenv("DOCKER_RT_SHOW_API_KEY", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    display_key = api_key if show_full else _mask_key(api_key)
+    stdout.write(f"  {key_label}  = {value % display_key}\n")
     stdout.write(f"  {cluster_label} = {value % cluster}\n")
     sync_value = f"{custom_count} (CUSTOM {custom_count}, OSWorld {osworld_count})"
     stdout.write(f"  {sync_label}    = {value % sync_value}\n")

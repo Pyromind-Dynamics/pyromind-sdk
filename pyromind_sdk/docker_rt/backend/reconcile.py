@@ -14,6 +14,7 @@ from kubernetes.client.rest import ApiException
 
 from pyromind_sdk.client.models import SandboxType
 
+from .container_map import sandbox_to_local, set_mapping
 from .runtime import (
     attach_kube_environment,
     build_core_v1_api,
@@ -116,7 +117,10 @@ async def reconcile_pyromind_sandboxes(
         image = sandbox.image or ""
         if not image and getattr(sandbox, "type", None) == SandboxType.OSWORLD:
             image = "osworld"
-        cid = hashlib.sha256(sandbox_id.encode()).hexdigest()
+        persisted_local = sandbox_to_local(sandbox_id)
+        cid = persisted_local or hashlib.sha256(sandbox_id.encode()).hexdigest()
+        if not persisted_local:
+            set_mapping(cid, sandbox_id)
         status = (sandbox.status or "").lower()
         state = (
             ContainerState.RUNNING

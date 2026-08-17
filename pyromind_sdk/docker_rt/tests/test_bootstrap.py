@@ -113,10 +113,27 @@ def test_print_connected_includes_parameters() -> None:
     assert "PYROMIND_API_KEY" in text
     assert "PYROMIND_CLUSTER" in text
     assert "DOCKER_RT_BACKEND" not in text
-    assert "test-key" in text
+    assert "test-key" not in text
+    assert "***" in text
     assert "us-west-2" in text
     assert "CUSTOM 3" in text
     assert "OSWorld 0" in text
+
+
+def test_print_connected_can_show_full_key(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DOCKER_RT_SHOW_API_KEY", "true")
+    stdout = io.StringIO()
+
+    print_connected(
+        "test-key",
+        "us-west-2",
+        1,
+        stdout=stdout,
+    )
+
+    assert "test-key" in stdout.getvalue()
 
 
 def test_print_connected_reports_osworld_breakdown() -> None:
