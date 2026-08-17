@@ -24,6 +24,7 @@ from .backend.archive import (  # noqa: E402
 )
 from .backend.events import EventBus  # noqa: E402
 from .backend.reconcile import (  # noqa: E402
+    _container_state_from_status,
     reconcile_on_startup,
     reconcile_pyromind_sandboxes,
 )
@@ -578,6 +579,25 @@ def _sandbox_identity(c: Any) -> tuple[str | None, str | None]:
     )
 
 
+async def _refresh_record_state(record: Any) -> None:
+    """Refresh lifecycle state from the backend before an operation."""
+    kube_env = getattr(record, "kube_env", None)
+    if kube_env is None or not hasattr(kube_env, "refresh_phase"):
+        return
+    try:
+        await asyncio.to_thread(kube_env.refresh_phase)
+    except Exception:
+        logger.debug(
+            "state refresh failed id=%s",
+            getattr(record, "id", "")[:12],
+            exc_info=True,
+        )
+        return
+    status = getattr(kube_env, "sandbox_status", None)
+    if status:
+        record.state = _container_state_from_status(str(status))
+
+
 def _resolve_gpu_resources(
     *,
     labels: dict[str, Any],
@@ -1099,6 +1119,7 @@ async def start_container(request: web.Request) -> web.Response:
     if record is None:
         return _err(404, f"No such container: {cid}")
 
+    await _refresh_record_state(record)
     async with record.lock:
         if record.state == ContainerState.RUNNING:
             return _empty(304)
@@ -1336,6 +1357,7 @@ async def stop_container(request: web.Request) -> web.Response:
     if record is None:
         return _err(404, f"No such container: {cid}")
 
+    await _refresh_record_state(record)
     async with record.lock:
         if record.state != ContainerState.RUNNING:
             return _empty(304)
@@ -1378,15 +1400,7 @@ async def kill_container(request: web.Request) -> web.Response:
     if record is None:
         return _err(404, f"No such container: {cid}")
 
-    if record.kube_env is not None and hasattr(record.kube_env, "refresh_phase"):
-        try:
-            phase = await asyncio.to_thread(record.kube_env.refresh_phase)
-            if phase == "NotFound":
-                record.state = ContainerState.EXITED
-                record.finished_at = time.time()
-                record.pod_name = None
-        except Exception:
-            logger.debug("kill refresh failed id=%s", cid[:12], exc_info=True)
+    await _refresh_record_state(record)
 
     async with record.lock:
         if record.state != ContainerState.RUNNING:
@@ -1419,6 +1433,7 @@ async def restart_container(request: web.Request) -> web.Response:
     if record is None:
         return _err(404, f"No such container: {cid}")
 
+    await _refresh_record_state(record)
     if record.kube_env is not None and hasattr(record.kube_env, "restart"):
         try:
             await asyncio.to_thread(record.kube_env.restart)
@@ -1567,6 +1582,7 @@ async def rename_container(request: web.Request) -> web.Response:
     if record is None:
         return _err(404, f"No such container: {cid}")
 
+    await _refresh_record_state(record)
     old_name = record.name
     try:
         await store.rename(record, new_name)
@@ -1679,6 +1695,7 @@ async def delete_container(request: web.Request) -> web.Response:
     if record is None:
         return _err(404, f"No such container: {cid}")
 
+    await _refresh_record_state(record)
     async with record.lock:
         if record.state == ContainerState.RUNNING:
             if not force:
@@ -1912,6 +1929,7 @@ async def get_container_archive(request: web.Request) -> web.StreamResponse | we
     record = store.get(cid)
     if record is None:
         return _err(404, f"No such container: {cid}")
+    await _refresh_record_state(record)
     if record.kube_env is None or record.state != ContainerState.RUNNING:
         return _err(409, "Container is not running")
 
@@ -2020,6 +2038,7 @@ async def put_container_archive(request: web.Request) -> web.Response:
     record = store.get(cid)
     if record is None:
         return _err(404, f"No such container: {cid}")
+    await _refresh_record_state(record)
     if record.kube_env is None or record.state != ContainerState.RUNNING:
         return _err(409, "Container is not running")
 
@@ -2044,6 +2063,7 @@ async def create_exec(request: web.Request) -> web.Response:
     record = store.get(cid)
     if record is None:
         return _err(404, f"No such container: {cid}")
+    await _refresh_record_state(record)
     if record.state != ContainerState.RUNNING or record.kube_env is None:
         return _err(409, "Container is not running")
 
@@ -2116,6 +2136,7 @@ async def start_exec(request: web.Request) -> web.StreamResponse | web.Response:
     container = store.get(exec_rec.container_id)
     if container is None or container.kube_env is None:
         return _err(404, "Container gone")
+    await _refresh_record_state(container)
     if container.state != ContainerState.RUNNING:
         return _err(409, "Container is not running")
 
@@ -2355,6 +2376,7 @@ async def attach_container(request: web.Request) -> web.StreamResponse | web.Res
     if record is None:
         return _err(404, f"No such container: {cid}")
 
+    await _refresh_record_state(record)
     q = request.rel_url.query
 
     def _flag(name: str, default: str = "0") -> bool:

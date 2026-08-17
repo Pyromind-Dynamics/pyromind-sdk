@@ -80,6 +80,18 @@ def list_managed_pods(
     return list(resp.items or [])
 
 
+def _container_state_from_status(status: str) -> ContainerState:
+    active = {
+        "running",
+        "pending",
+        "creating",
+        "starting",
+        "up",
+        "ready",
+    }
+    return ContainerState.RUNNING if status.lower() in active else ContainerState.EXITED
+
+
 async def reconcile_pyromind_sandboxes(
     store: ContainerStore,
     *,
@@ -111,6 +123,7 @@ async def reconcile_pyromind_sandboxes(
 
     seen_ids = {sandbox.id for sandbox in sandboxes}
     adopted = 0
+
     for sandbox in sandboxes:
         sandbox_id = sandbox.id
         name = sandbox.name or sandbox_id
@@ -122,11 +135,7 @@ async def reconcile_pyromind_sandboxes(
         if not persisted_local:
             set_mapping(cid, sandbox_id)
         status = (sandbox.status or "").lower()
-        state = (
-            ContainerState.RUNNING
-            if status == "running"
-            else ContainerState.EXITED
-        )
+        state = _container_state_from_status(status)
         try:
             kube_env = PyromindSDK.attach_existing(
                 sandbox_id,
