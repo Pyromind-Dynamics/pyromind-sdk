@@ -716,10 +716,14 @@ def _parse_filters(filters: str | None) -> dict[str, list[str]]:
 
 
 def _has_type_filter(filters: dict[str, list[str]]) -> bool:
-    for item in filters.get("label") or []:
-        key, _, _ = item.partition("=")
-        if key in ("docker-rt.type", "type"):
+    for key, values in filters.items():
+        if key in ("label.type", "type"):
             return True
+        if key == "label":
+            for item in values:
+                label_key, _, _ = item.partition("=")
+                if label_key in ("docker-rt.type", "type"):
+                    return True
     return False
 
 
@@ -732,6 +736,13 @@ def _matches_filters(c: Any, filters: dict[str, list[str]]) -> bool:
         display_id = sandbox_id
     state = (sandbox_status or c.state.value).lower()
     labels = _to_list_item(c).get("Labels", {})
+
+    def type_matches(values: list[str]) -> bool:
+        container_type = _container_type(c).lower()
+        for value in values:
+            if container_type in [alt.lower() for alt in value.split("/")]:
+                return True
+        return False
 
     for key, values in filters.items():
         if key == "name":
@@ -758,8 +769,14 @@ def _matches_filters(c: Any, filters: dict[str, list[str]]) -> bool:
                 if not sep:
                     if label_key not in labels:
                         return False
+                elif label_key in ("docker-rt.type", "type"):
+                    if not type_matches([label_value]):
+                        return False
                 elif labels.get(label_key) != label_value:
                     return False
+        elif key in ("label.type", "type"):
+            if not type_matches(values):
+                return False
     return True
 
 
