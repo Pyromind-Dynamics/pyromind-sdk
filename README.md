@@ -273,7 +273,8 @@ provide a cross-field substring filter; use the explicit filter that matches
 the field you know (`name`, `id`, `status`, `ancestor`, or `label`).
 
 When the docker wrapper is active, `docker ps` uses the custom header:
-`ID / NAME / STATUS / PORTS / IMAGE`.
+`CONTAINER ID / IMAGE / COMMAND / CREATED / STATUS / PORTS / NAMES`, matching standard Docker. Column widths are adaptive to the terminal and long values are truncated; `CREATED` is computed in standard Docker style (e.g. `About a minute ago`, `3 days ago`).
+The STATUS column shows only the state keyword (running shows `Up`, stopped shows `Exited`, pending shows `Created`, failed shows `Dead`, without a duration), while `--filter status=` still matches the internal state (`running` / `stopped` / `pending` / `failed`).
 
 ### Docker command reference
 
@@ -352,7 +353,7 @@ docker ps -a   # Running + Stopped
 With the wrapper active, the header is:
 
 ```text
-ID  NAME  STATUS  RESOURCES  PORTS  VOLUMES  IMAGE
+CONTAINER ID  IMAGE  COMMAND  CREATED  STATUS  PORTS  NAMES
 ```
 
 Long values are truncated with `...`; use `docker inspect` for full details.

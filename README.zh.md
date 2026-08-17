@@ -274,7 +274,8 @@ docker ps --filter label.type=custom
 `name` / `id` / `status` / `ancestor` / `label` filter。
 
 docker wrapper 生效后，`docker ps` 表头会变成：
-`ID / NAME / STATUS / PORTS / IMAGE`。
+`CONTAINER ID / IMAGE / COMMAND / CREATED / STATUS / PORTS / NAMES`，与标准 Docker 对齐；列宽自适应终端、长内容按列宽缩略，`CREATED` 按标准 Docker 风格计算（如 `About a minute ago`、`3 days ago`）。
+STATUS 列只显示状态词（running 显示 `Up`、stopped 显示 `Exited`、pending 显示 `Created`、failed 显示 `Dead`，不带时长）；`--filter status=` 仍按内部状态 `running / stopped / pending / failed` 匹配。
 
 ### Docker 命令参考
 
@@ -350,7 +351,7 @@ docker ps -a   # 显示 Running + Stopped
 wrapper 生效时，表头为：
 
 ```text
-ID  NAME  STATUS  RESOURCES  PORTS  VOLUMES  IMAGE
+CONTAINER ID  IMAGE  COMMAND  CREATED  STATUS  PORTS  NAMES
 ```
 
 长字段自动截断显示 `...`，完整内容用 `docker inspect` 查看。

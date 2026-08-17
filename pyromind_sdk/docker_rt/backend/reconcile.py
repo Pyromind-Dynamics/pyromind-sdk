@@ -147,6 +147,12 @@ async def reconcile_pyromind_sandboxes(
                 port_mappings=sandbox.port_mappings,
                 created_at=sandbox.created_at,
                 updated_at=sandbox.updated_at,
+                endpoint_url=getattr(sandbox, "endpoint_url", None) or getattr(sandbox, "endpoint", None),
+                web_vnc_url=getattr(sandbox, "web_vnc_url", None),
+                usage=getattr(sandbox, "usage", None),
+                uid=getattr(sandbox, "uid", None),
+                system_image_path=getattr(sandbox, "system_image_path", None),
+                screen_size=getattr(sandbox, "screen_size", None),
             )
             existing = store.get(name) or store.get(sandbox_id)
             if existing is not None:

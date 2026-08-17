@@ -19,6 +19,9 @@ from pyromind_sdk.client.base import PyroMindAPIError
 
 from ..aio_server import (
     _has_type_filter,
+    _created_epoch,
+    _display_status,
+    _display_status_text,
     _matches_filters,
     _parse_filters,
     _to_inspect,
@@ -264,6 +267,7 @@ def test_list_item_marks_sandbox_type() -> None:
     item = _to_list_item(record)
 
     assert item["Labels"]["docker-rt.type"] == "osworld"
+    assert item["Labels"]["docker-rt.created"] == str(int(record.created))
 
 
 def _record(type_: str) -> ContainerRecord:
@@ -315,6 +319,120 @@ def test_type_filter_all_matches_every_type() -> None:
     assert _matches_filters(_record("custom"), filters) is True
     assert _matches_filters(_record("k8s"), filters) is True
 
+
+def test_display_status_maps_lifecycle_states() -> None:
+    running = _record("custom")
+    running.state = ContainerState.RUNNING
+    running.kube_env.sandbox_status = None
+    pending = _record("custom")
+    pending.state = ContainerState.CREATED
+    pending.kube_env.sandbox_status = None
+    stopped = _record("custom")
+    stopped.state = ContainerState.EXITED
+    stopped.kube_env.sandbox_status = None
+    failed = _record("custom")
+    failed.state = ContainerState.DEAD
+    failed.kube_env.sandbox_status = None
+
+    assert _display_status(running) == "running"
+    assert _display_status(pending) == "pending"
+    assert _display_status(stopped) == "stopped"
+    assert _display_status(failed) == "failed"
+
+    failed.kube_env.sandbox_status = "Failed"
+    stopped.kube_env.sandbox_status = "Stopped"
+    assert _display_status(failed) == "failed"
+    assert _display_status(stopped) == "stopped"
+
+
+def test_display_status_text_uses_standard_docker_wording() -> None:
+    running = _record("custom")
+    running.state = ContainerState.RUNNING
+    running.kube_env.sandbox_status = None
+    pending = _record("custom")
+    pending.state = ContainerState.CREATED
+    pending.kube_env.sandbox_status = None
+    stopped = _record("custom")
+    stopped.state = ContainerState.EXITED
+    stopped.kube_env.sandbox_status = None
+    failed = _record("custom")
+    failed.state = ContainerState.DEAD
+    failed.kube_env.sandbox_status = None
+
+    assert _display_status_text(running) == "Up"
+    assert _display_status_text(pending) == "Created"
+    assert _display_status_text(stopped) == "Exited"
+    assert _display_status_text(failed) == "Dead"
+
+    assert _to_list_item(running)["Status"] == "Up"
+    assert _to_list_item(running)["State"] == "running"
+
+
+def test_status_filter_accepts_display_status() -> None:
+    stopped = _record("custom")
+    stopped.state = ContainerState.EXITED
+    stopped.kube_env.sandbox_status = None
+
+    assert _matches_filters(stopped, {"status": ["stopped"]}) is True
+    assert _matches_filters(stopped, {"status": ["exited"]}) is True
+
+
+def test_list_item_command_empty_when_no_cmd() -> None:
+    record = _record("custom")
+    record.cmd = []
+    assert _to_list_item(record)["Command"] == ""
+
+    record.cmd = ["sleep", "1h"]
+    assert _to_list_item(record)["Command"] == "sleep 1h"
+
+
+def test_created_epoch_prefers_kube_env_created_at() -> None:
+    record = _record("custom")
+    record.created = 1000
+    assert _created_epoch(record) == 1000
+
+    record.kube_env.created_at = "2020-01-01T00:00:00Z"
+    assert _created_epoch(record) == 1577836800
+
+
+def test_inspect_includes_sandbox_api_fields(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.delenv("DOCKER_RT_INSPECT_MODE", raising=False)
+    adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.sandbox_id = "sb-demo"
+    adapter.sandbox_status = "Running"
+    adapter.sandbox_type = "custom"
+    adapter.name = "demo"
+    adapter.command = []
+    adapter.resources = {"cpu": "1", "memory": "2", "gpu": "0"}
+    adapter.configuration = None
+    adapter.volume_mounts = []
+    adapter.port_mappings = []
+    adapter.created_at = "2026-08-14T08:09:11.582984Z"
+    adapter.updated_at = "2026-08-17T08:53:32.990000Z"
+    adapter.endpoint_url = "https://endpoint"
+    adapter.web_vnc_url = "https://vnc"
+    adapter.usage = {"cpu_usage": 0.1}
+    adapter.uid = "u-1"
+    adapter.system_image_path = "/sys/img"
+    adapter.screen_size = {"width": 1280, "height": 720}
+
+    record = ContainerRecord(
+        id="sb-demo",
+        name="demo",
+        image="ubuntu:22.04",
+        state=ContainerState.RUNNING,
+        created=1577836800,
+        started_at=1577836800,
+        finished_at=0,
+        kube_env=adapter,
+    )
+    insp = _to_inspect(record)
+    assert insp["endpoint_url"] == "https://endpoint"
+    assert insp["web_vnc_url"] == "https://vnc"
+    assert insp["usage"]["cpu_usage"] == 0.1
+    assert insp["uid"] == "u-1"
+    assert insp["system_image_path"] == "/sys/img"
+    assert insp["screen_size"]["width"] == 1280
 def test_legacy_docker_rt_type_label_filter_still_works() -> None:
     filters = _parse_filters(json.dumps({"label": ["docker-rt.type=osworld"]}))
 

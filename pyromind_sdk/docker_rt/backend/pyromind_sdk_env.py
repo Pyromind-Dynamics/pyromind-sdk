@@ -107,6 +107,12 @@ class PyromindSDK:
         port_mappings: list[Any] | None = None,
         created_at: Any | None = None,
         updated_at: Any | None = None,
+        endpoint_url: str | None = None,
+        web_vnc_url: str | None = None,
+        usage: Any | None = None,
+        uid: str | None = None,
+        system_image_path: str | None = None,
+        screen_size: Any | None = None,
         logger: logging.Logger | None = None,
     ) -> "PyromindSDK":
         obj = cls.__new__(cls)
@@ -135,6 +141,12 @@ class PyromindSDK:
         obj.port_mappings = obj._json_ready(port_mappings)
         obj.created_at = obj._json_ready(created_at)
         obj.updated_at = obj._json_ready(updated_at)
+        obj.endpoint_url = endpoint_url
+        obj.web_vnc_url = web_vnc_url
+        obj.usage = obj._json_ready(usage)
+        obj.uid = uid
+        obj.system_image_path = system_image_path
+        obj.screen_size = obj._json_ready(screen_size)
         obj._client = get_sandbox_client()
         return obj
 
@@ -175,6 +187,12 @@ class PyromindSDK:
         self.port_mappings: list[Any] | None = None
         self.created_at: Any | None = None
         self.updated_at: Any | None = None
+        self.endpoint_url: str | None = None
+        self.web_vnc_url: str | None = None
+        self.usage: Any | None = None
+        self.uid: str | None = None
+        self.system_image_path: str | None = None
+        self.screen_size: Any | None = None
         self._terminal_phase: str | None = None
         self._exit_code = 0
         self._resources = ResourceConfig(
@@ -216,6 +234,12 @@ class PyromindSDK:
         self.port_mappings = self._json_ready(response.port_mappings)
         self.created_at = self._json_ready(response.created_at)
         self.updated_at = self._json_ready(response.updated_at)
+        self.endpoint_url = response.endpoint_url or getattr(response, "endpoint", None)
+        self.web_vnc_url = response.web_vnc_url
+        self.usage = self._json_ready(response.usage)
+        self.uid = response.uid
+        self.system_image_path = response.system_image_path
+        self.screen_size = self._json_ready(response.screen_size)
         self.pod_name = response.id
         self.name = response.name or self.name
 
