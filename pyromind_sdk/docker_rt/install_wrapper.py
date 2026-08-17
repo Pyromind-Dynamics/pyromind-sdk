@@ -12,7 +12,7 @@ from pathlib import Path
 WRAPPER_DIR = Path.home() / ".pyromind" / "bin"
 WRAPPER_PATH = WRAPPER_DIR / "docker"
 PATH_LINE = 'export PATH="$HOME/.pyromind/bin:$PATH"'
-WRAPPER_VERSION = "3"
+WRAPPER_VERSION = "4"
 
 
 def find_real_docker() -> str:
@@ -218,14 +218,53 @@ if [[ "${{args[0]:-}}" == "rm" ]]; then
   fi
 fi
 if [[ "${{args[0]:-}}" == "run" ]]; then
+  detach=0
   foreground=1
   for arg in "${{args[@]:1}}"; do
     case "$arg" in
-      -d|--detach|--detach=true|--detach=1|-i|--interactive|-t|--tty|-it|-ti|-di|-dt|-dit|--help|-h)
+      -d|--detach|--detach=true|--detach=1|-d=*|--detach=*|-di|-dt|-dit)
+        detach=1
+        ;;
+      -i|--interactive|-t|--tty|-it|-ti|--help|-h)
         foreground=0
         ;;
     esac
   done
+  if [[ $detach -eq 1 ]]; then
+    _run_out="$(mktemp)"
+    _run_err="$(mktemp)"
+    "$REAL_DOCKER" "${{args[@]}}" >"$_run_out" 2>"$_run_err"
+    _run_rc=$?
+    python3 -c '
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+mapping = {{}}
+try:
+    map_path = os.environ.get(
+        "PYROMIND_DOCKER_RT_CONTAINER_MAP"
+    ) or str(Path.home() / ".pyromind" / "docker-rt-container-map.json")
+    raw = json.loads(Path(map_path).read_text())
+    if isinstance(raw, dict):
+        mapping = {{str(k): str(v) for k, v in raw.items()}}
+except Exception:
+    pass
+
+for line in sys.stdin:
+    parts = []
+    for token in line.split():
+        if re.fullmatch(r"[a-f0-9]{{64}}", token) and token in mapping:
+            token = mapping[token]
+        parts.append(token)
+    sys.stdout.write(" ".join(parts) + "\\n")
+' < "$_run_out"
+    cat "$_run_err" >&2
+    rm -f "$_run_out" "$_run_err"
+    exit $_run_rc
+  fi
   if [[ $foreground -eq 1 ]]; then
     echo "docker-rt does not support foreground docker run without -d/-i/-t." >&2
     echo "Use 'docker run -d' for background or 'docker run -it IMAGE bash' for interactive." >&2

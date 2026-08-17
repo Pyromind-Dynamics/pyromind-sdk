@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import tarfile
@@ -23,6 +24,7 @@ from ..aio_server import (
     _to_list_item,
 )
 from ..backend.pyromind_sdk_env import PyromindSDK, _OneShotWs
+from ..backend.reconcile import _container_state_from_status
 from ..backend.store import ContainerRecord, ContainerState
 
 
@@ -138,6 +140,37 @@ def test_archive_path_stat_uses_shell_exec(monkeypatch: MonkeyPatch) -> None:
     assert stat is not None
     assert stat["name"] == "a.txt"
     assert stat["size"] == 123
+
+
+def test_container_state_from_status_keeps_pending_running() -> None:
+    assert _container_state_from_status("Pending") == ContainerState.RUNNING
+    assert _container_state_from_status("running") == ContainerState.RUNNING
+    assert _container_state_from_status("Stopped") == ContainerState.EXITED
+
+
+def test_refresh_record_state_queries_backend_before_lifecycle() -> None:
+    from ..aio_server import _refresh_record_state
+
+    adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.sandbox_id = "sb-pending"
+    adapter.sandbox_status = "Pending"
+    client = MagicMock()
+    sandbox = MagicMock()
+    sandbox.status = "Pending"
+    client.get_sandbox.return_value = sandbox
+    adapter._client = client
+
+    record = ContainerRecord(
+        id="local-id",
+        name="demo",
+        image="busybox:1.36",
+        state=ContainerState.EXITED,
+        kube_env=adapter,
+    )
+    asyncio.run(_refresh_record_state(record))
+
+    client.get_sandbox.assert_called_once_with("sb-pending")
+    assert record.state == ContainerState.RUNNING
 
 
 def test_put_archive_writes_files_into_sandbox() -> None:

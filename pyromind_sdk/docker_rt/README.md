@@ -44,6 +44,9 @@ Running 后会直接返回并提示，因为前台 attach 暂不支持；需要�
 
 本地 container ID 到 sandbox ID 的映射持久化在
 `~/.pyromind/docker-rt-container-map.json`，daemon 重启后旧 ID 仍可用。
+`docker run -d` 的输出会由 wrapper 改写为 sandbox ID；`docker create` 时
+sandbox 尚未创建，仍返回本地 ID，start 后 `ps` / `stop` / `rm` 都接受
+sandbox ID。
 
 ## 常见问题
 
