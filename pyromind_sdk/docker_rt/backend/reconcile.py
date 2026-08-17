@@ -81,15 +81,13 @@ def list_managed_pods(
 
 
 def _container_state_from_status(status: str) -> ContainerState:
-    active = {
-        "running",
-        "pending",
-        "creating",
-        "starting",
-        "up",
-        "ready",
-    }
-    return ContainerState.RUNNING if status.lower() in active else ContainerState.EXITED
+    active = {"running", "up", "ready"}
+    status = status.lower()
+    if status in active:
+        return ContainerState.RUNNING
+    if status in {"stopped", "paused", "failed", "error", "succeeded", "success", "terminated", "notfound"}:
+        return ContainerState.EXITED
+    return ContainerState.CREATED
 
 
 async def reconcile_pyromind_sandboxes(

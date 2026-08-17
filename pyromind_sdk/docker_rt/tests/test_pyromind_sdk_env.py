@@ -99,10 +99,21 @@ def test_stop_only_pauses():
 
 def test_cleanup_pauses_before_delete():
     adapter, client = _adapter_with_fake_client()
+    adapter.sandbox_status = "Running"
 
     adapter.cleanup()
 
     client.pause.assert_called_once_with("sb-test-1")
+    client.delete.assert_called_once_with("sb-test-1")
+
+
+def test_cleanup_skips_pause_for_stopped_sandbox():
+    adapter, client = _adapter_with_fake_client()
+    adapter.sandbox_status = "Stopped"
+
+    adapter.cleanup()
+
+    client.pause.assert_not_called()
     client.delete.assert_called_once_with("sb-test-1")
 
 
@@ -118,6 +129,7 @@ def test_refresh_phase_marks_404_as_not_found():
 
 def test_cleanup_ignores_delete_404():
     adapter, client = _adapter_with_fake_client()
+    adapter.sandbox_status = "Running"
     client.delete.side_effect = PyroMindAPIError(
         "gone", status_code=404
     )
@@ -142,8 +154,8 @@ def test_archive_path_stat_uses_shell_exec(monkeypatch: MonkeyPatch) -> None:
     assert stat["size"] == 123
 
 
-def test_container_state_from_status_keeps_pending_running() -> None:
-    assert _container_state_from_status("Pending") == ContainerState.RUNNING
+def test_container_state_from_status_hides_pending_from_running_ps() -> None:
+    assert _container_state_from_status("Pending") == ContainerState.CREATED
     assert _container_state_from_status("running") == ContainerState.RUNNING
     assert _container_state_from_status("Stopped") == ContainerState.EXITED
 
@@ -170,7 +182,7 @@ def test_refresh_record_state_queries_backend_before_lifecycle() -> None:
     asyncio.run(_refresh_record_state(record))
 
     client.get_sandbox.assert_called_once_with("sb-pending")
-    assert record.state == ContainerState.RUNNING
+    assert record.state == ContainerState.CREATED
 
 
 def test_put_archive_writes_files_into_sandbox() -> None:
@@ -282,6 +294,29 @@ def test_standard_filters_match_record() -> None:
 
     assert _matches_filters(record, filters) is True
     assert _matches_filters(record, {"name": ["missing"]}) is False
+
+
+def test_name_filter_matches_container_name_not_sandbox_id() -> None:
+    adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.sandbox_id = "sb-docker-rt-debug"
+    adapter.sandbox_status = "Running"
+    adapter.sandbox_type = "custom"
+    adapter.resources = {}
+    adapter.volume_mounts = []
+    adapter.port_mappings = []
+
+    record = ContainerRecord(
+        id="sb-docker-rt-debug",
+        name="docker-labs-debug-tools-service",
+        image="docker/desktop-docker-debug-service:0.0.47",
+        state=ContainerState.RUNNING,
+        kube_env=adapter,
+    )
+
+    assert _matches_filters(record, {"name": ["docker-rt"]}) is False
+
+    record.name = "docker-rt-fbdd61e38578"
+    assert _matches_filters(record, {"name": ["docker-rt"]}) is True
 
 
 def test_one_shot_ws_yields_output_once():
