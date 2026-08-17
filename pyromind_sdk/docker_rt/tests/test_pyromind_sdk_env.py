@@ -18,6 +18,7 @@ from pytest import MonkeyPatch
 from pyromind_sdk.client.base import PyroMindAPIError
 
 from ..aio_server import (
+    _has_type_filter,
     _matches_filters,
     _parse_filters,
     _to_inspect,
@@ -263,6 +264,55 @@ def test_list_item_marks_sandbox_type() -> None:
     item = _to_list_item(record)
 
     assert item["Labels"]["docker-rt.type"] == "osworld"
+
+
+def _record(type_: str) -> ContainerRecord:
+    adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.sandbox_id = f"sb-{type_}"
+    adapter.sandbox_status = "Running"
+    adapter.sandbox_type = type_
+    adapter.resources = {}
+    adapter.volume_mounts = []
+    adapter.port_mappings = []
+
+    return ContainerRecord(
+        id=f"sb-{type_}",
+        name=f"{type_}-1",
+        image=f"{type_}:latest",
+        state=ContainerState.RUNNING,
+        kube_env=adapter,
+    )
+
+
+def test_type_filter_label_matches_container_type() -> None:
+    os_record = _record("osworld")
+    custom_record = _record("custom")
+
+    os_filters = _parse_filters(json.dumps({"label.type": ["osworld"]}))
+    custom_filters = _parse_filters(json.dumps({"label.type": ["custom"]}))
+
+    assert _has_type_filter(os_filters) is True
+    assert _matches_filters(os_record, os_filters) is True
+    assert _matches_filters(custom_record, os_filters) is False
+    assert _matches_filters(custom_record, custom_filters) is True
+    assert _matches_filters(os_record, custom_filters) is False
+
+
+def test_type_filter_osworld_custom_matches_both_types() -> None:
+    filters = _parse_filters(json.dumps({"label.type": ["osworld/custom"]}))
+
+    assert _has_type_filter(filters) is True
+    assert _matches_filters(_record("osworld"), filters) is True
+    assert _matches_filters(_record("custom"), filters) is True
+    assert _matches_filters(_record("k8s"), filters) is False
+
+
+def test_legacy_docker_rt_type_label_filter_still_works() -> None:
+    filters = _parse_filters(json.dumps({"label": ["docker-rt.type=osworld"]}))
+
+    assert _has_type_filter(filters) is True
+    assert _matches_filters(_record("osworld"), filters) is True
+    assert _matches_filters(_record("custom"), filters) is False
 
 
 def test_standard_filters_match_record() -> None:
