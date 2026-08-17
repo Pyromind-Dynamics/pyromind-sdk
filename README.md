@@ -245,9 +245,13 @@ docker create \
 `docker ps` only shows Running sandboxes by default; use `docker ps -a` to see
 Stopped sandboxes too.
 `docker ps` shows CUSTOM sandboxes only. To include OSWorld instances, use:
+`docker ps` shows CUSTOM sandboxes only. Filter by type using `label.type`
+(default CUSTOM, `osworld` for OSWorld, `all` for both):
 
 ```bash
-docker ps --filter label=docker-rt.type=osworld
+docker ps --filter label.type=osworld
+docker ps --filter label.type=custom
+docker ps --filter label.type=all
 ```
 
 Standard Docker filters are passed to the docker-rt server and applied there:
@@ -257,8 +261,10 @@ docker ps --filter name=test-sdk-1
 docker ps --filter id=sb-94d290
 docker ps --filter status=running
 docker ps --filter ancestor=swebench
-docker ps --filter label=docker-rt.type=custom
+docker ps --filter label.type=custom
 ```
+
+The legacy `--filter label=docker-rt.type=<type>` syntax is still supported.
 
 This is the correct way to search on the server side. `docker ps | grep XXXX`
 is client-side filtering: `grep` runs after the daemon has returned output, so

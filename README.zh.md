@@ -248,9 +248,12 @@ docker create \
 默认 `docker ps` 只显示 Running 的 sandbox；Stopped 的 sandbox 用
 `docker ps -a` 查看。
 `docker ps` 默认只展示 CUSTOM 类型。要看 OSWorld 实例，使用：
+`docker ps` 默认只展示 CUSTOM 类型。用 `label.type` 按类型过滤：
 
 ```bash
-docker ps --filter label=docker-rt.type=osworld
+docker ps --filter label.type=osworld
+docker ps --filter label.type=custom
+docker ps --filter label.type=all        # osworld + custom 两种都要
 ```
 
 标准 Docker filter 会传给 docker-rt 服务端并在服务端过滤：
@@ -260,8 +263,10 @@ docker ps --filter name=test-sdk-1
 docker ps --filter id=sb-94d290
 docker ps --filter status=running
 docker ps --filter ancestor=swebench
-docker ps --filter label=docker-rt.type=custom
+docker ps --filter label.type=custom
 ```
+
+旧的 `--filter label=docker-rt.type=<type>` 写法仍兼容。
 
 这才是服务端搜索的正确方式。`docker ps | grep XXXX` 属于客户端过滤：
 `grep` 在 daemon 返回输出之后才执行，docker-rt 服务端根本拿不到 `XXXX`。
