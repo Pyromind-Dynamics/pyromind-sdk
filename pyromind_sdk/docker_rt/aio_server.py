@@ -568,6 +568,78 @@ def _status_text(state: ContainerState) -> str:
     return state.value
 
 
+def _display_status(c: Any) -> str:
+    """Map a record to one of: running / stopped / pending / failed."""
+    _, sandbox_status = _sandbox_identity(c)
+    s = (sandbox_status or "").strip().lower()
+    if s in {"failed", "error", "dead"}:
+        return "failed"
+    if s in {"running", "up", "ready"}:
+        return "running"
+    if s in {"stopped", "paused", "exited", "succeeded", "success", "terminated", "notfound"}:
+        return "stopped"
+    if s in {"pending", "created", "unknown", "starting"}:
+        return "pending"
+    if c.state == ContainerState.DEAD:
+        return "failed"
+    if c.state == ContainerState.RUNNING:
+        return "running"
+    if c.state == ContainerState.EXITED:
+        return "stopped"
+    return "pending"
+
+
+def _display_status_text(c: Any) -> str:
+    """Docker-style STATUS state keyword, without the trailing duration."""
+    state = _display_status(c)
+    if state == "running":
+        return "Up"
+    if state == "stopped":
+        return "Exited"
+    if state == "failed":
+        return "Dead"
+    return "Created"
+
+
+def _parse_epoch(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return int(value.timestamp())
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            if s.isdigit():
+                return int(s)
+        except ValueError:
+            pass
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except ValueError:
+            return None
+    return None
+
+
+def _created_epoch(c: Any) -> int:
+    kube_env = getattr(c, "kube_env", None)
+    created_at = getattr(kube_env, "created_at", None)
+    ts = _parse_epoch(created_at)
+    if ts is None:
+        ts = int(c.created)
+    return ts
+
+
 def _sandbox_identity(c: Any) -> tuple[str | None, str | None]:
     """Return (sandbox_id, sandbox_status) for PyromindSDK-backed records."""
     kube_env = getattr(c, "kube_env", None)
@@ -636,6 +708,7 @@ def _to_list_item(c: Any) -> dict[str, Any]:
     display_id = sandbox_id or c.id
     labels: dict[str, Any] = {"com.docker-rt.pod": c.pod_name or ""}
     labels["docker-rt.type"] = _container_type(c)
+    labels["docker-rt.created"] = str(_created_epoch(c))
     kube_env = getattr(c, "kube_env", None)
     if kube_env is not None:
         resources = getattr(kube_env, "resources", None) or {}
@@ -676,12 +749,12 @@ def _to_list_item(c: Any) -> dict[str, Any]:
         "Names": [f"/{c.name}"],
         "Image": c.image,
         "ImageID": f"sha256:{display_id}",
-        "Command": " ".join(c.cmd) if c.cmd else "sleep",
-        "Created": int(c.created),
+        "Command": " ".join(c.cmd) if c.cmd else "",
+        "Created": _created_epoch(c),
         "Ports": ports_list,
         "Labels": labels,
         "State": (sandbox_status or c.state.value).lower(),
-        "Status": sandbox_status or _status_text(c.state),
+        "Status": _display_status_text(c),
         "HostConfig": {"NetworkMode": "default"},
         "NetworkSettings": {"Networks": {}},
         "Mounts": [],
@@ -756,7 +829,8 @@ def _matches_filters(c: Any, filters: dict[str, list[str]]) -> bool:
             if not any(display_id.startswith(value) for value in values):
                 return False
         elif key == "status":
-            if not any(value.lower() == state for value in values):
+            display = _display_status(c)
+            if not any(value.lower() in (state, display) for value in values):
                 return False
         elif key == "ancestor":
             if not any(
@@ -826,6 +900,36 @@ def _to_inspect(c: Any) -> dict[str, Any]:
                 getattr(kube_env, "port_mappings", None) or []
                 if kube_env is not None
                 else []
+            ),
+            "endpoint_url": (
+                getattr(kube_env, "endpoint_url", None) or ""
+                if kube_env is not None
+                else ""
+            ),
+            "web_vnc_url": (
+                getattr(kube_env, "web_vnc_url", None) or ""
+                if kube_env is not None
+                else ""
+            ),
+            "usage": (
+                getattr(kube_env, "usage", None) or {}
+                if kube_env is not None
+                else {}
+            ),
+            "uid": (
+                getattr(kube_env, "uid", None) or ""
+                if kube_env is not None
+                else ""
+            ),
+            "system_image_path": (
+                getattr(kube_env, "system_image_path", None) or ""
+                if kube_env is not None
+                else ""
+            ),
+            "screen_size": (
+                getattr(kube_env, "screen_size", None) or {}
+                if kube_env is not None
+                else {}
             ),
             "NetworkSettings": {"Ports": dict(published)},
             "Config": {"ExposedPorts": exposed or None},

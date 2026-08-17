@@ -12,7 +12,7 @@ from pathlib import Path
 WRAPPER_DIR = Path.home() / ".pyromind" / "bin"
 WRAPPER_PATH = WRAPPER_DIR / "docker"
 PATH_LINE = 'export PATH="$HOME/.pyromind/bin:$PATH"'
-WRAPPER_VERSION = "6"
+WRAPPER_VERSION = "10"
 
 
 def _wrapper_version() -> str | None:
@@ -147,64 +147,6 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
-quiet=0
-custom_format=0
-for arg in "${{args[@]:1}}"; do
-  case "$arg" in
-    --quiet|--quiet=*) quiet=1 ;;
-    --format|--format=*) custom_format=1 ;;
-    -*) if [[ "$arg" == *q* ]]; then quiet=1; fi ;;
-  esac
-done
-if [[ "${{args[0]:-}}" == "ps" && $quiet -eq 0 && $custom_format -eq 0 ]]; then
-  "$REAL_DOCKER" "${{args[@]}}" --no-trunc --format '{{{{.ID}}}}\\t{{{{.Names}}}}\\t{{{{.Status}}}}\\t{{{{.Label "docker-rt.resources"}}}}\\t{{{{.Ports}}}}\\t{{{{.Label "docker-rt.volumes"}}}}\\t{{{{.Image}}}}' | python3 -c '
-import sys
-import unicodedata
-
-def width(s):
-    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in s)
-
-def pad(s, n):
-    return s + " " * max(0, n - width(s))
-
-def short(s, n):
-    if width(s) <= n:
-        return s
-    out = []
-    used = 0
-    for ch in s:
-        ch_w = width(ch)
-        if used + ch_w > n - 1:
-            break
-        out.append(ch)
-        used += ch_w
-    return "".join(out) + "\\u2026"
-
-headers = ["ID", "NAME", "STATUS", "RESOURCES", "PORTS", "VOLUMES", "IMAGE"]
-widths = [26, 34, 10, 32, 42, 42, 60]
-print("".join(pad(h, w) for h, w in zip(headers, widths)).rstrip())
-for line in sys.stdin:
-    parts = line.rstrip("\\n").split("\\t")
-    if len(parts) >= 7:
-        parts[1] = parts[1].lstrip("/")
-        cells = [
-            short(parts[0], 24),
-            short(parts[1], 32),
-            short(parts[2], 9),
-            short(parts[3], 30),
-            short(parts[4], 40),
-            short(parts[5], 40),
-            short(parts[6], 60),
-        ]
-        print("".join(pad(c, w) for c, w in zip(cells, widths)).rstrip())
-    else:
-        print(line.rstrip())
-'
-  exit $?
-fi
-if [[ "${{args[0]:-}}" == "ps" && $quiet -eq 1 ]]; then
-  args+=(--no-trunc)
-fi
 if [[ "${{args[0]:-}}" == "rm" ]]; then
   rm_opts=()
   rm_targets=()

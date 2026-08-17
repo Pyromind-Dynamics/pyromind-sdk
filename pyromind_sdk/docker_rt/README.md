@@ -328,7 +328,8 @@ docker ps --filter label.type=custom
 
 `docker ps | grep XXXX` 是客户端过滤，daemon 收不到 `XXXX`；标准 Docker
 协议没有跨字段全文搜索，请明确字段后用标准 filter。
-docker wrapper 生效后，`docker ps` 表头为 `ID / NAME / STATUS / PORTS / IMAGE`。
+docker wrapper 生效后，`docker ps` 表头与标准 Docker 对齐（`CONTAINER ID / IMAGE / COMMAND / CREATED / STATUS / PORTS / NAMES`），列宽自适应终端、长内容按列宽缩略；`CREATED` 按标准 Docker 风格计算（如 `About a minute ago`、`3 days ago`）。
+STATUS 列只显示状态词（running 显示 `Up`、stopped 显示 `Exited`、pending 显示 `Created`、failed 显示 `Dead`，不带时长）；`--filter status=` 仍按内部状态 `running / stopped / pending / failed` 匹配。
 
 不支持：`docker build`、`docker buildx build`、`docker compose build`、
 `docker compose up --build`。请先用正常 Docker/BuildKit 构建并推送 registry。
