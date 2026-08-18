@@ -250,3 +250,64 @@ async def test_exec_errors(aiohttp_client, fake_kube: FakeKubeEnv):
     eid = (await resp.json())["Id"]
     resp = await client.post(f"/exec/{eid}/resize?h=40&w=120")
     assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_oneshot_empty_output_completes():
+    """Silent success (empty stdout) must not leave the exec stream hanging."""
+    from .. import aio_server as mod
+    from ..backend.pyromind_sdk_env import _OneShotWs
+
+    class _FakeEnv:
+        def attach_exec(self, cmd, *, stdin=False, tty=False, cwd=""):
+            # k8s_middleware returned a silent, successful one-shot result.
+            return _OneShotWs("", 0)
+
+    class _FakeResp:
+        async def write(self, _chunk):
+            raise AssertionError("empty command should write nothing")
+
+        async def drain(self):
+            return None
+
+    # Guard: must return (not hang) within ~2s for what is an instant command.
+    code = await asyncio.wait_for(
+        mod._stream_ws_oneshot(
+            resp=_FakeResp(),
+            kube_env=_FakeEnv(),
+            cmd=["test", "-d", "/home/user"],
+        ),
+        timeout=2,
+    )
+    assert code == 0
+
+
+@pytest.mark.asyncio
+async def test_oneshot_output_is_streamed():
+    """Non-empty one-shot output must still be written before completion."""
+    from .. import aio_server as mod
+    from ..backend.pyromind_sdk_env import _OneShotWs
+
+    class _FakeEnv:
+        def attach_exec(self, cmd, *, stdin=False, tty=False, cwd=""):
+            return _OneShotWs("hello\n", 0)
+
+    written = []
+
+    class _FakeResp:
+        async def write(self, chunk):
+            written.append(chunk)
+
+        async def drain(self):
+            return None
+
+    code = await asyncio.wait_for(
+        mod._stream_ws_oneshot(
+            resp=_FakeResp(),
+            kube_env=_FakeEnv(),
+            cmd=["echo", "hello"],
+        ),
+        timeout=2,
+    )
+    assert code == 0
+    assert b"hello" in b"".join(written)

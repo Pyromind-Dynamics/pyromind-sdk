@@ -404,6 +404,7 @@ def start_kube_environment(
         cpu_limit=cpu_limit,
         gpu=gpu,
         gpu_card=gpu_card,
+        ready_timeout=ready_timeout,
     )
 
 

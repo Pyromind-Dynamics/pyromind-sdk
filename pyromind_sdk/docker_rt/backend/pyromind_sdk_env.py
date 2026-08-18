@@ -13,6 +13,7 @@ import logging
 import posixpath
 import shlex
 import tarfile
+import time
 from typing import Any
 
 from pyromind_sdk.client.base import PyroMindAPIError
@@ -51,7 +52,10 @@ class _OneShotWs:
         self._started = False
 
     def is_open(self) -> bool:
-        return not self._started
+        # The exec already completed (one-shot, fully buffered: ``execute`` waits
+        # for the whole command). Treat it as closed so the reader finishes even
+        # for silent commands that produce no stdout/stderr (e.g. ``test -d ...``).
+        return False
 
     def update(self, timeout: float = 0.2) -> None:
         return None
@@ -169,6 +173,8 @@ class PyromindSDK:
         cpu_limit: str | None = None,
         gpu: str | None = None,
         gpu_card: str | None = None,
+        ready_timeout: int = 600,
+        ready_check_interval: int = 3,
         logger: logging.Logger | None = None,
         **kwargs: Any,
     ) -> None:
@@ -195,6 +201,8 @@ class PyromindSDK:
         self.screen_size: Any | None = None
         self._terminal_phase: str | None = None
         self._exit_code = 0
+        self.ready_timeout = ready_timeout
+        self.ready_check_interval = ready_check_interval
         self._resources = ResourceConfig(
             cpu=cpu_limit or DEFAULT_CPU,
             memory=memory_limit or DEFAULT_MEMORY,
@@ -286,6 +294,35 @@ class PyromindSDK:
             detail = f" (trace_id={trace_id})" if trace_id else ""
             raise RuntimeError(f"Sandbox {name!r} already exists{detail}") from exc
         self._bind_response(response)
+
+    def wait_until_running(self) -> None:
+        """Poll the single sandbox status until Running; raise on failure/timeout."""
+        if not self.sandbox_id:
+            return
+        deadline = time.monotonic() + self.ready_timeout
+        status = ""
+        while True:
+            try:
+                response = self._client.get_sandbox(self.sandbox_id)
+                status = str(getattr(response, "status", "") or "").lower()
+            except Exception as exc:
+                self.logger.debug(
+                    "status poll failed id=%s: %s", self.sandbox_id, exc,
+                )
+            if status in {"running", "up", "ready"}:
+                self.sandbox_status = status
+                self._terminal_phase = None
+                return
+            if status in {"failed", "error", "dead"}:
+                raise RuntimeError(
+                    f"sandbox {self.sandbox_id} failed to reach running: {status}"
+                )
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"timed out waiting for sandbox {self.sandbox_id} to be running "
+                    f"after {self.ready_timeout}s (last status={status!r})"
+                )
+            time.sleep(self.ready_check_interval)
 
     @staticmethod
     def _to_volume_mounts(

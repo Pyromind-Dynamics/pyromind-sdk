@@ -193,5 +193,10 @@ def main():
     # )
 
 
+#     client = StorageClient(access_key="X805271PGQEC8RDSNQNN", cluster="us-west-1#pre")
+#     # client.upload_folder("/Users/jiangwenchang/Downloads/tarballs", "testDir/slime/examples/coding_agent_rl/tarballs/", bucket_name="1000001514", part_size=20 * 1024 * 1024, num_parallel_uploads=5)
+#     client.upload_file("/Users/jiangwenchang/Downloads/tmax_train_full.jsonl", "testDir/slime/examples/coding_agent_rl/data/tmax_train_full.jsonl", bucket_name="1000001514", part_size=20 * 1024 * 1024, num_parallel_uploads=5)
+
+
 if __name__ == "__main__":
     main()

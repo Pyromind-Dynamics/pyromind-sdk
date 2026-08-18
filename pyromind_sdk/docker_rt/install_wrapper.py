@@ -12,7 +12,7 @@ from pathlib import Path
 WRAPPER_DIR = Path.home() / ".pyromind" / "bin"
 WRAPPER_PATH = WRAPPER_DIR / "docker"
 PATH_LINE = 'export PATH="$HOME/.pyromind/bin:$PATH"'
-WRAPPER_VERSION = "10"
+WRAPPER_VERSION = "12"
 
 
 def _wrapper_version() -> str | None:
@@ -223,7 +223,7 @@ if [[ "${{args[0]:-}}" == "run" ]]; then
         foreground=0
         ;;
     esac
-  done
+    done
   if [[ $detach -eq 1 ]]; then
     _run_out="$(mktemp)"
     _run_err="$(mktemp)"
@@ -258,11 +258,6 @@ for line in sys.stdin:
     cat "$_run_err" >&2
     rm -f "$_run_out" "$_run_err"
     exit $_run_rc
-  fi
-  if [[ $foreground -eq 1 ]]; then
-    echo "docker-rt does not support foreground docker run without -d/-i/-t." >&2
-    echo "Use 'docker run -d' for background or 'docker run -it IMAGE bash' for interactive." >&2
-    exit 1
   fi
 fi
 if [[ "${{args[0]:-}}" == "logs" ]]; then

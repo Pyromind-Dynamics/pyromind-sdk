@@ -334,9 +334,12 @@ docker rm -f test-sdk-1
 `--force`。使用 docker-rt wrapper 时，running 容器不带 `-f` 的 `docker rm`
 会先询问确认。如果提示 `No such container: NAME`，用 `docker ps -a` 查看
 实际容器名，只有创建时用了 `--name` 才会注册该名称。
-k8s-middleware 后端下，`docker run IMAGE` 不带 `-d` / `-it` 时，会在
-sandbox Running 后直接返回并给出提示，因为前台 attach 暂不支持。需要后台
-运行用 `docker run -d`，需要交互式终端用 `docker run -it IMAGE bash`。
+`docker run IMAGE`（前台，不带 `-d`）：docker-rt 会一直轮询直到 sandbox
+变成 Running/Up（600s 超时），然后绑定当前终端输出日志并阻塞到容器退出，
+Ctrl+C 发送 SIGINT 停止容器。
+`docker run -d`（后台 detach）：创建 sandbox 后立即返回 sandbox ID，不等
+Running，容器在后台异步启动（与 real docker detach 一致）。需要交互式
+终端用 `docker run -it IMAGE bash`。
 
 k8s-middleware 后端不传 `--cpus`、`--memory`、`--gpus` 时，默认使用
 `1 CPU / 2Gi 内存`，且不带 GPU。

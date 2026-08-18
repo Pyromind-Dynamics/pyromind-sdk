@@ -11,6 +11,7 @@ from .models import (
     InferenceJobResponse,
     InferencePage,
     ListQuery,
+    parse_pagination,
     InternalIPResponse,
 )
 
@@ -74,11 +75,14 @@ class InferenceClient(PyroMindClient):
         total = int(pagination.get("total") or len(jobs_data) or 0)
 
         jobs = [InferenceJobResponse(**job) if isinstance(job, dict) else job for job in jobs_data]
+        page_size, page_num = parse_pagination(
+            pagination, query.page_size or 20, query.page_num or 1
+        )
         return InferencePage(
             jobs=jobs,
             total=total,
-            page_size=int(pagination.get("pageSize") or query.page_size or 20),
-            page_num=int(pagination.get("pageNum") or query.page_num or 1),
+            page_size=page_size,
+            page_num=page_num,
         )
     
     def create(self, request: InferenceJobRequest) -> str:

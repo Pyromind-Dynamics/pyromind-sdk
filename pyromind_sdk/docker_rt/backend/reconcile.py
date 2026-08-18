@@ -14,7 +14,7 @@ from kubernetes.client.rest import ApiException
 
 from pyromind_sdk.client.models import SandboxType
 
-from .container_map import sandbox_to_local, set_mapping
+from .container_map import remove_mapping, sandbox_to_local, set_mapping
 from .runtime import (
     attach_kube_environment,
     build_core_v1_api,
@@ -185,16 +185,31 @@ async def reconcile_pyromind_sandboxes(
     reaped = 0
     for record in store.list(all_containers=True):
         kube_env = getattr(record, "kube_env", None)
-        if (
-            record.state == ContainerState.CREATED
-            or kube_env is None
-            or not isinstance(kube_env, PyromindSDK)
-        ):
+        if isinstance(kube_env, PyromindSDK):
+            sandbox_id = (
+                getattr(kube_env, "sandbox_id", None)
+                or record.sandbox_id
+                or record.pod_name
+            )
+        elif kube_env is None and (record.sandbox_id or record.pod_name):
+            # Pod was detached by the exit watcher after a server-side deletion;
+            # still tracked locally, so reap it when the server no longer lists it.
+            sandbox_id = record.sandbox_id or record.pod_name
+        else:
             continue
-        sandbox_id = getattr(kube_env, "sandbox_id", None) or record.pod_name
         if sandbox_id and sandbox_id not in seen_ids:
+            fwd = getattr(record, "port_forwarder", None)
+            record.port_forwarder = None
+            record.published_ports = {}
+            if fwd is not None:
+                try:
+                    await fwd.stop()
+                except Exception:
+                    logger.debug("reap port forward stop failed id=%s", record.id[:12], exc_info=True)
+            remove_mapping(record.id, record.sandbox_id or sandbox_id)
             await store.remove(record)
             reaped += 1
+            logger.info("reaped vanished sandbox %s locally", sandbox_id)
     _last_sync = now
     return {"adopted": adopted, "reaped": reaped}
 
