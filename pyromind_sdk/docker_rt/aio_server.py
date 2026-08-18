@@ -2307,7 +2307,8 @@ async def start_exec(request: web.Request) -> web.StreamResponse | web.Response:
         def _run() -> None:
             try:
                 kube_env.execute(
-                    {"command": " ".join(cmd)},
+                    # Keep argv intact so ``sh -c '<script>'`` quoting is preserved.
+                    {"command": list(cmd)},
                     cwd,
                 )
             finally:

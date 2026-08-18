@@ -417,7 +417,9 @@ class PyromindSDK:
             raise NotImplementedError(
                 "interactive exec through k8s_middleware requires the terminal websocket adapter"
             )
-        result = self.execute({"command": " ".join(cmd)}, cwd)
+        # Pass argv as a list so ``sh -c '<script>'`` quoting is preserved.
+        # (Joining with spaces would split the script into separate args.)
+        result = self.execute({"command": list(cmd)}, cwd)
         return _OneShotWs(result.get("output", ""), result.get("returncode", 0))
 
     def attach_main(
