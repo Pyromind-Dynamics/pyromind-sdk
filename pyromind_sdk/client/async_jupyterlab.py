@@ -11,6 +11,7 @@ from .models import (
     JupyterResponse,
     JupyterPage,
     ListQuery,
+    parse_pagination,
     InternalIPResponse,
 )
 
@@ -111,11 +112,14 @@ class AsyncJupyterLabClient(PyroMindAsyncClient):
                 converted_instance = self._convert_instance_data(instance)
                 converted_instances.append(JupyterResponse(**converted_instance))
 
+        page_size, page_num = parse_pagination(
+            pagination, query.page_size or 20, query.page_num or 1
+        )
         return JupyterPage(
             instances=converted_instances,
             total=total,
-            page_size=int(pagination.get("pageSize") or query.page_size or 20),
-            page_num=int(pagination.get("pageNum") or query.page_num or 1),
+            page_size=page_size,
+            page_num=page_num,
         )
 
     async def create(self, request: JupyterRequest) -> JupyterResponse:

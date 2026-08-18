@@ -38,9 +38,12 @@ docker rm -f test-sdk-1
 start/rm，必须先 `--name`。
 非 running 容器可直接 `docker rm NAME`；running 容器需要 `-f`，wrapper 会
 在缺少 `-f` 时先询问确认。
-k8s-middleware 后端下，`docker run IMAGE` 不带 `-d` / `-it` 时，sandbox
-Running 后会直接返回并提示，因为前台 attach 暂不支持；需要后台运行用
-`docker run -d`，需要交互终端用 `docker run -it IMAGE bash`。
+`docker run IMAGE`（前台，不带 `-d`）：docker-rt 会一直轮询直到 sandbox
+变成 Running/Up（600s 超时），然后绑定当前终端输出日志并阻塞到容器退出，
+Ctrl+C 发送 SIGINT 停止容器。
+`docker run -d`（后台 detach）：创建 sandbox 后立即返回 sandbox ID，不等
+Running，容器在后台异步启动（与 real docker detach 一致）。需要交互终端
+用 `docker run -it IMAGE bash`。
 
 本地 container ID 到 sandbox ID 的映射持久化在
 `~/.pyromind/docker-rt-container-map.json`，daemon 重启后旧 ID 仍可用。

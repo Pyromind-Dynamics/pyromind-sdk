@@ -15,6 +15,7 @@ from .models import (
     SandboxResponse,
     SandboxPage,
     ListQuery,
+    parse_pagination,
     InternalIPResponse,
     SandboxExecRequest,
     SandboxExecResponse,
@@ -148,11 +149,14 @@ class SandboxClient(PyroMindClient):
                 converted_sandbox = self._convert_sandbox_data(sandbox)
                 converted_sandboxes.append(SandboxResponse(**converted_sandbox))
 
+        page_size, page_num = parse_pagination(
+            pagination, query.page_size or 200, query.page_num or 1
+        )
         return SandboxPage(
             sandboxes=converted_sandboxes,
             total=total,
-            page_size=int(pagination.get("pageSize") or query.page_size or 200),
-            page_num=int(pagination.get("pageNum") or query.page_num or 1),
+            page_size=page_size,
+            page_num=page_num,
         )
     
     def create(self, request: SandboxRequest) -> SandboxResponse:

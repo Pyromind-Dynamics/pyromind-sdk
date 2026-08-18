@@ -1392,6 +1392,30 @@ async def start_container(request: web.Request) -> web.Response:
             record.state = ContainerState.RUNNING
             _spawn_pod_watch(request.app, record.id)
 
+            # docker run -d / docker start: block until the sandbox actually
+            # reports Running/Up (not just created/pending) so callers get a
+            # ready container. Cap at ready_timeout (default 600s).
+            wait_env = record.kube_env
+            if wait_env is not None and hasattr(wait_env, "refresh_phase"):
+                ready_timeout = float(getattr(record, "ready_timeout", 600) or 600)
+                deadline = time.monotonic() + max(ready_timeout, 1.0)
+                while time.monotonic() < deadline:
+                    try:
+                        await asyncio.to_thread(wait_env.refresh_phase)
+                    except Exception:
+                        pass
+                    status_word = _display_status(record)
+                    if status_word in {"running", "stopped", "failed"}:
+                        break
+                    await asyncio.sleep(2)
+                else:
+                    logger.error(
+                        "start timed out waiting for %s to become running (timeout=%ss status=%s)",
+                        record.id,
+                        ready_timeout,
+                        _display_status(record),
+                    )
+
     await _emit(request, action="start", record=record)
     if record.state == ContainerState.EXITED:
         await _emit(request, action="die", record=record)

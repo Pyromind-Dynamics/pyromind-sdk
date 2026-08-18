@@ -248,6 +248,65 @@ def test_create_defaults_to_1c2g_without_gpu(monkeypatch: MonkeyPatch) -> None:
     assert request.resources.gpu_card is None
 
 
+def _adapter_waiting() -> tuple[PyromindSDK, MagicMock]:
+    adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.sandbox_id = "sb-wait"
+    adapter.sandbox_status = "Pending"
+    adapter._terminal_phase = None
+    adapter.ready_timeout = 600
+    adapter.ready_check_interval = 0
+    client = MagicMock()
+    adapter._client = client
+    return adapter, client
+
+
+def test_wait_until_running_returns_when_up() -> None:
+    adapter, client = _adapter_waiting()
+    sandbox = MagicMock()
+    sandbox.status = "running"
+    client.get_sandbox.return_value = sandbox
+
+    adapter.wait_until_running()
+
+    assert adapter.sandbox_status == "running"
+    client.get_sandbox.assert_called_once_with("sb-wait")
+
+
+def test_wait_until_running_raises_on_failed_status() -> None:
+    adapter, client = _adapter_waiting()
+    sandbox = MagicMock()
+    sandbox.status = "failed"
+    client.get_sandbox.return_value = sandbox
+
+    try:
+        adapter.wait_until_running()
+    except RuntimeError as exc:
+        assert "failed to reach running" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_wait_until_running_times_out_within_budget() -> None:
+    adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.sandbox_id = "sb-tmo"
+    adapter.sandbox_status = "Pending"
+    adapter._terminal_phase = None
+    adapter.ready_timeout = 0.05
+    adapter.ready_check_interval = 0.005
+    client = MagicMock()
+    sandbox = MagicMock()
+    sandbox.status = "creating"
+    client.get_sandbox.return_value = sandbox
+    adapter._client = client
+
+    try:
+        adapter.wait_until_running()
+    except RuntimeError as exc:
+        assert "timed out waiting" in str(exc)
+    else:
+        raise AssertionError("expected timeout RuntimeError")
+
+
 def test_list_item_marks_sandbox_type() -> None:
     adapter = PyromindSDK.__new__(PyromindSDK)
     adapter.sandbox_id = "sb-os-1"

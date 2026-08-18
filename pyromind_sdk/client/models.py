@@ -350,6 +350,24 @@ class ListQuery(BaseModel):
         return params
 
 
+def parse_pagination(
+    pagination, default_page_size: int = 20, default_page_num: int = 1
+):
+    """Parse list pagination from the API (limit/offset) with a legacy fallback."""
+    pagination = pagination or {}
+    limit = pagination.get("limit") or pagination.get("pageSize")
+    offset = pagination.get("offset")
+    legacy_num = pagination.get("pageNum")
+    page_size = int(limit) if limit else default_page_size
+    if legacy_num is not None:
+        page_num = int(legacy_num)
+    elif limit is not None and offset is not None:
+        page_num = int(offset) // page_size + 1
+    else:
+        page_num = default_page_num
+    return page_size, page_num
+
+
 class SandboxAPIResponse(BaseModel):
     """Single sandbox API response"""
     sandbox: SandboxResponse
