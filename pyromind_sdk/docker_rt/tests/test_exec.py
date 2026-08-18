@@ -84,9 +84,27 @@ async def test_exec_detach_uses_execute(aiohttp_client, fake_kube: FakeKubeEnv):
         if getattr(fake_kube, "last_execute", None) is not None:
             break
         await asyncio.sleep(0.02)
-    assert fake_kube.last_execute["action"]["command"] == "true"
+    # argv must be passed through as a list so ``sh -c '<script>'`` quoting is kept.
+    assert fake_kube.last_execute["action"]["command"] == ["true"]
 
 
+
+    # A multi-arg ``sh -c '<script>'`` must also stay intact as an argv list.
+    fake_kube.last_execute = None
+    resp = await client.post(
+        f"/containers/{cid}/exec",
+        json={"Cmd": ["sh", "-c", "test -d /home/user && echo OK || echo NOT_EXIST"]},
+    )
+    eid = (await resp.json())["Id"]
+    start = await client.post(f"/exec/{eid}/start", json={"Detach": True, "Tty": False})
+    assert start.status == 200
+    for _ in range(100):
+        if getattr(fake_kube, "last_execute", None) is not None:
+            break
+        await asyncio.sleep(0.02)
+    assert fake_kube.last_execute["action"]["command"] == [
+        "sh", "-c", "test -d /home/user && echo OK || echo NOT_EXIST"
+    ]
 @pytest.mark.asyncio
 async def test_exec_interactive_adds_bash_i(aiohttp_client, fake_kube: FakeKubeEnv):
     from ..aio_server import create_aio_app

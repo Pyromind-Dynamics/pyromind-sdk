@@ -158,6 +158,28 @@ def test_archive_path_stat_uses_shell_exec(monkeypatch: MonkeyPatch) -> None:
     assert stat["size"] == 123
 
 
+def test_attach_exec_preserves_argv_quoting():
+    """argv (e.g. ``sh -c '<script>'``) must be sent as a list, not space-joined."""
+    adapter, client = _adapter_with_fake_client()
+    client.exec_command.return_value = MagicMock(
+        output="OK\n", stderr="", returncode=0, exception_info=""
+    )
+
+    adapter.working_dir = ""
+    ws = adapter.attach_exec(
+        ["sh", "-c", "test -d /home/user && echo OK || echo NOT_EXIST"],
+        stdin=False,
+        tty=False,
+        cwd="",
+    )
+
+    call = client.exec_command.call_args
+    assert call.args[0] == "sb-test-1"
+    assert call.args[1] == [
+        "sh", "-c", "test -d /home/user && echo OK || echo NOT_EXIST"
+    ]
+    assert ws.is_open() is False
+
 def test_container_state_from_status_hides_pending_from_running_ps() -> None:
     assert _container_state_from_status("Pending") == ContainerState.CREATED
     assert _container_state_from_status("running") == ContainerState.RUNNING
