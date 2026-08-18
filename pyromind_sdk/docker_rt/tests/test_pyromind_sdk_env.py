@@ -557,8 +557,9 @@ def test_name_filter_matches_container_name_not_sandbox_id() -> None:
 def test_one_shot_ws_yields_output_once():
     ws = _OneShotWs("hello\n", 0)
 
-    assert ws.is_open()
-    ws.update()
+    # A one-shot result is complete as soon as it is built (`execute` waits for
+    # the whole command), so it reports closed but still yields buffered output.
+    assert not ws.is_open()
     assert ws.peek_stdout()
     assert ws.read_stdout() == "hello\n"
     assert not ws.is_open()
