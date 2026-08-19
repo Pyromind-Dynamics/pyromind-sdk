@@ -264,6 +264,8 @@ docker ps   # 仍能看到 sb1
 | `DOCKER_RT_BUILD_REGISTRY` | （空） | 短 tag 推送前缀，如 `reg.example.com/docker-rt` |
 | `DOCKER_RT_BUILD_PUSH` | `true` | 是否 `push=true` |
 | `DOCKER_RT_SERVICE_DNS` | `true` | 启动时创建 ClusterIP Service（Compose 服务名 DNS） |
+| `DOCKER_RT_SOCKET_WAIT_SECONDS` | `30` | `--daemon` 启动时等待 socket 就绪的超时（秒），启动 reconcile 慢时调大 |
+| `DOCKER_RT_RM_CONCURRENCY` | `20` | `docker rm` 一次删 >5 个时并发删除的 worker 数 |
 | `DOCKER_RT_NODE_SELECTOR` | `none` | Pod `nodeSelector`（`key=val,...`；`none` 关闭） |
 | `LOG_LEVEL` | `INFO` | 日志 |
 

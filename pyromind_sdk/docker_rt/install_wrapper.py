@@ -12,7 +12,7 @@ from pathlib import Path
 WRAPPER_DIR = Path.home() / ".pyromind" / "bin"
 WRAPPER_PATH = WRAPPER_DIR / "docker"
 PATH_LINE = 'export PATH="$HOME/.pyromind/bin:$PATH"'
-WRAPPER_VERSION = "12"
+WRAPPER_VERSION = "13"
 
 
 def _wrapper_version() -> str | None:
@@ -192,22 +192,48 @@ if [[ "${{args[0]:-}}" == "rm" ]]; then
     fi
   fi
   rm_rc=0
-  for target in "${{rm_targets[@]}}"; do
-    _rm_out="$(mktemp)"
-    _rm_err="$(mktemp)"
-    "$REAL_DOCKER" rm "${{rm_opts[@]}}" "$target" >"$_rm_out" 2>"$_rm_err"
-    rc=$?
-    if [[ $rc -eq 0 ]]; then
-      printf '%s deleted\\n' "$target"
-      cat "$_rm_err" >&2
-    else
-      cat "$_rm_out" >&2
-      cat "$_rm_err" >&2
+  if [[ ${{#rm_targets[@]}} -gt 5 ]]; then
+    concurrency="${{DOCKER_RT_RM_CONCURRENCY:-20}}"
+    if ! [[ "$concurrency" =~ ^[0-9]+$ ]] || [[ "$concurrency" -lt 1 ]]; then
+      concurrency=20
     fi
-    rm -f "$_rm_out" "$_rm_err"
-    if [[ $rc -ne 0 ]]; then
-      rm_rc=$rc
+  else
+    concurrency=1
+  fi
+  _start=0
+  while [[ $_start -lt ${{#rm_targets[@]}} ]]; do
+    _end=$((_start + concurrency))
+    if [[ $_end -gt ${{#rm_targets[@]}} ]]; then
+      _end=${{#rm_targets[@]}}
     fi
+    _batch=("${{rm_targets[@]:_start:_end-_start}}")
+    _pids=()
+    for target in "${{_batch[@]}}"; do
+      (
+        _rm_out="$(mktemp)"
+        _rm_err="$(mktemp)"
+        "$REAL_DOCKER" rm "${{rm_opts[@]}}" "$target" >"$_rm_out" 2>"$_rm_err"
+        rc=$?
+        if [[ $rc -eq 0 ]]; then
+          printf '%s deleted\\n' "$target"
+          cat "$_rm_err" >&2
+        else
+          cat "$_rm_out" >&2
+          cat "$_rm_err" >&2
+        fi
+        rm -f "$_rm_out" "$_rm_err"
+        exit $rc
+      ) &
+      _pids+=($!)
+    done
+    for _pid in "${{_pids[@]}}"; do
+      wait "$_pid"
+      rc=$?
+      if [[ $rc -ne 0 && $rm_rc -eq 0 ]]; then
+        rm_rc=$rc
+      fi
+    done
+    _start=$_end
   done
   exit $rm_rc
 fi

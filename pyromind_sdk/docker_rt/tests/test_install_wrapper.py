@@ -154,6 +154,10 @@ def test_generated_wrapper_defers_ps_and_keeps_rm_batching(
     text = actual.read_text(encoding="utf-8")
     assert '"$REAL_DOCKER" rm "${rm_opts[@]}" "$target" >"$_rm_out"' in text
     assert "printf '%s deleted\\n' \"$target\"" in text
+    # rm parallelizes (>5 targets) with up to 10 concurrent workers and waits per pid.
+    # rm parallelizes (>5 targets) with configurable concurrency (default 20).
+    assert "${DOCKER_RT_RM_CONCURRENCY:-20}" in text
+    assert "concurrency=20" in text and 'wait "$_pid"' in text
     # docker ps is rendered natively by the real Docker CLI; no ps interception.
     assert '"$REAL_DOCKER" "${args[@]}" --no-trunc --format' not in text
     assert '"$REAL_DOCKER" "${args[@]}"' in text

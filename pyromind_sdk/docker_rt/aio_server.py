@@ -1117,6 +1117,57 @@ async def list_containers(request: web.Request) -> web.Response:
     return _json([_to_list_item(c) for c in records])
 
 
+def _normalize_extra_hosts(raw: Any) -> list[dict[str, str]]:
+    """Normalize HostConfig.ExtraHosts (docker --add-host) to {Hostname, IP}."""
+    out: list[dict[str, str]] = []
+    for entry in raw or []:
+        if isinstance(entry, dict):
+            hostname = str(entry.get("Hostname") or "").strip()
+            ip = str(entry.get("IP") or "").strip()
+        elif isinstance(entry, str):
+            hostname, _, ip = entry.partition(":")
+            hostname = hostname.strip()
+            ip = ip.strip()
+        else:
+            continue
+        if hostname and ip:
+            out.append({"Hostname": hostname, "IP": ip})
+    return out
+
+
+
+async def _apply_extra_hosts(record: Any) -> None:
+    """Write HostConfig.ExtraHosts (docker --add-host) into the sandbox /etc/hosts."""
+    hosts = getattr(record, "extra_hosts", None) or []
+    if not hosts:
+        return
+    kube_env = getattr(record, "kube_env", None)
+    if kube_env is None or not hasattr(kube_env, "execute"):
+        return
+    resolved: list[tuple[str, str]] = []
+    for entry in hosts:
+        hostname = str(entry.get("Hostname") or "").strip()
+        ip = str(entry.get("IP") or "").strip()
+        if not hostname or not ip:
+            continue
+        if ip == "host-gateway":
+            get_pod_ip = getattr(kube_env, "get_pod_ip", None)
+            ip = get_pod_ip() if callable(get_pod_ip) else None
+            if not ip:
+                logger.warning(
+                    "docker-rt could not resolve host-gateway for %s", hostname,
+                )
+                continue
+        resolved.append((ip, hostname))
+    if not resolved:
+        return
+    script = "; ".join(
+        f"grep -F '{host}' /etc/hosts >/dev/null 2>&1 || echo '{ip} {host}' >> /etc/hosts"
+        for ip, host in resolved
+    )
+    await asyncio.to_thread(kube_env.execute, {"command": ["sh", "-c", script]}, "/")
+
+
 async def create_container(request: web.Request) -> web.Response:
     store: ContainerStore = request.app["store"]
     networks: NetworkStore = request.app["networks"]
@@ -1150,6 +1201,7 @@ async def create_container(request: web.Request) -> web.Response:
     exposed_ports = dict(body.get("ExposedPorts") or {})
     networking_config = dict(body.get("NetworkingConfig") or {})
 
+    extra_hosts = _normalize_extra_hosts(host_config.get("ExtraHosts") or [])
     pod_timeout = "2h"
     if len(cmd) >= 2 and cmd[0] == "sleep":
         pod_timeout = str(cmd[1])
@@ -1202,6 +1254,7 @@ async def create_container(request: web.Request) -> web.Response:
             memory_request=memory_request,
             cpu_limit=cpu_limit,
             cpu_request=cpu_request,
+            extra_hosts=extra_hosts,
             gpu=gpu_count,
             gpu_card=gpu_card,
         )
@@ -1415,6 +1468,13 @@ async def start_container(request: web.Request) -> web.Response:
                         ready_timeout,
                         _display_status(record),
                     )
+
+    try:
+        await _apply_extra_hosts(record)
+    except Exception:
+        logger.exception(
+            "failed to apply --add-host for %s", record.name,
+        )
 
     await _emit(request, action="start", record=record)
     if record.state == ContainerState.EXITED:
