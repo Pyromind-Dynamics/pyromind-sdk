@@ -146,7 +146,8 @@ def start_daemon(
 
     spawn_watcher(proc.pid, log_file=log_path)
 
-    deadline = time.monotonic() + 5.0
+    socket_wait = float(os.getenv("DOCKER_RT_SOCKET_WAIT_SECONDS", "30"))
+    deadline = time.monotonic() + socket_wait
     started = False
     while time.monotonic() < deadline:
         if proc.poll() is not None:

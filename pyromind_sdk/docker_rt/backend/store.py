@@ -54,6 +54,8 @@ class ContainerRecord:
     exposed_ports: dict[str, Any] = field(default_factory=dict)
     publish_all_ports: bool = False
     # Runtime published maps (HostPort may be allocated)
+    # Docker --add-host / HostConfig.ExtraHosts
+    extra_hosts: list[dict[str, str]] = field(default_factory=list)
     published_ports: dict[str, list[dict[str, str]]] = field(default_factory=dict)
     port_forwarder: Any = None
     # ClusterIP Service for compose DNS
@@ -141,6 +143,7 @@ class ContainerStore:
         port_bindings: dict[str, Any] | None = None,
         exposed_ports: dict[str, Any] | None = None,
         publish_all_ports: bool = False,
+        extra_hosts: list[dict[str, str]] | None = None,
         memory_limit: str | None = None,
         memory_request: str | None = None,
         cpu_limit: str | None = None,
@@ -183,6 +186,7 @@ class ContainerStore:
                 port_bindings=dict(port_bindings or {}),
                 exposed_ports=dict(exposed_ports or {}),
                 publish_all_ports=bool(publish_all_ports),
+                extra_hosts=list(extra_hosts or []),
                 memory_limit=memory_limit,
                 memory_request=memory_request,
                 cpu_limit=cpu_limit,
