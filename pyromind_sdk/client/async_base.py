@@ -10,11 +10,9 @@ import logging
 import aiohttp
 from typing import Optional, Dict, Any
 
-from .base import append_trace_id, extract_trace_id
-
+from .base import append_trace_id, extract_trace_id, base_api_url
 
 # Constants
-DEFAULT_API_BASE_URL = "https://api-portal.pyromind.ai/api/v1"
 DEFAULT_CLUSTER = "us-west-2"
 DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_RETRIES = 3
@@ -106,7 +104,7 @@ class PyroMindAsyncClient:
 
         # Get base URL from parameter, environment variable, or use default
         if not base_url:
-            base_url = os.getenv(ENV_BASE_URL) or DEFAULT_API_BASE_URL
+            base_url = base_api_url()
 
         if not base_url:
             raise ValueError(

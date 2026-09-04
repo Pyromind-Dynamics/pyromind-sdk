@@ -32,7 +32,6 @@ from typing import Optional
 import aiohttp
 
 from pyromind_sdk.client.base import (
-    DEFAULT_API_BASE_URL,
     ENV_API_KEY,
     ENV_BASE_URL,
     ENV_CLUSTER,

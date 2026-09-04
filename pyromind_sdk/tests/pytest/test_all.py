@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+from pyromind_sdk.client.base import base_api_url
+
 # Add project root to Python path
 project_root = Path(__file__).parent.parent.parent
 if str(project_root) not in sys.path:
@@ -195,7 +197,7 @@ def run_pytest_class(class_name: str) -> int:
 def check_environment():
     """Check if required environment variables are set"""
     api_key = os.getenv("PYROMIND_API_KEY")
-    base_url = os.getenv("PYROMIND_BASE_URL", "https://api-portal.pyromind.ai/api/v1")
+    base_url = base_api_url()
 
     print("=" * 60)
     print("PyroMind SDK Integration Tests")
