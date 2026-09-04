@@ -22,8 +22,8 @@ except ImportError:
         "Please install it with: pip install minio"
     )
 
-from pyromind_sdk.client.base import PyroMindAPIError, DEFAULT_API_BASE_URL, DEFAULT_CLUSTER, ENV_API_KEY, ENV_BASE_URL, ENV_CLUSTER
-
+from pyromind_sdk.client.base import PyroMindAPIError, DEFAULT_API_BASE_URL, DEFAULT_CLUSTER, ENV_API_KEY, ENV_BASE_URL, \
+    ENV_CLUSTER, get_storage_url
 
 # Constants
 DEFAULT_STORAGE_ENDPOINT = "https://storage.pyromind.ai"
@@ -33,10 +33,6 @@ ENV_STORAGE_ENDPOINT = "PYROMIND_STORAGE_ENDPOINT"
 ENV_STORAGE_SECRET_KEY = "PYROMIND_STORAGE_SECRET_KEY"
 ENV_STORAGE_BUCKET = "PYROMIND_STORAGE_BUCKET"
 
-CLUSTER_STORAGE_ENDPOINTS = {
-    "us-west-1": "https://storage.pyromind.ai",
-    "us-west-2": "https://storage-us-west-2.pyromind.ai",
-}
 
 
 class StorageClient:
@@ -93,7 +89,10 @@ class StorageClient:
         if not endpoint:
             if cluster is None:
                 cluster = os.getenv(ENV_CLUSTER, DEFAULT_CLUSTER)
-            endpoint = CLUSTER_STORAGE_ENDPOINTS.get(cluster, "https://storage-us-west-2.pyromind.ai")
+            endpoint = get_storage_url(cluster, "https://storage-us-west-2.pyromind.ai")
+
+
+
 
         # Get access key from parameter or environment variable
         if access_key is None:

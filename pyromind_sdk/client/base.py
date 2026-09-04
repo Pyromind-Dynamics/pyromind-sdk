@@ -40,6 +40,7 @@ CLUSTER_RESOURCE = {
             "pre2": "https://pre2-api.pyromind.ai",
             "dev": "http://localhost:8001",
         },
+        "storage":"https://storage.pyromind.ai"
     },
     "us-west-2": {
         "http": {
@@ -48,8 +49,33 @@ CLUSTER_RESOURCE = {
             "pre2": "https://pre2-api-us-west-2.pyromind.ai",
             "dev": "http://localhost:8002",
         },
+        "storage":"https://storage-us-west-2.pyromind.ai"
+    },
+    "cn-east-1": {
+        "http": {
+            "prod": "https://api-cn-east-1.pyromind.ai",
+            "pre": "https://pre-api-cn-east-1.pyromind.ai",
+            "pre2": "https://pre2-api-cn-east-1.pyromind.ai",
+            "dev": "http://localhost:8002",
+        },
+        "storage": "https://storage-cn-east-1.pyromind.ai"
     },
 }
+
+
+def get_storage_url(cluster: Optional[str], def_url:str):
+    if not cluster:
+        return def_url
+    real_cluster, env = parse_cluster_code(cluster)
+    if real_cluster:
+        cfg = CLUSTER_RESOURCE.get(real_cluster)
+        if not cfg:
+            return def_url
+        return cfg.get("storage", def_url)
+    else:
+        return def_url
+
+
 
 
 def parse_cluster_code(cluster: str):
@@ -583,3 +609,5 @@ class PyroMindClient:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit"""
         self.close()
+
+
