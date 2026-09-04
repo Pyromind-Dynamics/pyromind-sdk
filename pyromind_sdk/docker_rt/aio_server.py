@@ -2921,23 +2921,25 @@ async def _hijack_session(
 
 
 def _pyromind_terminal_url(kube_env: Any) -> str:
+    """Build terminal WS URL from PYROMIND_CLUSTER (portal base URL cannot proxy WS)."""
     from pyromind_sdk.client.base import (
         ENV_API_KEY,
-        ENV_BASE_URL,
         ENV_CLUSTER,
         resolve_base_url_from_cluster,
     )
     from pyromind_sdk.terminal import build_terminal_websocket_url
 
-    base_url = (os.getenv(ENV_BASE_URL) or "").strip()
     cluster = (os.getenv(ENV_CLUSTER) or "").strip()
-    if not base_url and cluster:
-        base_url = resolve_base_url_from_cluster(cluster)
-    if not base_url:
-        base_url = "https://api-portal.pyromind.ai/api/v1"
+    if not cluster:
+        raise ValueError(
+            f"{ENV_CLUSTER} is required to resolve the terminal WebSocket URL "
+            "(e.g. us-west-1, us-west-1#pre, cn-east-1)."
+        )
+    # Raises ValueError for unknown cluster / env suffix.
+    base_cluster_url = resolve_base_url_from_cluster(cluster)
     api_key = (os.getenv(ENV_API_KEY) or "").strip()
     return build_terminal_websocket_url(
-        base_url,
+        base_cluster_url,
         kube_env.sandbox_id or "",
         api_key,
     )

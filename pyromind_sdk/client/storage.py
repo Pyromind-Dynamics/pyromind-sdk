@@ -22,8 +22,8 @@ except ImportError:
         "Please install it with: pip install minio"
     )
 
-from pyromind_sdk.client.base import PyroMindAPIError, DEFAULT_API_BASE_URL, DEFAULT_CLUSTER, ENV_API_KEY, ENV_BASE_URL, \
-    ENV_CLUSTER, get_storage_url
+from pyromind_sdk.client.base import PyroMindAPIError, DEFAULT_CLUSTER, ENV_API_KEY, \
+    ENV_CLUSTER, get_storage_url, base_api_url
 
 # Constants
 DEFAULT_STORAGE_ENDPOINT = "https://storage.pyromind.ai"
@@ -768,7 +768,7 @@ def get_storage_info() -> Dict[str, Any]:
             f"API key is required. Please set the {ENV_API_KEY} environment variable."
         )
 
-    base_url = os.getenv(ENV_BASE_URL, DEFAULT_API_BASE_URL)
+    base_url = base_api_url()
     cluster = os.getenv(ENV_CLUSTER, DEFAULT_CLUSTER)
 
     base_url = base_url.rstrip('/')

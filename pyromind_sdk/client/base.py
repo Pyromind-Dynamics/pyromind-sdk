@@ -63,6 +63,19 @@ CLUSTER_RESOURCE = {
 }
 
 
+
+
+def base_api_url():
+    """Get base URL from environment variable or use default"""
+    url = os.getenv(ENV_BASE_URL, DEFAULT_API_BASE_URL).strip()
+    if url:
+        print(f"[INFO] Using base URL: {url}")
+        return url
+    print(f"[INFO] Using base URL: {DEFAULT_API_BASE_URL}")
+    return DEFAULT_API_BASE_URL
+
+
+
 def get_storage_url(cluster: Optional[str], def_url:str):
     if not cluster:
         return def_url
@@ -240,7 +253,7 @@ class PyroMindClient:
 
         # Get base URL from parameter, environment variable, or use default
         if not base_url:
-            base_url = os.getenv(ENV_BASE_URL) or DEFAULT_API_BASE_URL
+            base_url = base_api_url()
 
         if not base_url:
             raise ValueError(

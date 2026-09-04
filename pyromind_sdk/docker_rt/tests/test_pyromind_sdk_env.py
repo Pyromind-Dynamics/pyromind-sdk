@@ -13,6 +13,7 @@ from pyromind_sdk.client.models import (
     SandboxType,
     VolumeMount,
 )
+import pytest
 from pytest import MonkeyPatch
 
 from pyromind_sdk.client.base import PyroMindAPIError
@@ -628,15 +629,19 @@ def test_inspect_sandbox_mode_default(monkeypatch: MonkeyPatch) -> None:
     assert result["resources"]["cpu"] == "4"
 
 
-def test_pyromind_terminal_url_uses_base_url(monkeypatch: MonkeyPatch) -> None:
+def test_pyromind_terminal_url_resolves_from_cluster(
+    monkeypatch: MonkeyPatch,
+) -> None:
     from ..aio_server import _pyromind_terminal_url
 
     adapter = PyromindSDK.__new__(PyromindSDK)
     adapter.sandbox_id = "sb-1"
-    monkeypatch.setenv(
-        "PYROMIND_BASE_URL", "https://pre-api.pyromind.ai/api/v1"
-    )
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-1#pre")
     monkeypatch.delenv("PYROMIND_API_KEY", raising=False)
+    # Portal / explicit base URL must not override cluster resolution.
+    monkeypatch.setenv(
+        "PYROMIND_BASE_URL", "https://api-portal.pyromind.ai/api/v1"
+    )
 
     url = _pyromind_terminal_url(adapter)
 
@@ -644,3 +649,48 @@ def test_pyromind_terminal_url_uses_base_url(monkeypatch: MonkeyPatch) -> None:
         "wss://pre-api.pyromind.ai/api/v1/sandboxes/sb-1/terminal?"
     )
     assert "cols=80&rows=24" in url
+    assert "token=" not in url
+
+
+def test_pyromind_terminal_url_cn_east_1_and_api_key(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    from ..aio_server import _pyromind_terminal_url
+
+    adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.sandbox_id = "sb-cn"
+    monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1")
+    monkeypatch.setenv("PYROMIND_API_KEY", "k-test")
+
+    url = _pyromind_terminal_url(adapter)
+
+    assert url.startswith(
+        "wss://api-cn-east-1.pyromind.ai/api/v1/sandboxes/sb-cn/terminal?"
+    )
+    assert "token=k-test" in url
+
+
+def test_pyromind_terminal_url_requires_cluster(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    from ..aio_server import _pyromind_terminal_url
+
+    adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.sandbox_id = "sb-1"
+    monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
+
+    with pytest.raises(ValueError, match="PYROMIND_CLUSTER is required"):
+        _pyromind_terminal_url(adapter)
+
+
+def test_pyromind_terminal_url_unknown_cluster(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    from ..aio_server import _pyromind_terminal_url
+
+    adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.sandbox_id = "sb-1"
+    monkeypatch.setenv("PYROMIND_CLUSTER", "no-such-region")
+
+    with pytest.raises(ValueError, match="Unknown cluster"):
+        _pyromind_terminal_url(adapter)
