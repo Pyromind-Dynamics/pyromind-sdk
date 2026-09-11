@@ -33,6 +33,7 @@ from .models import (
     JupyterPage,
     ListQuery,
     SandboxPage,
+    SandboxExecStreamChunk,
 )
 
 __all__ = [
@@ -64,4 +65,5 @@ __all__ = [
     "InferencePage",
     "EchoMindPage",
     "ListQuery",
+    "SandboxExecStreamChunk",
 ]

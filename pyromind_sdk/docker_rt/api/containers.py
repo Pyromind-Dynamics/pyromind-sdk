@@ -23,6 +23,7 @@ from ..backend.store import ContainerState, ContainerStore
 from ..backend.stream_framing import frame_stdout
 from ..backend.pyromind_sdk_env import PyromindSDK
 from ..backend.reconcile import _container_state_from_status
+from .images import image_id
 
 logger = logging.getLogger("docker_rt.containers")
 
@@ -52,7 +53,7 @@ def _to_list_item(c: Any) -> dict[str, Any]:
         "Id": c.id,
         "Names": [f"/{c.name}"],
         "Image": c.image,
-        "ImageID": f"sha256:{c.id}",
+        "ImageID": image_id(c.image),
         "Command": " ".join(c.cmd) if c.cmd else "sleep",
         "Created": int(c.created),
         "Ports": [],

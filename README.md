@@ -520,6 +520,30 @@ changes.
 | `PYROMIND_STORAGE_SECRET_KEY` | No | — | Storage secret key |
 | `PYROMIND_STORAGE_BUCKET` | No | — | Default storage bucket name |
 
+### Streaming sandbox exec
+
+Use `exec_command_stream` for long-running commands. Output arrives as
+raw stdout/stderr byte chunks without the one-shot HTTP timeout:
+
+```python
+import sys
+
+with PyroMindAPIClient() as client:
+    for chunk in client.sandboxes.exec_command_stream(
+        "sb-xxxx",
+        "python train.py",
+        cwd="/workspace",
+    ):
+        if chunk.type == "stdout":
+            sys.stdout.buffer.write(chunk.data)
+        elif chunk.type == "stderr":
+            sys.stderr.buffer.write(chunk.data)
+        elif chunk.type == "exit":
+            print(f"exit={chunk.returncode}")
+```
+
+The async client supports `async for chunk in client.sandboxes.exec_command_stream(...)`.
+
 ## Project Structure
 
 ```

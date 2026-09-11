@@ -81,6 +81,7 @@ from .client.models import (
     ResourceConfig,
     VolumeMount,
     PortMapping,
+    SandboxExecStreamChunk,
 )
 
 # Export workflow functionality
@@ -163,6 +164,7 @@ __all__ = [
     "ResourceConfig",
     "VolumeMount",
     "PortMapping",
+    "SandboxExecStreamChunk",
     # Workflow functionality
     "WorkflowLiteConverter",
     "LayoutGenerator",

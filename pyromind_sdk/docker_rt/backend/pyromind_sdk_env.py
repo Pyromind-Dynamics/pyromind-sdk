@@ -11,8 +11,10 @@ import base64
 import io
 import logging
 import posixpath
+import queue
 import shlex
 import tarfile
+import threading
 import time
 from typing import Any
 
@@ -25,6 +27,10 @@ from pyromind_sdk.client.models import (
     VolumeMount,
 )
 from pyromind_sdk.client.sandbox import SandboxClient
+from pyromind_sdk.exec_stream import (
+    build_exec_stream_websocket_url,
+    iter_exec_stream,
+)
 
 from .portforward import parse_publish_spec
 from .runtime import parse_binds
@@ -34,6 +40,7 @@ _client_singleton: SandboxClient | None = None
 
 DEFAULT_CPU = "1"
 DEFAULT_MEMORY = "2Gi"
+_EXEC_STREAM_QUEUE_SIZE = 64
 
 
 def get_sandbox_client() -> SandboxClient:
@@ -79,6 +86,119 @@ class _OneShotWs:
 
     def close(self) -> None:
         self._started = True
+
+
+class _SdkExecStreamWs:
+    """Kubernetes-WS-like adapter backed by ``exec_command_stream``."""
+
+    def __init__(
+        self,
+        events: Any,
+        stop_event: threading.Event | None = None,
+    ) -> None:
+        self._events = events
+        self._stop_event = stop_event or threading.Event()
+        self._queue: "queue.Queue[tuple[str, Any] | None]" = queue.Queue(
+            maxsize=_EXEC_STREAM_QUEUE_SIZE
+        )
+        self._stdout = bytearray()
+        self._stderr = bytearray()
+        self._returncode = 0
+        self._done = False
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(target=self._read_events, daemon=True)
+        self._thread.start()
+
+    def _put_event(self, event: tuple[str, Any] | None) -> bool:
+        """Queue one event, respecting early close as backpressure."""
+        while not self._stop_event.is_set():
+            try:
+                self._queue.put(event, timeout=0.2)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _read_events(self) -> None:
+        try:
+            for event in self._events:
+                event_type = getattr(event, "type", "")
+                if event_type in {"stdout", "stderr"}:
+                    if not self._put_event(
+                        (event_type, getattr(event, "data", ""))
+                    ):
+                        return
+                elif event_type == "exit":
+                    self._returncode = int(
+                        getattr(event, "returncode", 0) or 0
+                    )
+        except BaseException as exc:
+            self._error = exc
+            self._returncode = 1
+            message = str(exc).strip() or type(exc).__name__
+            self._put_event(
+                ("stderr", f"exec stream error: {message}\n".encode("utf-8"))
+            )
+        finally:
+            while not self._stop_event.is_set():
+                try:
+                    self._queue.put(None, timeout=0.2)
+                    break
+                except queue.Full:
+                    continue
+
+    def is_open(self) -> bool:
+        return not self._done
+
+    def update(self, timeout: float = 0.2) -> None:
+        try:
+            event = self._queue.get(timeout=max(timeout, 0))
+        except queue.Empty:
+            return
+        if event is None:
+            self._done = True
+            return
+        stream_type, data = event
+        if isinstance(data, bytes):
+            raw = data
+        elif isinstance(data, bytearray):
+            raw = bytes(data)
+        else:
+            raw = str(data).encode("utf-8")
+        if stream_type == "stdout":
+            self._stdout.extend(raw)
+        else:
+            self._stderr.extend(raw)
+
+    def peek_stdout(self) -> bool:
+        return bool(self._stdout)
+
+    def read_stdout(self) -> bytes:
+        data = bytes(self._stdout)
+        self._stdout.clear()
+        return data
+
+    def peek_stderr(self) -> bool:
+        return bool(self._stderr)
+
+    def read_stderr(self) -> bytes:
+        data = bytes(self._stderr)
+        self._stderr.clear()
+        return data
+
+    @property
+    def returncode(self) -> int:
+        return self._returncode
+
+    def close(self) -> None:
+        self._stop_event.set()
+        self._done = True
+        close = getattr(self._events, "close", None)
+        if callable(close):
+            try:
+                close()
+            except (RuntimeError, ValueError):
+                pass
 
 
 class PyromindSDK:
@@ -412,15 +532,28 @@ class PyromindSDK:
         stdin: bool = True,
         tty: bool = False,
         cwd: str = "",
-    ) -> _OneShotWs:
+    ) -> _SdkExecStreamWs:
         if stdin or tty:
             raise NotImplementedError(
                 "interactive exec through k8s_middleware requires the terminal websocket adapter"
             )
-        # Pass argv as a list so ``sh -c '<script>'`` quoting is preserved.
-        # (Joining with spaces would split the script into separate args.)
-        result = self.execute({"command": list(cmd)}, cwd)
-        return _OneShotWs(result.get("output", ""), result.get("returncode", 0))
+        # Stream output over the platform WebSocket so long-running commands are
+        # not subject to the one-shot HTTP request timeout or response buffering.
+        stop_event = threading.Event()
+        url = build_exec_stream_websocket_url(
+            self._client.base_url,
+            self.sandbox_id,
+            self._client.api_key,
+            self._client.cluster,
+        )
+        events = iter_exec_stream(
+            url=url,
+            command=list(cmd),
+            cwd=cwd or self.working_dir,
+            timeout=None,
+            stop_event=stop_event,
+        )
+        return _SdkExecStreamWs(events, stop_event)
 
     def attach_main(
         self,

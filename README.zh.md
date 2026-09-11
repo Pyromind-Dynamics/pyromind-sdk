@@ -517,6 +517,30 @@ PyromindSDK 后端本地端口转发暂不支持，
 | `PYROMIND_STORAGE_SECRET_KEY` | 否 | — | 存储密钥 |
 | `PYROMIND_STORAGE_BUCKET` | 否 | — | 默认存储桶名 |
 
+### Sandbox 流式命令
+
+长命令使用 `exec_command_stream`，输出会按 stdout/stderr 的原始字节分块返回，
+不受一次性 HTTP 请求超时限制：
+
+```python
+import sys
+
+with PyroMindAPIClient() as client:
+    for chunk in client.sandboxes.exec_command_stream(
+        "sb-xxxx",
+        "python train.py",
+        cwd="/workspace",
+    ):
+        if chunk.type == "stdout":
+            sys.stdout.buffer.write(chunk.data)
+        elif chunk.type == "stderr":
+            sys.stderr.buffer.write(chunk.data)
+        elif chunk.type == "exit":
+            print(f"exit={chunk.returncode}")
+```
+
+异步客户端使用 `async for chunk in client.sandboxes.exec_command_stream(...)`。
+
 ## 项目结构
 
 ```

@@ -7,7 +7,7 @@ This module provides a client for managing sandboxes via the PyroMind API.
 import os
 import time
 import traceback
-from typing import List, Optional, Dict, Any, Union, IO
+from typing import List, Optional, Dict, Any, Union, IO, Iterator
 
 from .base import PyroMindClient
 from .models import (
@@ -19,6 +19,11 @@ from .models import (
     InternalIPResponse,
     SandboxExecRequest,
     SandboxExecResponse,
+    SandboxExecStreamChunk,
+)
+from ..exec_stream import (
+    build_exec_stream_websocket_url,
+    iter_exec_stream,
 )
 
 
@@ -399,6 +404,45 @@ class SandboxClient(PyroMindClient):
         )
         data = self._extract_data(response)
         return SandboxExecResponse(**data)
+
+    def exec_command_stream(
+        self,
+        sandbox_id: str,
+        command: Union[str, List[str]],
+        cwd: str = "",
+        timeout: Optional[int] = None,
+    ) -> Iterator[SandboxExecStreamChunk]:
+        """Execute a command and yield stdout/stderr chunks as they arrive.
+
+        Unlike :meth:`exec_command`, this method does not wait for the command
+        to finish before returning output. The final yielded chunk has
+        ``type="exit"`` and carries ``returncode``. stdout/stderr chunks carry
+        raw ``bytes`` so non-UTF-8 output is preserved.
+
+        Args:
+            sandbox_id: ID of the sandbox
+            command: Shell command string or argv list
+            cwd: Working directory inside the container
+            timeout: Optional server-side timeout in seconds. ``None`` means
+                unlimited (the WebSocket itself has no total timeout).
+
+        Yields:
+            :class:`SandboxExecStreamChunk` events
+        """
+        if isinstance(command, str):
+            command = command.strip()
+        url = build_exec_stream_websocket_url(
+            self.base_url,
+            sandbox_id,
+            self.api_key,
+            self.cluster,
+        )
+        yield from iter_exec_stream(
+            url=url,
+            command=command,
+            cwd=cwd.strip() if cwd else "",
+            timeout=timeout,
+        )
 
     # ===================== File Operations (custom sandbox) =====================
 

@@ -4,6 +4,8 @@ import asyncio
 import io
 import json
 import tarfile
+import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from pyromind_sdk.client.models import (
@@ -27,7 +29,10 @@ from ..aio_server import (
     _to_inspect,
     _to_list_item,
 )
+from ..api.images import image_id
 from ..backend.pyromind_sdk_env import PyromindSDK, _OneShotWs
+from ..backend import pyromind_sdk_env as env_mod
+from ..backend.pyromind_sdk_env import _SdkExecStreamWs
 from ..backend.reconcile import _container_state_from_status
 from ..backend.store import ContainerRecord, ContainerState
 
@@ -37,8 +42,12 @@ def _adapter_with_fake_client() -> tuple[PyromindSDK, MagicMock]:
     adapter.sandbox_id = "sb-test-1"
     adapter.name = "old-name"
     adapter.image = "busybox:1.36"
+    adapter.working_dir = "/"
     adapter._resources = ResourceConfig(cpu="4", memory="8Gi")
     adapter._client = MagicMock()
+    adapter._client.base_url = "https://pre-api.pyromind.ai/api/v1"
+    adapter._client.api_key = "test-key"
+    adapter._client.cluster = "us-west-1"
 
     current = MagicMock()
     current.name = "old-name"
@@ -158,14 +167,23 @@ def test_archive_path_stat_uses_shell_exec(monkeypatch: MonkeyPatch) -> None:
     assert stat["size"] == 123
 
 
-def test_attach_exec_preserves_argv_quoting():
+def test_attach_exec_preserves_argv_quoting(monkeypatch: MonkeyPatch):
     """argv (e.g. ``sh -c '<script>'``) must be sent as a list, not space-joined."""
-    adapter, client = _adapter_with_fake_client()
-    client.exec_command.return_value = MagicMock(
-        output="OK\n", stderr="", returncode=0, exception_info=""
-    )
+    adapter, _ = _adapter_with_fake_client()
+    captured = {}
 
-    adapter.working_dir = ""
+    def fake_stream(**kwargs):
+        captured.update(kwargs)
+        return iter(
+            [
+                SimpleNamespace(type="stdout", data="OK\n"),
+                SimpleNamespace(type="exit", returncode=0),
+            ]
+        )
+
+    monkeypatch.setattr(env_mod, "iter_exec_stream", fake_stream)
+
+    adapter.working_dir = "/workspace"
     ws = adapter.attach_exec(
         ["sh", "-c", "test -d /home/user && echo OK || echo NOT_EXIST"],
         stdin=False,
@@ -173,12 +191,79 @@ def test_attach_exec_preserves_argv_quoting():
         cwd="",
     )
 
-    call = client.exec_command.call_args
-    assert call.args[0] == "sb-test-1"
-    assert call.args[1] == [
+    assert captured["command"] == [
         "sh", "-c", "test -d /home/user && echo OK || echo NOT_EXIST"
     ]
+    assert captured["cwd"] == "/workspace"
+    for _ in range(100):
+        ws.update(timeout=0.01)
+        if ws.peek_stdout() and not ws.is_open():
+            break
+    assert ws.read_stdout() == b"OK\n"
+    assert ws.returncode == 0
+
+
+def test_attach_exec_surfaces_stream_errors(monkeypatch: MonkeyPatch):
+    adapter, _ = _adapter_with_fake_client()
+
+    def fake_stream(**kwargs):
+        def events():
+            yield SimpleNamespace(type="stdout", data="partial\n")
+            raise RuntimeError("stream disconnected")
+
+        return events()
+
+    monkeypatch.setattr(env_mod, "iter_exec_stream", fake_stream)
+
+    ws = adapter.attach_exec(["echo", "hi"], stdin=False, tty=False)
+    for _ in range(100):
+        ws.update(timeout=0.01)
+        if not ws.is_open():
+            break
+
+    assert ws.read_stdout() == b"partial\n"
+    assert ws.read_stderr() == b"exec stream error: stream disconnected\n"
+    assert ws.returncode == 1
+
+
+def test_exec_stream_completes_when_output_queue_was_full(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(env_mod, "_EXEC_STREAM_QUEUE_SIZE", 2)
+
+    def events():
+        yield SimpleNamespace(type="stdout", data=b"one")
+        yield SimpleNamespace(type="stdout", data=b"two")
+        yield SimpleNamespace(type="exit", returncode=7)
+
+    ws = _SdkExecStreamWs(events())
+    time.sleep(0.6)
+
+    for _ in range(20):
+        ws.update(timeout=0.01)
+        if not ws.is_open():
+            break
+
     assert ws.is_open() is False
+    assert ws.read_stdout() == b"onetwo"
+    assert ws.returncode == 7
+
+
+def test_exec_stream_preserves_binary_output() -> None:
+    def events():
+        yield SimpleNamespace(type="stdout", data=b"\x00\xff\xe4")
+        yield SimpleNamespace(type="stderr", data=b"\xfe\x01")
+        yield SimpleNamespace(type="exit", returncode=0)
+
+    ws = _SdkExecStreamWs(events())
+    for _ in range(20):
+        ws.update(timeout=0.01)
+        if not ws.is_open():
+            break
+
+    assert ws.read_stdout() == b"\x00\xff\xe4"
+    assert ws.read_stderr() == b"\xfe\x01"
+
 
 def test_container_state_from_status_hides_pending_from_running_ps() -> None:
     assert _container_state_from_status("Pending") == ContainerState.CREATED
@@ -626,6 +711,81 @@ def test_inspect_sandbox_mode_default(monkeypatch: MonkeyPatch) -> None:
     assert result["id"] == "sb-1"
     assert result["status"] == "Running"
     assert result["resources"]["cpu"] == "4"
+
+
+def test_inspect_standard_mode_uses_docker_identity(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DOCKER_RT_INSPECT_MODE", "standard")
+    adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.sandbox_id = "sb-different"
+    adapter.sandbox_status = "Running"
+    adapter.resources = {}
+    adapter.configuration = None
+    adapter.volume_mounts = []
+    adapter.port_mappings = []
+    adapter.created_at = None
+    adapter.updated_at = None
+
+    record = ContainerRecord(
+        id="local-container-id",
+        name="demo",
+        image="busybox:1.36",
+        state=ContainerState.RUNNING,
+        kube_env=adapter,
+    )
+
+    result = _to_inspect(record)
+
+    assert result["Id"] == "local-container-id"
+    assert result["Name"] == "/demo"
+    assert result["Config"]["Labels"]["docker-rt.sandbox-id"] == "sb-different"
+    assert "id" not in result.keys()
+    assert "name" not in result.keys()
+
+
+def test_list_item_uses_docker_container_identity() -> None:
+    adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.sandbox_id = "sb-different"
+    adapter.sandbox_status = "Running"
+    adapter.sandbox_type = "custom"
+    adapter.resources = {}
+    adapter.volume_mounts = []
+
+    record = ContainerRecord(
+        id="local-container-id",
+        name="demo",
+        image="busybox:1.36",
+        state=ContainerState.RUNNING,
+        kube_env=adapter,
+    )
+
+    result = _to_list_item(record)
+
+    assert result["Id"] == "local-container-id"
+    assert result["Names"] == ["/demo"]
+    assert result["ImageID"] == image_id("busybox:1.36")
+    assert result["Labels"]["docker-rt.sandbox-id"] == "sb-different"
+
+
+def test_id_filter_uses_docker_id_not_sandbox_id() -> None:
+    adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.sandbox_id = "sb-different"
+    adapter.sandbox_status = "Running"
+    adapter.sandbox_type = "custom"
+    adapter.resources = {}
+    adapter.volume_mounts = []
+
+    record = ContainerRecord(
+        id="local-container-id",
+        name="demo",
+        image="busybox:1.36",
+        state=ContainerState.RUNNING,
+        kube_env=adapter,
+    )
+
+    assert _matches_filters(record, {"id": ["local-container"]}) is True
+    assert _matches_filters(record, {"id": ["sb-different"]}) is False
 
 
 def test_pyromind_terminal_url_uses_base_url(monkeypatch: MonkeyPatch) -> None:

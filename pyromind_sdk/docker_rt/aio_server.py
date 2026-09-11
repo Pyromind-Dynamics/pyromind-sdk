@@ -705,10 +705,11 @@ def _resolve_gpu_resources(
 def _to_list_item(c: Any) -> dict[str, Any]:
     published = getattr(c, "published_ports", None) or {}
     sandbox_id, sandbox_status = _sandbox_identity(c)
-    display_id = sandbox_id or c.id
     labels: dict[str, Any] = {"com.docker-rt.pod": c.pod_name or ""}
     labels["docker-rt.type"] = _container_type(c)
     labels["docker-rt.created"] = str(_created_epoch(c))
+    if sandbox_id:
+        labels["docker-rt.sandbox-id"] = sandbox_id
     kube_env = getattr(c, "kube_env", None)
     if kube_env is not None:
         resources = getattr(kube_env, "resources", None) or {}
@@ -745,10 +746,10 @@ def _to_list_item(c: Any) -> dict[str, Any]:
                     }
                 )
     result = {
-        "Id": display_id,
+        "Id": c.id,
         "Names": [f"/{c.name}"],
         "Image": c.image,
-        "ImageID": f"sha256:{display_id}",
+        "ImageID": images_mod.image_id(c.image),
         "Command": " ".join(c.cmd) if c.cmd else "",
         "Created": _created_epoch(c),
         "Ports": ports_list,
@@ -803,10 +804,7 @@ def _has_type_filter(filters: dict[str, list[str]]) -> bool:
 def _matches_filters(c: Any, filters: dict[str, list[str]]) -> bool:
     if not filters:
         return True
-    display_id = c.id
     sandbox_id, sandbox_status = _sandbox_identity(c)
-    if sandbox_id:
-        display_id = sandbox_id
     state = (sandbox_status or c.state.value).lower()
     labels = _to_list_item(c).get("Labels", {})
 
@@ -826,7 +824,7 @@ def _matches_filters(c: Any, filters: dict[str, list[str]]) -> bool:
             ):
                 return False
         elif key == "id":
-            if not any(display_id.startswith(value) for value in values):
+            if not any(c.id.startswith(value) for value in values):
                 return False
         elif key == "status":
             display = _display_status(c)
@@ -857,11 +855,11 @@ def _matches_filters(c: Any, filters: dict[str, list[str]]) -> bool:
 
 def _to_inspect(c: Any) -> dict[str, Any]:
     sandbox_id, sandbox_status = _sandbox_identity(c)
-    display_id = sandbox_id or c.id
     state_status = sandbox_status or c.state.value
     running = state_status.lower() in {"running", "up"}
     mode = os.getenv("DOCKER_RT_INSPECT_MODE", "sandbox").lower()
     if mode == "sandbox":
+        display_id = sandbox_id or c.id
         kube_env = getattr(c, "kube_env", None)
         published = getattr(c, "published_ports", None) or {}
         exposed = {key.lower(): {} for key in published}
@@ -939,6 +937,8 @@ def _to_inspect(c: Any) -> dict[str, Any]:
     published = getattr(c, "published_ports", None) or {}
     labels = dict(getattr(c, "labels", None) or {})
     labels.setdefault("com.docker-rt.pod", c.pod_name or "")
+    if sandbox_id:
+        labels.setdefault("docker-rt.sandbox-id", sandbox_id)
     hostname = resolve_service_name(labels=labels, container_name=c.name)
     # Networks: stub compose endpoints + Pod IP when running
     networks: dict[str, Any] = {}
@@ -1007,7 +1007,7 @@ def _to_inspect(c: Any) -> dict[str, Any]:
             }
         )
     result = {
-        "Id": display_id,
+        "Id": c.id,
         "Created": _iso(c.created),
         "Path": c.cmd[0] if c.cmd else "sleep",
         "Args": c.cmd[1:] if c.cmd else ["2h"],
@@ -1083,23 +1083,6 @@ def _to_inspect(c: Any) -> dict[str, Any]:
             "IPAddress": pod_ip,
         },
     }
-    if sandbox_id:
-        kube_env = getattr(c, "kube_env", None)
-        result.update(
-            {
-                "id": sandbox_id,
-                "name": c.name,
-                "type": "custom",
-                "status": state_status,
-                "configuration": getattr(kube_env, "configuration", None),
-                "resources": getattr(kube_env, "resources", None),
-                "created_at": getattr(kube_env, "created_at", None),
-                "updated_at": getattr(kube_env, "updated_at", None),
-                "image": c.image,
-                "volume_mounts": getattr(kube_env, "volume_mounts", None),
-                "port_mappings": getattr(kube_env, "port_mappings", None),
-            }
-        )
     return result
 
 

@@ -6,7 +6,7 @@ This module provides an async client for managing sandboxes via the PyroMind API
 
 import asyncio
 import os
-from typing import List, Optional, Dict, Any, Union, IO
+from typing import List, Optional, Dict, Any, Union, IO, AsyncIterator
 from .async_base import PyroMindAsyncClient
 from .models import (
     SandboxRequest,
@@ -21,6 +21,11 @@ from .models import (
     VNCResponse,
     SandboxExecRequest,
     SandboxExecResponse,
+    SandboxExecStreamChunk,
+)
+from ..exec_stream import (
+    build_exec_stream_websocket_url,
+    iter_exec_stream_async,
 )
 
 
@@ -438,6 +443,30 @@ class AsyncSandboxClient(PyroMindAsyncClient):
         )
         data = self._extract_data(response)
         return SandboxExecResponse(**data)
+
+    async def exec_command_stream(
+        self,
+        sandbox_id: str,
+        command: Union[str, List[str]],
+        cwd: str = "",
+        timeout: Optional[int] = None,
+    ) -> AsyncIterator[SandboxExecStreamChunk]:
+        """Execute a command and yield raw stdout/stderr byte chunks as they arrive."""
+        if isinstance(command, str):
+            command = command.strip()
+        url = build_exec_stream_websocket_url(
+            self.base_url,
+            sandbox_id,
+            self.api_key,
+            self.cluster,
+        )
+        async for chunk in iter_exec_stream_async(
+            url=url,
+            command=command,
+            cwd=cwd.strip() if cwd else "",
+            timeout=timeout,
+        ):
+            yield chunk
 
     # ===================== File Operations (custom sandbox) =====================
 

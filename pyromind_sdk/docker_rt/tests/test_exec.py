@@ -38,6 +38,9 @@ async def test_exec_create_inspect_and_oneshot(aiohttp_client, fake_kube: FakeKu
     body = await insp.json()
     assert body["ID"] == eid
     assert body["ContainerID"] == cid
+    container_inspect = await (await client.get(f"/containers/{cid}/json")).json()
+    assert container_inspect["Id"] == cid
+    assert body["ContainerID"] == container_inspect["Id"]
     assert body["Running"] is False
     assert body["ProcessConfig"]["entrypoint"] == "echo"
     assert body["ProcessConfig"]["arguments"] == ["hi"]

@@ -473,6 +473,23 @@ class SandboxExecResponse(BaseModel):
     extra: Optional[Dict[str, Any]] = Field(default=None, description="Optional server-side metadata")
 
 
+class SandboxExecStreamChunk(BaseModel):
+    """One event from a streaming sandbox command execution."""
+
+    type: Literal["stdout", "stderr", "exit"] = Field(
+        ...,
+        description="Chunk type: stdout, stderr, or exit",
+    )
+    data: Union[str, bytes] = Field(
+        default="",
+        description="Output data for stdout/stderr chunks",
+    )
+    returncode: Optional[int] = Field(
+        default=None,
+        description="Process exit code on the final exit chunk",
+    )
+
+
 class BatchActionRequest(BaseModel):
     """Batch action request model"""
     actions: List[ActionRequest]
