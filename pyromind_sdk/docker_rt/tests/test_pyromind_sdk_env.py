@@ -177,22 +177,59 @@ def test_cleanup_pauses_before_delete(monkeypatch):
 
     asyncio.run(adapter.cleanup())
 
-    client.pause.assert_called_once_with("sb-test-1")
-    client.delete.assert_called_once_with("sb-test-1")
+    client.pause.assert_called_once_with(
+        "sb-test-1",
+        timeout=env_mod._CLEANUP_PAUSE_REQUEST_TIMEOUT_S,
+        retry=False,
+    )
+    client.delete.assert_called_once_with(
+        "sb-test-1",
+        timeout=env_mod._CLEANUP_DELETE_TIMEOUT_S,
+        retry=False,
+    )
 
 
-def test_cleanup_still_pauses_when_cached_status_is_stopped():
+def test_cleanup_does_not_pause_when_fresh_status_is_stopped():
     adapter, client = _adapter_with_fake_client()
-    adapter.sandbox_status = "Stopped"
+    adapter.sandbox_status = "Running"
 
     asyncio.run(adapter.cleanup())
 
-    client.pause.assert_called_once_with("sb-test-1")
-    client.delete.assert_called_once_with("sb-test-1")
+    client.pause.assert_not_called()
+    client.delete.assert_called_once_with(
+        "sb-test-1",
+        timeout=env_mod._CLEANUP_DELETE_TIMEOUT_S,
+        retry=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["stopped", "paused", "failed", "error", "pending", "creating"],
+)
+def test_cleanup_directly_deletes_non_running_status(status):
+    adapter, client = _adapter_with_fake_client()
+    client.get_sandbox.return_value.status = status
+
+    asyncio.run(adapter.cleanup())
+
+    client.pause.assert_not_called()
+    client.delete.assert_called_once_with(
+        "sb-test-1",
+        timeout=env_mod._CLEANUP_DELETE_TIMEOUT_S,
+        retry=False,
+    )
 
 
 def test_cleanup_retries_delete_while_pause_is_transitioning(monkeypatch):
     adapter, client = _adapter_with_fake_client()
+    statuses = [
+        SimpleNamespace(status="Stopped"),
+        SimpleNamespace(status="Running"),
+        SimpleNamespace(status="Stopped"),
+    ]
+    client.get_sandbox.side_effect = statuses
+    client.pause.return_value.status = "Stopped"
     client.delete.side_effect = [
         PyroMindAPIError(
             "delete failed: instance's status is Running, can not delete!",
@@ -204,7 +241,7 @@ def test_cleanup_retries_delete_while_pause_is_transitioning(monkeypatch):
 
     asyncio.run(adapter.cleanup())
 
-    assert client.pause.call_count == 2
+    assert client.pause.call_count == 1
     assert client.delete.call_count == 2
 
 
@@ -216,6 +253,18 @@ def test_refresh_phase_marks_404_as_not_found():
 
     assert asyncio.run(adapter.refresh_phase()) == "NotFound"
     assert adapter.sandbox_status == "NotFound"
+
+
+def test_refresh_phase_does_not_refetch_after_not_found():
+    adapter, client = _adapter_with_fake_client()
+    client.get_sandbox.side_effect = PyroMindAPIError(
+        "gone", status_code=404
+    )
+
+    assert asyncio.run(adapter.refresh_phase()) == "NotFound"
+    assert asyncio.run(adapter.refresh_phase(force=True)) == "NotFound"
+
+    client.get_sandbox.assert_called_once_with("sb-test-1")
 
 
 def test_refresh_phase_singleflights_status_requests():
@@ -245,6 +294,36 @@ def test_cleanup_ignores_delete_404():
     asyncio.run(adapter.cleanup())
 
     assert adapter.sandbox_id is None
+
+
+def test_cleanup_when_page_already_deleted_skips_delete():
+    adapter, client = _adapter_with_fake_client()
+    client.get_sandbox.side_effect = PyroMindAPIError(
+        "gone", status_code=404
+    )
+
+    asyncio.run(adapter.cleanup())
+
+    client.pause.assert_not_called()
+    client.delete.assert_not_called()
+    assert adapter.sandbox_id is None
+
+
+def test_cleanup_status_timeout_does_not_pause_unconfirmed_running():
+    adapter, client = _adapter_with_fake_client()
+    adapter.sandbox_status = "Running"
+    client.get_sandbox.side_effect = PyroMindAPIError(
+        "status lookup timed out", status_code=None
+    )
+
+    asyncio.run(adapter.cleanup())
+
+    client.pause.assert_not_called()
+    client.delete.assert_called_once_with(
+        "sb-test-1",
+        timeout=env_mod._CLEANUP_DELETE_TIMEOUT_S,
+        retry=False,
+    )
 
 
 def test_archive_path_stat_uses_shell_exec(monkeypatch: MonkeyPatch) -> None:
@@ -609,7 +688,7 @@ def test_cleanup_is_deduplicated_per_sandbox() -> None:
     pause_response.status = "Stopped"
     client.pause = AsyncMock(return_value=pause_response)
 
-    async def delete(_sandbox_id):
+    async def delete(_sandbox_id, **_kwargs):
         await asyncio.sleep(0.01)
 
     client.delete = AsyncMock(side_effect=delete)
@@ -619,7 +698,11 @@ def test_cleanup_is_deduplicated_per_sandbox() -> None:
         await asyncio.gather(adapter.cleanup(), adapter.cleanup())
 
     asyncio.run(run_cleanup())
-    client.delete.assert_awaited_once_with("sb-cleanup")
+    client.delete.assert_awaited_once_with(
+        "sb-cleanup",
+        timeout=env_mod._CLEANUP_DELETE_TIMEOUT_S,
+        retry=False,
+    )
 
 
 def test_list_item_marks_sandbox_type() -> None:

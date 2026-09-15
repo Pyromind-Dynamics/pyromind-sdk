@@ -56,11 +56,14 @@ _SDK_API_ERRORS = (PyroMindAPIError, PyroMindAsyncAPIError)
 DEFAULT_CPU = "1"
 DEFAULT_MEMORY = "2Gi"
 _EXEC_STREAM_QUEUE_SIZE = 64
-_CLEANUP_DELETABLE_STATUSES = {"stopped", "paused", "failed", "error"}
+_CLEANUP_RUNNING_STATUS = "running"
 _CLEANUP_RETRY_ATTEMPTS = 60
 _CLEANUP_DELETE_RETRY_DELAY_S = 1.0
 _CLEANUP_PAUSE_TIMEOUT_S = 60.0
 _CLEANUP_PAUSE_POLL_INTERVAL_S = 1.0
+_CLEANUP_STATUS_TIMEOUT_S = 10.0
+_CLEANUP_PAUSE_REQUEST_TIMEOUT_S = 30.0
+_CLEANUP_DELETE_TIMEOUT_S = 30.0
 DEFAULT_POD_STATUS_RUNNING_CACHE_TTL_S = 15.0
 DEFAULT_POD_STATUS_PENDING_CACHE_TTL_S = 5.0
 
@@ -773,7 +776,12 @@ class PyromindSDK:
         return "Unknown"
 
     async def refresh_phase(self, *, force: bool = False) -> str:
-        if not self.sandbox_id:
+        if (
+            not self.sandbox_id
+            or getattr(self, "_terminal_phase", None) == "NotFound"
+            or (getattr(self, "sandbox_status", None) or "").lower()
+            == "notfound"
+        ):
             return "NotFound"
         loop = asyncio.get_running_loop()
 
@@ -827,12 +835,16 @@ class PyromindSDK:
 
     async def _cleanup_once(self, sandbox_id: str) -> None:
         for attempt in range(1, _CLEANUP_RETRY_ATTEMPTS + 1):
-            exists = await self._pause_and_wait_for_cleanup(sandbox_id)
+            exists = await self._prepare_for_cleanup(sandbox_id)
             if not exists:
                 self._mark_cleanup_complete()
                 return
             try:
-                await self._client.delete(sandbox_id)
+                await self._client.delete(
+                    sandbox_id,
+                    timeout=_CLEANUP_DELETE_TIMEOUT_S,
+                    retry=False,
+                )
                 self._mark_cleanup_complete()
                 return
             except _SDK_API_ERRORS as exc:
@@ -850,10 +862,20 @@ class PyromindSDK:
                 )
                 await asyncio.sleep(_CLEANUP_DELETE_RETRY_DELAY_S)
 
-    async def _pause_and_wait_for_cleanup(self, sandbox_id: str) -> bool:
-        """Pause a sandbox and wait until the backend reports it as deletable."""
+    async def _prepare_for_cleanup(self, sandbox_id: str) -> bool:
+        """Pause only a running sandbox; other states are directly deletable."""
+        exists, status = await self._get_cleanup_status(sandbox_id)
+        if not exists:
+            return False
+        if status != _CLEANUP_RUNNING_STATUS:
+            return True
+
         try:
-            response = await self._client.pause(sandbox_id)
+            response = await self._client.pause(
+                sandbox_id,
+                timeout=_CLEANUP_PAUSE_REQUEST_TIMEOUT_S,
+                retry=False,
+            )
         except _SDK_API_ERRORS as exc:
             if exc.status_code == 404:
                 return False
@@ -864,39 +886,52 @@ class PyromindSDK:
             ).lower()
             if response_status:
                 self.sandbox_status = response_status
-                if response_status in _CLEANUP_DELETABLE_STATUSES:
+                if response_status != _CLEANUP_RUNNING_STATUS:
                     return True
 
-        return await self._wait_until_deletable(sandbox_id)
+        return await self._wait_until_not_running(sandbox_id)
 
-    async def _wait_until_deletable(self, sandbox_id: str) -> bool:
+    async def _get_cleanup_status(self, sandbox_id: str) -> tuple[bool, str]:
+        """Return ``(exists, status)`` using a fresh backend lookup."""
+        if (
+            getattr(self, "_terminal_phase", None) == "NotFound"
+            or (getattr(self, "sandbox_status", None) or "").lower()
+            == "notfound"
+        ):
+            return False, "notfound"
+        try:
+            sandbox = await self._client.get_sandbox(
+                sandbox_id,
+                timeout=_CLEANUP_STATUS_TIMEOUT_S,
+                retry=False,
+            )
+        except _SDK_API_ERRORS as exc:
+            if exc.status_code == 404:
+                return False, "notfound"
+            logger.debug("cleanup status lookup failed: %s", exc)
+            return True, ""
+
+        status = str(getattr(sandbox, "status", "") or "").lower()
+        if status:
+            self.sandbox_status = status
+        return True, status
+
+    async def _wait_until_not_running(self, sandbox_id: str) -> bool:
         """Return False only when the sandbox no longer exists."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _CLEANUP_PAUSE_TIMEOUT_S
         last_status = (self.sandbox_status or "unknown").lower()
         while True:
-            try:
-                sandbox = await self._client.get_sandbox(sandbox_id)
-            except _SDK_API_ERRORS as exc:
-                if exc.status_code == 404:
-                    return False
-                logger.debug(
-                    "wait for deletable sandbox failed: %s",
-                    exc,
-                )
-            else:
-                last_status = str(
-                    getattr(sandbox, "status", "") or ""
-                ).lower()
-                if last_status:
-                    self.sandbox_status = last_status
-                if last_status in _CLEANUP_DELETABLE_STATUSES:
-                    return True
+            exists, last_status = await self._get_cleanup_status(sandbox_id)
+            if not exists:
+                return False
+            if last_status and last_status != _CLEANUP_RUNNING_STATUS:
+                return True
 
             remaining = deadline - loop.time()
             if remaining <= 0:
                 raise RuntimeError(
-                    f"sandbox {sandbox_id} did not become deletable after "
+                    f"sandbox {sandbox_id} did not leave running state after "
                     f"pause (last status={last_status!r})"
                 )
             await asyncio.sleep(
