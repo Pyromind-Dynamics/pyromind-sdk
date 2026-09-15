@@ -238,17 +238,28 @@ class AsyncSandboxClient(PyroMindAsyncClient):
 
         return SandboxResponse(**data)
 
-    async def get_sandbox(self, sandbox_id: str) -> SandboxResponse:
+    async def get_sandbox(
+        self,
+        sandbox_id: str,
+        *,
+        timeout: Optional[float] = None,
+        retry: bool = True,
+    ) -> SandboxResponse:
         """
         Get a specific sandbox by ID (async)
 
         Args:
             sandbox_id: ID of the sandbox to retrieve
+            timeout: Optional per-request timeout in seconds.
+            retry: Whether transient transport failures may be retried.
 
         Returns:
             SandboxResponse object
         """
-        response = await self.get(f"/sandboxes/{sandbox_id}")
+        kwargs = {"retry": retry}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        response = await self.get(f"/sandboxes/{sandbox_id}", **kwargs)
         data = self._extract_data(response)
 
         if isinstance(data, dict):
@@ -364,26 +375,51 @@ class AsyncSandboxClient(PyroMindAsyncClient):
 
         return SandboxResponse(**data)
 
-    async def delete(self, sandbox_id: str) -> None:
+    async def delete(
+        self,
+        sandbox_id: str,
+        *,
+        timeout: Optional[float] = None,
+        retry: bool = True,
+    ) -> None:
         """
         Delete a sandbox (async)
 
         Args:
             sandbox_id: ID of the sandbox to delete
+            timeout: Optional per-request timeout in seconds.
+            retry: Whether transient transport failures may be retried.
         """
-        await self._request("DELETE", f"/sandboxes/{sandbox_id}")
+        kwargs = {"retry": retry}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        await self._request("DELETE", f"/sandboxes/{sandbox_id}", **kwargs)
 
-    async def pause(self, sandbox_id: str) -> SandboxResponse:
+    async def pause(
+        self,
+        sandbox_id: str,
+        *,
+        timeout: Optional[float] = None,
+        retry: bool = True,
+    ) -> SandboxResponse:
         """
         Pause a running sandbox (async)
 
         Args:
             sandbox_id: ID of the sandbox to pause
+            timeout: Optional per-request timeout in seconds.
+            retry: Whether transient transport failures may be retried.
 
         Returns:
             SandboxResponse object
         """
-        response = await self.post(f"/sandboxes/{sandbox_id}/pause")
+        kwargs = {"retry": retry}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        response = await self.post(
+            f"/sandboxes/{sandbox_id}/pause",
+            **kwargs,
+        )
         data = self._extract_data(response)
 
         if isinstance(data, dict):

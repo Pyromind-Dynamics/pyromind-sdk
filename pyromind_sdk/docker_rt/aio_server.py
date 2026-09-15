@@ -2080,7 +2080,8 @@ async def delete_container(request: web.Request) -> web.Response:
     if record is None:
         return _err(404, f"No such container: {cid}")
 
-    await _refresh_record_state(record, store)
+    if not force:
+        await _refresh_record_state(record, store)
     async with record.lock:
         if record.state == ContainerState.RUNNING:
             if not force:
