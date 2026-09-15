@@ -6,8 +6,19 @@ This module provides an async client for managing sandboxes via the PyroMind API
 
 import asyncio
 import os
-from typing import List, Optional, Dict, Any, Union, IO, AsyncIterator
-from .async_base import PyroMindAsyncClient
+from contextlib import asynccontextmanager
+from typing import (
+    AsyncIterator,
+    Dict,
+    IO,
+    List,
+    Optional,
+    Union,
+    Any,
+)
+import aiohttp
+
+from .async_base import PyroMindAsyncAPIError, PyroMindAsyncClient
 from .models import (
     SandboxRequest,
     SandboxResponse,
@@ -28,6 +39,16 @@ from ..exec_stream import (
     iter_exec_stream_async,
 )
 
+_DEFAULT_EXEC_TIMEOUT_S = 600
+_DEFAULT_CREATE_TIMEOUT_S = 300
+_DEFAULT_CREATE_CONCURRENCY_LIMIT = 128
+
+
+def _decode_exec_stream_data(data: Union[str, bytes]) -> str:
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+    return str(data)
+
 
 class AsyncSandboxClient(PyroMindAsyncClient):
     """
@@ -36,6 +57,39 @@ class AsyncSandboxClient(PyroMindAsyncClient):
     Provides async methods for creating, listing, getting, deleting sandboxes,
     executing actions, and managing VNC connections.
     """
+
+    def __init__(
+        self,
+        *args: Any,
+        create_timeout: Optional[int] = None,
+        create_concurrency_limit: Optional[int] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.create_timeout = (
+            _DEFAULT_CREATE_TIMEOUT_S
+            if create_timeout is None
+            else max(1, int(create_timeout))
+        )
+        self.create_concurrency_limit = (
+            _DEFAULT_CREATE_CONCURRENCY_LIMIT
+            if create_concurrency_limit is None
+            else max(0, int(create_concurrency_limit))
+        )
+        self._create_semaphore: Optional[asyncio.Semaphore] = None
+
+    @asynccontextmanager
+    async def _create_slot(self):
+        """Bound concurrent create requests when a positive limit is configured."""
+        if self.create_concurrency_limit <= 0:
+            yield
+            return
+        if self._create_semaphore is None:
+            self._create_semaphore = asyncio.Semaphore(
+                self.create_concurrency_limit
+            )
+        async with self._create_semaphore:
+            yield
 
     def _convert_sandbox_data(self, sandbox_data: dict, default_id: str = "") -> dict:
         """
@@ -151,17 +205,32 @@ class AsyncSandboxClient(PyroMindAsyncClient):
             page_num=page_num,
         )
 
-    async def create(self, request: SandboxRequest) -> SandboxResponse:
+    async def create(
+        self,
+        request: SandboxRequest,
+        *,
+        timeout: Optional[int] = None,
+    ) -> SandboxResponse:
         """
         Create a new sandbox (async)
 
         Args:
             request: SandboxCreateRequest with sandbox configuration
+            timeout: Optional create-specific timeout in seconds. The server
+                may commit the create before a response is sent, so POST create
+                requests are deliberately never retried automatically.
 
         Returns:
             SandboxResponse object
         """
-        response = await self.post("/sandboxes", json_data=request.model_dump(exclude_none=True))
+        effective_timeout = self.create_timeout if timeout is None else timeout
+        async with self._create_slot():
+            response = await self.post(
+                "/sandboxes",
+                json_data=request.model_dump(exclude_none=True),
+                retry=False,
+                timeout=effective_timeout,
+            )
         data = self._extract_data(response)
 
         if isinstance(data, dict):
@@ -223,9 +292,12 @@ class AsyncSandboxClient(PyroMindAsyncClient):
             intermediate_statuses = ["creating", "pending", "starting"]
 
         target_lower = target_status.lower()
-        waited = 0
+        intermediate = {status.lower() for status in intermediate_statuses}
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
 
-        while waited < timeout:
+        interval = max(0.1, float(check_interval))
+        while loop.time() < deadline:
             try:
                 sandbox = await self.get_sandbox(sandbox_id)
                 current_status = (sandbox.status or "").lower()
@@ -234,13 +306,12 @@ class AsyncSandboxClient(PyroMindAsyncClient):
                     return False
                 if current_status == target_lower:
                     return True
-                if current_status not in intermediate_statuses:
+                if current_status not in intermediate:
                     return False
-            except Exception:
+            except (asyncio.TimeoutError, aiohttp.ClientError, PyroMindAsyncAPIError):
                 pass
 
-            await asyncio.sleep(check_interval)
-            waited += check_interval
+            await asyncio.sleep(min(interval, max(0.0, deadline - loop.time())))
 
         return False
 
@@ -253,7 +324,7 @@ class AsyncSandboxClient(PyroMindAsyncClient):
         intermediate_statuses: Optional[List[str]] = None,
     ) -> SandboxResponse:
         """
-        Create a sandbox and poll until it reaches `target_status` (async).
+        Create a sandbox and wait until it reaches `target_status` (async).
         """
         sandbox = await self.create(request)
         await self.wait_for_sandbox_status(
@@ -424,12 +495,11 @@ class AsyncSandboxClient(PyroMindAsyncClient):
                 (e.g. ``"uname -a"``, run via ``/bin/sh -c``) or a
                 ``List[str]`` argv array (e.g. ``["ls", "-la", "/workspace"]``).
             cwd: Working directory for command execution (default: "")
-            timeout: Execution timeout in seconds, max 600 (default: 30)
+            timeout: Execution timeout in seconds, max 600 (default: 600)
 
         Returns:
             SandboxExecResponse with output, stderr, returncode, and exception_info
         """
-        # Strip whitespace for str commands; pass list as-is
         if isinstance(command, str):
             command = command.strip()
         request = SandboxExecRequest(
@@ -437,12 +507,38 @@ class AsyncSandboxClient(PyroMindAsyncClient):
             cwd=cwd.strip() if cwd else "",
             timeout=timeout,
         )
-        response = await self.post(
-            f"/sandboxes/{sandbox_id}/exec",
-            json_data=request.model_dump(exclude_none=True),
+        stdout_chunks: List[str] = []
+        stderr_chunks: List[str] = []
+        returncode = -1
+        effective_timeout = (
+            request.timeout
+            if request.timeout is not None
+            else _DEFAULT_EXEC_TIMEOUT_S
         )
-        data = self._extract_data(response)
-        return SandboxExecResponse(**data)
+        async for chunk in self.exec_command_stream(
+            sandbox_id=sandbox_id,
+            command=request.command,
+            cwd=request.cwd,
+            timeout=effective_timeout,
+        ):
+            text = _decode_exec_stream_data(chunk.data)
+            if chunk.type == "stdout":
+                stdout_chunks.append(text)
+            elif chunk.type == "stderr":
+                stderr_chunks.append(text)
+            elif chunk.type == "exit":
+                returncode = (
+                    int(chunk.returncode)
+                    if chunk.returncode is not None
+                    else -1
+                )
+
+        return SandboxExecResponse(
+            output="".join(stdout_chunks),
+            stderr="".join(stderr_chunks),
+            returncode=returncode,
+            exception_info="",
+        )
 
     async def exec_command_stream(
         self,
@@ -450,6 +546,7 @@ class AsyncSandboxClient(PyroMindAsyncClient):
         command: Union[str, List[str]],
         cwd: str = "",
         timeout: Optional[int] = None,
+        tty: bool = False,
     ) -> AsyncIterator[SandboxExecStreamChunk]:
         """Execute a command and yield raw stdout/stderr byte chunks as they arrive."""
         if isinstance(command, str):
@@ -465,6 +562,7 @@ class AsyncSandboxClient(PyroMindAsyncClient):
             command=command,
             cwd=cwd.strip() if cwd else "",
             timeout=timeout,
+            tty=tty,
         ):
             yield chunk
 

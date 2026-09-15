@@ -6,12 +6,15 @@ import asyncio
 import json
 import logging
 import os
+import random
 import threading
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
 from aiohttp import web
+from aiohttp.client_exceptions import ClientConnectionResetError
 
 from .api.system import API_VERSION, MIN_API_VERSION  # noqa: E402
 from .backend.archive import (  # noqa: E402
@@ -41,7 +44,11 @@ from .backend.runtime import (  # noqa: E402
     start_kube_environment,
 )
 from .backend.socklock import assert_socket_available  # noqa: E402
-from .backend.store import ContainerState, ContainerStore  # noqa: E402
+from .backend.store import (  # noqa: E402
+    ContainerState,
+    ContainerStore,
+    container_wait_condition_met,
+)
 from .backend.container_map import remove_mapping, set_mapping  # noqa: E402
 from .backend.stream_framing import frame_stderr, frame_stdout  # noqa: E402
 from .backend.portforward import (  # noqa: E402
@@ -75,7 +82,13 @@ from .backend.resources import (  # noqa: E402
     resolve_cpu_resources,
     resolve_memory_resources,
 )
-from .backend.pyromind_sdk_env import PyromindSDK  # noqa: E402
+from .backend.pyromind_sdk_env import (  # noqa: E402
+    PyromindSDK,
+    call_environment_method,
+    call_maybe_async,
+    close_sandbox_client,
+    get_sandbox_client,
+)
 from .bootstrap import check_connection, print_connected  # noqa: E402
 from .register_context import (  # noqa: E402
     ensure_docker_rt_context,
@@ -85,6 +98,68 @@ from .api import images as images_mod  # noqa: E402
 from pyromind_sdk.client.base import format_exception_message  # noqa: E402
 
 logger = logging.getLogger("docker_rt")
+
+
+def _wait_watchdog_interval() -> float:
+    raw = os.getenv("DOCKER_RT_WAIT_WATCHDOG_INTERVAL", "1")
+    try:
+        return max(0.1, float(raw))
+    except ValueError:
+        return 1.0
+
+
+def _pod_watch_interval() -> float:
+    raw = os.getenv("DOCKER_RT_POD_WATCH_INTERVAL", "10")
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return 10.0
+
+
+def _pod_watch_sleep_interval() -> float:
+    interval = _pod_watch_interval()
+    raw = os.getenv("DOCKER_RT_POD_WATCH_JITTER", "0.2")
+    try:
+        jitter_ratio = min(1.0, max(0.0, float(raw)))
+    except ValueError:
+        jitter_ratio = 0.2
+    if jitter_ratio <= 0:
+        return interval
+    return interval + random.uniform(0, interval * jitter_ratio)
+
+
+async def _write_wait_result(
+    request: web.Request,
+    resp: web.StreamResponse,
+    payload: bytes,
+) -> None:
+    transport = request.transport
+    if transport is None or transport.is_closing():
+        return
+    try:
+        await resp.write(payload)
+        await resp.drain()
+    except (ClientConnectionResetError, ConnectionResetError):
+        return
+
+
+def _exec_concurrency_limit() -> int:
+    raw = os.getenv("DOCKER_RT_EXEC_MAX_CONCURRENCY", "0")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+@asynccontextmanager
+async def _exec_concurrency_guard(app: web.Application):
+    """Acquire an exec slot when a positive concurrency cap is configured."""
+    semaphore = app.get("exec_semaphore")
+    if semaphore is None:
+        yield
+        return
+    async with semaphore:
+        yield
 
 
 async def _keep_docker_rt_context(app: web.Application) -> None:
@@ -237,6 +312,73 @@ def _queue_put_from_thread(
     asyncio.run_coroutine_threadsafe(queue.put(item), loop).result(timeout=timeout)
 
 
+def _exec_chunk_bytes(data: Any) -> bytes:
+    if isinstance(data, bytes):
+        return data
+    if isinstance(data, (bytearray, memoryview)):
+        return bytes(data)
+    if data is None:
+        return b""
+    return str(data).encode("utf-8")
+
+
+async def _stream_pyromind_exec(
+    *,
+    resp: web.StreamResponse,
+    kube_env: PyromindSDK,
+    cmd: list[str],
+    tty: bool = False,
+    session_id: str = "",
+    cwd: str = "",
+) -> int:
+    """Stream a PyromindSDK command directly on the aiohttp event loop."""
+    returncode = -1
+    out_n = 0
+    err_n = 0
+    try:
+        async for chunk in kube_env.iter_exec_stream(
+            cmd,
+            tty=tty,
+            cwd=cwd,
+        ):
+            if chunk.type == "exit":
+                returncode = (
+                    int(chunk.returncode)
+                    if chunk.returncode is not None
+                    else -1
+                )
+                continue
+            if chunk.type not in {"stdout", "stderr"}:
+                continue
+            raw = _exec_chunk_bytes(chunk.data)
+            if not raw:
+                continue
+            if tty:
+                payload = raw
+            elif chunk.type == "stderr":
+                err_n += len(raw)
+                payload = frame_stderr(raw)
+            else:
+                out_n += len(raw)
+                payload = frame_stdout(raw)
+            await resp.write(payload)
+            await resp.drain()
+    except (ConnectionResetError, ConnectionError, OSError, RuntimeError):
+        logger.debug(
+            "pyromind exec stream ended id=%s",
+            session_id[:12] or "?",
+            exc_info=True,
+        )
+    logger.info(
+        "pyromind exec stream id=%s out=%d err=%d code=%s",
+        session_id[:12] or "?",
+        out_n,
+        err_n,
+        returncode,
+    )
+    return returncode
+
+
 async def _stream_ws_oneshot(
     *,
     resp: web.StreamResponse,
@@ -251,6 +393,16 @@ async def _stream_ws_oneshot(
     Does not buffer the full output in memory — chunks are written as they arrive.
     Returns the remote exit code (best-effort).
     """
+    if isinstance(kube_env, PyromindSDK):
+        return await _stream_pyromind_exec(
+            resp=resp,
+            kube_env=kube_env,
+            cmd=cmd,
+            tty=False,
+            session_id=session_id,
+            cwd=cwd,
+        )
+
     ws = await asyncio.to_thread(
         kube_env.attach_exec, cmd, stdin=False, tty=False, cwd=cwd
     )
@@ -651,13 +803,17 @@ def _sandbox_identity(c: Any) -> tuple[str | None, str | None]:
     )
 
 
-async def _refresh_record_state(record: Any) -> None:
+async def _refresh_record_state(
+    record: Any,
+    store: ContainerStore | None = None,
+) -> None:
     """Refresh lifecycle state from the backend before an operation."""
     kube_env = getattr(record, "kube_env", None)
     if kube_env is None or not hasattr(kube_env, "refresh_phase"):
         return
     try:
-        await asyncio.to_thread(kube_env.refresh_phase)
+        kwargs = {"force": True} if isinstance(kube_env, PyromindSDK) else {}
+        await call_environment_method(kube_env, "refresh_phase", **kwargs)
     except Exception:
         logger.debug(
             "state refresh failed id=%s",
@@ -667,7 +823,11 @@ async def _refresh_record_state(record: Any) -> None:
         return
     status = getattr(kube_env, "sandbox_status", None)
     if status:
-        record.state = _container_state_from_status(str(status))
+        state = _container_state_from_status(str(status))
+        if store is None:
+            record.state = state
+        else:
+            await store.set_state(record, state)
 
 
 def _resolve_gpu_resources(
@@ -945,7 +1105,11 @@ def _to_inspect(c: Any) -> dict[str, Any]:
     net_cfg = getattr(c, "networking_config", None) or {}
     endpoints = net_cfg.get("EndpointsConfig") or {}
     pod_ip = ""
-    if running and getattr(c, "kube_env", None) is not None:
+    if (
+        running
+        and getattr(c, "kube_env", None) is not None
+        and not isinstance(c.kube_env, PyromindSDK)
+    ):
         try:
             pod_ip = c.kube_env.get_pod_ip() or ""
         except Exception:
@@ -1135,7 +1299,11 @@ async def _apply_extra_hosts(record: Any) -> None:
             continue
         if ip == "host-gateway":
             get_pod_ip = getattr(kube_env, "get_pod_ip", None)
-            ip = get_pod_ip() if callable(get_pod_ip) else None
+            ip = (
+                await call_environment_method(kube_env, "get_pod_ip")
+                if callable(get_pod_ip)
+                else None
+            )
             if not ip:
                 logger.warning(
                     "docker-rt could not resolve host-gateway for %s", hostname,
@@ -1148,7 +1316,12 @@ async def _apply_extra_hosts(record: Any) -> None:
         f"grep -F '{host}' /etc/hosts >/dev/null 2>&1 || echo '{ip} {host}' >> /etc/hosts"
         for ip, host in resolved
     )
-    await asyncio.to_thread(kube_env.execute, {"command": ["sh", "-c", script]}, "/")
+    await call_environment_method(
+        kube_env,
+        "execute",
+        {"command": ["sh", "-c", script]},
+        cwd="/",
+    )
 
 
 async def create_container(request: web.Request) -> web.Response:
@@ -1277,19 +1450,19 @@ async def start_container(request: web.Request) -> web.Response:
     if record is None:
         return _err(404, f"No such container: {cid}")
 
-    await _refresh_record_state(record)
+    await _refresh_record_state(record, store)
     async with record.lock:
         if record.state == ContainerState.RUNNING:
             return _empty(304)
         if record.kube_env is not None and hasattr(record.kube_env, "resume"):
             try:
-                await asyncio.to_thread(record.kube_env.resume)
+                await call_environment_method(record.kube_env, "resume")
             except Exception as exc:
-                record.state = ContainerState.DEAD
                 record.error = format_exception_message(exc)
+                await store.set_state(record, ContainerState.DEAD)
                 logger.exception("resume failed")
                 return _err(500, format_exception_message(exc))
-            record.state = ContainerState.RUNNING
+            await store.set_state(record, ContainerState.RUNNING)
             record.error = None
             record.finished_at = None
             record.started_at = time.time()
@@ -1304,13 +1477,13 @@ async def start_container(request: web.Request) -> web.Response:
                 await _start_port_forward(record)
             except Exception as exc:
                 try:
-                    await asyncio.to_thread(record.kube_env.cleanup)
+                    await call_environment_method(record.kube_env, "cleanup")
                 except Exception:
                     logger.exception("resume cleanup failed")
                 record.kube_env = None
                 record.pod_name = None
-                record.state = ContainerState.DEAD
                 record.error = format_exception_message(exc)
+                await store.set_state(record, ContainerState.DEAD)
                 logger.exception("port publish failed")
                 return _err(500, format_exception_message(exc))
             _spawn_pod_watch(request.app, record.id)
@@ -1322,7 +1495,7 @@ async def start_container(request: web.Request) -> web.Response:
             container_name=record.name,
         )
         try:
-            kube_env = await asyncio.to_thread(
+            kube_env = await call_maybe_async(
                 start_kube_environment,
                 image=pull_image,
                 namespace=record.namespace,
@@ -1357,8 +1530,8 @@ async def start_container(request: web.Request) -> web.Response:
                 gpu_card=getattr(record, "gpu_card", None),
             )
         except Exception as exc:
-            record.state = ContainerState.DEAD
             record.error = format_exception_message(exc)
+            await store.set_state(record, ContainerState.DEAD)
             logger.exception("start failed")
             return _err(500, format_exception_message(exc))
 
@@ -1371,22 +1544,22 @@ async def start_container(request: web.Request) -> web.Response:
         record.started_at = time.time()
         record.error = None
         if getattr(kube_env, "is_terminal", False):
-            record.state = ContainerState.EXITED
             record.exit_code = int(getattr(kube_env, "exit_code", 0) or 0)
             record.finished_at = time.time()
+            await store.set_state(record, ContainerState.EXITED)
         else:
             try:
                 await _start_port_forward(record)
             except Exception as exc:
                 # Roll back pod if publish fails.
                 try:
-                    await asyncio.to_thread(kube_env.cleanup)
+                    await call_environment_method(kube_env, "cleanup")
                 except Exception:
                     pass
                 record.kube_env = None
                 record.pod_name = None
-                record.state = ContainerState.DEAD
                 record.error = format_exception_message(exc)
+                await store.set_state(record, ContainerState.DEAD)
                 logger.exception("port publish failed")
                 return _err(500, format_exception_message(exc))
             # ClusterIP Service for compose DNS (ownerRef → Pod)
@@ -1425,7 +1598,7 @@ async def start_container(request: web.Request) -> web.Response:
                         record.name,
                         exc,
                     )
-            record.state = ContainerState.RUNNING
+            await store.set_state(record, ContainerState.RUNNING)
             _spawn_pod_watch(request.app, record.id)
 
             # docker run -d / docker start: block until the sandbox actually
@@ -1437,7 +1610,9 @@ async def start_container(request: web.Request) -> web.Response:
                 deadline = time.monotonic() + max(ready_timeout, 1.0)
                 while time.monotonic() < deadline:
                     try:
-                        await asyncio.to_thread(wait_env.refresh_phase)
+                        await call_environment_method(
+                            wait_env, "refresh_phase"
+                        )
                     except Exception:
                         pass
                     status_word = _display_status(record)
@@ -1476,20 +1651,22 @@ async def _watch_pod_exit(app: web.Application, cid: str) -> None:
             if record.state != ContainerState.RUNNING:
                 return
             try:
-                phase = await asyncio.to_thread(record.kube_env.refresh_phase)
+                phase = await call_environment_method(
+                    record.kube_env, "refresh_phase"
+                )
             except Exception:
                 logger.debug("pod watch failed id=%s", cid[:12], exc_info=True)
-                await asyncio.sleep(2)
+                await asyncio.sleep(_pod_watch_sleep_interval())
                 continue
             if phase in {"Succeeded", "Failed", "NotFound"}:
                 async with record.lock:
                     if record.state == ContainerState.RUNNING:
                         await _stop_port_forward(record)
-                        record.state = ContainerState.EXITED
                         record.exit_code = int(
                             getattr(record.kube_env, "exit_code", 0) or 0
                         )
                         record.finished_at = time.time()
+                        await store.set_state(record, ContainerState.EXITED)
                         if phase == "NotFound":
                             env = record.kube_env
                             record.kube_env = None
@@ -1514,7 +1691,7 @@ async def _watch_pod_exit(app: web.Application, cid: str) -> None:
                 except Exception:
                     pass
                 return
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(_pod_watch_sleep_interval())
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -1546,7 +1723,7 @@ async def stop_container(request: web.Request) -> web.Response:
     if record is None:
         return _err(404, f"No such container: {cid}")
 
-    await _refresh_record_state(record)
+    await _refresh_record_state(record, store)
     async with record.lock:
         if record.state != ContainerState.RUNNING:
             return _empty(304)
@@ -1554,9 +1731,9 @@ async def stop_container(request: web.Request) -> web.Response:
         if record.kube_env is not None:
             stop = getattr(record.kube_env, "stop", None)
             if callable(stop):
-                await asyncio.to_thread(stop)
+                await call_environment_method(record.kube_env, "stop")
             else:
-                await asyncio.to_thread(record.kube_env.cleanup)
+                await call_environment_method(record.kube_env, "cleanup")
             record.sandbox_status = getattr(
                 record.kube_env, "sandbox_status", "Stopped"
             )
@@ -1565,9 +1742,9 @@ async def stop_container(request: web.Request) -> web.Response:
             if record.kube_env is not None
             else None
         )
-        record.state = ContainerState.EXITED
         record.exit_code = 0
         record.finished_at = time.time()
+        await store.set_state(record, ContainerState.EXITED)
 
     await _release_service(record, request.app)
     await _emit(request, action="die", record=record)
@@ -1589,7 +1766,7 @@ async def kill_container(request: web.Request) -> web.Response:
     if record is None:
         return _err(404, f"No such container: {cid}")
 
-    await _refresh_record_state(record)
+    await _refresh_record_state(record, store)
 
     async with record.lock:
         if record.state != ContainerState.RUNNING:
@@ -1597,16 +1774,16 @@ async def kill_container(request: web.Request) -> web.Response:
         await _stop_port_forward(record)
         if record.kube_env is not None:
             try:
-                await asyncio.to_thread(record.kube_env.cleanup)
+                await call_environment_method(record.kube_env, "cleanup")
             except Exception as exc:
                 record.error = format_exception_message(exc)
                 return _err(500, format_exception_message(exc))
             record.kube_env = None
         record.pod_name = None
-        record.state = ContainerState.EXITED
         # Conventional exit codes: 128 + signal number (SIGKILL=9 -> 137)
         record.exit_code = 137 if "KILL" in sig_name else 143 if "TERM" in sig_name else 1
         record.finished_at = time.time()
+        await store.set_state(record, ContainerState.EXITED)
 
     await _release_service(record, request.app)
     await _emit(request, action="kill", record=record)
@@ -1622,16 +1799,16 @@ async def restart_container(request: web.Request) -> web.Response:
     if record is None:
         return _err(404, f"No such container: {cid}")
 
-    await _refresh_record_state(record)
+    await _refresh_record_state(record, store)
     if record.kube_env is not None and hasattr(record.kube_env, "restart"):
         try:
-            await asyncio.to_thread(record.kube_env.restart)
+            await call_environment_method(record.kube_env, "restart")
         except Exception as exc:
             return _err(
                 500,
                 f"restart backend failed: {format_exception_message(exc)}",
             )
-        record.state = ContainerState.RUNNING
+        await store.set_state(record, ContainerState.RUNNING)
         record.error = None
         record.finished_at = None
         await _emit(request, action="restart", record=record)
@@ -1641,11 +1818,12 @@ async def restart_container(request: web.Request) -> web.Response:
     async with record.lock:
         if record.state == ContainerState.RUNNING and record.kube_env is not None:
             await _stop_port_forward(record)
-            await asyncio.to_thread(record.kube_env.cleanup)
+            await call_environment_method(record.kube_env, "cleanup")
             record.kube_env = None
             record.pod_name = None
-            record.state = ContainerState.EXITED
+            record.exit_code = 0
             record.finished_at = time.time()
+            await store.set_state(record, ContainerState.EXITED)
 
     await _release_service(record, request.app)
     await _emit(request, action="die", record=record)
@@ -1657,7 +1835,7 @@ async def restart_container(request: web.Request) -> web.Response:
     )
     async with record.lock:
         try:
-            kube_env = await asyncio.to_thread(
+            kube_env = await call_maybe_async(
                 start_kube_environment,
                 image=pull_image,
                 namespace=record.namespace,
@@ -1688,10 +1866,12 @@ async def restart_container(request: web.Request) -> web.Response:
                 memory_request=getattr(record, "memory_request", None),
                 cpu_limit=getattr(record, "cpu_limit", None),
                 cpu_request=getattr(record, "cpu_request", None),
+                gpu=getattr(record, "gpu", None),
+                gpu_card=getattr(record, "gpu_card", None),
             )
         except Exception as exc:
-            record.state = ContainerState.DEAD
             record.error = format_exception_message(exc)
+            await store.set_state(record, ContainerState.DEAD)
             logger.exception("restart failed")
             return _err(500, format_exception_message(exc))
         record.kube_env = kube_env
@@ -1699,21 +1879,21 @@ async def restart_container(request: web.Request) -> web.Response:
         record.started_at = time.time()
         record.error = None
         if getattr(kube_env, "is_terminal", False):
-            record.state = ContainerState.EXITED
             record.exit_code = int(getattr(kube_env, "exit_code", 0) or 0)
             record.finished_at = time.time()
+            await store.set_state(record, ContainerState.EXITED)
         else:
             try:
                 await _start_port_forward(record)
             except Exception as exc:
                 try:
-                    await asyncio.to_thread(kube_env.cleanup)
+                    await call_environment_method(kube_env, "cleanup")
                 except Exception:
                     pass
                 record.kube_env = None
                 record.pod_name = None
-                record.state = ContainerState.DEAD
                 record.error = format_exception_message(exc)
+                await store.set_state(record, ContainerState.DEAD)
                 logger.exception("port publish failed on restart")
                 return _err(500, format_exception_message(exc))
             if (
@@ -1751,7 +1931,7 @@ async def restart_container(request: web.Request) -> web.Response:
                         record.name,
                         exc,
                     )
-            record.state = ContainerState.RUNNING
+            await store.set_state(record, ContainerState.RUNNING)
             _spawn_pod_watch(request.app, record.id)
         record.exit_code = 0
 
@@ -1771,7 +1951,7 @@ async def rename_container(request: web.Request) -> web.Response:
     if record is None:
         return _err(404, f"No such container: {cid}")
 
-    await _refresh_record_state(record)
+    await _refresh_record_state(record, store)
     old_name = record.name
     try:
         await store.rename(record, new_name)
@@ -1779,7 +1959,11 @@ async def rename_container(request: web.Request) -> web.Response:
         return _err(409, format_exception_message(exc))
     if record.kube_env is not None and hasattr(record.kube_env, "rename"):
         try:
-            await asyncio.to_thread(record.kube_env.rename, new_name)
+            await call_environment_method(
+                record.kube_env,
+                "rename",
+                new_name,
+            )
         except Exception as exc:
             try:
                 await store.rename(record, old_name)
@@ -1799,8 +1983,9 @@ async def rename_container(request: web.Request) -> web.Response:
                 exposed_ports=getattr(record, "exposed_ports", None) or {},
                 publish_all_ports=bool(getattr(record, "publish_all_ports", False)),
             )
-            await asyncio.to_thread(
-                record.kube_env.patch_pod_metadata,
+            await call_environment_method(
+                record.kube_env,
+                "patch_pod_metadata",
                 labels=labels,
                 annotations=annotations,
             )
@@ -1830,6 +2015,7 @@ async def wait_container(request: web.Request) -> web.StreamResponse:
     record = store.get(cid)
     if record is None:
         return _err(404, f"No such container: {cid}")
+    container_id = record.id
 
     resp = web.StreamResponse(
         status=200,
@@ -1841,39 +2027,49 @@ async def wait_container(request: web.Request) -> web.StreamResponse:
             "Content-Type": "application/json",
         },
     )
-    # Acknowledge wait so the CLI can continue to start
-    await resp.prepare(request)
+    try:
+        # Acknowledge wait so the CLI can continue to start.
+        await resp.prepare(request)
+    except (ClientConnectionResetError, ConnectionResetError):
+        return resp
 
-    terminal = {ContainerState.EXITED, ContainerState.DEAD, ContainerState.REMOVED}
-
+    snapshot = store.state_snapshot(container_id)
+    watchdog = _wait_watchdog_interval()
     while True:
-        record = store.get(cid)
-        if record is None:
-            if condition in {"removed", "not-running", "next-exit", ""}:
-                await resp.write(b'{"StatusCode":0}\n')
-                await resp.drain()
-                return resp
-            await resp.write(
-                json.dumps({"Error": {"Message": f"No such container: {cid}"}}).encode()
+        if snapshot.exists and container_wait_condition_met(snapshot, condition):
+            await _write_wait_result(
+                request,
+                resp,
+                json.dumps({"StatusCode": snapshot.exit_code}).encode() + b"\n",
             )
-            await resp.drain()
+            return resp
+        if not snapshot.exists:
+            if container_wait_condition_met(snapshot, condition):
+                await _write_wait_result(request, resp, b'{"StatusCode":0}\n')
+            else:
+                await _write_wait_result(
+                    request,
+                    resp,
+                    json.dumps(
+                        {"Error": {"Message": f"No such container: {cid}"}}
+                    ).encode(),
+                )
             return resp
 
-        done = False
-        code = int(getattr(record, "exit_code", 0) or 0)
-        if condition in {"not-running", "next-exit", ""}:
-            done = record.state in terminal
-        elif condition == "removed":
-            done = record.state == ContainerState.REMOVED
-        else:
-            done = record.state in terminal
-
-        if done:
-            await resp.write(json.dumps({"StatusCode": code}).encode() + b"\n")
-            await resp.drain()
+        transport = request.transport
+        if transport is None or transport.is_closing():
             return resp
 
-        await asyncio.sleep(0.5)
+        changed = await store.wait_for_state_change(
+            container_id,
+            snapshot.revision,
+            timeout=watchdog,
+        )
+        snapshot = (
+            changed
+            if changed is not None
+            else store.state_snapshot(container_id)
+        )
 
 
 async def delete_container(request: web.Request) -> web.Response:
@@ -1884,7 +2080,7 @@ async def delete_container(request: web.Request) -> web.Response:
     if record is None:
         return _err(404, f"No such container: {cid}")
 
-    await _refresh_record_state(record)
+    await _refresh_record_state(record, store)
     async with record.lock:
         if record.state == ContainerState.RUNNING:
             if not force:
@@ -1895,7 +2091,7 @@ async def delete_container(request: web.Request) -> web.Response:
         if record.kube_env is not None:
             await _stop_port_forward(record)
             try:
-                await asyncio.to_thread(record.kube_env.cleanup)
+                await call_environment_method(record.kube_env, "cleanup")
             except Exception as exc:
                 record.error = format_exception_message(exc)
                 logger.exception("container cleanup failed")
@@ -1904,9 +2100,9 @@ async def delete_container(request: web.Request) -> web.Response:
             record.sandbox_id = None
             record.sandbox_status = None
             record.pod_name = None
-            record.state = ContainerState.EXITED
             record.exit_code = 0
             record.finished_at = time.time()
+            await store.set_state(record, ContainerState.EXITED)
         else:
             await _stop_port_forward(record)
 
@@ -1930,11 +2126,18 @@ async def inspect_container(request: web.Request) -> web.Response:
         return _err(404, f"No such container: {cid}")
     if record.kube_env is not None and hasattr(record.kube_env, "refresh_phase"):
         try:
-            phase = await asyncio.to_thread(record.kube_env.refresh_phase)
+            kwargs = (
+                {"force": True}
+                if isinstance(record.kube_env, PyromindSDK)
+                else {}
+            )
+            phase = await call_environment_method(
+                record.kube_env, "refresh_phase", **kwargs
+            )
             if phase == "NotFound" and record.state == ContainerState.RUNNING:
-                record.state = ContainerState.EXITED
                 record.finished_at = time.time()
                 record.pod_name = None
+                await store.set_state(record, ContainerState.EXITED)
         except Exception:
             logger.debug("inspect refresh failed id=%s", cid[:12], exc_info=True)
     return _json(_to_inspect(record))
@@ -2118,12 +2321,15 @@ async def get_container_archive(request: web.Request) -> web.StreamResponse | we
     record = store.get(cid)
     if record is None:
         return _err(404, f"No such container: {cid}")
-    await _refresh_record_state(record)
+    await _refresh_record_state(record, store)
     if record.kube_env is None or record.state != ContainerState.RUNNING:
         return _err(409, "Container is not running")
 
     try:
-        stat = await asyncio.to_thread(path_stat, record.kube_env, path)
+        if isinstance(record.kube_env, PyromindSDK):
+            stat = await record.kube_env.archive_path_stat(path)
+        else:
+            stat = await asyncio.to_thread(path_stat, record.kube_env, path)
     except Exception as exc:
         return _err(500, format_exception_message(exc))
     if stat is None:
@@ -2139,6 +2345,17 @@ async def get_container_archive(request: web.Request) -> web.StreamResponse | we
         },
     )
     await resp.prepare(request)
+
+    if isinstance(record.kube_env, PyromindSDK):
+        try:
+            async for chunk in record.kube_env.iter_archive_chunks(path):
+                await resp.write(chunk)
+            await resp.drain()
+        except (ConnectionResetError, ConnectionError, OSError):
+            pass
+        except Exception as exc:
+            logger.error("archive get failed id=%s: %s", cid[:12], exc)
+        return resp
 
     loop = asyncio.get_running_loop()
     out_q: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=32)
@@ -2197,7 +2414,10 @@ async def head_container_archive(request: web.Request) -> web.Response:
         return _err(409, "Container is not running")
 
     try:
-        stat = await asyncio.to_thread(path_stat, record.kube_env, path)
+        if isinstance(record.kube_env, PyromindSDK):
+            stat = await record.kube_env.archive_path_stat(path)
+        else:
+            stat = await asyncio.to_thread(path_stat, record.kube_env, path)
     except Exception as exc:
         return _err(500, format_exception_message(exc))
     if stat is None:
@@ -2227,7 +2447,7 @@ async def put_container_archive(request: web.Request) -> web.Response:
     record = store.get(cid)
     if record is None:
         return _err(404, f"No such container: {cid}")
-    await _refresh_record_state(record)
+    await _refresh_record_state(record, store)
     if record.kube_env is None or record.state != ContainerState.RUNNING:
         return _err(409, "Container is not running")
 
@@ -2236,7 +2456,10 @@ async def put_container_archive(request: web.Request) -> web.Response:
         async for chunk in request.content.iter_chunked(64 * 1024):
             chunks.append(chunk)
         data = b"".join(chunks)
-        await asyncio.to_thread(put_archive, record.kube_env, path, data)
+        if isinstance(record.kube_env, PyromindSDK):
+            await record.kube_env.put_archive(path, data)
+        else:
+            await asyncio.to_thread(put_archive, record.kube_env, path, data)
     except Exception as exc:
         logger.exception("archive put failed id=%s", cid[:12])
         return _err(500, format_exception_message(exc))
@@ -2252,11 +2475,22 @@ async def create_exec(request: web.Request) -> web.Response:
     record = store.get(cid)
     if record is None:
         return _err(404, f"No such container: {cid}")
-    await _refresh_record_state(record)
-    if record.state != ContainerState.RUNNING or record.kube_env is None:
-        return _err(409, "Container is not running")
 
-    body = await request.json()
+    try:
+        body = await request.json()
+    except ConnectionResetError:
+        logger.debug("exec create client disconnected id=%s", cid[:12])
+        return _empty(499)
+    except ValueError:
+        return _err(400, "Invalid JSON body")
+
+    # Container watches keep the local state current. Avoid a remote status
+    # lookup for every exec in the normal running path.
+    if record.state != ContainerState.RUNNING or record.kube_env is None:
+        await _refresh_record_state(record, store)
+        if record.state != ContainerState.RUNNING or record.kube_env is None:
+            return _err(409, "Container is not running")
+
     cmd = body.get("Cmd") or []
     if isinstance(cmd, str):
         cmd = [cmd]
@@ -2325,14 +2559,19 @@ async def start_exec(request: web.Request) -> web.StreamResponse | web.Response:
     container = store.get(exec_rec.container_id)
     if container is None or container.kube_env is None:
         return _err(404, "Container gone")
-    await _refresh_record_state(container)
-    if container.state != ContainerState.RUNNING:
-        return _err(409, "Container is not running")
 
     try:
         body = await request.json()
+    except ConnectionResetError:
+        logger.debug("exec start client disconnected id=%s", eid[:12])
+        return _empty(499)
     except Exception:
         body = {}
+
+    if container.state != ContainerState.RUNNING:
+        await _refresh_record_state(container, store)
+        if container.state != ContainerState.RUNNING:
+            return _err(409, "Container is not running")
 
     detach = bool(body.get("Detach", False))
     tty = bool(body.get("Tty", exec_rec.tty))
@@ -2347,18 +2586,31 @@ async def start_exec(request: web.Request) -> web.StreamResponse | web.Response:
     if detach:
         exec_rec.running = True
 
-        def _run() -> None:
-            try:
-                kube_env.execute(
-                    # Keep argv intact so ``sh -c '<script>'`` quoting is preserved.
-                    {"command": list(cmd)},
-                    cwd,
-                )
-            finally:
-                exec_rec.running = False
-                exec_rec.exit_code = 0
+        async def _run_detached() -> None:
+            async with _exec_concurrency_guard(request.app):
+                try:
+                    if isinstance(kube_env, PyromindSDK):
+                        async for _chunk in kube_env.iter_exec_stream(
+                            list(cmd),
+                            tty=tty,
+                            cwd=cwd,
+                        ):
+                            pass
+                    else:
+                        await asyncio.to_thread(
+                            kube_env.execute,
+                            # Keep argv intact so ``sh -c '<script>'`` quoting is preserved.
+                            {"command": list(cmd)},
+                            cwd,
+                        )
+                finally:
+                    exec_rec.running = False
+                    exec_rec.exit_code = 0
 
-        threading.Thread(target=_run, daemon=True).start()
+        task = asyncio.create_task(_run_detached())
+        exec_tasks: set[asyncio.Task[Any]] = request.app["exec_tasks"]
+        exec_tasks.add(task)
+        task.add_done_callback(exec_tasks.discard)
         return _empty(200)
 
     upgrade = request.headers.get("Upgrade", "").lower()
@@ -2367,44 +2619,46 @@ async def start_exec(request: web.Request) -> web.StreamResponse | web.Response:
     interactive = wants_hijack or exec_rec.attach_stdin or tty
 
     if interactive:
-        return await _exec_hijack(
-            request,
-            exec_rec,
-            kube_env,
-            cmd,
-            tty,
-            stdin=bool(exec_rec.attach_stdin),
-            cwd=cwd,
-        )
+        async with _exec_concurrency_guard(request.app):
+            return await _exec_hijack(
+                request,
+                exec_rec,
+                kube_env,
+                cmd,
+                tty,
+                stdin=bool(exec_rec.attach_stdin),
+                cwd=cwd,
+            )
 
     # Non-interactive one-shot using raw argv (preserves quoting)
-    exec_rec.running = True
-    resp = web.StreamResponse(
-        status=200,
-        headers={
-            "Api-Version": API_VERSION,
-            "Content-Type": "application/vnd.docker.raw-stream",
-        },
-    )
-    await resp.prepare(request)
-    try:
-        exec_rec.exit_code = await _stream_ws_oneshot(
-            resp=resp,
-            kube_env=kube_env,
-            cmd=cmd,
-            session_id=exec_rec.id,
-            cwd=cwd,
+    async with _exec_concurrency_guard(request.app):
+        exec_rec.running = True
+        resp = web.StreamResponse(
+            status=200,
+            headers={
+                "Api-Version": API_VERSION,
+                "Content-Type": "application/vnd.docker.raw-stream",
+            },
         )
-    except Exception:
-        logger.exception("oneshot exec failed id=%s", exec_rec.id[:12])
-        exec_rec.exit_code = 1
-    finally:
-        exec_rec.running = False
+        await resp.prepare(request)
         try:
-            store.prune_execs()
+            exec_rec.exit_code = await _stream_ws_oneshot(
+                resp=resp,
+                kube_env=kube_env,
+                cmd=cmd,
+                session_id=exec_rec.id,
+                cwd=cwd,
+            )
         except Exception:
-            pass
-    return resp
+            logger.exception("oneshot exec failed id=%s", exec_rec.id[:12])
+            exec_rec.exit_code = 1
+        finally:
+            exec_rec.running = False
+            try:
+                store.prune_execs()
+            except Exception:
+                pass
+        return resp
 
 
 def _force_close_hijack(request: web.Request, resp: web.StreamResponse) -> None:
@@ -2566,7 +2820,7 @@ async def attach_container(request: web.Request) -> web.StreamResponse | web.Res
     if record is None:
         return _err(404, f"No such container: {cid}")
 
-    await _refresh_record_state(record)
+    await _refresh_record_state(record, store)
     q = request.rel_url.query
 
     def _flag(name: str, default: str = "0") -> bool:
@@ -2670,7 +2924,9 @@ async def attach_container(request: web.Request) -> web.StreamResponse | web.Res
             latest = store.get(cid)
             if latest is not None and latest.kube_env is not None:
                 try:
-                    phase = await asyncio.to_thread(latest.kube_env.refresh_phase)
+                    phase = await call_environment_method(
+                        latest.kube_env, "refresh_phase"
+                    )
                 except Exception:
                     phase = ""
                 if phase in {"Succeeded", "Failed", "NotFound"} or getattr(
@@ -2679,13 +2935,13 @@ async def attach_container(request: web.Request) -> web.StreamResponse | web.Res
                     async with latest.lock:
                         if latest.state == ContainerState.RUNNING:
                             await _stop_port_forward(latest)
-                            latest.state = ContainerState.EXITED
                             latest.exit_code = int(
                                 getattr(latest.kube_env, "exit_code", 0)
                                 or session.exit_code
                                 or 0
                             )
                             latest.finished_at = time.time()
+                            await store.set_state(latest, ContainerState.EXITED)
                             if phase == "NotFound":
                                 env = latest.kube_env
                                 latest.kube_env = None
@@ -2737,8 +2993,25 @@ async def _hijack_session(
             _force_close_hijack(request, resp)
         return resp
 
-    if isinstance(kube_env, PyromindSDK):
-        if cmd is None and not stdin and not tty:
+    # PyromindSDK command streaming is output-only. Docker's -i flag still
+    # selects the streaming path, but stdin is not forwarded to the sandbox.
+    if isinstance(kube_env, PyromindSDK) and cmd is not None:
+        try:
+            session.exit_code = await _stream_pyromind_exec(
+                resp=resp,
+                kube_env=kube_env,
+                cmd=cmd,
+                tty=tty,
+                session_id=getattr(session, "id", "") or "",
+                cwd=cwd,
+            )
+        finally:
+            session.running = False
+            _force_close_hijack(request, resp)
+        return resp
+
+    if isinstance(kube_env, PyromindSDK) and cmd is None:
+        if not stdin and not tty:
             # k8s-middleware has no main-process log stream yet. Close the
             # non-interactive foreground attach after the sandbox is Running
             # instead of hanging like a terminal websocket.
@@ -2836,6 +3109,8 @@ async def _hijack_session(
 
     async def pump_in() -> None:
         """Read stdin from upgraded connection (_message_tail) or residual payload."""
+        if not stdin:
+            return
         try:
             while not stop.is_set():
                 data = b""
@@ -3395,10 +3670,10 @@ async def on_startup(app: web.Application) -> None:
         task.add_done_callback(_keeper_done)
 
     store: ContainerStore = app["store"]
-    await asyncio.to_thread(
-        check_connection,
+    await check_connection(
         api_key=os.getenv("PYROMIND_API_KEY"),
         cluster=os.getenv("PYROMIND_CLUSTER"),
+        client=get_sandbox_client(),
     )
     try:
         stats = await reconcile_pyromind_sandboxes(store, force=True)
@@ -3438,6 +3713,8 @@ async def on_cleanup(app: web.Application) -> None:
     store: ContainerStore = app["store"]
     for task in list(app.get("watch_tasks", set())):
         task.cancel()
+    for task in list(app.get("exec_tasks", set())):
+        task.cancel()
     for record in list(store.list(all_containers=True)):
         try:
             await _stop_port_forward(record)
@@ -3452,23 +3729,34 @@ async def on_cleanup(app: web.Application) -> None:
         "true",
         "yes",
     }
-    if not cleanup:
+    if cleanup:
+        for record in list(store.list(all_containers=True)):
+            if record.kube_env is not None:
+                try:
+                    await call_environment_method(
+                        record.kube_env, "cleanup"
+                    )
+                except Exception:
+                    pass
+    else:
         logger.info("DOCKER_RT_CLEANUP_ON_EXIT=false — leaving Pods for adopt")
-        return
-    for record in list(store.list(all_containers=True)):
-        if record.kube_env is not None:
-            try:
-                record.kube_env.cleanup()
-            except Exception:
-                pass
+    await close_sandbox_client(app.get("sandbox_client"))
 
 
 def create_aio_app(*, run_reconcile: bool = True) -> web.Application:
     app = web.Application(client_max_size=0)  # stream docker cp; no body cap
+    app["sandbox_client"] = None
     app["store"] = ContainerStore()
     app["volumes"] = VolumeStore()
     app["networks"] = NetworkStore()
     app["events"] = EventBus()
+    exec_concurrency_limit = _exec_concurrency_limit()
+    app["exec_semaphore"] = (
+        asyncio.Semaphore(exec_concurrency_limit)
+        if exec_concurrency_limit > 0
+        else None
+    )
+    app["exec_tasks"] = set()
     kubeconfig = resolve_kubeconfig()
     kube_context = os.getenv("DOCKER_RT_KUBE_CONTEXT", DEFAULT_KUBE_CONTEXT)
     app["kubeconfig"] = kubeconfig

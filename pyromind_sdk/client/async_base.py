@@ -7,6 +7,7 @@ HTTP requests, and error handling for all async API clients.
 
 import os
 import logging
+import asyncio
 import aiohttp
 from typing import Optional, Dict, Any
 
@@ -16,8 +17,9 @@ from .base import append_trace_id, extract_trace_id
 # Constants
 DEFAULT_API_BASE_URL = "https://api-portal.pyromind.ai/api/v1"
 DEFAULT_CLUSTER = "us-west-2"
-DEFAULT_TIMEOUT = 30
+DEFAULT_TIMEOUT = 60
 DEFAULT_MAX_RETRIES = 3
+DEFAULT_CONNECTOR_LIMIT = 256
 ENV_API_KEY = "PYROMIND_API_KEY"
 ENV_BASE_URL = "PYROMIND_BASE_URL"
 ENV_CLUSTER = "PYROMIND_CLUSTER"
@@ -75,8 +77,11 @@ class PyroMindAsyncClient:
         cluster: Target cluster identifier. Will be sent as X-Cluster header
                 on every request. If not provided, will try to read from
                 PYROMIND_CLUSTER environment variable. Defaults to "default".
-        timeout: Request timeout in seconds (default: 30)
+        timeout: Request timeout in seconds (default: 60)
         max_retries: Maximum number of retries for failed requests (default: 3)
+        connector_limit: Maximum number of pooled connections (default: 256)
+        connector_limit_per_host: Per-host connection cap; defaults to
+            ``connector_limit``
 
     Raises:
         ValueError: If api_key is not provided and PYROMIND_API_KEY environment
@@ -89,7 +94,9 @@ class PyroMindAsyncClient:
         base_url: Optional[str] = None,
         cluster: Optional[str] = None,
         timeout: int = DEFAULT_TIMEOUT,
-        max_retries: int = DEFAULT_MAX_RETRIES
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        connector_limit: int = DEFAULT_CONNECTOR_LIMIT,
+        connector_limit_per_host: Optional[int] = None,
     ):
         # Get API key from parameter or environment variable
         if api_key is None:
@@ -123,22 +130,50 @@ class PyroMindAsyncClient:
 
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.max_retries = max_retries
+        self.connector_limit = max(1, int(connector_limit))
+        self.connector_limit_per_host = (
+            self.connector_limit
+            if connector_limit_per_host is None
+            else max(1, int(connector_limit_per_host))
+        )
 
-        # Session will be created lazily
+        # Session will be created lazily inside the active event loop.
         self._session: Optional[aiohttp.ClientSession] = None
+        self._session_lock: Optional[asyncio.Lock] = None
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def _get_session_lock(self) -> asyncio.Lock:
+        """Create the session lock lazily so it binds to the active event loop."""
+        if self._session_lock is None:
+            self._session_lock = asyncio.Lock()
+        return self._session_lock
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session"""
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=self.timeout,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                    "X-Cluster": self.cluster,
-                }
-            )
+        if self._closed:
+            raise RuntimeError("client is closed")
+        async with self._get_session_lock():
+            if self._closed:
+                raise RuntimeError("client is closed")
+            if self._session is None or self._session.closed:
+                connector = aiohttp.TCPConnector(
+                    limit=self.connector_limit,
+                    limit_per_host=self.connector_limit_per_host,
+                )
+                self._session = aiohttp.ClientSession(
+                    timeout=self.timeout,
+                    connector=connector,
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                        "X-Cluster": self.cluster,
+                    }
+                )
         return self._session
 
     def _extract_data(self, response: Dict[str, Any]) -> Any:
@@ -173,12 +208,15 @@ class PyroMindAsyncClient:
 
     # ========== Error Data Extraction ==========
 
-    def _extract_error_data(self, response: aiohttp.ClientResponse) -> Dict[str, Any]:
+    async def _extract_error_data(
+        self,
+        response: aiohttp.ClientResponse,
+    ) -> Dict[str, Any]:
         """Extract error data from response, handling JSON parse failures"""
         try:
-            return response.json()
+            return await response.json()
         except Exception:
-            return {"message": response.text}
+            return {"message": await response.text()}
 
     def _truncate_error_message(self, error_data: Dict[str, Any], max_length: int = 500) -> Dict[str, Any]:
         """Truncate error message to avoid flooding logs"""
@@ -336,6 +374,7 @@ class PyroMindAsyncClient:
         endpoint: str,
         params: Optional[Dict[str, Any]] = None,
         json_data: Optional[Dict[str, Any]] = None,
+        retry: bool = True,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -346,6 +385,8 @@ class PyroMindAsyncClient:
             endpoint: API endpoint (relative to base_url)
             params: Query parameters
             json_data: JSON request body
+            retry: Whether transient transport failures may be retried. This
+                must be False for non-idempotent create-style operations.
             **kwargs: Additional arguments to pass to aiohttp
 
         Returns:
@@ -370,7 +411,8 @@ class PyroMindAsyncClient:
         logger.debug(f"[REQUEST] headers: {safe_headers}")
 
         last_exception = None
-        for attempt in range(self.max_retries):
+        attempts = max(1, self.max_retries) if retry else 1
+        for attempt in range(attempts):
             try:
                 async with session.request(
                     method=method,
@@ -391,6 +433,12 @@ class PyroMindAsyncClient:
 
                     # Handle non-2xx responses
                     if not response.ok:
+                        if (
+                            response.status in RETRY_STATUS_CODES
+                            and attempt < attempts - 1
+                        ):
+                            await asyncio.sleep(0.5 * (2 ** attempt))
+                            continue
                         await self._handle_error_response(response, request_context)
 
                     # Return JSON response
@@ -398,13 +446,12 @@ class PyroMindAsyncClient:
                         return await response.json()
                     return {}
 
-            except aiohttp.ClientError as e:
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
                 last_exception = e
                 # Log exception
-                logger.error(f"[ERROR] {request_context} - {type(e).__name__}: {str(e)} (attempt {attempt + 1}/{self.max_retries})")
-                if attempt < self.max_retries - 1:
-                    import asyncio
-                    await asyncio.sleep(1 ** attempt)  # Exponential backoff
+                logger.error(f"[ERROR] {request_context} - {type(e).__name__}: {str(e)} (attempt {attempt + 1}/{attempts})")
+                if attempt < attempts - 1:
+                    await asyncio.sleep(0.5 * (2 ** attempt))
                     continue
                 raise PyroMindAsyncAPIError(
                     message=f"{request_context} request failed: {type(e).__name__}: {str(e)}",
@@ -412,9 +459,9 @@ class PyroMindAsyncClient:
                 )
 
         # If we get here, all retries failed
-        logger.error(f"[ERROR] {request_context} - All {self.max_retries} retries failed")
+        logger.error(f"[ERROR] {request_context} - All {attempts} attempts failed")
         raise PyroMindAsyncAPIError(
-            message=f"{request_context} request failed after {self.max_retries} retries: {str(last_exception)}",
+            message=f"{request_context} request failed after {attempts} attempts: {str(last_exception)}",
             status_code=None
         )
     
@@ -449,9 +496,22 @@ class PyroMindAsyncClient:
         """Make an async GET request"""
         return await self._request("GET", endpoint, params=params, **kwargs)
 
-    async def post(self, endpoint: str, json_data: Optional[Dict[str, Any]] = None, **kwargs) -> Dict[str, Any]:
+    async def post(
+        self,
+        endpoint: str,
+        json_data: Optional[Dict[str, Any]] = None,
+        *,
+        retry: bool = True,
+        **kwargs,
+    ) -> Dict[str, Any]:
         """Make an async POST request"""
-        return await self._request("POST", endpoint, json_data=json_data, **kwargs)
+        return await self._request(
+            "POST",
+            endpoint,
+            json_data=json_data,
+            retry=retry,
+            **kwargs,
+        )
 
     async def put(self, endpoint: str, json_data: Optional[Dict[str, Any]] = None, **kwargs) -> Dict[str, Any]:
         """Make an async PUT request"""
@@ -463,9 +523,12 @@ class PyroMindAsyncClient:
 
     async def close(self):
         """Close the session"""
-        if self._session and not self._session.closed:
-            await self._session.close()
+        async with self._get_session_lock():
+            self._closed = True
+            session = self._session
             self._session = None
+        if session and not session.closed:
+            await session.close()
 
     async def __aenter__(self):
         """Async context manager entry"""

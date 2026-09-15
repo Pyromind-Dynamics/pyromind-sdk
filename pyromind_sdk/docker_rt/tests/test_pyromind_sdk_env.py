@@ -4,10 +4,12 @@ import asyncio
 import io
 import json
 import tarfile
+import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from pyromind_sdk.client.models import (
     PortMapping,
     ResourceConfig,
@@ -18,7 +20,6 @@ from pyromind_sdk.client.models import (
 from pytest import MonkeyPatch
 
 from pyromind_sdk.client.base import PyroMindAPIError
-
 from ..aio_server import (
     _has_type_filter,
     _created_epoch,
@@ -44,27 +45,79 @@ def _adapter_with_fake_client() -> tuple[PyromindSDK, MagicMock]:
     adapter.image = "busybox:1.36"
     adapter.working_dir = "/"
     adapter._resources = ResourceConfig(cpu="4", memory="8Gi")
-    adapter._client = MagicMock()
+    client = MagicMock()
+    for method_name in (
+        "create",
+        "get_sandbox",
+        "get_internal_ip",
+        "exec_command",
+        "delete",
+        "pause",
+        "resume",
+        "update",
+        "read_file",
+        "write_file",
+    ):
+        setattr(client, method_name, AsyncMock())
+    adapter._client = client
     adapter._client.base_url = "https://pre-api.pyromind.ai/api/v1"
     adapter._client.api_key = "test-key"
     adapter._client.cluster = "us-west-1#pre"
 
+    pause_response = MagicMock()
+    pause_response.status = "Stopped"
+    client.pause.return_value = pause_response
+
     current = MagicMock()
     current.name = "old-name"
     current.image = "busybox:1.36"
+    current.status = "Stopped"
     current.resources = ResourceConfig(cpu="4", memory="8Gi")
     current.volume_mounts = [
         VolumeMount(host_path="/workspace", mount_path="/data")
     ]
     current.port_mappings = [PortMapping(container_port=80, host_port=8080)]
-    adapter._client.get_sandbox.return_value = current
+    client.get_sandbox.return_value = current
     return adapter, adapter._client
+
+
+def test_shared_async_client_uses_256_connection_pool(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PYROMIND_API_KEY", "test-key")
+    client = env_mod.new_sandbox_client()
+
+    async def _check() -> None:
+        session = await client._get_session()
+        assert session.connector.limit == 256
+        assert session.connector.limit_per_host == 256
+        await client.close()
+
+    asyncio.run(_check())
+
+
+def test_close_sandbox_client_clears_shared_singleton() -> None:
+    client = MagicMock()
+    client.close = AsyncMock()
+    env_mod._client_singleton = client
+    env_mod._client_singleton_closing = False
+
+    try:
+        asyncio.run(env_mod.close_sandbox_client())
+
+        client.close.assert_awaited_once()
+        assert env_mod._client_singleton is None
+        with pytest.raises(RuntimeError, match="closing"):
+            env_mod.get_sandbox_client()
+    finally:
+        env_mod._client_singleton = None
+        env_mod._client_singleton_closing = False
 
 
 def test_rename_keeps_other_fields_and_updates_name():
     adapter, client = _adapter_with_fake_client()
 
-    adapter.rename("new-name")
+    asyncio.run(adapter.rename("new-name"))
 
     request = client.update.call_args.args[1]
     assert request.name == "new-name"
@@ -75,8 +128,9 @@ def test_rename_keeps_other_fields_and_updates_name():
 
 def test_restart_pauses_then_resumes():
     adapter, client = _adapter_with_fake_client()
+    client.resume.return_value = MagicMock()
 
-    adapter.restart()
+    asyncio.run(adapter.restart())
 
     client.pause.assert_called_once_with("sb-test-1")
     client.resume.assert_called_once_with("sb-test-1")
@@ -95,7 +149,7 @@ def test_resume_binds_response():
     response.updated_at = None
     client.resume.return_value = response
 
-    adapter.resume()
+    asyncio.run(adapter.resume())
 
     client.resume.assert_called_once_with("sb-test-1")
     assert adapter.sandbox_status == "Running"
@@ -104,30 +158,54 @@ def test_resume_binds_response():
 def test_stop_only_pauses():
     adapter, client = _adapter_with_fake_client()
 
-    adapter.stop()
+    asyncio.run(adapter.stop())
 
     client.pause.assert_called_once_with("sb-test-1")
     client.delete.assert_not_called()
 
 
-def test_cleanup_pauses_before_delete():
+def test_cleanup_pauses_before_delete(monkeypatch):
     adapter, client = _adapter_with_fake_client()
-    adapter.sandbox_status = "Running"
+    adapter.sandbox_status = "Stopped"
+    client.pause.return_value.status = "Running"
+    statuses = [
+        SimpleNamespace(status="Running"),
+        SimpleNamespace(status="Stopped"),
+    ]
+    client.get_sandbox.side_effect = statuses
+    monkeypatch.setattr(env_mod, "_CLEANUP_PAUSE_POLL_INTERVAL_S", 0)
 
-    adapter.cleanup()
+    asyncio.run(adapter.cleanup())
 
     client.pause.assert_called_once_with("sb-test-1")
     client.delete.assert_called_once_with("sb-test-1")
 
 
-def test_cleanup_skips_pause_for_stopped_sandbox():
+def test_cleanup_still_pauses_when_cached_status_is_stopped():
     adapter, client = _adapter_with_fake_client()
     adapter.sandbox_status = "Stopped"
 
-    adapter.cleanup()
+    asyncio.run(adapter.cleanup())
 
-    client.pause.assert_not_called()
+    client.pause.assert_called_once_with("sb-test-1")
     client.delete.assert_called_once_with("sb-test-1")
+
+
+def test_cleanup_retries_delete_while_pause_is_transitioning(monkeypatch):
+    adapter, client = _adapter_with_fake_client()
+    client.delete.side_effect = [
+        PyroMindAPIError(
+            "delete failed: instance's status is Running, can not delete!",
+            status_code=500,
+        ),
+        None,
+    ]
+    monkeypatch.setattr(env_mod, "_CLEANUP_DELETE_RETRY_DELAY_S", 0)
+
+    asyncio.run(adapter.cleanup())
+
+    assert client.pause.call_count == 2
+    assert client.delete.call_count == 2
 
 
 def test_refresh_phase_marks_404_as_not_found():
@@ -136,8 +214,25 @@ def test_refresh_phase_marks_404_as_not_found():
         "gone", status_code=404
     )
 
-    assert adapter.refresh_phase() == "NotFound"
+    assert asyncio.run(adapter.refresh_phase()) == "NotFound"
     assert adapter.sandbox_status == "NotFound"
+
+
+def test_refresh_phase_singleflights_status_requests():
+    adapter, client = _adapter_with_fake_client()
+    adapter.sandbox_status = "Pending"
+
+    async def run():
+        await asyncio.gather(
+            adapter.refresh_phase(),
+            adapter.refresh_phase(),
+            adapter.refresh_phase(),
+        )
+
+    asyncio.run(run())
+
+    client.get_sandbox.assert_called_once_with("sb-test-1")
+    assert adapter.sandbox_status == "stopped"
 
 
 def test_cleanup_ignores_delete_404():
@@ -147,7 +242,7 @@ def test_cleanup_ignores_delete_404():
         "gone", status_code=404
     )
 
-    adapter.cleanup()
+    asyncio.run(adapter.cleanup())
 
     assert adapter.sandbox_id is None
 
@@ -155,12 +250,12 @@ def test_cleanup_ignores_delete_404():
 def test_archive_path_stat_uses_shell_exec(monkeypatch: MonkeyPatch) -> None:
     adapter, _ = _adapter_with_fake_client()
 
-    def fake_execute(action, cwd=""):
+    async def fake_execute(action, cwd=""):
         return {"returncode": 0, "output": "file|123|644|a.txt"}
 
     monkeypatch.setattr(adapter, "execute", fake_execute)
 
-    stat = adapter.archive_path_stat("/tmp/a.txt")
+    stat = asyncio.run(adapter.archive_path_stat("/tmp/a.txt"))
 
     assert stat is not None
     assert stat["name"] == "a.txt"
@@ -169,19 +264,19 @@ def test_archive_path_stat_uses_shell_exec(monkeypatch: MonkeyPatch) -> None:
 
 def test_attach_exec_preserves_argv_quoting(monkeypatch: MonkeyPatch):
     """argv (e.g. ``sh -c '<script>'``) must be sent as a list, not space-joined."""
-    adapter, _ = _adapter_with_fake_client()
+    adapter, client = _adapter_with_fake_client()
     captured = {}
 
     def fake_stream(**kwargs):
         captured.update(kwargs)
-        return iter(
-            [
-                SimpleNamespace(type="stdout", data="OK\n"),
-                SimpleNamespace(type="exit", returncode=0),
-            ]
-        )
 
-    monkeypatch.setattr(env_mod, "iter_exec_stream", fake_stream)
+        async def events():
+            yield SimpleNamespace(type="stdout", data="OK\n")
+            yield SimpleNamespace(type="exit", returncode=0)
+
+        return events()
+
+    monkeypatch.setattr(env_mod, "iter_exec_stream_async", fake_stream)
 
     adapter.working_dir = "/workspace"
     ws = adapter.attach_exec(
@@ -194,26 +289,30 @@ def test_attach_exec_preserves_argv_quoting(monkeypatch: MonkeyPatch):
     assert captured["command"] == [
         "sh", "-c", "test -d /home/user && echo OK || echo NOT_EXIST"
     ]
+    assert captured["tty"] is False
     assert captured["cwd"] == "/workspace"
+    assert captured["timeout"] is None
+    assert captured["stop_event"].is_set() is False
     for _ in range(100):
         ws.update(timeout=0.01)
         if ws.peek_stdout() and not ws.is_open():
             break
     assert ws.read_stdout() == b"OK\n"
     assert ws.returncode == 0
+    assert client.exec_command_stream.call_count == 0
 
 
 def test_attach_exec_surfaces_stream_errors(monkeypatch: MonkeyPatch):
     adapter, _ = _adapter_with_fake_client()
 
     def fake_stream(**kwargs):
-        def events():
+        async def events():
             yield SimpleNamespace(type="stdout", data="partial\n")
             raise RuntimeError("stream disconnected")
 
         return events()
 
-    monkeypatch.setattr(env_mod, "iter_exec_stream", fake_stream)
+    monkeypatch.setattr(env_mod, "iter_exec_stream_async", fake_stream)
 
     ws = adapter.attach_exec(["echo", "hi"], stdin=False, tty=False)
     for _ in range(100):
@@ -224,6 +323,37 @@ def test_attach_exec_surfaces_stream_errors(monkeypatch: MonkeyPatch):
     assert ws.read_stdout() == b"partial\n"
     assert ws.read_stderr() == b"exec stream error: stream disconnected\n"
     assert ws.returncode == 1
+
+
+def test_attach_exec_interactive_streams_output_with_tty(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    adapter, _ = _adapter_with_fake_client()
+    captured = {}
+
+    def fake_stream(**kwargs):
+        captured.update(kwargs)
+
+        async def events():
+            yield SimpleNamespace(type="stdout", data=b"ready\n")
+            yield SimpleNamespace(type="exit", returncode=0)
+
+        return events()
+
+    monkeypatch.setattr(env_mod, "iter_exec_stream_async", fake_stream)
+
+    ws = adapter.attach_exec(["bash"], stdin=True, tty=True)
+    for _ in range(100):
+        if captured:
+            break
+        time.sleep(0.01)
+    assert captured["command"] == ["bash"]
+    assert captured["tty"] is True
+    for _ in range(100):
+        ws.update(timeout=0.01)
+        if ws.peek_stdout() and not ws.is_open():
+            break
+    assert ws.read_stdout() == b"ready\n"
 
 
 def test_exec_stream_completes_when_output_queue_was_full(
@@ -265,6 +395,53 @@ def test_exec_stream_preserves_binary_output() -> None:
     assert ws.read_stderr() == b"\xfe\x01"
 
 
+def test_async_exec_stream_uses_one_reader_thread(monkeypatch: MonkeyPatch) -> None:
+    adapter, _ = _adapter_with_fake_client()
+    starting_threads = threading.active_count()
+    seen_threads = []
+
+    def fake_stream(**kwargs):
+        async def events():
+            seen_threads.append(threading.active_count())
+            yield SimpleNamespace(type="exit", returncode=0)
+
+        return events()
+
+    monkeypatch.setattr(env_mod, "iter_exec_stream_async", fake_stream)
+
+    ws = adapter.attach_exec(["true"], stdin=False, tty=False)
+    for _ in range(100):
+        ws.update(timeout=0.01)
+        if not ws.is_open():
+            break
+
+    assert seen_threads == [starting_threads + 1]
+
+
+def test_async_exec_stream_close_stops_reader(monkeypatch: MonkeyPatch) -> None:
+    adapter, _ = _adapter_with_fake_client()
+    stopped = threading.Event()
+
+    def fake_stream(**kwargs):
+        stop_event = kwargs["stop_event"]
+
+        async def events():
+            while not stop_event.is_set():
+                await asyncio.sleep(0.01)
+            stopped.set()
+            if False:
+                yield SimpleNamespace(type="exit", returncode=0)
+
+        return events()
+
+    monkeypatch.setattr(env_mod, "iter_exec_stream_async", fake_stream)
+
+    ws = adapter.attach_exec(["cat"], stdin=True, tty=True)
+    ws.close()
+
+    assert stopped.wait(timeout=1)
+
+
 def test_container_state_from_status_hides_pending_from_running_ps() -> None:
     assert _container_state_from_status("Pending") == ContainerState.CREATED
     assert _container_state_from_status("running") == ContainerState.RUNNING
@@ -278,6 +455,7 @@ def test_refresh_record_state_queries_backend_before_lifecycle() -> None:
     adapter.sandbox_id = "sb-pending"
     adapter.sandbox_status = "Pending"
     client = MagicMock()
+    client.get_sandbox = AsyncMock()
     sandbox = MagicMock()
     sandbox.status = "Pending"
     client.get_sandbox.return_value = sandbox
@@ -304,7 +482,7 @@ def test_put_archive_writes_files_into_sandbox() -> None:
         info.size = 5
         tar.addfile(info, io.BytesIO(b"hello"))
 
-    adapter.put_archive("/var", buf.getvalue())
+    asyncio.run(adapter.put_archive("/var", buf.getvalue()))
 
     client.write_file.assert_called_once()
     args = client.write_file.call_args.args
@@ -322,7 +500,7 @@ def test_put_archive_rejects_path_traversal() -> None:
         tar.addfile(info, io.BytesIO(b"x"))
 
     try:
-        adapter.put_archive("/var", buf.getvalue())
+        asyncio.run(adapter.put_archive("/var", buf.getvalue()))
     except ValueError as exc:
         assert "unsafe path" in str(exc)
     else:
@@ -334,19 +512,19 @@ def test_create_defaults_to_1c2g_without_gpu(monkeypatch: MonkeyPatch) -> None:
     import pyromind_sdk.docker_rt.backend.pyromind_sdk_env as env_mod
 
     client = MagicMock()
-    client.create.return_value = SandboxResponse(
+    client.create = AsyncMock(return_value=SandboxResponse(
         id="sb-default",
         name="demo",
         type=SandboxType.CUSTOM,
         status="creating",
         resources=ResourceConfig(cpu="1", memory="2Gi"),
-    )
+    ))
     monkeypatch.setattr(env_mod, "get_sandbox_client", lambda: client)
 
-    env_mod.PyromindSDK(
+    asyncio.run(env_mod.PyromindSDK.create(
         image="python:3.11-slim",
         name="demo",
-    )
+    ))
 
     request = client.create.call_args.args[0]
     assert request.resources.cpu == "1"
@@ -355,38 +533,39 @@ def test_create_defaults_to_1c2g_without_gpu(monkeypatch: MonkeyPatch) -> None:
     assert request.resources.gpu_card is None
 
 
-def _adapter_waiting() -> tuple[PyromindSDK, MagicMock]:
+def _adapter_waiting(
+    *,
+    status: str = "running",
+) -> tuple[PyromindSDK, MagicMock]:
     adapter = PyromindSDK.__new__(PyromindSDK)
     adapter.sandbox_id = "sb-wait"
     adapter.sandbox_status = "Pending"
     adapter._terminal_phase = None
     adapter.ready_timeout = 600
     adapter.ready_check_interval = 0
+    adapter.logger = MagicMock()
     client = MagicMock()
+    sandbox = MagicMock()
+    sandbox.status = status
+    client.get_sandbox = AsyncMock(return_value=sandbox)
     adapter._client = client
     return adapter, client
 
 
 def test_wait_until_running_returns_when_up() -> None:
-    adapter, client = _adapter_waiting()
-    sandbox = MagicMock()
-    sandbox.status = "running"
-    client.get_sandbox.return_value = sandbox
+    adapter, client = _adapter_waiting(status="running")
 
-    adapter.wait_until_running()
+    asyncio.run(adapter.wait_until_running())
 
     assert adapter.sandbox_status == "running"
     client.get_sandbox.assert_called_once_with("sb-wait")
 
 
 def test_wait_until_running_raises_on_failed_status() -> None:
-    adapter, client = _adapter_waiting()
-    sandbox = MagicMock()
-    sandbox.status = "failed"
-    client.get_sandbox.return_value = sandbox
+    adapter, _ = _adapter_waiting(status="failed")
 
     try:
-        adapter.wait_until_running()
+        asyncio.run(adapter.wait_until_running())
     except RuntimeError as exc:
         assert "failed to reach running" in str(exc)
     else:
@@ -400,18 +579,47 @@ def test_wait_until_running_times_out_within_budget() -> None:
     adapter._terminal_phase = None
     adapter.ready_timeout = 0.05
     adapter.ready_check_interval = 0.005
+    adapter.logger = MagicMock()
     client = MagicMock()
+    client.get_sandbox = AsyncMock()
     sandbox = MagicMock()
     sandbox.status = "creating"
     client.get_sandbox.return_value = sandbox
     adapter._client = client
 
     try:
-        adapter.wait_until_running()
+        asyncio.run(adapter.wait_until_running())
     except RuntimeError as exc:
         assert "timed out waiting" in str(exc)
     else:
         raise AssertionError("expected timeout RuntimeError")
+
+
+def test_cleanup_is_deduplicated_per_sandbox() -> None:
+    adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.sandbox_id = "sb-cleanup"
+    adapter.sandbox_status = "Stopped"
+    adapter._terminal_phase = None
+    adapter.logger = MagicMock()
+    sandbox = MagicMock()
+    sandbox.status = "stopped"
+    client = MagicMock()
+    client.get_sandbox = AsyncMock(return_value=sandbox)
+    pause_response = MagicMock()
+    pause_response.status = "Stopped"
+    client.pause = AsyncMock(return_value=pause_response)
+
+    async def delete(_sandbox_id):
+        await asyncio.sleep(0.01)
+
+    client.delete = AsyncMock(side_effect=delete)
+    adapter._client = client
+
+    async def run_cleanup():
+        await asyncio.gather(adapter.cleanup(), adapter.cleanup())
+
+    asyncio.run(run_cleanup())
+    client.delete.assert_awaited_once_with("sb-cleanup")
 
 
 def test_list_item_marks_sandbox_type() -> None:

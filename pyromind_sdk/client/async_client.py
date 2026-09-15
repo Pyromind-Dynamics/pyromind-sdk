@@ -37,8 +37,11 @@ class PyroMindAsyncAPIClient:
         cluster: Target cluster identifier. Will be sent as X-Cluster header
                 on every request. If not provided, will try to read from
                 PYROMIND_CLUSTER environment variable. Defaults to "default".
-        timeout: Request timeout in seconds (default: 30)
+        timeout: Request timeout in seconds (default: 60)
         max_retries: Maximum number of retries for failed requests (default: 3)
+        create_timeout: Sandbox create timeout in seconds (default: 300)
+        create_concurrency_limit: Maximum concurrent sandbox creates
+            (default: 128; set to 0 to disable the client-side cap)
 
     Raises:
         ValueError: If api_key is not provided and PYROMIND_API_KEY environment
@@ -50,8 +53,10 @@ class PyroMindAsyncAPIClient:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         cluster: Optional[str] = None,
-        timeout: int = 30,
-        max_retries: int = 3
+        timeout: int = 60,
+        max_retries: int = 3,
+        create_timeout: Optional[int] = None,
+        create_concurrency_limit: Optional[int] = None,
     ):
         # Initialize base client with common settings
         self._base_client = _PyroMindAsyncClientBase(
@@ -59,7 +64,7 @@ class PyroMindAsyncAPIClient:
             base_url=base_url,
             cluster=cluster,
             timeout=timeout,
-            max_retries=max_retries
+            max_retries=max_retries,
         )
 
         # Initialize sub-clients
@@ -68,7 +73,7 @@ class PyroMindAsyncAPIClient:
             base_url=base_url,
             cluster=cluster,
             timeout=timeout,
-            max_retries=max_retries
+            max_retries=max_retries,
         )
         self.inference = AsyncInferenceClient(
             api_key=api_key,
@@ -89,7 +94,9 @@ class PyroMindAsyncAPIClient:
             base_url=base_url,
             cluster=cluster,
             timeout=timeout,
-            max_retries=max_retries
+            max_retries=max_retries,
+            create_timeout=create_timeout,
+            create_concurrency_limit=create_concurrency_limit,
         )
         self.studio = AsyncStudioClient(
             api_key=api_key,

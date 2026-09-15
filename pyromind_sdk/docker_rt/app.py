@@ -21,6 +21,10 @@ from .backend.runtime import (
     resolve_kubeconfig,
     resolve_namespace,
 )
+from .backend.pyromind_sdk_env import (
+    call_environment_method,
+    close_sandbox_client,
+)
 from .backend.store import ContainerStore
 
 _VERSION_RE = re.compile(r"^/v\d+\.\d+(/.*)?$")
@@ -45,6 +49,7 @@ class StripApiVersionMiddleware:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.store = ContainerStore()
+    app.state.sandbox_client = None
     kubeconfig = resolve_kubeconfig()
     kube_context = os.getenv("DOCKER_RT_KUBE_CONTEXT", DEFAULT_KUBE_CONTEXT)
     app.state.kubeconfig = kubeconfig
@@ -58,9 +63,12 @@ async def lifespan(app: FastAPI):
     for record in list(store.list(all_containers=True)):
         if record.kube_env is not None:
             try:
-                record.kube_env.cleanup()
+                await call_environment_method(
+                    record.kube_env, "cleanup"
+                )
             except Exception:
                 pass
+    await close_sandbox_client(app.state.sandbox_client)
 
 
 def create_app() -> FastAPI:

@@ -6,7 +6,14 @@ import asyncio
 import json
 import queue
 import threading
-from typing import Any, AsyncIterator, Dict, Iterator, Optional, Union
+from typing import (
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterator,
+    Optional,
+    Union,
+)
 from urllib.parse import urlencode, urlparse
 
 import aiohttp
@@ -77,12 +84,14 @@ async def _iter_exec_stream_events(
     command: Union[str, list],
     cwd: str = "",
     timeout: Optional[int] = None,
+    tty: bool = False,
     stop_event: Optional[threading.Event] = None,
     ping_interval_s: float = 60.0,
 ) -> AsyncIterator[Dict[str, Any]]:
     request: Dict[str, Any] = {
         "command": command,
         "cwd": cwd or "",
+        "tty": bool(tty),
     }
     if timeout is not None:
         request["timeout"] = timeout
@@ -105,12 +114,13 @@ async def _iter_exec_stream_events(
             loop = asyncio.get_running_loop()
             last_ping = loop.time()
             saw_exit = False
-
             while True:
                 if stop_event is not None and stop_event.is_set():
                     break
                 try:
-                    message = await asyncio.wait_for(ws.receive(), timeout=0.5)
+                    message = await asyncio.wait_for(
+                        ws.receive(), timeout=0.5
+                    )
                 except asyncio.TimeoutError:
                     if loop.time() - last_ping >= ping_interval_s:
                         await ws.send_str('{"type":"ping"}')
@@ -136,12 +146,17 @@ async def _iter_exec_stream_events(
                         saw_exit = True
                         yield {
                             "type": "exit",
-                            "returncode": int(event.get("returncode") or 0),
+                            "returncode": int(
+                                event.get("returncode") or 0
+                            ),
                         }
                         break
                     if event_type in {"error", "timeout"}:
                         raise SandboxExecStreamError(
-                            str(event.get("message") or "exec stream failed"),
+                            str(
+                                event.get("message")
+                                or "exec stream failed"
+                            ),
                             str(event.get("code") or "") or None,
                         )
                     continue
@@ -159,7 +174,9 @@ async def _iter_exec_stream_events(
                 }:
                     break
 
-            if not saw_exit and not (stop_event is not None and stop_event.is_set()):
+            if not saw_exit and not (
+                stop_event is not None and stop_event.is_set()
+            ):
                 yield {"type": "exit", "returncode": -1}
         finally:
             await ws.close()
@@ -171,6 +188,7 @@ def iter_exec_stream(
     command: Union[str, list],
     cwd: str = "",
     timeout: Optional[int] = None,
+    tty: bool = False,
     stop_event: Optional[threading.Event] = None,
 ) -> Iterator[SandboxExecStreamChunk]:
     """Yield streaming exec events synchronously."""
@@ -203,6 +221,7 @@ def iter_exec_stream(
                     command=command,
                     cwd=cwd,
                     timeout=timeout,
+                    tty=tty,
                     stop_event=stop_event,
                 ):
                     put_event("event", event)
@@ -242,6 +261,8 @@ async def iter_exec_stream_async(
     command: Union[str, list],
     cwd: str = "",
     timeout: Optional[int] = None,
+    tty: bool = False,
+    stop_event: Optional[threading.Event] = None,
 ) -> AsyncIterator[SandboxExecStreamChunk]:
     """Yield streaming exec events asynchronously."""
     async for event in _iter_exec_stream_events(
@@ -249,5 +270,7 @@ async def iter_exec_stream_async(
         command=command,
         cwd=cwd,
         timeout=timeout,
+        tty=tty,
+        stop_event=stop_event,
     ):
         yield SandboxExecStreamChunk(**event)

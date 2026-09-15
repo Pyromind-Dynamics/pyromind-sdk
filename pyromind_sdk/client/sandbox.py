@@ -7,7 +7,15 @@ This module provides a client for managing sandboxes via the PyroMind API.
 import os
 import time
 import traceback
-from typing import List, Optional, Dict, Any, Union, IO, Iterator
+from typing import (
+    Any,
+    Dict,
+    IO,
+    Iterator,
+    List,
+    Optional,
+    Union,
+)
 
 from .base import PyroMindClient
 from .models import (
@@ -25,6 +33,14 @@ from ..exec_stream import (
     build_exec_stream_websocket_url,
     iter_exec_stream,
 )
+
+_DEFAULT_EXEC_TIMEOUT_S = 600
+
+
+def _decode_exec_stream_data(data: Union[str, bytes]) -> str:
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+    return str(data)
 
 
 class SandboxClient(PyroMindClient):
@@ -385,12 +401,11 @@ class SandboxClient(PyroMindClient):
                 (e.g. ``"uname -a"``, run via ``/bin/sh -c``) or a
                 ``List[str]`` argv array (e.g. ``["ls", "-la", "/workspace"]``).
             cwd: Working directory for command execution (default: "")
-            timeout: Execution timeout in seconds, max 600 (default: 30)
+            timeout: Execution timeout in seconds, max 600 (default: 600)
 
         Returns:
             SandboxExecResponse with output, returncode, and exception_info
         """
-        # Strip whitespace for str commands; pass list as-is
         if isinstance(command, str):
             command = command.strip()
         request = SandboxExecRequest(
@@ -398,12 +413,38 @@ class SandboxClient(PyroMindClient):
             cwd=cwd.strip() if cwd else "",
             timeout=timeout,
         )
-        response = self.post(
-            f"/sandboxes/{sandbox_id}/exec",
-            json_data=request.model_dump(exclude_none=True),
+        stdout_chunks: List[str] = []
+        stderr_chunks: List[str] = []
+        returncode = -1
+        effective_timeout = (
+            request.timeout
+            if request.timeout is not None
+            else _DEFAULT_EXEC_TIMEOUT_S
         )
-        data = self._extract_data(response)
-        return SandboxExecResponse(**data)
+        for chunk in self.exec_command_stream(
+            sandbox_id=sandbox_id,
+            command=request.command,
+            cwd=request.cwd,
+            timeout=effective_timeout,
+        ):
+            text = _decode_exec_stream_data(chunk.data)
+            if chunk.type == "stdout":
+                stdout_chunks.append(text)
+            elif chunk.type == "stderr":
+                stderr_chunks.append(text)
+            elif chunk.type == "exit":
+                returncode = (
+                    int(chunk.returncode)
+                    if chunk.returncode is not None
+                    else -1
+                )
+
+        return SandboxExecResponse(
+            output="".join(stdout_chunks),
+            stderr="".join(stderr_chunks),
+            returncode=returncode,
+            exception_info="",
+        )
 
     def exec_command_stream(
         self,
@@ -411,6 +452,7 @@ class SandboxClient(PyroMindClient):
         command: Union[str, List[str]],
         cwd: str = "",
         timeout: Optional[int] = None,
+        tty: bool = False,
     ) -> Iterator[SandboxExecStreamChunk]:
         """Execute a command and yield stdout/stderr chunks as they arrive.
 
@@ -425,6 +467,7 @@ class SandboxClient(PyroMindClient):
             cwd: Working directory inside the container
             timeout: Optional server-side timeout in seconds. ``None`` means
                 unlimited (the WebSocket itself has no total timeout).
+            tty: Allocate a pseudo-terminal for the command.
 
         Yields:
             :class:`SandboxExecStreamChunk` events
@@ -442,6 +485,7 @@ class SandboxClient(PyroMindClient):
             command=command,
             cwd=cwd.strip() if cwd else "",
             timeout=timeout,
+            tty=tty,
         )
 
     # ===================== File Operations (custom sandbox) =====================

@@ -2,52 +2,153 @@
 
 This adapter exposes the same methods docker-rt expects from
 ``KubeEnvironment``, but talks to ``k8s_middleware`` through the existing
-``pyromind_sdk.client.sandbox.SandboxClient`` OpenAPI client.
+``pyromind_sdk.client.async_sandbox.AsyncSandboxClient`` OpenAPI client.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
+import inspect
 import logging
+import os
 import posixpath
 import queue
 import shlex
 import tarfile
 import threading
-import time
-from typing import Any
+import weakref
+from typing import Any, AsyncIterator
 
+from pyromind_sdk.client.async_base import (
+    DEFAULT_CONNECTOR_LIMIT,
+    PyroMindAsyncAPIError,
+)
+from pyromind_sdk.client.async_sandbox import AsyncSandboxClient
 from pyromind_sdk.client.base import PyroMindAPIError
 from pyromind_sdk.client.models import (
     PortMapping,
     ResourceConfig,
+    SandboxExecStreamChunk,
     SandboxRequest,
     SandboxType,
     VolumeMount,
 )
-from pyromind_sdk.client.sandbox import SandboxClient
 from pyromind_sdk.exec_stream import (
     build_exec_stream_websocket_url,
-    iter_exec_stream,
+    iter_exec_stream_async,
 )
 
 from .portforward import parse_publish_spec
 from .runtime import parse_binds
 
 logger = logging.getLogger("docker_rt.pyromind_sdk")
-_client_singleton: SandboxClient | None = None
+_client_singleton: AsyncSandboxClient | None = None
+_client_singleton_lock = threading.Lock()
+_client_singleton_closing = False
+_cleanup_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+_cleanup_locks_guard = threading.Lock()
+_SDK_API_ERRORS = (PyroMindAPIError, PyroMindAsyncAPIError)
 
 DEFAULT_CPU = "1"
 DEFAULT_MEMORY = "2Gi"
 _EXEC_STREAM_QUEUE_SIZE = 64
+_CLEANUP_DELETABLE_STATUSES = {"stopped", "paused", "failed", "error"}
+_CLEANUP_RETRY_ATTEMPTS = 60
+_CLEANUP_DELETE_RETRY_DELAY_S = 1.0
+_CLEANUP_PAUSE_TIMEOUT_S = 60.0
+_CLEANUP_PAUSE_POLL_INTERVAL_S = 1.0
+DEFAULT_POD_STATUS_RUNNING_CACHE_TTL_S = 15.0
+DEFAULT_POD_STATUS_PENDING_CACHE_TTL_S = 5.0
 
 
-def get_sandbox_client() -> SandboxClient:
+def _pod_status_cache_ttl(status: str) -> float:
+    if status in {"running", "stopped", "paused", "failed", "error"}:
+        name = "DOCKER_RT_POD_STATUS_RUNNING_CACHE_TTL"
+        default = DEFAULT_POD_STATUS_RUNNING_CACHE_TTL_S
+    else:
+        name = "DOCKER_RT_POD_STATUS_PENDING_CACHE_TTL"
+        default = DEFAULT_POD_STATUS_PENDING_CACHE_TTL_S
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return default
+
+
+def new_sandbox_client() -> AsyncSandboxClient:
+    return AsyncSandboxClient(
+        connector_limit=DEFAULT_CONNECTOR_LIMIT,
+        connector_limit_per_host=DEFAULT_CONNECTOR_LIMIT,
+    )
+
+
+def get_sandbox_client() -> AsyncSandboxClient:
     global _client_singleton
-    if _client_singleton is None:
-        _client_singleton = SandboxClient()
-    return _client_singleton
+    with _client_singleton_lock:
+        if _client_singleton_closing:
+            raise RuntimeError("shared sandbox client is closing")
+        if _client_singleton is None or _client_singleton.closed:
+            _client_singleton = new_sandbox_client()
+        return _client_singleton
+
+
+async def close_sandbox_client(
+    client: AsyncSandboxClient | None = None,
+) -> None:
+    """Close an async SDK client and clear the process-wide fallback."""
+    global _client_singleton, _client_singleton_closing
+    with _client_singleton_lock:
+        _client_singleton_closing = True
+        target = client or _client_singleton
+        if target is _client_singleton:
+            _client_singleton = None
+    if target is not None:
+        await target.close()
+
+
+def _get_cleanup_lock(sandbox_id: str) -> asyncio.Lock:
+    with _cleanup_locks_guard:
+        lock = _cleanup_locks.get(sandbox_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _cleanup_locks[sandbox_id] = lock
+        return lock
+
+
+async def call_environment_method(
+    kube_env: Any,
+    method_name: str,
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Call SDK methods on the loop and keep other sync backends off-loop."""
+    method = getattr(kube_env, method_name)
+    if isinstance(kube_env, PyromindSDK):
+        result = method(*args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+    return await asyncio.to_thread(method, *args, **kwargs)
+
+
+async def call_maybe_async(
+    func: Any,
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Await a function result when needed, supporting sync test doubles."""
+    result = func(*args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
 
 
 class _OneShotWs:
@@ -89,15 +190,18 @@ class _OneShotWs:
 
 
 class _SdkExecStreamWs:
-    """Kubernetes-WS-like adapter backed by ``exec_command_stream``."""
+    """Kubernetes-WS-like adapter backed by streaming exec events."""
 
     def __init__(
         self,
         events: Any,
         stop_event: threading.Event | None = None,
+        *,
+        async_events: bool = False,
     ) -> None:
         self._events = events
         self._stop_event = stop_event or threading.Event()
+        self._async_events = async_events
         self._queue: "queue.Queue[tuple[str, Any] | None]" = queue.Queue(
             maxsize=_EXEC_STREAM_QUEUE_SIZE
         )
@@ -119,33 +223,49 @@ class _SdkExecStreamWs:
                 continue
         return False
 
+    def _handle_event(self, event: Any) -> bool:
+        event_type = getattr(event, "type", "")
+        if event_type in {"stdout", "stderr"}:
+            return self._put_event(
+                (event_type, getattr(event, "data", ""))
+            )
+        if event_type == "exit":
+            self._returncode = int(getattr(event, "returncode", 0) or 0)
+        return True
+
+    def _record_error(self, exc: BaseException) -> None:
+        self._error = exc
+        self._returncode = 1
+        message = str(exc).strip() or type(exc).__name__
+        self._put_event(
+            ("stderr", f"exec stream error: {message}\n".encode("utf-8"))
+        )
+
+    def _signal_done(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self._queue.put(None, timeout=0.2)
+                break
+            except queue.Full:
+                continue
+
+    async def _consume_async_events(self) -> None:
+        async for event in self._events:
+            if not self._handle_event(event):
+                return
+
     def _read_events(self) -> None:
         try:
-            for event in self._events:
-                event_type = getattr(event, "type", "")
-                if event_type in {"stdout", "stderr"}:
-                    if not self._put_event(
-                        (event_type, getattr(event, "data", ""))
-                    ):
+            if self._async_events:
+                asyncio.run(self._consume_async_events())
+            else:
+                for event in self._events:
+                    if not self._handle_event(event):
                         return
-                elif event_type == "exit":
-                    self._returncode = int(
-                        getattr(event, "returncode", 0) or 0
-                    )
         except BaseException as exc:
-            self._error = exc
-            self._returncode = 1
-            message = str(exc).strip() or type(exc).__name__
-            self._put_event(
-                ("stderr", f"exec stream error: {message}\n".encode("utf-8"))
-            )
+            self._record_error(exc)
         finally:
-            while not self._stop_event.is_set():
-                try:
-                    self._queue.put(None, timeout=0.2)
-                    break
-                except queue.Full:
-                    continue
+            self._signal_done()
 
     def is_open(self) -> bool:
         return not self._done
@@ -193,6 +313,8 @@ class _SdkExecStreamWs:
     def close(self) -> None:
         self._stop_event.set()
         self._done = True
+        if self._async_events:
+            return
         close = getattr(self._events, "close", None)
         if callable(close):
             try:
@@ -238,6 +360,7 @@ class PyromindSDK:
         system_image_path: str | None = None,
         screen_size: Any | None = None,
         logger: logging.Logger | None = None,
+        client: AsyncSandboxClient | None = None,
     ) -> "PyromindSDK":
         obj = cls.__new__(cls)
         obj.logger = logger or logging.getLogger("docker_rt.pyromind_sdk")
@@ -271,7 +394,7 @@ class PyromindSDK:
         obj.uid = uid
         obj.system_image_path = system_image_path
         obj.screen_size = obj._json_ready(screen_size)
-        obj._client = get_sandbox_client()
+        obj._client = client or get_sandbox_client()
         return obj
 
     def __init__(
@@ -296,6 +419,7 @@ class PyromindSDK:
         ready_timeout: int = 600,
         ready_check_interval: int = 3,
         logger: logging.Logger | None = None,
+        client: AsyncSandboxClient | None = None,
         **kwargs: Any,
     ) -> None:
         self.logger = logger or logging.getLogger("docker_rt.pyromind_sdk")
@@ -321,6 +445,8 @@ class PyromindSDK:
         self.screen_size: Any | None = None
         self._terminal_phase: str | None = None
         self._exit_code = 0
+        self._phase_refresh_lock: asyncio.Lock | None = None
+        self._phase_refreshed_at = 0.0
         self.ready_timeout = ready_timeout
         self.ready_check_interval = ready_check_interval
         self._resources = ResourceConfig(
@@ -329,27 +455,38 @@ class PyromindSDK:
             gpu=gpu,
             gpu_card=gpu_card,
         )
-        self._client = get_sandbox_client()
-        self._create_sandbox(
-            image=image,
-            name=name,
-            binds=binds,
-            mounts=mounts,
-            tmpfs=tmpfs,
-            port_bindings=port_bindings,
-            exposed_ports=exposed_ports,
-            publish_all_ports=publish_all_ports,
-            memory_limit=memory_limit,
-            cpu_limit=cpu_limit,
-            gpu=gpu,
-            gpu_card=gpu_card,
+        self._client = client or get_sandbox_client()
+
+    @classmethod
+    async def create(
+        cls,
+        *,
+        client: AsyncSandboxClient | None = None,
+        **kwargs: Any,
+    ) -> "PyromindSDK":
+        """Create a sandbox and return an initialized async adapter."""
+        obj = cls(client=client, **kwargs)
+        await obj._create_sandbox(
+            image=obj.image,
+            name=obj.name,
+            binds=kwargs.get("binds"),
+            mounts=kwargs.get("mounts"),
+            tmpfs=kwargs.get("tmpfs"),
+            port_bindings=kwargs.get("port_bindings"),
+            exposed_ports=kwargs.get("exposed_ports"),
+            publish_all_ports=bool(kwargs.get("publish_all_ports", False)),
+            memory_limit=kwargs.get("memory_limit"),
+            cpu_limit=kwargs.get("cpu_limit"),
+            gpu=kwargs.get("gpu"),
+            gpu_card=kwargs.get("gpu_card"),
         )
-        if command and command not in (["sleep"], ["sleep", "2h"]):
-            self.logger.warning(
+        if obj.command and obj.command not in (["sleep"], ["sleep", "2h"]):
+            obj.logger.warning(
                 "k8s_middleware does not accept Cmd yet; "
                 "container will use the image default command. cmd=%s",
-                command,
+                obj.command,
             )
+        return obj
 
     # ---- construction helpers -------------------------------------------
 
@@ -371,7 +508,7 @@ class PyromindSDK:
         self.pod_name = response.id
         self.name = response.name or self.name
 
-    def _create_sandbox(
+    async def _create_sandbox(
         self,
         *,
         image: str,
@@ -405,8 +542,8 @@ class PyromindSDK:
             ),
         )
         try:
-            response = self._client.create(request)
-        except PyroMindAPIError as exc:
+            response = await self._client.create(request)
+        except _SDK_API_ERRORS as exc:
             msg = f"{getattr(exc, 'message', '')} {getattr(exc, 'response', '')}"
             if "INSTANCE_EXIST" not in msg and "already exists" not in msg.lower():
                 raise
@@ -415,16 +552,21 @@ class PyromindSDK:
             raise RuntimeError(f"Sandbox {name!r} already exists{detail}") from exc
         self._bind_response(response)
 
-    def wait_until_running(self) -> None:
-        """Poll the single sandbox status until Running; raise on failure/timeout."""
+    async def wait_until_running(self) -> None:
+        """Poll the sandbox status until Running; raise on failure/timeout."""
         if not self.sandbox_id:
             return
-        deadline = time.monotonic() + self.ready_timeout
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.ready_timeout
+        await self._wait_until_running_polling(deadline)
+
+    async def _wait_until_running_polling(self, deadline: float) -> None:
+        loop = asyncio.get_running_loop()
         status = ""
         while True:
             try:
-                response = self._client.get_sandbox(self.sandbox_id)
-                status = str(getattr(response, "status", "") or "").lower()
+                await self.refresh_phase()
+                status = str(self.sandbox_status or "").lower()
             except Exception as exc:
                 self.logger.debug(
                     "status poll failed id=%s: %s", self.sandbox_id, exc,
@@ -437,12 +579,17 @@ class PyromindSDK:
                 raise RuntimeError(
                     f"sandbox {self.sandbox_id} failed to reach running: {status}"
                 )
-            if time.monotonic() >= deadline:
+            if loop.time() >= deadline:
                 raise RuntimeError(
                     f"timed out waiting for sandbox {self.sandbox_id} to be running "
                     f"after {self.ready_timeout}s (last status={status!r})"
                 )
-            time.sleep(self.ready_check_interval)
+            await asyncio.sleep(
+                min(
+                    max(0.1, float(self.ready_check_interval)),
+                    max(0.0, deadline - loop.time()),
+                )
+            )
 
     @staticmethod
     def _to_volume_mounts(
@@ -502,7 +649,7 @@ class PyromindSDK:
     def exit_code(self) -> int:
         return self._exit_code
 
-    def execute(
+    async def execute(
         self,
         action: dict[str, Any],
         cwd: str = "",
@@ -512,7 +659,7 @@ class PyromindSDK:
         if not self.sandbox_id:
             raise RuntimeError("sandbox is not started")
         command = action.get("command", "")
-        result = self._client.exec_command(
+        result = await self._client.exec_command(
             self.sandbox_id,
             command,
             cwd=cwd or self.working_dir,
@@ -533,12 +680,10 @@ class PyromindSDK:
         tty: bool = False,
         cwd: str = "",
     ) -> _SdkExecStreamWs:
-        if stdin or tty:
-            raise NotImplementedError(
-                "interactive exec through k8s_middleware requires the terminal websocket adapter"
-            )
         # Stream output over the platform WebSocket so long-running commands are
         # not subject to the one-shot HTTP request timeout or response buffering.
+        # Docker's -i/-it flags select this path, but stdin is intentionally not
+        # forwarded to the sandbox.
         stop_event = threading.Event()
         url = build_exec_stream_websocket_url(
             self._client.base_url,
@@ -546,14 +691,41 @@ class PyromindSDK:
             self._client.api_key,
             self._client.cluster,
         )
-        events = iter_exec_stream(
+        events = iter_exec_stream_async(
             url=url,
             command=list(cmd),
             cwd=cwd or self.working_dir,
             timeout=None,
+            tty=tty,
             stop_event=stop_event,
         )
-        return _SdkExecStreamWs(events, stop_event)
+        return _SdkExecStreamWs(events, stop_event, async_events=True)
+
+    async def iter_exec_stream(
+        self,
+        cmd: list[str],
+        *,
+        tty: bool = False,
+        cwd: str = "",
+        timeout: int | None = None,
+    ) -> AsyncIterator[SandboxExecStreamChunk]:
+        """Stream one exec command without leaving the running event loop."""
+        if not self.sandbox_id:
+            raise RuntimeError("sandbox is not started")
+        url = build_exec_stream_websocket_url(
+            self._client.base_url,
+            self.sandbox_id,
+            self._client.api_key,
+            self._client.cluster,
+        )
+        async for chunk in iter_exec_stream_async(
+            url=url,
+            command=list(cmd),
+            cwd=cwd or self.working_dir,
+            timeout=timeout,
+            tty=tty,
+        ):
+            yield chunk
 
     def attach_main(
         self,
@@ -572,30 +744,25 @@ class PyromindSDK:
             "k8s_middleware does not expose a sandbox logs endpoint yet"
         )
 
-    def get_pod_ip(self) -> str | None:
+    async def get_pod_ip(self) -> str | None:
         if not self.sandbox_id:
             return None
         try:
-            return self._client.get_internal_ip(self.sandbox_id).internal_ip or None
-        except PyroMindAPIError:
+            response = await self._client.get_internal_ip(self.sandbox_id)
+            return response.internal_ip or None
+        except _SDK_API_ERRORS:
             return None
 
-    def refresh_phase(self) -> str:
-        if not self.sandbox_id:
-            return "NotFound"
-        try:
-            sandbox = self._client.get_sandbox(self.sandbox_id)
-        except PyroMindAPIError as exc:
-            if exc.status_code == 404:
-                self._terminal_phase = "NotFound"
-                self.sandbox_status = "NotFound"
-                return "NotFound"
-            logger.debug("refresh_phase failed: %s", exc)
-            return "Unknown"
-        status = (sandbox.status or "").lower()
-        self.sandbox_status = status
+    def _phase_lock(self) -> asyncio.Lock:
+        if getattr(self, "_phase_refresh_lock", None) is None:
+            self._phase_refresh_lock = asyncio.Lock()
+        return self._phase_refresh_lock
+
+    def _phase_from_status(self, status: str) -> str:
         if status == "running":
             return "Running"
+        if status == "notfound":
+            return "NotFound"
         if status in {"stopped", "paused"}:
             self._terminal_phase = "Succeeded"
             return "Succeeded"
@@ -605,38 +772,164 @@ class PyromindSDK:
             return "Failed"
         return "Unknown"
 
-    def cleanup(self) -> None:
+    async def refresh_phase(self, *, force: bool = False) -> str:
+        if not self.sandbox_id:
+            return "NotFound"
+        loop = asyncio.get_running_loop()
+
+        def _cached_phase() -> str | None:
+            cached_status = (
+                getattr(self, "sandbox_status", None) or ""
+            ).lower()
+            ttl = _pod_status_cache_ttl(cached_status)
+            refreshed_at = getattr(self, "_phase_refreshed_at", 0.0)
+            if (
+                cached_status
+                and loop.time() - refreshed_at < ttl
+            ):
+                return self._phase_from_status(cached_status)
+            return None
+
+        if not force:
+            cached = _cached_phase()
+            if cached is not None:
+                return cached
+
+        async with self._phase_lock():
+            if not force:
+                cached = _cached_phase()
+                if cached is not None:
+                    return cached
+            try:
+                sandbox = await self._client.get_sandbox(self.sandbox_id)
+            except _SDK_API_ERRORS as exc:
+                self._phase_refreshed_at = loop.time()
+                if exc.status_code == 404:
+                    self._terminal_phase = "NotFound"
+                    self.sandbox_status = "NotFound"
+                    return "NotFound"
+                logger.debug("refresh_phase failed: %s", exc)
+                return "Unknown"
+
+            status = (sandbox.status or "").lower()
+            self.sandbox_status = status
+            self._phase_refreshed_at = loop.time()
+            return self._phase_from_status(status)
+
+    async def cleanup(self) -> None:
         if not self.sandbox_id:
             return
-        # Only pause an active instance; stopped sandboxes must be deleted directly.
-        status = (self.sandbox_status or "").lower()
-        if status in {"running", "pending", "unknown"}:
+        sandbox_id = self.sandbox_id
+        async with _get_cleanup_lock(sandbox_id):
+            if self.sandbox_id != sandbox_id:
+                return
+            await self._cleanup_once(sandbox_id)
+
+    async def _cleanup_once(self, sandbox_id: str) -> None:
+        for attempt in range(1, _CLEANUP_RETRY_ATTEMPTS + 1):
+            exists = await self._pause_and_wait_for_cleanup(sandbox_id)
+            if not exists:
+                self._mark_cleanup_complete()
+                return
             try:
-                self._client.pause(self.sandbox_id)
-            except PyroMindAPIError as exc:
-                self.logger.debug("pause before delete skipped: %s", exc)
+                await self._client.delete(sandbox_id)
+                self._mark_cleanup_complete()
+                return
+            except _SDK_API_ERRORS as exc:
+                if exc.status_code == 404:
+                    self._mark_cleanup_complete()
+                    return
+                if not self._is_running_delete_error(exc):
+                    raise
+                if attempt >= _CLEANUP_RETRY_ATTEMPTS:
+                    raise
+                logger.debug(
+                    "delete raced with pause transition id=%s attempt=%s",
+                    sandbox_id,
+                    attempt,
+                )
+                await asyncio.sleep(_CLEANUP_DELETE_RETRY_DELAY_S)
+
+    async def _pause_and_wait_for_cleanup(self, sandbox_id: str) -> bool:
+        """Pause a sandbox and wait until the backend reports it as deletable."""
         try:
-            self._client.delete(self.sandbox_id)
-        except PyroMindAPIError as exc:
-            if exc.status_code != 404:
-                raise
+            response = await self._client.pause(sandbox_id)
+        except _SDK_API_ERRORS as exc:
+            if exc.status_code == 404:
+                return False
+            logger.debug("pause before delete failed: %s", exc)
+        else:
+            response_status = str(
+                getattr(response, "status", "") or ""
+            ).lower()
+            if response_status:
+                self.sandbox_status = response_status
+                if response_status in _CLEANUP_DELETABLE_STATUSES:
+                    return True
+
+        return await self._wait_until_deletable(sandbox_id)
+
+    async def _wait_until_deletable(self, sandbox_id: str) -> bool:
+        """Return False only when the sandbox no longer exists."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _CLEANUP_PAUSE_TIMEOUT_S
+        last_status = (self.sandbox_status or "unknown").lower()
+        while True:
+            try:
+                sandbox = await self._client.get_sandbox(sandbox_id)
+            except _SDK_API_ERRORS as exc:
+                if exc.status_code == 404:
+                    return False
+                logger.debug(
+                    "wait for deletable sandbox failed: %s",
+                    exc,
+                )
+            else:
+                last_status = str(
+                    getattr(sandbox, "status", "") or ""
+                ).lower()
+                if last_status:
+                    self.sandbox_status = last_status
+                if last_status in _CLEANUP_DELETABLE_STATUSES:
+                    return True
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"sandbox {sandbox_id} did not become deletable after "
+                    f"pause (last status={last_status!r})"
+                )
+            await asyncio.sleep(
+                min(_CLEANUP_PAUSE_POLL_INTERVAL_S, remaining)
+            )
+
+    @staticmethod
+    def _is_running_delete_error(exc: PyroMindAPIError) -> bool:
+        message = str(getattr(exc, "message", exc)).lower()
+        return (
+            "status is running" in message
+            or "can not delete" in message
+            or "cannot delete" in message
+        )
+
+    def _mark_cleanup_complete(self) -> None:
         self.sandbox_id = None
         self._terminal_phase = "NotFound"
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         if not self.sandbox_id:
             return
-        self._client.pause(self.sandbox_id)
+        await self._client.pause(self.sandbox_id)
         self.sandbox_status = "Stopped"
 
-    def resume(self) -> None:
+    async def resume(self) -> None:
         if not self.sandbox_id:
             raise RuntimeError("sandbox is not started")
-        response = self._client.resume(self.sandbox_id)
+        response = await self._client.resume(self.sandbox_id)
         self._bind_response(response)
         self._terminal_phase = None
 
-    def archive_path_stat(self, path: str) -> dict[str, Any] | None:
+    async def archive_path_stat(self, path: str) -> dict[str, Any] | None:
         """Docker-style path stat for k8s-middleware via shell exec."""
         target = path if path.startswith("/") else f"/{path}"
         script = (
@@ -649,7 +942,7 @@ class PyromindSDK:
             f'name=$(basename "$target"); '
             f'printf "%s|%s|%s|%s\\n" "$kind" "$size" "$mode" "$name"'
         )
-        result = self.execute({"command": script}, cwd="/")
+        result = await self.execute({"command": script}, cwd="/")
         code = int(result.get("returncode", 0) or 0)
         if code != 0:
             return None
@@ -676,12 +969,12 @@ class PyromindSDK:
             "linkTarget": "",
         }
 
-    def iter_archive_chunks(self, path: str):
+    async def iter_archive_chunks(self, path: str):
         """Yield tar bytes for ``docker cp`` from a k8s-middleware sandbox."""
         target = path if path.startswith("/") else f"/{path}"
         parent = target.rsplit("/", 1)[0] or "/"
         base = target.rsplit("/", 1)[-1]
-        stat = self.archive_path_stat(target)
+        stat = await self.archive_path_stat(target)
         if stat is None:
             raise FileNotFoundError(target)
 
@@ -690,7 +983,7 @@ class PyromindSDK:
                 f"tar -C {shlex.quote(parent)} -cf - {shlex.quote(base)} "
                 "| base64 -w0"
             )
-            result = self.execute({"command": script}, cwd="/")
+            result = await self.execute({"command": script}, cwd="/")
             code = int(result.get("returncode", 0) or 0)
             if code != 0:
                 raise RuntimeError(
@@ -702,7 +995,7 @@ class PyromindSDK:
             yield raw
             return
 
-        data = self._client.read_file(self.sandbox_id, target)
+        data = await self._client.read_file(self.sandbox_id, target)
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w") as tar:
             info = tarfile.TarInfo(name=base or "/")
@@ -711,7 +1004,7 @@ class PyromindSDK:
             tar.addfile(info, io.BytesIO(data))
         yield buf.getvalue()
 
-    def put_archive(self, dest_path: str, tar_bytes: bytes) -> None:
+    async def put_archive(self, dest_path: str, tar_bytes: bytes) -> None:
         """Extract ``docker cp`` tar bytes into a k8s-middleware sandbox."""
         dest = dest_path or "/"
         with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r") as tar:
@@ -726,7 +1019,7 @@ class PyromindSDK:
                     raise ValueError(f"unsafe path in tar archive: {member.name!r}")
                 if member.isdir():
                     target = posixpath.join(dest, name)
-                    self.execute(
+                    await self.execute(
                         {"command": f"mkdir -p {shlex.quote(target)}"},
                         cwd="/",
                     )
@@ -738,7 +1031,7 @@ class PyromindSDK:
                 target = posixpath.join(dest, name)
                 if not dest.endswith("/") and name == posixpath.basename(dest):
                     target = dest
-                self._client.write_file(self.sandbox_id, target, data)
+                await self._client.write_file(self.sandbox_id, target, data)
 
     def patch_pod_metadata(self, **kwargs: Any) -> None:
         return None
@@ -748,10 +1041,10 @@ class PyromindSDK:
 
     # ---- k8s_middleware update helpers -----------------------------------
 
-    def _full_request(self) -> SandboxRequest:
+    async def _full_request(self) -> SandboxRequest:
         if not self.sandbox_id:
             raise RuntimeError("sandbox is not started")
-        sandbox = self._client.get_sandbox(self.sandbox_id)
+        sandbox = await self._client.get_sandbox(self.sandbox_id)
         return SandboxRequest(
             sandbox_type=SandboxType.CUSTOM,
             name=sandbox.name or self.name,
@@ -761,17 +1054,17 @@ class PyromindSDK:
             port_mappings=sandbox.port_mappings,
         )
 
-    def rename(self, new_name: str) -> None:
-        request = self._full_request()
+    async def rename(self, new_name: str) -> None:
+        request = await self._full_request()
         request.name = new_name
-        self._client.update(self.sandbox_id, request)
+        await self._client.update(self.sandbox_id, request)
         self.name = new_name
 
-    def restart(self) -> None:
+    async def restart(self) -> None:
         if not self.sandbox_id:
             raise RuntimeError("sandbox is not started")
-        self.stop()
-        self.resume()
+        await self.stop()
+        await self.resume()
 
 
 __all__ = ["PyromindSDK"]

@@ -12,6 +12,7 @@ from typing import Any
 from kubernetes import client
 from kubernetes.client.rest import ApiException
 
+from pyromind_sdk.client.async_sandbox import AsyncSandboxClient
 from pyromind_sdk.client.models import SandboxType
 
 from .container_map import remove_mapping, sandbox_to_local, set_mapping
@@ -95,6 +96,7 @@ async def reconcile_pyromind_sandboxes(
     *,
     policy: str | None = None,
     force: bool = False,
+    sandbox_client: AsyncSandboxClient | None = None,
     **kwargs: Any,
 ) -> dict[str, int]:
     """Adopt Running sandboxes from k8s_middleware into the local store."""
@@ -114,7 +116,8 @@ async def reconcile_pyromind_sandboxes(
         }
 
     try:
-        sandboxes = get_sandbox_client().list()
+        client = sandbox_client or get_sandbox_client()
+        sandboxes = await client.list()
     except Exception as exc:
         logger.warning("PyromindSDK reconcile list failed: %s", exc)
         return {"adopted": 0, "reaped": 0}
@@ -153,13 +156,14 @@ async def reconcile_pyromind_sandboxes(
                 uid=getattr(sandbox, "uid", None),
                 system_image_path=getattr(sandbox, "system_image_path", None),
                 screen_size=getattr(sandbox, "screen_size", None),
+                client=client,
             )
             existing = store.get(name) or store.get(sandbox_id)
             if existing is not None:
                 existing.kube_env = kube_env
                 existing.pod_name = sandbox_id
                 existing.image = image
-                existing.state = state
+                await store.set_state(existing, state)
                 existing.published_ports = _published_ports(sandbox)
             else:
                 adopted_record = await store.adopt_container(

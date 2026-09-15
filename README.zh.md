@@ -540,6 +540,7 @@ with PyroMindAPIClient() as client:
 ```
 
 异步客户端使用 `async for chunk in client.sandboxes.exec_command_stream(...)`。
+命令输出需要伪终端时设置 `tty=True`。
 
 ## 项目结构
 

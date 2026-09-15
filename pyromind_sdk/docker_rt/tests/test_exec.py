@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -108,6 +110,39 @@ async def test_exec_detach_uses_execute(aiohttp_client, fake_kube: FakeKubeEnv):
     assert fake_kube.last_execute["action"]["command"] == [
         "sh", "-c", "test -d /home/user && echo OK || echo NOT_EXIST"
     ]
+
+
+@pytest.mark.asyncio
+async def test_running_exec_skips_backend_refresh(
+    aiohttp_client, fake_kube: FakeKubeEnv
+):
+    from ..aio_server import create_aio_app
+    from .. import aio_server as mod
+
+    app = create_aio_app(run_reconcile=False)
+    mod.start_kube_environment = lambda **kw: fake_kube  # type: ignore
+    client = await aiohttp_client(app)
+    cid = await create_started_container(client, name="exec-no-refresh")
+
+    fake_kube.refresh_phase = MagicMock(wraps=fake_kube.refresh_phase)
+    resp = await client.post(f"/containers/{cid}/exec", json={"Cmd": ["true"]})
+    assert resp.status == 200
+    fake_kube.refresh_phase.assert_not_called()
+
+    eid = (await resp.json())["Id"]
+    start = await client.post(
+        f"/exec/{eid}/start", json={"Detach": True, "Tty": False}
+    )
+    assert start.status == 200
+    fake_kube.refresh_phase.assert_not_called()
+
+    for _ in range(100):
+        if getattr(fake_kube, "last_execute", None) is not None:
+            break
+        await asyncio.sleep(0.02)
+    assert fake_kube.last_execute["action"]["command"] == ["true"]
+
+
 @pytest.mark.asyncio
 async def test_exec_interactive_adds_bash_i(aiohttp_client, fake_kube: FakeKubeEnv):
     from ..aio_server import create_aio_app
@@ -143,6 +178,121 @@ async def test_exec_interactive_adds_bash_i(aiohttp_client, fake_kube: FakeKubeE
     assert fake_kube.last_attach_kwargs.get("stdin") is True
     assert fake_kube.last_attach_kwargs.get("tty") is True
     assert (await start_task).status == 101
+
+
+@pytest.mark.asyncio
+async def test_pyromind_exec_interactive_uses_command_stream(monkeypatch):
+    from .. import aio_server as mod
+    from ..backend.pyromind_sdk_env import PyromindSDK
+
+    class FakeRequest:
+        def __init__(self, protocol):
+            self.content = None
+            self.transport = None
+            self.protocol = protocol
+
+    class FakeProtocol:
+        def __init__(self):
+            self._message_tail = b"echo ok\n"
+
+        def force_close(self):
+            return None
+
+    class FakeResp:
+        def __init__(self):
+            self.written = []
+
+        async def write(self, data):
+            self.written.append(data)
+
+        async def drain(self):
+            return None
+
+        def force_close(self):
+            return None
+
+    kube_env = PyromindSDK.__new__(PyromindSDK)
+    stream_kwargs = {}
+
+    async def fake_stream(cmd, **kwargs):
+        stream_kwargs["cmd"] = cmd
+        stream_kwargs.update(kwargs)
+        yield SimpleNamespace(type="stdout", data=b"hello\n")
+        yield SimpleNamespace(type="exit", returncode=0)
+
+    monkeypatch.setattr(kube_env, "iter_exec_stream", fake_stream)
+    resp = FakeResp()
+    session = SimpleNamespace(id="exec-test", running=False, exit_code=None)
+
+    protocol = FakeProtocol()
+    await asyncio.wait_for(
+        mod._hijack_session(
+            FakeRequest(protocol),
+            resp,
+            protocol,
+            session,
+            kube_env,
+            ["cat"],
+            True,
+            stdin=True,
+            cwd="/workspace",
+        ),
+        timeout=2,
+    )
+
+    assert stream_kwargs["cmd"] == ["cat"]
+    assert stream_kwargs["tty"] is True
+    assert stream_kwargs["cwd"] == "/workspace"
+    assert resp.written == [b"hello\n"]
+
+
+@pytest.mark.asyncio
+async def test_pyromind_oneshot_never_uses_thread_pool(monkeypatch):
+    from .. import aio_server as mod
+    from ..backend.pyromind_sdk_env import PyromindSDK
+
+    kube_env = PyromindSDK.__new__(PyromindSDK)
+
+    async def fake_stream(cmd, **kwargs):
+        yield SimpleNamespace(type="stdout", data="hello\n")
+        yield SimpleNamespace(type="stderr", data=b"warn\n")
+        yield SimpleNamespace(type="exit", returncode=7)
+
+    async def fail_to_thread(*args, **kwargs):
+        raise AssertionError("exec must not use asyncio.to_thread")
+
+    monkeypatch.setattr(kube_env, "iter_exec_stream", fake_stream)
+    monkeypatch.setattr(mod.asyncio, "to_thread", fail_to_thread)
+
+    written = []
+
+    class FakeResp:
+        async def write(self, chunk):
+            written.append(chunk)
+
+        async def drain(self):
+            return None
+
+    code = await mod._stream_ws_oneshot(
+        resp=FakeResp(),
+        kube_env=kube_env,
+        cmd=["echo", "hello"],
+        session_id="exec-async",
+    )
+
+    assert code == 7
+    assert b"hello\n" in b"".join(written)
+    assert b"warn\n" in b"".join(written)
+
+
+def test_exec_concurrency_defaults_to_unlimited(monkeypatch):
+    from .. import aio_server as mod
+
+    monkeypatch.delenv("DOCKER_RT_EXEC_MAX_CONCURRENCY", raising=False)
+    assert mod._exec_concurrency_limit() == 0
+
+    monkeypatch.setenv("DOCKER_RT_EXEC_MAX_CONCURRENCY", "128")
+    assert mod._exec_concurrency_limit() == 128
 
 
 @pytest.mark.asyncio

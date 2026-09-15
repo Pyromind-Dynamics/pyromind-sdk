@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from ..backend.reconcile import reconcile_pyromind_sandboxes
 from ..backend.store import ContainerRecord, ContainerState, ContainerStore
@@ -10,7 +10,7 @@ from pyromind_sdk.client.models import SandboxResponse, SandboxType
 
 def _empty_client() -> MagicMock:
     client = MagicMock()
-    client.list.return_value = []
+    client.list = AsyncMock(return_value=[])
     return client
 
 
@@ -51,7 +51,7 @@ def test_keep_record_when_sandbox_still_listed(monkeypatch) -> None:
         status="Running",
     )
     client = MagicMock()
-    client.list.return_value = [sandbox]
+    client.list = AsyncMock(return_value=[sandbox])
 
     monkeypatch.setattr(env_mod, "get_sandbox_client", lambda: client)
     store = _store_with_zombie("sb-still-here")
