@@ -152,21 +152,25 @@ def prepare_env(
     return result
 
 
-def check_connection(
+async def check_connection(
     api_key: str | None = None,
     cluster: str | None = None,
+    *,
+    client: Any | None = None,
 ) -> int:
     """Verify PyroMind API access and return the number of visible sandboxes."""
-    from pyromind_sdk.client.sandbox import SandboxClient
+    from pyromind_sdk.client.async_sandbox import AsyncSandboxClient
 
-    client = SandboxClient(
+    owns_client = client is None
+    client = client or AsyncSandboxClient(
         api_key=api_key or os.getenv("PYROMIND_API_KEY"),
         cluster=cluster or os.getenv("PYROMIND_CLUSTER"),
     )
     try:
-        return len(client.list())
+        return len(await client.list())
     finally:
-        client.close()
+        if owns_client:
+            await client.close()
 
 
 def _mask_key(api_key: str) -> str:

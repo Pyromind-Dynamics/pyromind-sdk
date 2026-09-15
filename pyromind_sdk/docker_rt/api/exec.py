@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from starlette.responses import Response as StarletteResponse
 from starlette.types import Receive, Scope, Send
 
+from ..backend.pyromind_sdk_env import PyromindSDK
 from ..backend.store import ContainerState, ContainerStore
 from ..backend.stream_framing import frame_stderr, frame_stdout
 
@@ -125,6 +126,17 @@ async def _pump_interactive(
     cwd: str = "",
 ) -> None:
     """Bridge Docker hijacked connection <-> Kubernetes exec stream."""
+    if isinstance(kube_env, PyromindSDK):
+        await _pump_pyromind_interactive(
+            kube_env=kube_env,
+            cmd=cmd,
+            tty=tty,
+            receive=receive,
+            send=send,
+            cwd=cwd,
+        )
+        return
+
     ws = await asyncio.to_thread(
         kube_env.attach_exec,
         cmd,
@@ -213,6 +225,67 @@ async def _pump_interactive(
     await asyncio.gather(write_out(), read_in())
 
 
+async def _pump_pyromind_interactive(
+    *,
+    kube_env: PyromindSDK,
+    cmd: list[str],
+    tty: bool,
+    receive: Receive,
+    send: Send,
+    cwd: str = "",
+) -> None:
+    """Stream a PyroMind exec result without using a worker thread."""
+    disconnected = asyncio.Event()
+
+    async def write_out() -> None:
+        async for chunk in kube_env.iter_exec_stream(
+            cmd,
+            tty=tty,
+            cwd=cwd,
+        ):
+            if chunk.type not in {"stdout", "stderr"}:
+                continue
+            data = chunk.data
+            raw = data.encode("utf-8") if isinstance(data, str) else bytes(data)
+            if not raw:
+                continue
+            if tty:
+                body = raw
+            elif chunk.type == "stderr":
+                body = frame_stderr(raw)
+            else:
+                body = frame_stdout(raw)
+            await send(
+                {"type": "http.response.body", "body": body, "more_body": True}
+            )
+        await send(
+            {"type": "http.response.body", "body": b"", "more_body": False}
+        )
+
+    async def read_in() -> None:
+        while not disconnected.is_set():
+            message = await receive()
+            if message.get("type") == "http.disconnect":
+                disconnected.set()
+                return
+
+    write_task = asyncio.create_task(write_out())
+    read_task = asyncio.create_task(read_in())
+    try:
+        done, pending = await asyncio.wait(
+            (write_task, read_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        disconnected.set()
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            task.result()
+    finally:
+        disconnected.set()
+
+
 @router.post("/exec/{id}/start")
 async def start_exec(request: Request, id: str) -> Response:
     store = get_store(request)
@@ -239,17 +312,25 @@ async def start_exec(request: Request, id: str) -> Response:
         # Fire-and-forget non-attached exec
         exec_rec.running = True
 
-        def _run() -> None:
+        async def _run() -> None:
             try:
-                container.kube_env.execute(
-                    {"command": " ".join(exec_rec.cmd)},
-                    cwd,
-                )
+                if isinstance(container.kube_env, PyromindSDK):
+                    async for _chunk in container.kube_env.iter_exec_stream(
+                        list(exec_rec.cmd),
+                        cwd=cwd,
+                    ):
+                        pass
+                else:
+                    await asyncio.to_thread(
+                        container.kube_env.execute,
+                        {"command": " ".join(exec_rec.cmd)},
+                        cwd,
+                    )
             finally:
                 exec_rec.running = False
                 exec_rec.exit_code = 0
 
-        threading.Thread(target=_run, daemon=True).start()
+        asyncio.create_task(_run())
         return Response(status_code=200)
 
     upgrade = request.headers.get("upgrade", "").lower()
@@ -283,11 +364,17 @@ async def start_exec(request: Request, id: str) -> Response:
 
     async def generate():
         try:
-            result = await asyncio.to_thread(
-                kube_env.execute,
-                {"command": " ".join(cmd)},
-                cwd,
-            )
+            if isinstance(kube_env, PyromindSDK):
+                result = await kube_env.execute(
+                    {"command": list(cmd)},
+                    cwd,
+                )
+            else:
+                result = await asyncio.to_thread(
+                    kube_env.execute,
+                    {"command": " ".join(cmd)},
+                    cwd,
+                )
             output = result.get("output") or ""
             data = output.encode("utf-8") if isinstance(output, str) else output
             if data:

@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from ..aio_server import _stream_ws_oneshot
-from ..backend.store import ContainerStore
+from ..backend.store import ContainerState, ContainerStore
 from ..backend.stream_framing import frame_stdout
 
 
@@ -140,6 +140,84 @@ async def test_store_resolves_container_by_name():
     assert store.get("test-sdk-1").id == record.id
     await store.remove(record)
     assert store.get("test-sdk-1") is None
+
+
+@pytest.mark.asyncio
+async def test_state_change_wakes_all_waiters():
+    store = ContainerStore()
+    record = await store.create_container(
+        name="wait-many",
+        image="ubuntu:22.04",
+        env={},
+        cmd=["sleep", "1"],
+        working_dir="/",
+        namespace="",
+    )
+    snapshot = store.state_snapshot(record.id)
+    waiters = [
+        asyncio.create_task(
+            store.wait_for_state_change(record.id, snapshot.revision, timeout=1)
+        )
+        for _ in range(3)
+    ]
+    await asyncio.sleep(0)
+
+    await store.set_state(record, ContainerState.RUNNING)
+    results = await asyncio.gather(*waiters)
+
+    assert all(result is not None for result in results)
+    assert all(result.state == ContainerState.RUNNING for result in results)
+    assert record.id not in store._state_waiters
+
+
+@pytest.mark.asyncio
+async def test_wait_for_state_change_watchdog_timeout_cleans_waiter():
+    store = ContainerStore()
+    record = await store.create_container(
+        name="wait-timeout",
+        image="ubuntu:22.04",
+        env={},
+        cmd=["sleep", "1"],
+        working_dir="/",
+        namespace="",
+    )
+    snapshot = store.state_snapshot(record.id)
+
+    result = await store.wait_for_state_change(
+        record.id,
+        snapshot.revision,
+        timeout=0.01,
+    )
+
+    assert result is None
+    assert record.id not in store._state_waiters
+
+
+@pytest.mark.asyncio
+async def test_remove_wakes_waiters_with_removed_snapshot():
+    store = ContainerStore()
+    record = await store.create_container(
+        name="wait-remove",
+        image="ubuntu:22.04",
+        env={},
+        cmd=["sleep", "1"],
+        working_dir="/",
+        namespace="",
+    )
+    snapshot = store.state_snapshot(record.id)
+    waiter = asyncio.create_task(
+        store.wait_for_state_change(record.id, snapshot.revision, timeout=1)
+    )
+    await asyncio.sleep(0)
+
+    await store.remove(record)
+    result = await waiter
+
+    assert result is not None
+    assert result.exists is True
+    assert result.state == ContainerState.REMOVED
+    assert store.state_snapshot(record.id).exists is False
+    assert record.id not in store._state_waiters
 
 
 def test_prune_execs_by_age_and_cap():

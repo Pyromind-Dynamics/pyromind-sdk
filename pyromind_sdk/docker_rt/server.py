@@ -6,6 +6,8 @@ Uses aiohttp so ``docker exec -it`` TCP Upgrade works. FastAPI app in
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import os
 import sys
 
@@ -48,7 +50,12 @@ def main(argv: list[str] | None = None) -> int:
                 api_key=args.api_key,
                 cluster=args.cluster,
             )
-            check_connection()
+            async def _check_connection() -> None:
+                result = check_connection()
+                if inspect.isawaitable(result):
+                    await result
+
+            asyncio.run(_check_connection())
             os.environ["PYROMIND_DOCKER_RT_BOOTSTRAPPED"] = "1"
         except KeyboardInterrupt:
             print("docker-rt setup cancelled.", file=sys.stderr)

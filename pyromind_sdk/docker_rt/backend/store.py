@@ -19,6 +19,33 @@ class ContainerState(str, Enum):
     REMOVED = "removed"
 
 
+@dataclass(frozen=True)
+class ContainerStateSnapshot:
+    container_id: str
+    exists: bool
+    state: ContainerState | None
+    exit_code: int
+    revision: int
+
+
+def container_wait_condition_met(
+    snapshot: ContainerStateSnapshot,
+    condition: str,
+) -> bool:
+    terminal = {
+        ContainerState.EXITED,
+        ContainerState.DEAD,
+        ContainerState.REMOVED,
+    }
+    if not snapshot.exists:
+        return condition in {"removed", "not-running", "next-exit", ""}
+    if condition in {"not-running", "next-exit", ""}:
+        return snapshot.state in terminal
+    if condition == "removed":
+        return snapshot.state == ContainerState.REMOVED
+    return snapshot.state in terminal
+
+
 @dataclass
 class ContainerRecord:
     id: str
@@ -110,10 +137,92 @@ class ContainerStore:
         self._containers: dict[str, ContainerRecord] = {}
         self._names: dict[str, str] = {}  # name -> id
         self._execs: dict[str, ExecRecord] = {}
+        self._state_waiters: dict[
+            str, set[asyncio.Future[ContainerStateSnapshot]]
+        ] = {}
+        self._state_versions: dict[str, int] = {}
         self._extra_images: set[str] = set()
         # short/local image name → pullable registry ref (from buildctl)
         self._image_aliases: dict[str, str] = {}
         self._lock = asyncio.Lock()
+
+    def state_snapshot(self, container_id: str) -> ContainerStateSnapshot:
+        """Return an atomic lifecycle view used by Docker wait handlers."""
+        record = self._containers.get(container_id)
+        revision = self._state_versions.get(container_id, 0)
+        if record is None:
+            return ContainerStateSnapshot(
+                container_id=container_id,
+                exists=False,
+                state=None,
+                exit_code=0,
+                revision=revision,
+            )
+        return ContainerStateSnapshot(
+            container_id=container_id,
+            exists=True,
+            state=record.state,
+            exit_code=int(getattr(record, "exit_code", 0) or 0),
+            revision=revision,
+        )
+
+    def _notify_state_change(self, record: ContainerRecord) -> None:
+        container_id = record.id
+        self._state_versions[container_id] = (
+            self._state_versions.get(container_id, 0) + 1
+        )
+        snapshot = self.state_snapshot(container_id)
+        waiters = self._state_waiters.pop(container_id, set())
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result(snapshot)
+
+    async def set_state(
+        self,
+        record: ContainerRecord,
+        state: ContainerState,
+    ) -> None:
+        """Update state and wake all waiters when the value changes."""
+        async with self._lock:
+            if record.state == state:
+                return
+            record.state = state
+            if self._containers.get(record.id) is record:
+                self._notify_state_change(record)
+
+    async def wait_for_state_change(
+        self,
+        container_id: str,
+        revision: int,
+        *,
+        timeout: float | None = None,
+    ) -> ContainerStateSnapshot | None:
+        """Wait for a state revision change.
+
+        Returns the state snapshot captured at notification time. ``None``
+        means the watchdog timeout elapsed without a notification.
+        """
+        loop = asyncio.get_running_loop()
+        waiter = loop.create_future()
+        async with self._lock:
+            current = self.state_snapshot(container_id)
+            if not current.exists or current.revision != revision:
+                return current
+            self._state_waiters.setdefault(container_id, set()).add(waiter)
+        try:
+            if timeout is None:
+                return await waiter
+            return await asyncio.wait_for(waiter, timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            waiters = self._state_waiters.get(container_id)
+            if waiters is not None:
+                waiters.discard(waiter)
+                if not waiters:
+                    self._state_waiters.pop(container_id, None)
+            if not waiter.done():
+                waiter.cancel()
 
     async def create_container(
         self,
@@ -326,8 +435,10 @@ class ContainerStore:
         async with self._lock:
             self._names.pop(record.name, None)
             record.state = ContainerState.REMOVED
+            self._notify_state_change(record)
             # Keep record briefly for inspect-after-rm edge cases; drop hard ref
             self._containers.pop(record.id, None)
+            self._state_versions.pop(record.id, None)
             # Drop exec sessions for this container.
             dead = [
                 eid

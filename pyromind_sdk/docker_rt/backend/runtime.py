@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from pyromind_sdk.client.async_sandbox import AsyncSandboxClient
+
 logger = logging.getLogger("docker_rt.runtime")
 
 _DOCKER_RT_ROOT = Path(__file__).resolve().parents[1]
@@ -343,7 +345,7 @@ def parse_binds(binds: list[str] | None) -> list[dict[str, Any]]:
     return out
 
 
-def start_kube_environment(
+async def start_kube_environment(
     *,
     image: str,
     namespace: str,
@@ -373,6 +375,7 @@ def start_kube_environment(
     cpu_request: str | None = None,
     gpu: str | None = None,
     gpu_card: str | None = None,
+    sandbox_client: AsyncSandboxClient | None = None,
 ) -> KubeEnvironment:
     """Start a sandbox through the k8s-middleware PyromindSDK backend."""
     from .pyromind_sdk_env import PyromindSDK
@@ -387,7 +390,7 @@ def start_kube_environment(
         memory_limit or "-",
         cpu_limit or "-",
     )
-    return PyromindSDK(
+    return await PyromindSDK.create(
         image=image,
         name=container_name or hostname,
         namespace=namespace,
@@ -405,6 +408,7 @@ def start_kube_environment(
         gpu=gpu,
         gpu_card=gpu_card,
         ready_timeout=ready_timeout,
+        client=sandbox_client,
     )
 
 

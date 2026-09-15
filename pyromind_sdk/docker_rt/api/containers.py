@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -19,15 +20,31 @@ from ..backend.runtime import (
     parse_env_list,
     start_kube_environment,
 )
-from ..backend.store import ContainerState, ContainerStore
+from ..backend.store import (
+    ContainerState,
+    ContainerStore,
+    container_wait_condition_met,
+)
 from ..backend.stream_framing import frame_stdout
-from ..backend.pyromind_sdk_env import PyromindSDK
+from ..backend.pyromind_sdk_env import (
+    PyromindSDK,
+    call_environment_method,
+    call_maybe_async,
+)
 from ..backend.reconcile import _container_state_from_status
 from .images import image_id
 
 logger = logging.getLogger("docker_rt.containers")
 
 router = APIRouter(tags=["containers"])
+
+
+def _wait_watchdog_interval() -> float:
+    raw = os.getenv("DOCKER_RT_WAIT_WATCHDOG_INTERVAL", "1")
+    try:
+        return max(0.1, float(raw))
+    except ValueError:
+        return 1.0
 
 
 def _iso(ts: float | None) -> str:
@@ -213,13 +230,16 @@ def get_store(request: Request) -> ContainerStore:
     return request.app.state.store
 
 
-async def _refresh_record_state(record: Any) -> None:
+async def _refresh_record_state(
+    record: Any,
+    store: ContainerStore | None = None,
+) -> None:
     """Refresh lifecycle state from the backend before an operation."""
     kube_env = getattr(record, "kube_env", None)
     if kube_env is None or not hasattr(kube_env, "refresh_phase"):
         return
     try:
-        await asyncio.to_thread(kube_env.refresh_phase)
+        await call_environment_method(kube_env, "refresh_phase")
     except Exception:
         logger.debug(
             "state refresh failed id=%s",
@@ -229,7 +249,11 @@ async def _refresh_record_state(record: Any) -> None:
         return
     status = getattr(kube_env, "sandbox_status", None)
     if status:
-        record.state = _container_state_from_status(str(status))
+        state = _container_state_from_status(str(status))
+        if store is None:
+            record.state = state
+        else:
+            await store.set_state(record, state)
 
 
 @router.get("/containers/json")
@@ -317,7 +341,7 @@ async def start_container(request: Request, id: str) -> Response:
     if record is None:
         raise HTTPException(status_code=404, detail=f"No such container: {id}")
 
-    await _refresh_record_state(record)
+    await _refresh_record_state(record, store)
     async with record.lock:
         if record.state == ContainerState.RUNNING:
             return Response(status_code=304)
@@ -327,7 +351,7 @@ async def start_container(request: Request, id: str) -> Response:
                 detail=f"Cannot start container in state {record.state.value}",
             )
         try:
-            kube_env = await asyncio.to_thread(
+            kube_env = await call_maybe_async(
                 start_kube_environment,
                 image=record.image,
                 namespace=record.namespace,
@@ -347,8 +371,8 @@ async def start_container(request: Request, id: str) -> Response:
                 ),
             )
         except Exception as exc:
-            record.state = ContainerState.DEAD
             record.error = format_exception_message(exc)
+            await store.set_state(record, ContainerState.DEAD)
             logger.exception("Failed to start container %s", record.id)
             raise HTTPException(
                 status_code=500,
@@ -357,7 +381,7 @@ async def start_container(request: Request, id: str) -> Response:
 
         record.kube_env = kube_env
         record.pod_name = kube_env.pod_name
-        record.state = ContainerState.RUNNING
+        await store.set_state(record, ContainerState.RUNNING)
         record.started_at = time.time()
         record.error = None
 
@@ -376,17 +400,17 @@ async def stop_container(
     if record is None:
         raise HTTPException(status_code=404, detail=f"No such container: {id}")
 
-    await _refresh_record_state(record)
+    await _refresh_record_state(record, store)
     async with record.lock:
         if record.state != ContainerState.RUNNING:
             return Response(status_code=304)
         if record.kube_env is not None:
-            await asyncio.to_thread(record.kube_env.cleanup)
+            await call_environment_method(record.kube_env, "cleanup")
             record.kube_env = None
         record.pod_name = None
-        record.state = ContainerState.EXITED
         record.exit_code = 0
         record.finished_at = time.time()
+        await store.set_state(record, ContainerState.EXITED)
 
     return Response(status_code=204)
 
@@ -403,7 +427,7 @@ async def kill_container(
     if record is None:
         raise HTTPException(status_code=404, detail=f"No such container: {id}")
 
-    await _refresh_record_state(record)
+    await _refresh_record_state(record, store)
 
     sig_name = signal.upper()
     if not sig_name.startswith("SIG") and not sig_name.isdigit():
@@ -416,7 +440,7 @@ async def kill_container(
             )
         if record.kube_env is not None:
             try:
-                await asyncio.to_thread(record.kube_env.cleanup)
+                await call_environment_method(record.kube_env, "cleanup")
             except Exception as exc:
                 raise HTTPException(
                     status_code=500,
@@ -424,11 +448,11 @@ async def kill_container(
                 ) from exc
             record.kube_env = None
         record.pod_name = None
-        record.state = ContainerState.EXITED
         record.exit_code = (
             137 if "KILL" in sig_name else 143 if "TERM" in sig_name else 1
         )
         record.finished_at = time.time()
+        await store.set_state(record, ContainerState.EXITED)
 
     return Response(status_code=204)
 
@@ -445,35 +469,38 @@ async def wait_container(
     if record is None:
         raise HTTPException(status_code=404, detail=f"No such container: {id}")
 
-    terminal = {ContainerState.EXITED, ContainerState.DEAD, ContainerState.REMOVED}
+    container_id = record.id
     cond = (condition or "not-running").lower()
+    watchdog = _wait_watchdog_interval()
 
     async def generate():
         # Force headers to flush immediately (Go json.Decoder skips leading WS).
         yield b"\n"
+        snapshot = store.state_snapshot(container_id)
         while True:
-            record = store.get(id)
-            if record is None:
-                if cond in {"removed", "not-running", "next-exit", ""}:
+            if snapshot.exists and container_wait_condition_met(snapshot, cond):
+                yield (json.dumps({"StatusCode": snapshot.exit_code}) + "\n").encode()
+                return
+            if not snapshot.exists:
+                if container_wait_condition_met(snapshot, cond):
                     yield b'{"StatusCode":0}\n'
-                    return
-                yield b'{"Error":{"Message":"No such container"}}\n'
+                else:
+                    yield b'{"Error":{"Message":"No such container"}}\n'
                 return
 
-            done = False
-            code = int(getattr(record, "exit_code", 0) or 0)
-            if cond in {"not-running", "next-exit", ""}:
-                done = record.state in terminal
-            elif cond == "removed":
-                done = record.state == ContainerState.REMOVED
-            else:
-                done = record.state in terminal
-
-            if done:
-                yield (json.dumps({"StatusCode": code}) + "\n").encode()
+            if await request.is_disconnected():
                 return
 
-            await asyncio.sleep(0.5)
+            changed = await store.wait_for_state_change(
+                container_id,
+                snapshot.revision,
+                timeout=watchdog,
+            )
+            snapshot = (
+                changed
+                if changed is not None
+                else store.state_snapshot(container_id)
+            )
 
     return StreamingResponse(
         generate(),
@@ -498,7 +525,7 @@ async def delete_container(
     if record is None:
         raise HTTPException(status_code=404, detail=f"No such container: {id}")
 
-    await _refresh_record_state(record)
+    await _refresh_record_state(record, store)
     async with record.lock:
         if record.state == ContainerState.RUNNING:
             if not force:
@@ -508,7 +535,9 @@ async def delete_container(
                 )
             if record.kube_env is not None:
                 try:
-                    await asyncio.to_thread(record.kube_env.cleanup)
+                    await call_environment_method(
+                        record.kube_env, "cleanup"
+                    )
                 except Exception as exc:
                     raise HTTPException(
                         status_code=500,
@@ -516,9 +545,9 @@ async def delete_container(
                     ) from exc
                 record.kube_env = None
             record.pod_name = None
-            record.state = ContainerState.EXITED
             record.exit_code = 0
             record.finished_at = time.time()
+            await store.set_state(record, ContainerState.EXITED)
 
     await store.remove(record)
     return Response(status_code=204)

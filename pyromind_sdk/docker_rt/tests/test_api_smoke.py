@@ -134,6 +134,140 @@ async def test_wait_headers_first(aiohttp_client):
 
 
 @pytest.mark.asyncio
+async def test_wait_removed_is_event_driven(aiohttp_client):
+    from ..aio_server import create_aio_app
+
+    app = create_aio_app(run_reconcile=False)
+    client = await aiohttp_client(app)
+    resp = await client.post(
+        "/containers/create?name=wait-rm",
+        json={"Image": "ubuntu:22.04", "Cmd": ["sleep", "1h"]},
+    )
+    cid = (await resp.json())["Id"]
+
+    wait_task = asyncio.create_task(
+        client.post(f"/containers/{cid}/wait?condition=removed")
+    )
+    await asyncio.sleep(0.05)
+    resp = await client.delete(f"/containers/{cid}?force=true")
+    assert resp.status == 204
+
+    wait_resp = await asyncio.wait_for(wait_task, timeout=1)
+    assert wait_resp.status == 200
+    assert await wait_resp.json() == {"StatusCode": 0}
+
+
+@pytest.mark.asyncio
+async def test_many_waiters_are_woken_by_remove(aiohttp_client):
+    from ..aio_server import create_aio_app
+
+    app = create_aio_app(run_reconcile=False)
+    client = await aiohttp_client(app)
+    resp = await client.post(
+        "/containers/create?name=wait-many-http",
+        json={"Image": "ubuntu:22.04", "Cmd": ["sleep", "1h"]},
+    )
+    cid = (await resp.json())["Id"]
+
+    wait_tasks = [
+        asyncio.create_task(
+            client.post(f"/containers/{cid}/wait?condition=removed")
+        )
+        for _ in range(32)
+    ]
+    await asyncio.sleep(0.05)
+    resp = await client.delete(f"/containers/{cid}?force=true")
+    assert resp.status == 204
+
+    responses = await asyncio.wait_for(asyncio.gather(*wait_tasks), timeout=2)
+    assert all(response.status == 200 for response in responses)
+    bodies = await asyncio.gather(*(response.json() for response in responses))
+    assert all(body == {"StatusCode": 0} for body in bodies)
+
+
+@pytest.mark.asyncio
+async def test_wait_returns_terminal_exit_code(aiohttp_client):
+    from ..aio_server import create_aio_app
+    from .. import aio_server as mod
+
+    app = create_aio_app(run_reconcile=False)
+    mod.start_kube_environment = lambda **kw: FakeKubeEnv()  # type: ignore
+    client = await aiohttp_client(app)
+    resp = await client.post(
+        "/containers/create?name=wait-kill",
+        json={"Image": "ubuntu:22.04", "Cmd": ["sleep", "1h"]},
+    )
+    cid = (await resp.json())["Id"]
+    assert (await client.post(f"/containers/{cid}/start")).status == 204
+
+    wait_task = asyncio.create_task(
+        client.post(f"/containers/{cid}/wait?condition=next-exit")
+    )
+    await asyncio.sleep(0.05)
+    assert (await client.post(f"/containers/{cid}/kill")).status == 204
+
+    wait_resp = await asyncio.wait_for(wait_task, timeout=1)
+    assert await wait_resp.json() == {"StatusCode": 137}
+
+
+@pytest.mark.asyncio
+async def test_wait_watchdog_recovers_missing_notification(
+    aiohttp_client,
+    monkeypatch,
+):
+    from ..aio_server import create_aio_app
+    from ..backend.store import ContainerState
+
+    monkeypatch.setenv("DOCKER_RT_WAIT_WATCHDOG_INTERVAL", "0.05")
+    app = create_aio_app(run_reconcile=False)
+    client = await aiohttp_client(app)
+    resp = await client.post(
+        "/containers/create?name=wait-watchdog",
+        json={"Image": "ubuntu:22.04", "Cmd": ["sleep", "1h"]},
+    )
+    cid = (await resp.json())["Id"]
+
+    wait_task = asyncio.create_task(
+        client.post(f"/containers/{cid}/wait?condition=next-exit")
+    )
+    await asyncio.sleep(0.02)
+
+    record = app["store"].get(cid)
+    record.state = ContainerState.EXITED
+    record.exit_code = 7
+
+    wait_resp = await asyncio.wait_for(wait_task, timeout=0.5)
+    assert await wait_resp.json() == {"StatusCode": 7}
+
+
+@pytest.mark.asyncio
+async def test_wait_write_ignores_client_disconnect():
+    from aiohttp.client_exceptions import ClientConnectionResetError
+
+    from ..aio_server import _write_wait_result
+
+    class _Transport:
+        def is_closing(self) -> bool:
+            return False
+
+    class _Request:
+        transport = _Transport()
+
+    class _Response:
+        async def write(self, payload: bytes) -> None:
+            raise ClientConnectionResetError("closed")
+
+        async def drain(self) -> None:
+            raise AssertionError("drain should not run after a failed write")
+
+    await _write_wait_result(
+        _Request(),  # type: ignore[arg-type]
+        _Response(),  # type: ignore[arg-type]
+        b'{"StatusCode":0}\n',
+    )
+
+
+@pytest.mark.asyncio
 async def test_lifecycle_rename_restart_kill_events(aiohttp_client):
     from ..aio_server import create_aio_app
     from .. import aio_server as mod
@@ -316,6 +450,15 @@ async def test_watch_pod_not_found_marks_exited(aiohttp_client, fake_kube: FakeK
     assert not any(c["Id"] == cid for c in listing2)
     listing_all = await (await client.get("/containers/json?all=1")).json()
     assert any(c["Id"] == cid for c in listing_all)
+
+
+def test_pod_watch_interval_has_safe_default(monkeypatch):
+    from ..aio_server import _pod_watch_interval
+
+    monkeypatch.delenv("DOCKER_RT_POD_WATCH_INTERVAL", raising=False)
+    assert _pod_watch_interval() == 10.0
+    monkeypatch.setenv("DOCKER_RT_POD_WATCH_INTERVAL", "0")
+    assert _pod_watch_interval() == 1.0
 
 
 @pytest.mark.asyncio

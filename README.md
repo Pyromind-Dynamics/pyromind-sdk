@@ -543,6 +543,7 @@ with PyroMindAPIClient() as client:
 ```
 
 The async client supports `async for chunk in client.sandboxes.exec_command_stream(...)`.
+Pass `tty=True` when the command needs a pseudo-terminal for its output.
 
 ## Project Structure
 
