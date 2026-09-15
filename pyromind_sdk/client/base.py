@@ -40,6 +40,7 @@ CLUSTER_RESOURCE = {
             "pre2": "https://pre2-api.pyromind.ai",
             "dev": "http://localhost:8001",
         },
+        "storage":"https://storage.pyromind.ai"
     },
     "us-west-2": {
         "http": {
@@ -48,6 +49,16 @@ CLUSTER_RESOURCE = {
             "pre2": "https://pre2-api-us-west-2.pyromind.ai",
             "dev": "http://localhost:8002",
         },
+        "storage":"https://storage-us-west-2.pyromind.ai"
+    },
+    "cn-east-1": {
+        "http": {
+            "prod": "https://api-cn-east-1.pyromind.ai",
+            "pre": "https://pre-api-cn-east-1.pyromind.ai",
+            "pre2": "https://pre2-api-cn-east-1.pyromind.ai",
+            "dev": "http://localhost:8002",
+        },
+        "storage": "https://storage-cn-east-1.pyromind.ai"
     },
 }
 
