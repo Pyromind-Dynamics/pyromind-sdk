@@ -50,6 +50,9 @@ _client_singleton_closing = False
 _cleanup_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
+_cleanup_semaphores: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Semaphore
+] = weakref.WeakKeyDictionary()
 _cleanup_locks_guard = threading.Lock()
 _SDK_API_ERRORS = (PyroMindAPIError, PyroMindAsyncAPIError)
 
@@ -64,6 +67,7 @@ _CLEANUP_PAUSE_POLL_INTERVAL_S = 1.0
 _CLEANUP_STATUS_TIMEOUT_S = 10.0
 _CLEANUP_PAUSE_REQUEST_TIMEOUT_S = 30.0
 _CLEANUP_DELETE_TIMEOUT_S = 30.0
+DEFAULT_CLEANUP_CONCURRENCY = 4
 DEFAULT_POD_STATUS_RUNNING_CACHE_TTL_S = 15.0
 DEFAULT_POD_STATUS_PENDING_CACHE_TTL_S = 5.0
 
@@ -122,6 +126,26 @@ def _get_cleanup_lock(sandbox_id: str) -> asyncio.Lock:
             lock = asyncio.Lock()
             _cleanup_locks[sandbox_id] = lock
         return lock
+
+
+def _cleanup_concurrency_limit() -> int:
+    raw = os.getenv("DOCKER_RT_CLEANUP_CONCURRENCY")
+    if raw is None:
+        return DEFAULT_CLEANUP_CONCURRENCY
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_CLEANUP_CONCURRENCY
+
+
+def _get_cleanup_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    with _cleanup_locks_guard:
+        semaphore = _cleanup_semaphores.get(loop)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(_cleanup_concurrency_limit())
+            _cleanup_semaphores[loop] = semaphore
+        return semaphore
 
 
 async def call_environment_method(
@@ -831,7 +855,8 @@ class PyromindSDK:
         async with _get_cleanup_lock(sandbox_id):
             if self.sandbox_id != sandbox_id:
                 return
-            await self._cleanup_once(sandbox_id)
+            async with _get_cleanup_semaphore():
+                await self._cleanup_once(sandbox_id)
 
     async def _cleanup_once(self, sandbox_id: str) -> None:
         for attempt in range(1, _CLEANUP_RETRY_ATTEMPTS + 1):
@@ -870,6 +895,7 @@ class PyromindSDK:
         if status != _CLEANUP_RUNNING_STATUS:
             return True
 
+        pause_failed = False
         try:
             response = await self._client.pause(
                 sandbox_id,
@@ -880,6 +906,7 @@ class PyromindSDK:
             if exc.status_code == 404:
                 return False
             logger.debug("pause before delete failed: %s", exc)
+            pause_failed = True
         else:
             response_status = str(
                 getattr(response, "status", "") or ""
@@ -889,6 +916,11 @@ class PyromindSDK:
                 if response_status != _CLEANUP_RUNNING_STATUS:
                     return True
 
+        if pause_failed:
+            # SQLite can hold a write lock longer than the pause timeout. Try
+            # delete immediately; if the backend still rejects running state,
+            # _cleanup_once retries the pause/delete cycle.
+            return True
         return await self._wait_until_not_running(sandbox_id)
 
     async def _get_cleanup_status(self, sandbox_id: str) -> tuple[bool, str]:

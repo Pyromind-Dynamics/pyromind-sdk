@@ -19,6 +19,7 @@ setup(
     url="https://pyromind.ai/",
     license="MIT",
     packages=find_packages(),
+    py_modules=["pyromind_docker_sdk_timeout_boot"],
     python_requires=">=3.8",
     install_requires=[
         "pyyaml>=6.0",

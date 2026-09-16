@@ -193,8 +193,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not check_docker_cli():
             return 1
         from pyromind_sdk.docker_rt.install_wrapper import install_wrapper
+        from pyromind_sdk.docker_rt.site_hooks import ensure_docker_sdk_timeout_hook
 
         path = install_wrapper()
+        ensure_docker_sdk_timeout_hook()
         print(f"Installed docker wrapper: {path}")
         print("New terminals will use it automatically.")
         return 0

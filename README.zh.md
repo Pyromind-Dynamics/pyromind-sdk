@@ -169,7 +169,7 @@ sandbox。
 | `docker stop` / `docker kill` | 停止或杀掉容器 | 无 |
 | `docker restart` | 重启容器 | 无 |
 | `docker rename` | 重命名容器 | 无 |
-| `docker rm` | 删除容器 | `-f` / `--force`；running 且未加 `-f` 时 wrapper 会先询问 |
+| `docker rm` | 删除容器 | `-f` / `--force`；带不带 `-f` 语义一致 |
 | `docker port` | 查看端口映射 | 无 |
 | `docker volume` / `docker network` | 卷和网络 stub | 基础 `create` / `inspect` / `ls` / `rm` |
 | `docker compose up` | 受限的 Compose 支持 | 基础 `up` / `down` |
@@ -330,9 +330,8 @@ docker rm -f test-sdk-1
 自定义名称必须用 `--name`。`docker create test-sdk-1 IMAGE` 会把
 `test-sdk-1` 当作镜像名。使用 `--name` 创建后，`docker start test-sdk-1` 和
 `docker rm -f test-sdk-1` 都可以直接用名称操作。
-非 running 容器可以直接 `docker rm NAME` 删除；running 容器需要 `-f` /
-`--force`。使用 docker-rt wrapper 时，running 容器不带 `-f` 的 `docker rm`
-会先询问确认。如果提示 `No such container: NAME`，用 `docker ps -a` 查看
+`docker rm NAME` 和 `docker rm -f NAME` 语义一致；running 容器会先暂停，
+再删除 sandbox。如果提示 `No such container: NAME`，用 `docker ps -a` 查看
 实际容器名，只有创建时用了 `--name` 才会注册该名称。
 `docker run IMAGE`（前台，不带 `-d`）：docker-rt 会一直轮询直到 sandbox
 变成 Running/Up（600s 超时），然后绑定当前终端输出日志并阻塞到容器退出，
@@ -491,7 +490,7 @@ PyromindSDK 后端本地端口转发暂不支持，
 | `docker` 命令连到 `~/.docker/run/docker.sock` | Docker context 不是 `docker-rt` | 执行 `docker-rt-context`，或使用 `DOCKER_HOST=unix:///tmp/docker-rt.sock` |
 | `docker logs` / `docker events` 一直等待或不支持 | k8s-middleware 后端不支持这两个命令 | 使用 `docker exec -it <container> bash`、`docker ps`、`docker inspect` |
 | `docker cp` 完成但没有 `Successfully copied` 文案 | 旧 wrapper 重定向了 Docker 输出，Docker CLI 检测到非 TTY 后不打印成功文案 | 升级 SDK/wrapper 并重启 docker-rt |
-| `docker rm <sb-...>` 会询问，`docker rm <本地ID>` 直接报错 | wrapper 只能识别当前 daemon 还知道的 ID | 使用 `sb-...` sandbox ID，或重启 docker-rt 刷新本地记录 |
+| `docker rm <本地ID>` 提示不存在 | 当前 daemon 已不认识该本地 ID | 使用 `sb-...` sandbox ID，或重启 docker-rt 刷新本地记录 |
 | API 错误没有 `trace_id` | 该操作没有真正请求到 k8s-middleware（本地校验直接返回） | 只有带 `x-trace-id` 响应头的后端请求错误才会显示 `trace_id=` |
 
 ## 配置

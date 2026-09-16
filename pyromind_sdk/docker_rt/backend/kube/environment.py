@@ -569,6 +569,8 @@ class KubeEnvironment:
         cwd = cwd or self.config.cwd
         assert self.pod_name, "Pod not started"
 
+        if isinstance(command, (list, tuple)):
+            command = shlex.join(str(part) for part in command)
         script = command
         if cwd and cwd != "/":
             script = f"cd {shlex.quote(cwd)} && {command}"

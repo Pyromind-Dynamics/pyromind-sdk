@@ -17,6 +17,8 @@ def test_server_parser_accepts_daemon_flags() -> None:
             "/tmp/docker-rt-test.log",
             "--pid-file",
             "/tmp/docker-rt-test.pid",
+            "--ready-timeout",
+            "900",
         ]
     )
 
@@ -24,6 +26,7 @@ def test_server_parser_accepts_daemon_flags() -> None:
     assert args.sock == "/tmp/docker-rt-test.sock"
     assert args.log_file == "/tmp/docker-rt-test.log"
     assert args.pid_file == "/tmp/docker-rt-test.pid"
+    assert args.ready_timeout == 900
 
 
 def test_server_parser_accepts_stop_flag() -> None:
@@ -69,6 +72,59 @@ def test_stop_daemon_kills_pid_and_removes_pid_file(
     assert not pid_file.exists()
 
 
+def test_start_daemon_defaults_to_standard_inspect_mode(
+    monkeypatch: MonkeyPatch,
+    tmp_path,
+) -> None:
+    from .. import daemon as daemon_mod
+
+    captured = {}
+
+    class FakeProcess:
+        pid = 12345
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+    class FakeSocket:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, address):
+            pass
+
+        def close(self):
+            pass
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs["env"]
+        return FakeProcess()
+
+    monkeypatch.delenv("DOCKER_RT_INSPECT_MODE", raising=False)
+    monkeypatch.setenv("DOCKER_RT_HOST", "127.0.0.1")
+    monkeypatch.setenv("DOCKER_RT_PORT", "2375")
+    monkeypatch.setattr(daemon_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(daemon_mod, "spawn_watcher", lambda *args, **kwargs: None)
+    monkeypatch.setattr(daemon_mod.socket, "socket", lambda *args, **kwargs: FakeSocket())
+
+    assert (
+        daemon_mod.start_daemon(
+            log_file=str(tmp_path / "daemon.log"),
+            pid_file=str(tmp_path / "daemon.pid"),
+        )
+        == 0
+    )
+    assert captured["env"]["DOCKER_RT_INSPECT_MODE"] == "standard"
+
+
 def test_server_main_daemon_uses_background_start(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -99,10 +155,11 @@ def test_server_main_daemon_uses_background_start(
     monkeypatch.delenv("PYROMIND_DOCKER_RT_DAEMON_CHILD", raising=False)
     monkeypatch.delenv("PYROMIND_DOCKER_RT_BOOTSTRAPPED", raising=False)
 
-    rc = server_mod.main(["--daemon"])
+    rc = server_mod.main(["--daemon", "--ready-timeout", "901"])
 
     assert rc == 7
     assert called["pid_file"] is None
+    assert os.environ["DOCKER_RT_READY_TIMEOUT"] == "901"
 
 
 def test_server_main_foreground_spawns_watcher(
@@ -136,9 +193,11 @@ def test_server_main_foreground_spawns_watcher(
     monkeypatch.delenv("PYROMIND_DOCKER_RT_DAEMON_CHILD", raising=False)
     monkeypatch.delenv("PYROMIND_DOCKER_RT_BOOTSTRAPPED", raising=False)
     monkeypatch.delenv("PYROMIND_DOCKER_RT_WATCHER_SPAWNED", raising=False)
+    monkeypatch.delenv("DOCKER_RT_INSPECT_MODE", raising=False)
 
     assert server_mod.main([]) == 0
     assert spawned == [os.getpid()]
+    assert os.environ["DOCKER_RT_INSPECT_MODE"] == "standard"
 
 
 def test_server_main_daemon_child_does_not_spawn_watcher(

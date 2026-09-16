@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pyromind-sdk"
 ## todo update_version
-version = "0.2.11.dev"
+version = "0.2.19.dev"
 description = "Lightweight SDK stub for local development and testing of third-party nodes without the full platform codebase"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -57,6 +57,7 @@ Repository = "https://github.com/pyromind/pyromind-sdk"
 Issues = "https://github.com/pyromind/pyromind-sdk/issues"
 
 [tool.setuptools]
+py-modules = ["pyromind_docker_sdk_timeout_boot"]
 packages = [
     "pyromind_sdk",
     "pyromind_sdk.common",
