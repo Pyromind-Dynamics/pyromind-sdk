@@ -119,6 +119,9 @@ class ExecRecord:
     attach_stdout: bool = True
     attach_stderr: bool = True
     tty: bool = False
+    detach_keys: str = ""
+    privileged: bool = False
+    user: str = ""
     working_dir: str = ""
     env: list[str] = field(default_factory=list)
     running: bool = False
@@ -457,6 +460,9 @@ class ContainerStore:
         attach_stdout: bool,
         attach_stderr: bool,
         tty: bool,
+        detach_keys: str = "",
+        privileged: bool = False,
+        user: str = "",
         working_dir: str = "",
         env: list[str] | None = None,
     ) -> ExecRecord:
@@ -469,6 +475,9 @@ class ContainerStore:
             attach_stdout=attach_stdout,
             attach_stderr=attach_stderr,
             tty=tty,
+            detach_keys=detach_keys,
+            privileged=privileged,
+            user=user,
             working_dir=working_dir,
             env=env or [],
         )

@@ -93,6 +93,7 @@ remove the wrapper and its PATH entry.
 | `--pid-file FILE` | Write/read the daemon PID file | `$DOCKER_RT_PID_FILE` or `/tmp/docker-rt-<sock>.pid` |
 | `--apikey KEY` (`--api-key KEY`) | PyroMind API key | `$PYROMIND_API_KEY` |
 | `--cluster CLUSTER` | Target cluster, e.g. `us-west-1#pre` | `$PYROMIND_CLUSTER` |
+| `--ready-timeout SECONDS` | Wait for a newly created sandbox to become running | `$DOCKER_RT_READY_TIMEOUT` or `600` |
 | `-h`, `--help` | Show help and exit | - |
 
 ```bash
@@ -126,8 +127,10 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 | `DOCKER_RT_KUBE_CONTEXT` | `docker-desktop` | Kubernetes context name |
 | `DOCKER_RT_NAMESPACE` | `default` | Target Kubernetes namespace |
 | `DOCKER_RT_NODE_SELECTOR` | `none` | Pod `nodeSelector` (`key=val,...`; `none` disables) |
+| `DOCKER_RT_READY_TIMEOUT` | `600` | Seconds to wait for a newly created sandbox to become running |
 | `DOCKER_RT_GPU_CARD` | empty | GPU card name when using `docker run --gpus` with the k8s-middleware backend |
-| `DOCKER_RT_INSPECT_MODE` | `sandbox` | `docker inspect` structure: `sandbox` or `standard` |
+| `DOCKER_RT_INSPECT_MODE` | `standard` | `docker inspect` structure: `standard` or `sandbox` |
+| `DOCKER_RT_CLEANUP_CONCURRENCY` | `4` | Maximum concurrent sandbox pause/delete cleanups |
 | `DOCKER_RT_DEFAULT_IMAGE` | SWE-bench default image | `docker images` default entry |
 | `DOCKER_RT_PORT_FORWARD_MODE` | `auto` | `-p` backend: `auto` / `direct` / `api` |
 | `DOCKER_RT_BUILDKIT_ADDR` | empty | `buildctl` address, e.g. `unix:///run/buildkit/buildkitd.sock` |
@@ -145,6 +148,11 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 | `DOCKER_RT_JUICEFS_HOST_PREFIXES` | empty | Extra host path to JuiceFS subPath mappings |
 | `DOCKER_RT_CONTEXT` | `docker-rt` | Docker context name used by `docker-rt-context` |
 | `LOG_LEVEL` | `INFO` | Log level |
+
+`DOCKER_RT_READY_TIMEOUT` / `--ready-timeout` controls the docker-rt server's
+sandbox readiness wait. It does not change the Docker client's HTTP timeout.
+Python clients must create the Docker client with a suitable timeout, for
+example `docker.from_env(timeout=600)`.
 
 For the default `k8s-middleware` backend, `docker-rt` checks
 `PYROMIND_API_KEY` and `PYROMIND_CLUSTER`; missing values are prompted one by
@@ -167,14 +175,25 @@ and syncs the sandbox list once during startup.
 | `docker stop` / `docker kill` | Stop or kill a container | none |
 | `docker restart` | Restart a container | none |
 | `docker rename` | Rename a container | none |
-| `docker rm` | Remove a container | `-f` / `--force`; wrapper prompts when running without `-f` |
+| `docker rm` | Remove a container | `-f` / `--force`; same behavior with or without `-f` |
 | `docker port` | Show port mappings | none |
 | `docker volume` / `docker network` | Volume and network stubs | basic `create` / `inspect` / `ls` / `rm` |
 | `docker compose up` | Limited Compose support | basic `up` / `down` |
 
 #### `docker inspect` output
 
-Default `DOCKER_RT_INSPECT_MODE=sandbox`. `docker inspect` returns only:
+Default `DOCKER_RT_INSPECT_MODE=standard`, which keeps the standard Docker
+inspect fields used by the Python Docker SDK:
+
+```json
+{
+  "Id": "sb-94d290262ee8",
+  "Name": "/test-for-doc",
+  "State": {"Status": "Stopped"}
+}
+```
+
+Set `DOCKER_RT_INSPECT_MODE=sandbox` to return only the compact sandbox fields:
 
 ```json
 {
@@ -191,9 +210,6 @@ Default `DOCKER_RT_INSPECT_MODE=sandbox`. `docker inspect` returns only:
   "port_mappings": []
 }
 ```
-
-Set `DOCKER_RT_INSPECT_MODE=standard` to keep the standard Docker inspect
-fields as well.
 
 #### GPU card via Docker flags
 
@@ -330,14 +346,15 @@ docker rm -f test-sdk-1
 `docker create test-sdk-1 IMAGE` treats `test-sdk-1` as the image name.
 After creating with `--name`, `docker start test-sdk-1` and
 `docker rm -f test-sdk-1` work by name.
-Non-running containers can be removed directly with `docker rm NAME`; running
-containers need `-f` / `--force`. When using the docker-rt wrapper, a running
-`docker rm` without `-f` asks for confirmation first. If you see
+`docker rm NAME` and `docker rm -f NAME` have the same behavior; running
+containers are paused before deletion. If you see
 `No such container: NAME`, run `docker ps -a` to check the actual container
 name — it is only registered when create used `--name`.
 With the k8s-middleware backend, `docker run IMAGE` without `-d` or `-it`
 returns after the sandbox is Running with a hint, because foreground attach is
-not supported yet. Use `docker run -d` for a background sandbox or
+not supported yet. `docker run -d` and `docker start` also wait until the
+sandbox is Running before returning, so a following `docker exec` cannot race
+Pod creation. The command itself keeps running in the background. Use
 `docker run -it IMAGE bash` for an interactive terminal.
 
 For the k8s-middleware backend, omitting `--cpus`, `--memory` and `--gpus`
@@ -365,8 +382,8 @@ docker inspect gpu-demo
 docker inspect gpu-demo --format '{{json .resources}}'
 ```
 
-The default response only contains sandbox fields. Set
-`DOCKER_RT_INSPECT_MODE=standard` to keep standard Docker inspect fields.
+The default response contains standard Docker inspect fields. Set
+`DOCKER_RT_INSPECT_MODE=sandbox` to return only compact sandbox fields.
 
 #### `docker exec`
 
@@ -494,7 +511,7 @@ changes.
 | `docker` commands connect to `~/.docker/run/docker.sock` | Docker context is `desktop-linux` / `default` instead of `docker-rt` | Run `docker-rt-context`, or use `DOCKER_HOST=unix:///tmp/docker-rt.sock` |
 | `docker logs` / `docker events` wait forever or return unsupported | These commands are not supported by the `k8s-middleware` backend | Use `docker exec -it <container> bash`, `docker ps`, and `docker inspect` |
 | `docker cp` finishes but no `Successfully copied` message | An old wrapper redirected Docker output, and Docker CLI suppressed the message when stdout/stderr was not a TTY | Update the SDK/wrapper and restart docker-rt |
-| `docker rm <sb-...>` asks for confirmation but `docker rm <local-id>` returns an error | The wrapper can only inspect IDs that the current daemon still knows | Use the `sb-...` sandbox ID, or restart docker-rt to refresh local records |
+| `docker rm <local-id>` returns no such container | The current daemon does not know that local ID | Use the `sb-...` sandbox ID, or restart docker-rt to refresh local records |
 | An API error has no `trace_id` | The operation did not reach k8s-middleware (local validation only) | Only backend responses carrying `x-trace-id` will include `trace_id=` |
 
 ## Configuration

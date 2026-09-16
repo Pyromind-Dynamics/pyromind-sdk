@@ -525,25 +525,23 @@ async def delete_container(
     if record is None:
         raise HTTPException(status_code=404, detail=f"No such container: {id}")
 
+    # docker rm and docker rm -f intentionally share the same behavior.
+    # Cleanup pauses a running sandbox before deleting it.
     await _refresh_record_state(record, store)
     async with record.lock:
-        if record.state == ContainerState.RUNNING:
-            if not force:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"container {id} is running: docker rm -f {id}",
+        if record.kube_env is not None:
+            try:
+                await call_environment_method(
+                    record.kube_env, "cleanup"
                 )
-            if record.kube_env is not None:
-                try:
-                    await call_environment_method(
-                        record.kube_env, "cleanup"
-                    )
-                except Exception as exc:
-                    raise HTTPException(
-                        status_code=500,
-                        detail=format_exception_message(exc),
-                    ) from exc
-                record.kube_env = None
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=format_exception_message(exc),
+                ) from exc
+            record.kube_env = None
+            record.sandbox_id = None
+            record.sandbox_status = None
             record.pod_name = None
             record.exit_code = 0
             record.finished_at = time.time()

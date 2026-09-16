@@ -1,8 +1,18 @@
 from __future__ import annotations
 
-from pytest import MonkeyPatch
+from pytest import MonkeyPatch, fixture
 
 from .. import install_wrapper as mod
+from .. import site_hooks
+
+
+@fixture(autouse=True)
+def disable_sdk_timeout_hook(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        site_hooks,
+        "ensure_docker_sdk_timeout_hook",
+        lambda site_packages=None: None,
+    )
 
 
 def test_is_wrapper_installed_checks_version_marker(
@@ -141,7 +151,7 @@ def test_wrapper_in_path_compares_resolved_docker(
     assert mod.wrapper_in_path() is False
 
 
-def test_generated_wrapper_defers_ps_and_keeps_rm_batching(
+def test_generated_wrapper_defers_ps_and_normalizes_rm(
     monkeypatch: MonkeyPatch,
     tmp_path,
 ) -> None:
@@ -153,6 +163,9 @@ def test_generated_wrapper_defers_ps_and_keeps_rm_batching(
     actual = mod.install_wrapper()
     text = actual.read_text(encoding="utf-8")
     assert '"$REAL_DOCKER" rm "${rm_opts[@]}" "$target" >"$_rm_out"' in text
+    assert "rm_opts+=(--force)" in text
+    assert "Force remove?" not in text
+    assert "read -r -p" not in text
     assert "printf '%s deleted\\n' \"$target\"" in text
     # rm parallelizes (>5 targets) with up to 10 concurrent workers and waits per pid.
     # rm parallelizes (>5 targets) with configurable concurrency (default 20).

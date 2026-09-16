@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from starlette.responses import Response as StarletteResponse
 from starlette.types import Receive, Scope, Send
 
+from ..backend.exec_utils import argv_with_exec_env, argv_with_exec_user
 from ..backend.pyromind_sdk_env import PyromindSDK
 from ..backend.store import ContainerState, ContainerStore
 from ..backend.stream_framing import frame_stderr, frame_stdout
@@ -48,6 +49,9 @@ async def create_exec(request: Request, id: str) -> dict[str, str]:
         attach_stdout=bool(body.get("AttachStdout", True)),
         attach_stderr=bool(body.get("AttachStderr", True)),
         tty=bool(body.get("Tty", False)),
+        detach_keys=body.get("DetachKeys") or "",
+        privileged=bool(body.get("Privileged", False)),
+        user=body.get("User") or "",
         working_dir=body.get("WorkingDir") or "",
         env=body.get("Env") or [],
     )
@@ -64,7 +68,7 @@ async def inspect_exec(request: Request, id: str) -> dict[str, Any]:
     return {
         "CanRemove": False,
         "ContainerID": exec_rec.container_id,
-        "DetachKeys": "",
+        "DetachKeys": exec_rec.detach_keys,
         "ExitCode": exec_rec.exit_code if exec_rec.exit_code is not None else 0,
         "ID": exec_rec.id,
         "OpenStderr": exec_rec.attach_stderr,
@@ -75,9 +79,9 @@ async def inspect_exec(request: Request, id: str) -> dict[str, Any]:
         "ProcessConfig": {
             "arguments": exec_rec.cmd[1:],
             "entrypoint": exec_rec.cmd[0] if exec_rec.cmd else "",
-            "privileged": False,
+            "privileged": exec_rec.privileged,
             "tty": exec_rec.tty,
-            "user": "",
+            "user": exec_rec.user,
         },
         "Container": {
             "State": {
@@ -307,6 +311,11 @@ async def start_exec(request: Request, id: str) -> Response:
     detach = bool(body.get("Detach", False))
     tty = bool(body.get("Tty", exec_rec.tty))
     cwd = (exec_rec.working_dir or container.working_dir or "").strip()
+    cmd = list(exec_rec.cmd)
+    if tty and cmd in (["bash"], ["sh"], ["/bin/bash"], ["/bin/sh"]):
+        cmd = [cmd[0], "-i"]
+    cmd = argv_with_exec_user(cmd, exec_rec.user)
+    cmd = argv_with_exec_env(cmd, exec_rec.env)
 
     if detach:
         # Fire-and-forget non-attached exec
@@ -316,14 +325,15 @@ async def start_exec(request: Request, id: str) -> Response:
             try:
                 if isinstance(container.kube_env, PyromindSDK):
                     async for _chunk in container.kube_env.iter_exec_stream(
-                        list(exec_rec.cmd),
+                        list(cmd),
+                        tty=tty,
                         cwd=cwd,
                     ):
                         pass
                 else:
                     await asyncio.to_thread(
                         container.kube_env.execute,
-                        {"command": " ".join(exec_rec.cmd)},
+                        {"command": list(cmd)},
                         cwd,
                     )
             finally:
@@ -338,7 +348,6 @@ async def start_exec(request: Request, id: str) -> Response:
     wants_hijack = upgrade == "tcp" or "upgrade" in connection
 
     kube_env = container.kube_env
-    cmd = list(exec_rec.cmd)
 
     if wants_hijack or exec_rec.attach_stdin or tty:
         exec_rec.running = True
@@ -372,7 +381,7 @@ async def start_exec(request: Request, id: str) -> Response:
             else:
                 result = await asyncio.to_thread(
                     kube_env.execute,
-                    {"command": " ".join(cmd)},
+                    {"command": list(cmd)},
                     cwd,
                 )
             output = result.get("output") or ""

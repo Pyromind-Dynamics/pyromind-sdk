@@ -24,6 +24,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = prepare_server_parser().parse_args(argv)
+    if args.ready_timeout is not None:
+        os.environ["DOCKER_RT_READY_TIMEOUT"] = str(args.ready_timeout)
     if args.stop:
         from .daemon import stop_daemon
         from .register_context import restore_main
@@ -35,6 +37,7 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:
                 pass
         return rc
+    os.environ.setdefault("DOCKER_RT_INSPECT_MODE", "standard")
     if not check_docker_cli():
         return 1
     if not ensure_wrapper_installed(

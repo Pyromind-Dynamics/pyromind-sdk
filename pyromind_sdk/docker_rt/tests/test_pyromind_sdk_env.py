@@ -6,6 +6,7 @@ import json
 import tarfile
 import threading
 import time
+import weakref
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -324,6 +325,63 @@ def test_cleanup_status_timeout_does_not_pause_unconfirmed_running():
         timeout=env_mod._CLEANUP_DELETE_TIMEOUT_S,
         retry=False,
     )
+
+
+def test_pause_timeout_still_attempts_delete():
+    adapter, client = _adapter_with_fake_client()
+    client.get_sandbox.return_value.status = "Running"
+    client.pause.side_effect = PyroMindAPIError(
+        "pause timed out", status_code=None
+    )
+
+    asyncio.run(adapter.cleanup())
+
+    client.pause.assert_awaited_once_with(
+        "sb-test-1",
+        timeout=env_mod._CLEANUP_PAUSE_REQUEST_TIMEOUT_S,
+        retry=False,
+    )
+    client.delete.assert_awaited_once_with(
+        "sb-test-1",
+        timeout=env_mod._CLEANUP_DELETE_TIMEOUT_S,
+        retry=False,
+    )
+    assert adapter.sandbox_id is None
+
+
+def test_cleanup_concurrency_is_bounded(monkeypatch):
+    monkeypatch.setenv("DOCKER_RT_CLEANUP_CONCURRENCY", "2")
+    monkeypatch.setattr(
+        env_mod, "_cleanup_semaphores", weakref.WeakKeyDictionary()
+    )
+    adapters = []
+    clients = []
+    active = 0
+    max_active = 0
+
+    async def delete(_sandbox_id, **_kwargs):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+
+    for index in range(5):
+        adapter, client = _adapter_with_fake_client()
+        adapter.sandbox_id = f"sb-cleanup-{index}"
+        client.get_sandbox.return_value.status = "Stopped"
+        client.delete.side_effect = delete
+        adapters.append(adapter)
+        clients.append(client)
+
+    async def run_cleanup():
+        await asyncio.gather(*(adapter.cleanup() for adapter in adapters))
+
+    asyncio.run(run_cleanup())
+
+    assert max_active == 2
+    for client in clients:
+        client.delete.assert_awaited_once()
 
 
 def test_archive_path_stat_uses_shell_exec(monkeypatch: MonkeyPatch) -> None:
@@ -853,7 +911,7 @@ def test_created_epoch_prefers_kube_env_created_at() -> None:
 
 
 def test_inspect_includes_sandbox_api_fields(monkeypatch: MonkeyPatch) -> None:
-    monkeypatch.delenv("DOCKER_RT_INSPECT_MODE", raising=False)
+    monkeypatch.setenv("DOCKER_RT_INSPECT_MODE", "sandbox")
     adapter = PyromindSDK.__new__(PyromindSDK)
     adapter.sandbox_id = "sb-demo"
     adapter.sandbox_status = "Running"
@@ -964,8 +1022,8 @@ def test_one_shot_ws_yields_output_once():
     assert ws.returncode == 0
 
 
-def test_inspect_sandbox_mode_default(monkeypatch: MonkeyPatch) -> None:
-    monkeypatch.delenv("DOCKER_RT_INSPECT_MODE", raising=False)
+def test_inspect_sandbox_mode_opt_in(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("DOCKER_RT_INSPECT_MODE", "sandbox")
     adapter = PyromindSDK.__new__(PyromindSDK)
     adapter.sandbox_id = "sb-1"
     adapter.sandbox_status = "Running"
@@ -1004,10 +1062,10 @@ def test_inspect_sandbox_mode_default(monkeypatch: MonkeyPatch) -> None:
     assert result["resources"]["cpu"] == "4"
 
 
-def test_inspect_standard_mode_uses_docker_identity(
+def test_inspect_standard_mode_is_default(
     monkeypatch: MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("DOCKER_RT_INSPECT_MODE", "standard")
+    monkeypatch.delenv("DOCKER_RT_INSPECT_MODE", raising=False)
     adapter = PyromindSDK.__new__(PyromindSDK)
     adapter.sandbox_id = "sb-different"
     adapter.sandbox_status = "Running"

@@ -91,6 +91,141 @@ async def test_attach_waits_for_start(aiohttp_client, fake_kube: FakeKubeEnv):
 
 
 @pytest.mark.asyncio
+async def test_start_waits_until_sandbox_is_running(
+    aiohttp_client,
+    monkeypatch,
+):
+    from ..aio_server import create_aio_app
+    from .. import aio_server as mod
+    from ..backend.store import ContainerState
+
+    monkeypatch.setenv("DOCKER_RT_CONTAINER_READY_POLL_INTERVAL", "0.01")
+
+    class SlowSandbox:
+        pod_name = "slow-sandbox"
+        sandbox_id = None
+        sandbox_status = "creating"
+        is_terminal = False
+        exit_code = 0
+
+        def __init__(self):
+            self.refresh_calls = 0
+            self.cleaned = False
+            self.allow_running = False
+
+        def refresh_phase(self):
+            self.refresh_calls += 1
+            if self.allow_running:
+                self.sandbox_status = "running"
+            return self.sandbox_status
+
+        def cleanup(self):
+            self.cleaned = True
+
+    sandbox = SlowSandbox()
+    app = create_aio_app(run_reconcile=False)
+    mod.start_kube_environment = lambda **kw: sandbox  # type: ignore
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/containers/create?name=slow-start",
+        json={"Image": "ubuntu:22.04", "Cmd": ["sleep", "2h"]},
+    )
+    cid = (await resp.json())["Id"]
+
+    start_task = asyncio.create_task(client.post(f"/containers/{cid}/start"))
+    await asyncio.sleep(0.02)
+    record = app["store"].get(cid)
+    assert record is not None
+    assert record.state == ContainerState.CREATED
+    assert not start_task.done()
+    early_exec = await client.post(
+        f"/containers/{cid}/exec",
+        json={"Cmd": ["true"], "AttachStdout": True},
+    )
+    assert early_exec.status == 409
+
+    sandbox.allow_running = True
+    start = await start_task
+    assert start.status == 204
+    assert record.state == ContainerState.RUNNING
+    assert sandbox.refresh_calls >= 3
+    assert sandbox.cleaned is False
+
+
+@pytest.mark.asyncio
+async def test_start_fails_and_cleans_up_failed_sandbox(
+    aiohttp_client,
+):
+    from ..aio_server import create_aio_app
+    from .. import aio_server as mod
+    from ..backend.store import ContainerState
+
+    class FailedSandbox:
+        pod_name = "failed-sandbox"
+        sandbox_id = None
+        sandbox_status = "failed"
+        is_terminal = False
+        exit_code = 1
+
+        def __init__(self):
+            self.cleaned = False
+
+        def refresh_phase(self):
+            return "Failed"
+
+        def cleanup(self):
+            self.cleaned = True
+
+    sandbox = FailedSandbox()
+    app = create_aio_app(run_reconcile=False)
+    mod.start_kube_environment = lambda **kw: sandbox  # type: ignore
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/containers/create?name=failed-start",
+        json={"Image": "ubuntu:22.04", "Cmd": ["sleep", "2h"]},
+    )
+    cid = (await resp.json())["Id"]
+    start = await client.post(f"/containers/{cid}/start")
+
+    assert start.status == 500
+    assert sandbox.cleaned is True
+    record = app["store"].get(cid)
+    assert record is not None
+    assert record.state == ContainerState.DEAD
+
+
+@pytest.mark.asyncio
+async def test_create_uses_daemon_ready_timeout(
+    aiohttp_client,
+    monkeypatch,
+):
+    from ..aio_server import create_aio_app
+
+    monkeypatch.setenv("DOCKER_RT_READY_TIMEOUT", "777")
+    app = create_aio_app(run_reconcile=False)
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/containers/create?name=default-ready-timeout",
+        json={"Image": "ubuntu:22.04"},
+    )
+    cid = (await resp.json())["Id"]
+    assert app["store"].get(cid).ready_timeout == 777
+
+    resp = await client.post(
+        "/containers/create?name=label-ready-timeout",
+        json={
+            "Image": "ubuntu:22.04",
+            "Labels": {"docker-rt.ready-timeout": "888"},
+        },
+    )
+    cid = (await resp.json())["Id"]
+    assert app["store"].get(cid).ready_timeout == 888
+
+
+@pytest.mark.asyncio
 async def test_ping(aiohttp_client):
     from ..aio_server import create_aio_app
 
@@ -347,6 +482,29 @@ async def test_delete_stopped_container_cleans_backend(
     assert (await client.post(f"/containers/{cid}/stop")).status == 204
     assert (await client.delete(f"/containers/{cid}")).status == 204
     assert fake_kube.cleaned is True
+
+
+@pytest.mark.asyncio
+async def test_delete_running_container_without_force_cleans_backend(
+    aiohttp_client, fake_kube: FakeKubeEnv
+):
+    from ..aio_server import create_aio_app
+    from .. import aio_server as mod
+
+    app = create_aio_app(run_reconcile=False)
+    mod.start_kube_environment = lambda **kw: fake_kube  # type: ignore
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/containers/create?name=rm-running",
+        json={"Image": "ubuntu:22.04", "Cmd": ["sleep", "2h"]},
+    )
+    cid = (await resp.json())["Id"]
+    assert (await client.post(f"/containers/{cid}/start")).status == 204
+
+    assert (await client.delete(f"/containers/{cid}")).status == 204
+    assert fake_kube.cleaned is True
+    assert (await client.get(f"/containers/{cid}/json")).status == 404
 
 
 @pytest.mark.asyncio

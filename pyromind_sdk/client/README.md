@@ -816,7 +816,7 @@ export PYROMIND_BASE_URL="https://custom-api.example.com/api/v1"
 client = PyroMindAPIClient(
     api_key="your-api-key",
     base_url="https://custom-api.example.com/api/v1",
-    timeout=60,
+    timeout=600,
     max_retries=5
 )
 ```

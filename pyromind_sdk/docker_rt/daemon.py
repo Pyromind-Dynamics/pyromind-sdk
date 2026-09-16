@@ -117,6 +117,7 @@ def start_daemon(
     child_env["PYROMIND_DOCKER_RT_DAEMON_CHILD"] = "1"
     child_env["PYROMIND_DOCKER_RT_SKIP_WRAPPER_PROMPT"] = "1"
     child_env["PYROMIND_DOCKER_RT_WATCHER_SPAWNED"] = "1"
+    child_env.setdefault("DOCKER_RT_INSPECT_MODE", "standard")
 
     log_path = log_file or os.getenv("DOCKER_RT_LOG_FILE", "/tmp/docker-rt.log")
     sock_path = sock or os.getenv("DOCKER_RT_SOCK", "/tmp/docker-rt.sock")
@@ -257,6 +258,15 @@ def stop_daemon(
 def prepare_server_parser() -> Any:
     import argparse
 
+    def positive_int(value: str) -> int:
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be an integer") from exc
+        if parsed <= 0:
+            raise argparse.ArgumentTypeError("must be greater than zero")
+        return parsed
+
     parser = argparse.ArgumentParser(
         prog="docker-rt",
         description="docker-rt Docker Engine API daemon",
@@ -297,5 +307,14 @@ def prepare_server_parser() -> Any:
         "--cluster",
         default=None,
         help="Target cluster, e.g. us-west-1, us-west-1#pre (defaults to $PYROMIND_CLUSTER)",
+    )
+    parser.add_argument(
+        "--ready-timeout",
+        type=positive_int,
+        default=None,
+        help=(
+            "Seconds to wait for a newly created sandbox to become running "
+            "(defaults to $DOCKER_RT_READY_TIMEOUT or 600)"
+        ),
     )
     return parser

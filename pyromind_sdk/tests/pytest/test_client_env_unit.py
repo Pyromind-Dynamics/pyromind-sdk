@@ -99,6 +99,18 @@ class TestPyroMindAPIClientCluster:
             client = PyroMindAPIClient(api_key="test-key")
 
 
+def test_async_client_default_timeout_is_600_seconds():
+    from pyromind_sdk.client.async_base import (
+        DEFAULT_TIMEOUT,
+        PyroMindAsyncClient,
+    )
+
+    client = PyroMindAsyncClient(api_key="test-key")
+
+    assert DEFAULT_TIMEOUT == 600
+    assert client.timeout.total == 600
+
+
 # --- StorageClient ---
 
 class TestStorageClientEndpoint:

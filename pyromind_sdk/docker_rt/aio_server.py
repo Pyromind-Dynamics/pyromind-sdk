@@ -26,6 +26,10 @@ from .backend.archive import (  # noqa: E402
     write_put_chunk,
 )
 from .backend.events import EventBus  # noqa: E402
+from .backend.exec_utils import (  # noqa: E402
+    argv_with_exec_env,
+    argv_with_exec_user,
+)
 from .backend.reconcile import (  # noqa: E402
     _container_state_from_status,
     reconcile_on_startup,
@@ -126,6 +130,22 @@ def _pod_watch_sleep_interval() -> float:
     if jitter_ratio <= 0:
         return interval
     return interval + random.uniform(0, interval * jitter_ratio)
+
+
+def _container_ready_poll_interval() -> float:
+    raw = os.getenv("DOCKER_RT_CONTAINER_READY_POLL_INTERVAL", "2")
+    try:
+        return max(0.01, float(raw))
+    except ValueError:
+        return 2.0
+
+
+def _default_ready_timeout() -> int:
+    raw = os.getenv("DOCKER_RT_READY_TIMEOUT", "600")
+    try:
+        return max(1, int(float(raw)))
+    except ValueError:
+        return 600
 
 
 async def _write_wait_result(
@@ -830,6 +850,62 @@ async def _refresh_record_state(
             await store.set_state(record, state)
 
 
+def _status_word_from_phase(phase: Any) -> str | None:
+    """Map a backend phase to Docker's running/stopped/failed vocabulary."""
+    value = str(phase or "").strip().lower()
+    if value in {"running", "up", "ready"}:
+        return "running"
+    if value in {"failed", "error", "dead", "notfound"}:
+        return "failed"
+    if value in {
+        "stopped",
+        "paused",
+        "exited",
+        "succeeded",
+        "success",
+        "terminated",
+    }:
+        return "stopped"
+    return None
+
+
+async def _wait_container_ready(record: Any, *, timeout: float) -> str:
+    """Wait until the backend sandbox is running or reaches a terminal phase.
+
+    ``POST /containers/{id}/start`` must not report success while the backing
+    sandbox is merely ``starting``. Docker callers immediately issue ``exec``
+    or archive operations after start, so the local record stays non-running
+    until this gate succeeds.
+    """
+    kube_env = getattr(record, "kube_env", None)
+    if kube_env is None or not hasattr(kube_env, "refresh_phase"):
+        return "running"
+
+    deadline = time.monotonic() + max(float(timeout), 0.01)
+    last_phase: Any = "Unknown"
+    while True:
+        try:
+            kwargs = {"force": True} if isinstance(kube_env, PyromindSDK) else {}
+            last_phase = await call_environment_method(
+                kube_env, "refresh_phase", **kwargs
+            )
+        except Exception as exc:
+            last_phase = f"error: {exc}"
+
+        status_word = _status_word_from_phase(last_phase)
+        if status_word in {"running", "stopped", "failed"}:
+            return status_word
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"timed out waiting for container {getattr(record, 'id', '')[:12]} "
+                f"to become running after {timeout}s "
+                f"(last phase={last_phase!r}, status={_display_status(record)})"
+            )
+        await asyncio.sleep(min(_container_ready_poll_interval(), remaining))
+
+
 def _resolve_gpu_resources(
     *,
     labels: dict[str, Any],
@@ -1017,7 +1093,7 @@ def _to_inspect(c: Any) -> dict[str, Any]:
     sandbox_id, sandbox_status = _sandbox_identity(c)
     state_status = sandbox_status or c.state.value
     running = state_status.lower() in {"running", "up"}
-    mode = os.getenv("DOCKER_RT_INSPECT_MODE", "sandbox").lower()
+    mode = os.getenv("DOCKER_RT_INSPECT_MODE", "standard").lower()
     if mode == "sandbox":
         display_id = sandbox_id or c.id
         kube_env = getattr(c, "kube_env", None)
@@ -1380,6 +1456,9 @@ async def create_container(request: web.Request) -> web.Response:
         gpu_count, gpu_card = _resolve_gpu_resources(
             labels=labels, host_config=host_config
         )
+        default_ready_timeout = int(
+            request.app.get("ready_timeout", _default_ready_timeout())
+        )
         record = await store.create_container(
             name=name,
             image=image,
@@ -1390,7 +1469,12 @@ async def create_container(request: web.Request) -> web.Response:
             kubeconfig=request.app.get("kubeconfig"),
             kube_context=request.app.get("kube_context"),
             image_pull_secrets=image_pull_secrets,
-            ready_timeout=int(labels.get("docker-rt.ready-timeout", "600")),
+            ready_timeout=int(
+                labels.get(
+                    "docker-rt.ready-timeout",
+                    str(default_ready_timeout),
+                )
+            ),
             pod_timeout=pod_timeout,
             tty=bool(body.get("Tty", False)),
             attach_stdin=bool(body.get("AttachStdin", False)),
@@ -1462,7 +1546,6 @@ async def start_container(request: web.Request) -> web.Response:
                 await store.set_state(record, ContainerState.DEAD)
                 logger.exception("resume failed")
                 return _err(500, format_exception_message(exc))
-            await store.set_state(record, ContainerState.RUNNING)
             record.error = None
             record.finished_at = None
             record.started_at = time.time()
@@ -1473,6 +1556,41 @@ async def start_container(request: web.Request) -> web.Response:
             )
             if record.sandbox_id:
                 set_mapping(record.id, record.sandbox_id)
+            ready_timeout = float(getattr(record, "ready_timeout", 600) or 600)
+            try:
+                ready_status = await _wait_container_ready(
+                    record, timeout=ready_timeout
+                )
+            except Exception as exc:
+                record.error = format_exception_message(exc)
+                try:
+                    await call_environment_method(record.kube_env, "cleanup")
+                except Exception:
+                    logger.exception("resume cleanup failed")
+                record.kube_env = None
+                record.pod_name = None
+                await store.set_state(record, ContainerState.DEAD)
+                logger.exception("resume readiness wait failed")
+                return _err(500, format_exception_message(exc))
+            if ready_status == "failed":
+                record.error = (
+                    f"sandbox failed to start: "
+                    f"{getattr(record.kube_env, 'sandbox_status', 'failed')}"
+                )
+                try:
+                    await call_environment_method(record.kube_env, "cleanup")
+                except Exception:
+                    logger.exception("resume cleanup failed")
+                record.kube_env = None
+                record.pod_name = None
+                await store.set_state(record, ContainerState.DEAD)
+                return _err(500, record.error)
+            if ready_status == "stopped":
+                record.finished_at = time.time()
+                await store.set_state(record, ContainerState.EXITED)
+                await _emit(request, action="start", record=record)
+                await _emit(request, action="die", record=record)
+                return _empty(204)
             try:
                 await _start_port_forward(record)
             except Exception as exc:
@@ -1486,6 +1604,7 @@ async def start_container(request: web.Request) -> web.Response:
                 await store.set_state(record, ContainerState.DEAD)
                 logger.exception("port publish failed")
                 return _err(500, format_exception_message(exc))
+            await store.set_state(record, ContainerState.RUNNING)
             _spawn_pod_watch(request.app, record.id)
             await _emit(request, action="start", record=record)
             return _empty(204)
@@ -1548,91 +1667,105 @@ async def start_container(request: web.Request) -> web.Response:
             record.finished_at = time.time()
             await store.set_state(record, ContainerState.EXITED)
         else:
+            # docker run -d / docker start: block until the backing sandbox is
+            # actually running. The local record remains non-running so exec
+            # and archive requests cannot race ahead of the Pod.
+            ready_timeout = float(getattr(record, "ready_timeout", 600) or 600)
             try:
-                await _start_port_forward(record)
+                ready_status = await _wait_container_ready(
+                    record, timeout=ready_timeout
+                )
             except Exception as exc:
-                # Roll back pod if publish fails.
+                record.error = format_exception_message(exc)
                 try:
                     await call_environment_method(kube_env, "cleanup")
                 except Exception:
-                    pass
+                    logger.exception("start cleanup failed")
                 record.kube_env = None
                 record.pod_name = None
-                record.error = format_exception_message(exc)
                 await store.set_state(record, ContainerState.DEAD)
-                logger.exception("port publish failed")
+                logger.exception("start readiness wait failed")
                 return _err(500, format_exception_message(exc))
-            # ClusterIP Service for compose DNS (ownerRef → Pod)
-            if (
-                not isinstance(kube_env, PyromindSDK)
-                and os.getenv("DOCKER_RT_SERVICE_DNS", "true").lower() not in {
-                "0",
-                "false",
-                "no",
-                }
-            ):
-                try:
-                    pod_uid = await asyncio.to_thread(
-                        read_pod_uid,
-                        namespace=record.namespace,
-                        pod_name=kube_env.pod_name,
-                        kubeconfig=record.kubeconfig,
-                        kube_context=record.kube_context,
-                    )
-                    svc_name = await asyncio.to_thread(
-                        create_service_for_pod,
-                        namespace=record.namespace,
-                        service_name=hostname,
-                        pod_name=kube_env.pod_name,
-                        pod_uid=pod_uid,
-                        container_id=record.id,
-                        exposed_ports=getattr(record, "exposed_ports", None) or {},
-                        port_bindings=getattr(record, "port_bindings", None) or {},
-                        kubeconfig=record.kubeconfig,
-                        kube_context=record.kube_context,
-                    )
-                    record.k8s_service_name = svc_name
-                except Exception as exc:
-                    logger.warning(
-                        "Service DNS create failed for %s: %s",
-                        record.name,
-                        exc,
-                    )
-            await store.set_state(record, ContainerState.RUNNING)
-            _spawn_pod_watch(request.app, record.id)
 
-            # docker run -d / docker start: block until the sandbox actually
-            # reports Running/Up (not just created/pending) so callers get a
-            # ready container. Cap at ready_timeout (default 600s).
-            wait_env = record.kube_env
-            if wait_env is not None and hasattr(wait_env, "refresh_phase"):
-                ready_timeout = float(getattr(record, "ready_timeout", 600) or 600)
-                deadline = time.monotonic() + max(ready_timeout, 1.0)
-                while time.monotonic() < deadline:
+            if ready_status == "failed":
+                record.error = (
+                    f"sandbox failed to start: "
+                    f"{getattr(kube_env, 'sandbox_status', 'failed')}"
+                )
+                try:
+                    await call_environment_method(kube_env, "cleanup")
+                except Exception:
+                    logger.exception("start cleanup failed")
+                record.kube_env = None
+                record.pod_name = None
+                await store.set_state(record, ContainerState.DEAD)
+                return _err(500, record.error)
+
+            if ready_status == "stopped":
+                record.exit_code = int(getattr(kube_env, "exit_code", 0) or 0)
+                record.finished_at = time.time()
+                await store.set_state(record, ContainerState.EXITED)
+            else:
+                try:
+                    await _start_port_forward(record)
+                except Exception as exc:
+                    # Roll back pod if publish fails.
                     try:
-                        await call_environment_method(
-                            wait_env, "refresh_phase"
-                        )
+                        await call_environment_method(kube_env, "cleanup")
                     except Exception:
                         pass
-                    status_word = _display_status(record)
-                    if status_word in {"running", "stopped", "failed"}:
-                        break
-                    await asyncio.sleep(2)
-                else:
-                    logger.error(
-                        "start timed out waiting for %s to become running (timeout=%ss status=%s)",
-                        record.id,
-                        ready_timeout,
-                        _display_status(record),
-                    )
+                    record.kube_env = None
+                    record.pod_name = None
+                    record.error = format_exception_message(exc)
+                    await store.set_state(record, ContainerState.DEAD)
+                    logger.exception("port publish failed")
+                    return _err(500, format_exception_message(exc))
+                # ClusterIP Service for compose DNS (ownerRef -> Pod)
+                if (
+                    not isinstance(kube_env, PyromindSDK)
+                    and os.getenv("DOCKER_RT_SERVICE_DNS", "true").lower() not in {
+                    "0",
+                    "false",
+                    "no",
+                    }
+                ):
+                    try:
+                        pod_uid = await asyncio.to_thread(
+                            read_pod_uid,
+                            namespace=record.namespace,
+                            pod_name=kube_env.pod_name,
+                            kubeconfig=record.kubeconfig,
+                            kube_context=record.kube_context,
+                        )
+                        svc_name = await asyncio.to_thread(
+                            create_service_for_pod,
+                            namespace=record.namespace,
+                            service_name=hostname,
+                            pod_name=kube_env.pod_name,
+                            pod_uid=pod_uid,
+                            container_id=record.id,
+                            exposed_ports=getattr(record, "exposed_ports", None) or {},
+                            port_bindings=getattr(record, "port_bindings", None) or {},
+                            kubeconfig=record.kubeconfig,
+                            kube_context=record.kube_context,
+                        )
+                        record.k8s_service_name = svc_name
+                    except Exception as exc:
+                        logger.warning(
+                            "Service DNS create failed for %s: %s",
+                            record.name,
+                            exc,
+                        )
+                await store.set_state(record, ContainerState.RUNNING)
+                _spawn_pod_watch(request.app, record.id)
 
-    try:
-        await _apply_extra_hosts(record)
-    except Exception:
-        logger.exception(
-            "failed to apply --add-host for %s", record.name,
-        )
+    if record.state == ContainerState.RUNNING:
+        try:
+            await _apply_extra_hosts(record)
+        except Exception:
+            logger.exception(
+                "failed to apply --add-host for %s", record.name,
+            )
 
     await _emit(request, action="start", record=record)
     if record.state == ContainerState.EXITED:
@@ -2075,20 +2208,14 @@ async def wait_container(request: web.Request) -> web.StreamResponse:
 async def delete_container(request: web.Request) -> web.Response:
     store: ContainerStore = request.app["store"]
     cid = request.match_info["id"]
-    force = request.rel_url.query.get("force", "0") in {"1", "true", "True"}
     record = store.get(cid)
     if record is None:
         return _err(404, f"No such container: {cid}")
 
-    if not force:
-        await _refresh_record_state(record, store)
+    # docker rm and docker rm -f intentionally share the same behavior.
+    # Cleanup pauses a running sandbox before deleting it.
+    await _refresh_record_state(record, store)
     async with record.lock:
-        if record.state == ContainerState.RUNNING:
-            if not force:
-                return _err(
-                    409,
-                    f"container {cid} is running: docker rm -f {cid}",
-                )
         if record.kube_env is not None:
             await _stop_port_forward(record)
             try:
@@ -2505,6 +2632,9 @@ async def create_exec(request: web.Request) -> web.Response:
         attach_stdout=bool(body.get("AttachStdout", True)),
         attach_stderr=bool(body.get("AttachStderr", True)),
         tty=bool(body.get("Tty", False)),
+        detach_keys=body.get("DetachKeys") or "",
+        privileged=bool(body.get("Privileged", False)),
+        user=body.get("User") or "",
         working_dir=body.get("WorkingDir") or "",
         env=body.get("Env") or [],
     )
@@ -2522,7 +2652,7 @@ async def inspect_exec(request: web.Request) -> web.Response:
         {
             "CanRemove": False,
             "ContainerID": exec_rec.container_id,
-            "DetachKeys": "",
+            "DetachKeys": exec_rec.detach_keys,
             "ExitCode": exec_rec.exit_code if exec_rec.exit_code is not None else 0,
             "ID": exec_rec.id,
             "OpenStderr": exec_rec.attach_stderr,
@@ -2533,9 +2663,9 @@ async def inspect_exec(request: web.Request) -> web.Response:
             "ProcessConfig": {
                 "arguments": exec_rec.cmd[1:],
                 "entrypoint": exec_rec.cmd[0] if exec_rec.cmd else "",
-                "privileged": False,
+                "privileged": exec_rec.privileged,
                 "tty": exec_rec.tty,
-                "user": "",
+                "user": exec_rec.user,
             },
             "Container": {
                 "State": {
@@ -2583,6 +2713,8 @@ async def start_exec(request: web.Request) -> web.StreamResponse | web.Response:
     # Interactive bash: ensure a login-capable interactive shell
     if tty and cmd in (["bash"], ["sh"], ["/bin/bash"], ["/bin/sh"]):
         cmd = [cmd[0], "-i"]
+    cmd = argv_with_exec_user(cmd, exec_rec.user)
+    cmd = argv_with_exec_env(cmd, exec_rec.env)
 
     if detach:
         exec_rec.running = True
@@ -3765,6 +3897,7 @@ def create_aio_app(*, run_reconcile: bool = True) -> web.Application:
     app["namespace"] = resolve_namespace(
         kubeconfig=kubeconfig, kube_context=kube_context
     )
+    app["ready_timeout"] = _default_ready_timeout()
     app["default_image"] = os.getenv("DOCKER_RT_DEFAULT_IMAGE", DEFAULT_IMAGE)
     if kubeconfig:
         logger.info(

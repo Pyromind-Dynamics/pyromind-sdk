@@ -12,7 +12,7 @@ from pathlib import Path
 WRAPPER_DIR = Path.home() / ".pyromind" / "bin"
 WRAPPER_PATH = WRAPPER_DIR / "docker"
 PATH_LINE = 'export PATH="$HOME/.pyromind/bin:$PATH"'
-WRAPPER_VERSION = "13"
+WRAPPER_VERSION = "14"
 
 
 def _wrapper_version() -> str | None:
@@ -170,26 +170,8 @@ if [[ "${{args[0]:-}}" == "rm" ]]; then
     exit $?
   fi
   if [[ $force -eq 0 ]]; then
-    running=()
-    for target in "${{rm_targets[@]}}"; do
-      status="$("$REAL_DOCKER" inspect --format '{{{{.State.Status}}}}' "$target" 2>/dev/null)"
-      if [[ "$status" != "running" ]]; then
-        status="$("$REAL_DOCKER" inspect --format '{{{{.status}}}}' "$target" 2>/dev/null)"
-      fi
-      status_lower="$(printf '%s' "$status" | tr '[:upper:]' '[:lower:]')"
-      if [[ "$status_lower" == "running" ]]; then
-        running+=("$target")
-      fi
-    done
-    if [[ ${{#running[@]}} -gt 0 ]]; then
-      read -r -p "Container(s) ${{running[*]}} are running. Force remove? [y/N]: " ans
-      if [[ "$ans" =~ ^[yY] ]]; then
-        rm_opts+=(--force)
-      else
-        echo "Remove cancelled. Use 'docker rm -f ${{running[*]}}' to force remove." >&2
-        exit 1
-      fi
-    fi
+    # docker-rt defines docker rm and docker rm -f with identical semantics.
+    rm_opts+=(--force)
   fi
   rm_rc=0
   if [[ ${{#rm_targets[@]}} -gt 5 ]]; then
@@ -392,6 +374,10 @@ exec "$REAL_DOCKER" "${{args[@]}}"
 
 def ensure_wrapper_installed(*, interactive: bool = True) -> bool:
     """Ensure the docker wrapper is installed and up to date."""
+    from .site_hooks import ensure_docker_sdk_timeout_hook
+
+    ensure_docker_sdk_timeout_hook()
+
     try:
         find_real_docker()
     except RuntimeError as exc:
@@ -473,11 +459,14 @@ def uninstall_wrapper() -> bool:
 
 
 def uninstall_main() -> int:
-    removed = uninstall_wrapper()
-    if removed:
-        print("Removed docker wrapper and PATH entry.")
+    from .site_hooks import uninstall_docker_sdk_timeout_hook
+
+    wrapper_removed = uninstall_wrapper()
+    hook_removed = uninstall_docker_sdk_timeout_hook()
+    if wrapper_removed or hook_removed:
+        print("Removed docker wrapper, PATH entry, and Docker SDK timeout hook.")
     else:
-        print("No docker wrapper found; nothing to remove.")
+        print("No docker wrapper or SDK timeout hook found; nothing to remove.")
     return 0
 
 

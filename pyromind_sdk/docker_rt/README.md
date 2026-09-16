@@ -36,14 +36,14 @@ docker rm -f test-sdk-1
 
 `docker create test-sdk-1 IMAGE` 会把 `test-sdk-1` 当成镜像名；要按名称
 start/rm，必须先 `--name`。
-非 running 容器可直接 `docker rm NAME`；running 容器需要 `-f`，wrapper 会
-在缺少 `-f` 时先询问确认。
+`docker rm NAME` 和 `docker rm -f NAME` 语义一致；running 容器会先暂停，
+再删除 sandbox。
 `docker run IMAGE`（前台，不带 `-d`）：docker-rt 会一直轮询直到 sandbox
 变成 Running/Up（600s 超时），然后绑定当前终端输出日志并阻塞到容器退出，
 Ctrl+C 发送 SIGINT 停止容器。
-`docker run -d`（后台 detach）：创建 sandbox 后立即返回 sandbox ID，不等
-Running，容器在后台异步启动（与 real docker detach 一致）。需要交互终端
-用 `docker run -it IMAGE bash`。
+`docker run -d`（后台 detach）：等待 sandbox 变成 Running/Up 后返回 sandbox
+ID，容器进程继续在后台运行（与 `docker start` 相同，不等待应用自身 Ready）。
+需要交互终端用 `docker run -it IMAGE bash`。
 
 本地 container ID 到 sandbox ID 的映射持久化在
 `~/.pyromind/docker-rt-container-map.json`，daemon 重启后旧 ID 仍可用。
@@ -59,7 +59,7 @@ sandbox ID。
 | 命令连到 Docker Desktop socket | context 不是 `docker-rt` | `docker-rt-context` 或 `DOCKER_HOST=unix:///tmp/docker-rt.sock` |
 | `docker logs` / `docker events` 等待或不支持 | k8s-middleware 不支持 | 用 `docker exec -it` / `docker ps` / `docker inspect` |
 | `docker cp` 无成功文案 | 旧 wrapper 重定向输出导致 Docker 不打印 | 升级 SDK/wrapper 并重启 docker-rt |
-| `docker rm <本地ID>` 行为不一致 | daemon 已不认识该本地 ID | 使用 `sb-...` ID 或重启 daemon |
+| `docker rm <本地ID>` 提示不存在 | daemon 已不认识该本地 ID | 使用 `sb-...` ID 或重启 daemon |
 | API 错误无 trace_id | 未请求到 k8s-middleware | 只有带 `x-trace-id` 的后端响应会显示 |
 
 ## 架构
@@ -257,7 +257,9 @@ docker ps   # 仍能看到 sb1
 | `DOCKER_RT_KUBE_CONTEXT` | `docker-desktop` | Kubernetes context 名 |
 | `DOCKER_RT_NAMESPACE` | `default` | 目标 namespace |
 | `DOCKER_RT_GPU_CARD` | （空） | k8s-middleware 后端 `--gpus` 对应的 GPU 卡型号 |
-| `DOCKER_RT_INSPECT_MODE` | `sandbox` | `docker inspect` 结构：`sandbox` / `standard` |
+| `DOCKER_RT_INSPECT_MODE` | `standard` | `docker inspect` 结构：`standard` / `sandbox` |
+| `DOCKER_RT_READY_TIMEOUT` | `600` | 等待新建 sandbox 变成 running 的秒数；`--ready-timeout` 可覆盖 |
+| `DOCKER_RT_CLEANUP_CONCURRENCY` | `4` | 同时执行 sandbox pause/delete 清理的最大并发数 |
 | `DOCKER_RT_DEFAULT_IMAGE` | `backend.kube` DEFAULT | `docker images` 默认条目 |
 | `DOCKER_RT_PORT_FORWARD_MODE` | `auto` | `-p` 后端：`auto` / `direct` / `api` |
 | `DOCKER_RT_BUILDKIT_ADDR` | （空） | buildctl 地址，如 `unix:///run/buildkit/buildkitd.sock` |
@@ -271,7 +273,17 @@ docker ps   # 仍能看到 sb1
 
 ### `docker inspect` 返回结构
 
-默认 `DOCKER_RT_INSPECT_MODE=sandbox`，只返回：
+默认 `DOCKER_RT_INSPECT_MODE=standard`，返回 Docker SDK 需要的大写标准字段：
+
+```json
+{
+  "Id": "sb-94d290262ee8",
+  "Name": "/test-for-doc",
+  "State": {"Status": "Stopped"}
+}
+```
+
+设置 `DOCKER_RT_INSPECT_MODE=sandbox` 时只返回紧凑的 sandbox 字段：
 
 ```json
 {
@@ -288,8 +300,6 @@ docker ps   # 仍能看到 sb1
   "port_mappings": []
 }
 ```
-
-`DOCKER_RT_INSPECT_MODE=standard` 可保留标准 Docker 字段。
 
 ### 通过 Docker 参数指定 GPU 卡型号
 

@@ -46,6 +46,9 @@ async def test_exec_create_inspect_and_oneshot(aiohttp_client, fake_kube: FakeKu
     assert body["Running"] is False
     assert body["ProcessConfig"]["entrypoint"] == "echo"
     assert body["ProcessConfig"]["arguments"] == ["hi"]
+    assert body["DetachKeys"] == ""
+    assert body["ProcessConfig"]["privileged"] is False
+    assert body["ProcessConfig"]["user"] == ""
     assert body["Container"]["State"]["Running"] is True
 
     # Non-TTY oneshot still uses Upgrade:tcp (matches Docker CLI).
@@ -79,7 +82,11 @@ async def test_exec_detach_uses_execute(aiohttp_client, fake_kube: FakeKubeEnv):
 
     resp = await client.post(
         f"/containers/{cid}/exec",
-        json={"Cmd": ["true"], "AttachStdout": False},
+        json={
+            "Cmd": ["true"],
+            "Env": ["PYROMIND_EXEC_ENV=detached"],
+            "AttachStdout": False,
+        },
     )
     eid = (await resp.json())["Id"]
 
@@ -90,7 +97,11 @@ async def test_exec_detach_uses_execute(aiohttp_client, fake_kube: FakeKubeEnv):
             break
         await asyncio.sleep(0.02)
     # argv must be passed through as a list so ``sh -c '<script>'`` quoting is kept.
-    assert fake_kube.last_execute["action"]["command"] == ["true"]
+    assert fake_kube.last_execute["action"]["command"] == [
+        "env",
+        "PYROMIND_EXEC_ENV=detached",
+        "true",
+    ]
 
 
 
@@ -98,7 +109,10 @@ async def test_exec_detach_uses_execute(aiohttp_client, fake_kube: FakeKubeEnv):
     fake_kube.last_execute = None
     resp = await client.post(
         f"/containers/{cid}/exec",
-        json={"Cmd": ["sh", "-c", "test -d /home/user && echo OK || echo NOT_EXIST"]},
+        json={
+            "Cmd": ["sh", "-c", "test -d /home/user && echo OK || echo NOT_EXIST"],
+            "Env": ["BASH_ENV=/root/.bashrc"],
+        },
     )
     eid = (await resp.json())["Id"]
     start = await client.post(f"/exec/{eid}/start", json={"Detach": True, "Tty": False})
@@ -108,7 +122,11 @@ async def test_exec_detach_uses_execute(aiohttp_client, fake_kube: FakeKubeEnv):
             break
         await asyncio.sleep(0.02)
     assert fake_kube.last_execute["action"]["command"] == [
-        "sh", "-c", "test -d /home/user && echo OK || echo NOT_EXIST"
+        "env",
+        "BASH_ENV=/root/.bashrc",
+        "sh",
+        "-c",
+        "test -d /home/user && echo OK || echo NOT_EXIST",
     ]
 
 
@@ -157,6 +175,7 @@ async def test_exec_interactive_adds_bash_i(aiohttp_client, fake_kube: FakeKubeE
         f"/containers/{cid}/exec",
         json={
             "Cmd": ["bash"],
+            "Env": ["BASH_ENV=/root/.bashrc"],
             "AttachStdin": True,
             "AttachStdout": True,
             "Tty": True,
@@ -174,10 +193,117 @@ async def test_exec_interactive_adds_bash_i(aiohttp_client, fake_kube: FakeKubeE
         if fake_kube.last_attach_cmd is not None:
             break
         await asyncio.sleep(0.02)
-    assert fake_kube.last_attach_cmd == ["bash", "-i"]
+    assert fake_kube.last_attach_cmd == [
+        "env",
+        "BASH_ENV=/root/.bashrc",
+        "bash",
+        "-i",
+    ]
     assert fake_kube.last_attach_kwargs.get("stdin") is True
     assert fake_kube.last_attach_kwargs.get("tty") is True
     assert (await start_task).status == 101
+
+
+@pytest.mark.asyncio
+async def test_exec_env_is_applied_to_oneshot(aiohttp_client, fake_kube: FakeKubeEnv):
+    from ..aio_server import create_aio_app
+    from .. import aio_server as mod
+    from ..backend.kube.environment import argv_with_cwd
+
+    app = create_aio_app(run_reconcile=False)
+    mod.start_kube_environment = lambda **kw: fake_kube  # type: ignore
+    client = await aiohttp_client(app)
+    cid = await create_started_container(client, name="exec-env")
+
+    command = ["bash", "-c", "echo $PYROMIND_EXEC_ENV"]
+    env = ["BASH_ENV=/root/.bashrc", "PYROMIND_EXEC_ENV=configured"]
+    resp = await client.post(
+        f"/containers/{cid}/exec",
+        json={
+            "Cmd": command,
+            "Env": env,
+            "WorkingDir": "/testbed",
+            "AttachStdout": True,
+            "AttachStderr": True,
+            "Tty": False,
+        },
+    )
+    assert resp.status == 200
+    eid = (await resp.json())["Id"]
+
+    start = await client.post(
+        f"/exec/{eid}/start",
+        json={"Detach": False, "Tty": False},
+        headers={"Connection": "Upgrade", "Upgrade": "tcp"},
+    )
+    assert start.status == 101
+    for _ in range(100):
+        if fake_kube.last_attach_cmd is not None:
+            break
+        await asyncio.sleep(0.02)
+
+    assert fake_kube.last_attach_cmd == argv_with_cwd(["env", *env, *command], "/testbed")
+    assert fake_kube.last_attach_kwargs.get("cwd") == "/testbed"
+    _ = await start.read()
+
+
+@pytest.mark.asyncio
+async def test_exec_all_create_options_are_applied_and_inspected(
+    aiohttp_client, fake_kube: FakeKubeEnv
+):
+    from ..aio_server import create_aio_app
+    from .. import aio_server as mod
+    from ..backend.exec_utils import argv_with_exec_env, argv_with_exec_user
+    from ..backend.kube.environment import argv_with_cwd
+
+    app = create_aio_app(run_reconcile=False)
+    mod.start_kube_environment = lambda **kw: fake_kube  # type: ignore
+    client = await aiohttp_client(app)
+    cid = await create_started_container(client, name="exec-options")
+
+    command = ["bash", "-c", "echo $PYROMIND_EXEC_ENV"]
+    env = ["BASH_ENV=/root/.bashrc", "PYROMIND_EXEC_ENV=configured"]
+    user = "1000:1000"
+    resp = await client.post(
+        f"/containers/{cid}/exec",
+        json={
+            "Cmd": command,
+            "Env": env,
+            "WorkingDir": "/testbed",
+            "AttachStdin": False,
+            "AttachStdout": True,
+            "AttachStderr": False,
+            "Tty": False,
+            "DetachKeys": "ctrl-p,ctrl-q",
+            "Privileged": True,
+            "User": user,
+        },
+    )
+    assert resp.status == 200
+    eid = (await resp.json())["Id"]
+
+    inspected = await (await client.get(f"/exec/{eid}/json")).json()
+    assert inspected["DetachKeys"] == "ctrl-p,ctrl-q"
+    assert inspected["OpenStdin"] is False
+    assert inspected["OpenStdout"] is True
+    assert inspected["OpenStderr"] is False
+    assert inspected["ProcessConfig"]["privileged"] is True
+    assert inspected["ProcessConfig"]["user"] == user
+
+    start = await client.post(
+        f"/exec/{eid}/start",
+        json={"Detach": False, "Tty": False},
+        headers={"Connection": "Upgrade", "Upgrade": "tcp"},
+    )
+    assert start.status == 101
+    for _ in range(100):
+        if fake_kube.last_attach_cmd is not None:
+            break
+        await asyncio.sleep(0.02)
+
+    expected = argv_with_exec_env(argv_with_exec_user(command, user), env)
+    assert fake_kube.last_attach_cmd == argv_with_cwd(expected, "/testbed")
+    _ = await start.read()
 
 
 @pytest.mark.asyncio
@@ -377,6 +503,35 @@ def test_argv_with_cwd_unit():
     # Spaces / metacharacters are shell-quoted in the cd path.
     wrapped = argv_with_cwd(["true"], "/tmp/my dir")
     assert "cd '/tmp/my dir'" in wrapped[2] or 'cd "/tmp/my dir"' in wrapped[2] or "cd /tmp/my\\ dir" in wrapped[2]
+
+
+def test_argv_with_exec_env_unit():
+    from ..backend.exec_utils import argv_with_exec_env
+
+    command = ["bash", "-c", "echo $VALUE"]
+    assert argv_with_exec_env(command, None) == command
+    assert argv_with_exec_env(command, []) == command
+    assert argv_with_exec_env(command, ["", "VALUE=configured"]) == [
+        "env",
+        "VALUE=configured",
+        *command,
+    ]
+    assert command == ["bash", "-c", "echo $VALUE"]
+
+
+def test_argv_with_exec_user_unit():
+    from ..backend.exec_utils import argv_with_exec_user
+
+    command = ["id", "-u"]
+    assert argv_with_exec_user(command, None) == command
+    assert argv_with_exec_user(command, "") == command
+
+    wrapped = argv_with_exec_user(command, "1000:1000")
+    assert wrapped[:2] == ["sh", "-c"]
+    assert "setpriv" in wrapped[2]
+    assert wrapped[4] == "1000:1000"
+    assert wrapped[5:] == command
+    assert command == ["id", "-u"]
 
 
 @pytest.mark.asyncio

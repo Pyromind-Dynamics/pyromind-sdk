@@ -17,7 +17,7 @@ from .base import append_trace_id, extract_trace_id
 # Constants
 DEFAULT_API_BASE_URL = "https://api-portal.pyromind.ai/api/v1"
 DEFAULT_CLUSTER = "us-west-2"
-DEFAULT_TIMEOUT = 60
+DEFAULT_TIMEOUT = 600
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_CONNECTOR_LIMIT = 256
 ENV_API_KEY = "PYROMIND_API_KEY"
@@ -77,7 +77,7 @@ class PyroMindAsyncClient:
         cluster: Target cluster identifier. Will be sent as X-Cluster header
                 on every request. If not provided, will try to read from
                 PYROMIND_CLUSTER environment variable. Defaults to "default".
-        timeout: Request timeout in seconds (default: 60)
+        timeout: Request timeout in seconds (default: 600)
         max_retries: Maximum number of retries for failed requests (default: 3)
         connector_limit: Maximum number of pooled connections (default: 256)
         connector_limit_per_host: Per-host connection cap; defaults to
