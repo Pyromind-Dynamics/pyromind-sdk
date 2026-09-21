@@ -126,6 +126,7 @@ class AsyncSandboxClient(PyroMindAsyncClient):
             "resources": sandbox_data.get("resources"),
             "volume_mounts": sandbox_data.get("volume_mounts"),
             "port_mappings": sandbox_data.get("port_mappings"),
+            "mount_public_dir": sandbox_data.get("mount_public_dir"),
         }
 
         if "screen_size" in sandbox_data and sandbox_data["screen_size"]:
