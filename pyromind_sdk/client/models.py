@@ -205,6 +205,12 @@ class SandboxRequest(BaseModel):
         port_mappings: Optional port exposures (docker ``-p`` style). Each
             ``PortMapping(container_port=8080)`` opens that port on the node.
             Useful for CUSTOM sandboxes running HTTP / gRPC servers.
+        mount_public_dir: **CUSTOM only.** Set ``True`` to mount the platform's
+            shared read-only directories inside the container. The directory
+            list is registered by the platform (not by the client) and every
+            mount is read-only under ``/public/<dir>``. ``None`` leaves the
+            setting untouched, which is what you want on update calls that
+            should not change it.
     """
     sandbox_type: SandboxType
     resources: Optional[ResourceConfig] = None
@@ -236,6 +242,14 @@ class SandboxRequest(BaseModel):
         description=(
             "Optional port mappings (docker -p style). Each entry needs at "
             "least a container_port."
+        ),
+    )
+    mount_public_dir: Optional[bool] = Field(
+        default=None,
+        description=(
+            "CUSTOM only: mount the platform's shared read-only directories "
+            "under /public/<dir>. The list is platform-registered and always "
+            "read-only. None leaves the current setting unchanged."
         ),
     )
 
@@ -274,6 +288,9 @@ class SandboxResponse(BaseModel):
         image: **CUSTOM.** Docker/OCI container image reference in use.
         volume_mounts: **CUSTOM.** Active hostPath mounts (docker ``-v`` style).
         port_mappings: **CUSTOM.** Active port mappings (docker ``-p`` style).
+        mount_public_dir: **CUSTOM.** Whether the platform's shared read-only
+            directories are mounted under ``/public/<dir>``. ``None`` when the
+            server does not report it.
     """
     id: str
     name: str
@@ -305,6 +322,13 @@ class SandboxResponse(BaseModel):
     port_mappings: Optional[List[PortMapping]] = Field(
         default=None,
         description="Active port mappings (docker -p style).",
+    )
+    mount_public_dir: Optional[bool] = Field(
+        default=None,
+        description=(
+            "CUSTOM: whether the platform's shared read-only directories are "
+            "mounted under /public/<dir>."
+        ),
     )
 
 

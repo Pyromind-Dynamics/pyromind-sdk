@@ -89,6 +89,7 @@ class SandboxClient(PyroMindClient):
             "resources": sandbox_data.get("resources"),
             "volume_mounts": sandbox_data.get("volume_mounts"),
             "port_mappings": sandbox_data.get("port_mappings"),
+            "mount_public_dir": sandbox_data.get("mount_public_dir"),
         }
         
         # Convert screen_size to screen_resolution if present
