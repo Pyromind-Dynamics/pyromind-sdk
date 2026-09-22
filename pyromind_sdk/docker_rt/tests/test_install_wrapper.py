@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import shutil
+import stat
+import subprocess
+
+import pytest
 from pytest import MonkeyPatch, fixture
 
 from .. import install_wrapper as mod
@@ -174,3 +179,241 @@ def test_generated_wrapper_defers_ps_and_normalizes_rm(
     # docker ps is rendered natively by the real Docker CLI; no ps interception.
     assert '"$REAL_DOCKER" "${args[@]}" --no-trunc --format' not in text
     assert '"$REAL_DOCKER" "${args[@]}"' in text
+
+
+def test_wrapper_allows_docker_build_and_forces_the_classic_builder(
+    monkeypatch: MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "docker"
+    monkeypatch.setattr(mod, "WRAPPER_PATH", path)
+    monkeypatch.setattr(mod, "find_real_docker", lambda: "/usr/local/bin/docker")
+    monkeypatch.setattr(mod, "_shell_rc_path", lambda: tmp_path / "rc")
+
+    text = mod.install_wrapper().read_text(encoding="utf-8")
+
+    # build is forwarded now, with BuildKit disabled so the CLI posts the context
+    # tar to POST /build instead of dialling buildkitd over the socket.
+    assert "export DOCKER_BUILDKIT=0" in text
+    assert "does not support docker build / buildx build" not in text
+    assert "does not support docker build." not in text
+
+
+def test_wrapper_rejects_buildkit_only_build_flags(
+    monkeypatch: MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "docker"
+    monkeypatch.setattr(mod, "WRAPPER_PATH", path)
+    monkeypatch.setattr(mod, "find_real_docker", lambda: "/usr/local/bin/docker")
+    monkeypatch.setattr(mod, "_shell_rc_path", lambda: tmp_path / "rc")
+
+    text = mod.install_wrapper().read_text(encoding="utf-8")
+
+    # kaniko cannot honour these; rejecting is the only honest answer.
+    #
+    # NOTE: `--platform` is deliberately NOT in this list. It is forwarded so the
+    # daemon can read it off the /build query string and pass it to kaniko as
+    # `--customPlatform`. Assert on the case-label list rather than on a bare
+    # substring, because the flag name also appears in the comments above the loop.
+    rejection_case = text.split("--builder|--builder=*|", 1)[1].split(")", 1)[0]
+    for flag in ("--secret", "--ssh", "--output", "--cache-to", "--load", "--push"):
+        assert flag in rejection_case, flag
+    assert "--platform" not in rejection_case
+    assert "not supported by the cluster build sandbox (kaniko)" in text
+    assert '"$REAL_DOCKER" "${filtered_args[@]}"' in text
+
+
+def test_generated_wrapper_forwards_build_argv_verbatim(
+    monkeypatch: MonkeyPatch,
+    tmp_path,
+) -> None:
+    """Run the real wrapper and assert what the real docker CLI would receive.
+
+    This is the behavioural counterpart to the text assertions above: it actually
+    executes the generated bash, so a wrapper that silently drops or mangles build
+    arguments fails here instead of only in the user's terminal.
+    """
+    if shutil.which("bash") is None:
+        pytest.skip("bash is not available")
+
+    wrapper = tmp_path / "docker"
+    fake_docker = tmp_path / "fake-docker"
+    log = tmp_path / "calls.log"
+    fake_docker.write_text(
+        "#!/usr/bin/env bash\n"
+        "{\n"
+        '  echo "DOCKER_BUILDKIT=${DOCKER_BUILDKIT:-<unset>}"\n'
+        '  for a in "$@"; do echo "ARG:$a"; done\n'
+        '} >> "$FAKE_LOG"\n',
+        encoding="utf-8",
+    )
+    fake_docker.chmod(fake_docker.stat().st_mode | stat.S_IXUSR)
+
+    monkeypatch.setattr(mod, "WRAPPER_PATH", wrapper)
+    monkeypatch.setattr(mod, "WRAPPER_DIR", tmp_path)
+    monkeypatch.setattr(mod, "find_real_docker", lambda: str(fake_docker))
+    monkeypatch.setattr(mod, "_shell_rc_path", lambda: tmp_path / "rc")
+    mod.install_wrapper()
+
+    def run(argv: list[str], *, docker_rt: bool = True) -> subprocess.CompletedProcess:
+        log.unlink(missing_ok=True)
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "FAKE_LOG": str(log),
+            "DOCKER_HOST": (
+                "unix:///tmp/docker-rt.sock" if docker_rt else "unix:///var/run/docker.sock"
+            ),
+        }
+        return subprocess.run(
+            ["bash", str(wrapper), *argv],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    def forwarded() -> list[str]:
+        if not log.exists():
+            return []
+        return [ln[4:] for ln in log.read_text().splitlines() if ln.startswith("ARG:")]
+
+    # The user's exact shape: --platform + -f + -t + an out-of-tree context path.
+    user_args = [
+        "build",
+        "--platform",
+        "linux/amd64",
+        "-f",
+        "Dockerfile-dev",
+        "-t",
+        "pyromind-console:dev",
+        "/Users/x/pyromind-console-1",
+    ]
+    proc = run(user_args)
+    assert proc.returncode == 0, proc.stderr
+    assert forwarded() == user_args
+    assert "DOCKER_BUILDKIT=0" in log.read_text()
+
+    # BuildKit-only flags are refused before the real docker is touched.
+    for argv in (
+        ["build", "--secret", "id=x", "-t", "app:dev", "."],
+        ["build", "--load", "-t", "app:dev", "."],
+    ):
+        proc = run(argv)
+        assert proc.returncode == 1
+        assert "not supported by the cluster build sandbox" in proc.stderr
+        assert forwarded() == []
+
+    # Outside the docker-rt context the wrapper is a pure passthrough: even the
+    # flags it would otherwise refuse must reach the real CLI untouched.
+    passthrough = ["build", "--secret", "id=x", "--platform", "linux/arm64", "-t", "a", "."]
+    proc = run(passthrough, docker_rt=False)
+    assert proc.returncode == 0, proc.stderr
+    assert forwarded() == passthrough
+    assert "DOCKER_BUILDKIT=0" not in log.read_text()
+
+
+def test_wrapper_still_gates_buildx_and_compose_build(
+    monkeypatch: MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "docker"
+    monkeypatch.setattr(mod, "WRAPPER_PATH", path)
+    monkeypatch.setattr(mod, "find_real_docker", lambda: "/usr/local/bin/docker")
+    monkeypatch.setattr(mod, "_shell_rc_path", lambda: tmp_path / "rc")
+
+    text = mod.install_wrapper().read_text(encoding="utf-8")
+
+    assert "does not support docker buildx build yet" in text
+    assert "does not support docker compose build yet" in text
+
+
+def test_wrapper_build_filters_stderr_instead_of_execing_docker(
+    monkeypatch: MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "docker"
+    monkeypatch.setattr(mod, "WRAPPER_PATH", path)
+    monkeypatch.setattr(mod, "find_real_docker", lambda: "/usr/local/bin/docker")
+    monkeypatch.setattr(mod, "_shell_rc_path", lambda: tmp_path / "rc")
+
+    text = mod.install_wrapper().read_text(encoding="utf-8")
+
+    # `exec` would hand the terminal straight to the real CLI, leaving no chance
+    # to remove the legacy-builder banner it prints because of DOCKER_BUILDKIT=0.
+    assert 'exec "$REAL_DOCKER" "${filtered_args[@]}"' not in text
+    assert '_strip_legacy_builder_banner' in text
+    assert (
+        '"$REAL_DOCKER" "${filtered_args[@]}" 2>&1 1>&3 | _strip_legacy_builder_banner >&2'
+        in text
+    )
+    # The real CLI's exit code must survive the pipeline.
+    assert "_build_rc=${PIPESTATUS[0]}" in text
+    assert "exit $_build_rc" in text
+
+
+def test_generated_wrapper_drops_the_cli_legacy_builder_banner(
+    monkeypatch: MonkeyPatch,
+    tmp_path,
+) -> None:
+    """DOCKER_BUILDKIT=0 makes the real CLI print a banner users blame docker-rt for.
+
+    The wrapper forces that variable (it is what routes the build to POST /build),
+    so it must strip exactly the banner - both documented variants - while leaving
+    docker's stdout, its other stderr lines and its exit code alone.
+    """
+    if shutil.which("bash") is None:
+        pytest.skip("bash is not available")
+
+    wrapper = tmp_path / "docker"
+    fake_docker = tmp_path / "fake-docker"
+    fake_docker.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo 'step 1/2 : FROM scratch'\n"
+        "echo 'Sending build context to Docker daemon  95.57MB' >&2\n"
+        # The DOCKER_BUILDKIT=0 variant, exactly as docker/cli prints it.
+        "echo 'DEPRECATED: The legacy builder is deprecated and will be removed in a future release.' >&2\n"
+        "echo '            BuildKit is currently disabled; enable it by removing the DOCKER_BUILDKIT=0' >&2\n"
+        "echo '            environment-variable.' >&2\n"
+        "echo '' >&2\n"
+        "echo 'ERROR: something the user must still see' >&2\n"
+        # The sibling "buildx is missing" variant shares the same first line.
+        "echo 'DEPRECATED: The legacy builder is deprecated and will be removed in a future release.' >&2\n"
+        "echo '            Install the buildx component to build images with BuildKit:' >&2\n"
+        "echo '            https://docs.docker.com/go/buildx/' >&2\n"
+        "echo '' >&2\n"
+        "echo 'still-visible-stderr' >&2\n"
+        "exit 7\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(
+        fake_docker.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+    )
+
+    monkeypatch.setattr(mod, "WRAPPER_PATH", wrapper)
+    monkeypatch.setattr(mod, "WRAPPER_DIR", tmp_path)
+    monkeypatch.setattr(mod, "find_real_docker", lambda: str(fake_docker))
+    monkeypatch.setattr(mod, "_shell_rc_path", lambda: tmp_path / "rc")
+    mod.install_wrapper()
+
+    proc = subprocess.run(
+        ["bash", str(wrapper), "build", "-t", "app:dev", "."],
+        env={"PATH": "/usr/bin:/bin", "DOCKER_HOST": "unix:///tmp/docker-rt.sock"},
+        capture_output=True,
+        text=True,
+    )
+
+    # The CLI's exit code is preserved even though it now runs through a pipeline.
+    assert proc.returncode == 7, proc.stderr
+
+    assert "DEPRECATED" not in proc.stderr
+    assert "BuildKit is currently disabled" not in proc.stderr
+    assert "environment-variable." not in proc.stderr
+    assert "Install the buildx component" not in proc.stderr
+    assert "https://docs.docker.com/go/buildx/" not in proc.stderr
+
+    # Everything else docker wrote still reaches the user, on the right stream.
+    assert "Sending build context to Docker daemon" in proc.stderr
+    assert "ERROR: something the user must still see" in proc.stderr
+    assert "still-visible-stderr" in proc.stderr
+    assert "step 1/2 : FROM scratch" in proc.stdout
+    assert "DEPRECATED" not in proc.stdout

@@ -3496,15 +3496,20 @@ async def resize_container(request: web.Request) -> web.Response:
 
 
 async def build_image(request: web.Request) -> web.StreamResponse:
-    """POST /build — stream Docker-style progress; build via buildctl."""
-    from .backend.buildkit import build_from_tar, parse_buildargs_query
+    """POST /build — stream Docker-style progress; build in a k8s sandbox."""
+    from .backend.build_sandbox import build_in_sandbox
+    from .backend.buildkit import parse_buildargs_query, parse_labels_query
 
     store: ContainerStore = request.app["store"]
+    namespace = request.app.get("namespace") or DEFAULT_NAMESPACE
     q = request.rel_url.query
     tags = list(q.getall("t") or [])
     dockerfile = q.get("dockerfile") or "Dockerfile"
     buildargs = parse_buildargs_query(q.get("buildargs"))
+    labels = parse_labels_query(q.get("labels"))
+    target = q.get("target") or None
     quiet = q.get("q", "0") in {"1", "true", "True"}
+    platform = q.get("platform") or "linux/amd64"
 
     tar_bytes = await request.read()
     if not tar_bytes:
@@ -3522,11 +3527,15 @@ async def build_image(request: web.Request) -> web.StreamResponse:
     failed = False
     aliases: dict[str, str] = {}
     try:
-        for event in build_from_tar(
-            tar_bytes,
-            tags=tags or ["docker-rt-build:latest"],
+        async for event in build_in_sandbox(
+            tar_bytes=tar_bytes,
+            tags=tags,
             dockerfile=dockerfile,
             buildargs=buildargs,
+            labels=labels,
+            target=target,
+            namespace=namespace,
+            platform=platform,
         ):
             if "docker_rt" in event:
                 aliases = dict((event.get("docker_rt") or {}).get("aliases") or {})

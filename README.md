@@ -133,10 +133,18 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 | `DOCKER_RT_CLEANUP_CONCURRENCY` | `4` | Maximum concurrent sandbox pause/delete cleanups |
 | `DOCKER_RT_DEFAULT_IMAGE` | SWE-bench default image | `docker images` default entry |
 | `DOCKER_RT_PORT_FORWARD_MODE` | `auto` | `-p` backend: `auto` / `direct` / `api` |
-| `DOCKER_RT_BUILDKIT_ADDR` | empty | `buildctl` address, e.g. `unix:///run/buildkit/buildkitd.sock` |
-| `DOCKER_RT_BUILD_REGISTRY` | empty | Push prefix for short image tags |
+| `DOCKER_RT_BUILD_IMAGE` | empty | **Hard prerequisite** for builds: a cluster-pullable kaniko executor image (must be the `-debug` variant) |
+| `DOCKER_RT_BUILD_REGISTRY` | empty | Push prefix for short image tags; derived from the cluster profile when empty |
 | `DOCKER_RT_BUILD_PUSH` | `true` | Whether build pushes to the registry |
-| `DOCKER_RT_BUILD_TIMEOUT` | `3600` | `buildctl` timeout in seconds |
+| `DOCKER_RT_BUILD_EXECUTOR` | `kaniko` | Build executor; only kaniko is implemented |
+| `DOCKER_RT_BUILD_TIMEOUT` | `3600` | Timeout (seconds) for one build |
+| `DOCKER_RT_BUILD_SANDBOX_CPU` / `_MEMORY` | `2` / `4Gi` | Build sandbox resources |
+| `DOCKER_RT_BUILD_SANDBOX_KEEP` | `false` | Keep the build sandbox (troubleshooting only) |
+| `DOCKER_RT_REGISTRY_CLUSTER` | empty | Push profile: `us-west-1` / `us-west-2` / `cn-east-1` |
+| `DOCKER_RT_REGISTRY_NAMESPACE` | empty | Registry namespace; required on Docker Hub clusters |
+| `DOCKER_RT_REGISTRY_USERNAME` / `_PASSWORD` | empty | Push credentials |
+| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | `/etc/docker-image/.dockerconfigjson` | Reuse an existing dockerconfigjson |
+| `DOCKER_RT_ACR_ACCESS_KEY_ID` / `_SECRET` / `_INSTANCE_ID` | empty | Used to pre-create ACR repositories in Shanghai |
 | `DOCKER_RT_SERVICE_DNS` | `true` | Create ClusterIP Service for Compose service DNS |
 | `DOCKER_RT_ORPHAN_POLICY` | `adopt` | `adopt` restores managed Pods; `reap` deletes them on startup |
 | `DOCKER_RT_CLEANUP_ON_EXIT` | `false` | Delete managed Pods on SIGINT/SIGTERM when `true` |
@@ -469,7 +477,6 @@ port-forward / NodePort.
 After starting docker-rt, these commands are not supported:
 
 ```text
-docker build
 docker buildx build
 docker compose build
 docker compose up --build
@@ -477,15 +484,63 @@ docker logs
 docker events
 ```
 
-They depend on a real Docker daemon / BuildKit container lifecycle. Build the
-image with normal Docker/BuildKit first and push it to a registry, then use
-`docker run` with that image. `docker logs` is not supported by the
-`k8s-middleware` backend; use `docker exec -it <container> bash` to view logs
-inside the container.
+`docker build` **is** supported (see "Image builds" below): it builds with kaniko
+inside a throwaway sandbox in the cluster and pushes to a registry, so it needs
+neither a local Docker daemon nor any privilege. `buildx build` / `compose build`
+are not wired up yet — use `docker build` or plain Docker for now.
+`docker logs` is not supported by the `k8s-middleware` backend; use
+`docker exec -it <container> bash` to view logs inside the container.
 
 Chain: `Docker CLI -> docker-rt daemon -> KubeEnvironment -> Kubernetes API`.
 The current implementation uses the official Kubernetes Python SDK directly; a
 future adapter can replace that hop with the `k8s_middleware` HTTP API.
+
+### Image builds
+
+How `docker build -t myapp .` works:
+
+```text
+wrapper exports DOCKER_BUILDKIT=0
+  → the classic builder POSTs the context tar to docker-rt's /build
+  → a throwaway CUSTOM sandbox is created from DOCKER_RT_BUILD_IMAGE
+  → the context is uploaded as a single gzipped file
+  → exec kaniko --context=tar://… --destination=… --digest-file=…
+  → read the digest, register the short-tag alias, delete the sandbox
+docker run myapp   → a normal sandbox pulls the image that was just pushed
+```
+
+Four things worth knowing:
+
+1. **The build sandbox must be disposable** and cannot be the container the user
+   already has: kaniko unpacks the `FROM` image's rootfs into **its own container
+   root** ("may overwrite anything already there"), so it can only ever run in a
+   throwaway container.
+2. **The builder image must be kaniko's `-debug` variant** (e.g.
+   `gcr.io/kaniko-project/executor:v1.24.0-debug`): the default executor image is
+   `FROM scratch` — no `sleep`, no shell — while the sandbox template pins
+   `command: ["sleep", "infinity"]`. Also, `gcr.io` is unreachable from some
+   clusters, so mirror it into a registry the cluster can pull and point
+   `DOCKER_RT_BUILD_IMAGE` at the mirror. See
+   `pyromind_sdk/docker_rt/builder-image/kaniko/README.md`.
+3. **The push target differs per cluster**: west pushes to Docker Hub, Shanghai
+   pushes to Aliyun ACR Enterprise Edition and **requires the repository to exist
+   first** (docker-rt creates it before spending a sandbox; missing AccessKey /
+   instance id is a skip-with-warning). Short tags need
+   `DOCKER_RT_BUILD_REGISTRY` (or a cluster profile plus
+   `DOCKER_RT_REGISTRY_NAMESPACE`); when it cannot be resolved the build is
+   **rejected rather than guessed**.
+4. **The legacy-builder deprecation banner is stripped by the wrapper.** Forcing
+   `DOCKER_BUILDKIT=0` (which is what routes the build to `POST /build`) makes the
+   real `docker` CLI print `DEPRECATED: The legacy builder is deprecated …` on
+   stderr. That notice is about docker's own builder — not a docker-rt problem —
+   and docker ships no switch to silence it, so the wrapper pipes the CLI's
+   stderr through a filter that drops exactly that banner. stdout, every other
+   stderr line and the CLI's exit code pass through untouched.
+
+kaniko does not implement BuildKit-only features: `RUN --mount=type=cache/secret/ssh`,
+heredocs, `--cache-to/from`, true multi-platform builds. BuildKit-only flags such
+as `--platform` / `--secret` / `--ssh` are rejected by the wrapper instead of
+being silently ignored.
 
 To run through `k8s_middleware` OpenAPI instead:
 

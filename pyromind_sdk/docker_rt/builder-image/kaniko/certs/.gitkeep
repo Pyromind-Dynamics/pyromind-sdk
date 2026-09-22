@@ -1,0 +1,2 @@
+Drop private/self-signed CA certificates (*.crt) here; they are added to the
+executor's trust store at build time. Empty = only the public CA bundle.

@@ -133,10 +133,18 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 | `DOCKER_RT_INSPECT_MODE` | `sandbox` | `docker inspect` 返回结构：`sandbox` 或 `standard` |
 | `DOCKER_RT_DEFAULT_IMAGE` | SWE-bench 默认镜像 | `docker images` 默认条目 |
 | `DOCKER_RT_PORT_FORWARD_MODE` | `auto` | `-p` 后端：`auto` / `direct` / `api` |
-| `DOCKER_RT_BUILDKIT_ADDR` | 空 | `buildctl` 地址，如 `unix:///run/buildkit/buildkitd.sock` |
-| `DOCKER_RT_BUILD_REGISTRY` | 空 | 短镜像 tag 的推送前缀 |
+| `DOCKER_RT_BUILD_IMAGE` | 空 | **构建的硬前提**：集群能拉的 kaniko executor 镜像（必须 `-debug` 变体） |
+| `DOCKER_RT_BUILD_REGISTRY` | 空 | 短镜像 tag 的推送前缀；留空时按集群 profile 推导 |
 | `DOCKER_RT_BUILD_PUSH` | `true` | build 后是否 push |
-| `DOCKER_RT_BUILD_TIMEOUT` | `3600` | `buildctl` 超时秒数 |
+| `DOCKER_RT_BUILD_EXECUTOR` | `kaniko` | 构建器；目前只实现 kaniko |
+| `DOCKER_RT_BUILD_TIMEOUT` | `3600` | 单次构建（沙箱内命令）超时秒数 |
+| `DOCKER_RT_BUILD_SANDBOX_CPU` / `_MEMORY` | `2` / `4Gi` | 构建沙箱资源 |
+| `DOCKER_RT_BUILD_SANDBOX_KEEP` | `false` | `true` 时不删构建沙箱（仅供排障） |
+| `DOCKER_RT_REGISTRY_CLUSTER` | 空 | 推送 profile：`us-west-1` / `us-west-2` / `cn-east-1` |
+| `DOCKER_RT_REGISTRY_NAMESPACE` | 空 | registry 命名空间；Docker Hub 集群必填 |
+| `DOCKER_RT_REGISTRY_USERNAME` / `_PASSWORD` | 空 | 推送凭据 |
+| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | `/etc/docker-image/.dockerconfigjson` | 复用现成的 dockerconfigjson |
+| `DOCKER_RT_ACR_ACCESS_KEY_ID` / `_SECRET` / `_INSTANCE_ID` | 空 | 上海 ACR 建仓用 |
 | `DOCKER_RT_SERVICE_DNS` | `true` | 创建 ClusterIP Service 支持 Compose 服务名 DNS |
 | `DOCKER_RT_ORPHAN_POLICY` | `adopt` | `adopt` 恢复受管 Pod；`reap` 启动时删除 |
 | `DOCKER_RT_CLEANUP_ON_EXIT` | `false` | `true` 时退出删除受管 Pod |
@@ -450,7 +458,6 @@ PyromindSDK 后端**不支持**本机端口转发，只展示端口映射；需�
 启动 docker-rt 后，以下命令当前不支持：
 
 ```text
-docker build
 docker buildx build
 docker compose build
 docker compose up --build
@@ -458,15 +465,56 @@ docker logs
 docker events
 ```
 
-这些命令依赖真实 Docker daemon / BuildKit 容器生命周期，docker-rt 不提供假实现。
-建议先用正常 Docker/BuildKit 构建镜像并推送到 registry，再通过
-`docker run` 使用该镜像。`docker logs` 在 `k8s-middleware` 后端不支持，
+`docker build` **已支持**（见「镜像构建」）：它在集群里一个一次性 sandbox 内用
+kaniko 构建并推送到 registry，不需要本机 Docker daemon，也不需要任何特权。
+`buildx build` / `compose build` 还没接上，先用 `docker build` 或本机 Docker。
+`docker logs` / `docker events` 在 `k8s-middleware` 后端不支持，
 请使用 `docker exec -it <container> bash` 进入容器查看日志。
 
 链路：`Docker CLI -> docker-rt daemon -> KubeEnvironment -> Kubernetes API`。
 当前实现由 `KubeEnvironment` 直接通过官方 Kubernetes Python SDK 调用集群；
 如果希望 `k8s_middleware` 成为唯一后端，下一阶段需要把这一跳替换成
 `k8s_middleware` HTTP API 适配器。
+
+### 镜像构建
+
+`docker build -t myapp .` 的链路：
+
+```text
+wrapper 注入 DOCKER_BUILDKIT=0
+  → 经典 builder 把 context tar POST 到 docker-rt 的 /build
+  → 用 DOCKER_RT_BUILD_IMAGE 创建一次性 CUSTOM sandbox
+  → context 以单个 gzip 文件写进沙箱
+  → exec kaniko --context=tar://… --destination=… --digest-file=…
+  → 读回 digest，登记短 tag 别名，删除沙箱
+docker run myapp   → 普通 sandbox 拉 registry 里刚推的镜像
+```
+
+必须知道的四件事：
+
+1. **构建沙箱必须是一次性的**，不能复用用户正在用的容器 —— kaniko 会把 `FROM`
+   镜像的 rootfs 解包到**自己容器的 `/`**（官方原话 "may overwrite anything
+   already there"），所以它天生只能跑在丢弃式容器里。
+2. **构建器镜像必须用 kaniko 的 `-debug` 变体**
+   （如 `gcr.io/kaniko-project/executor:v1.24.0-debug`）：默认 executor 镜像是
+   `FROM scratch`，没有 `sleep` 也没有 shell，而 sandbox 模板硬编码了
+   `command: ["sleep", "infinity"]`。另外 `gcr.io` 在部分集群不可达，需要先
+   mirror 到集群能拉的 registry，再通过 `DOCKER_RT_BUILD_IMAGE` 指定。
+   见 `pyromind_sdk/docker_rt/builder-image/kaniko/README.md`。
+3. **推送目标按集群不同**：西区推 Docker Hub，上海推阿里云 ACR 企业版并且
+   **必须先建仓**（docker-rt 会在创建沙箱之前自动建，缺 AccessKey / 实例 ID 时
+   跳过并告警）。短 tag 需要 `DOCKER_RT_BUILD_REGISTRY`（或集群 profile +
+   `DOCKER_RT_REGISTRY_NAMESPACE`），缺失时**拒绝构建而不是猜**。
+4. **经典 builder 的弃用横幅由 wrapper 过滤掉。** 构建要走 `POST /build` 就必须注入
+   `DOCKER_BUILDKIT=0`，而这会让真 docker CLI 往 stderr 打印
+   `DEPRECATED: The legacy builder is deprecated …`。那是 docker 在提示它自己的
+   builder，不是 docker-rt 的问题，而 docker 也没有开关能关掉它，所以 wrapper 把
+   CLI 的 stderr 接过一层过滤器，只丢这两行横幅；stdout、其余 stderr 内容和退出码
+   都原样透传。
+
+kaniko 不支持 BuildKit 专属能力：`RUN --mount=type=cache/secret/ssh`、heredoc、
+`--cache-to/from`、真正的多平台构建。`--platform` / `--secret` / `--ssh` 等
+BuildKit 专属参数会被 wrapper 直接拒绝，而不是静默忽略。
 
 通过 `k8s_middleware` OpenAPI 运行：
 

@@ -9,7 +9,7 @@
 |------|------|
 | `docker version` / `info` / `ps` / `inspect` | 系统与容器列表 |
 | `docker images` / `pull` | pull 为 **stub**（记入 known images，不真拉取） |
-| `docker build` | 本机 **buildctl** 构建并 push 到 registry |
+| `docker build` | 在集群里一个**一次性 sandbox**内用 **kaniko** 构建并 push 到 registry（见下方「镜像构建」） |
 | `docker volume` / `network` | 命名卷 + 网络 stub（够 Compose 用） |
 | `docker run` / `create` / `start` | `run`=创建并启动；`create` 只建本地记录；`start` 才真正创建/启动 Pod |
 | `docker run -p` / `docker port` | kube 后端本机 TCP 转发；PyromindSDK 后端仅显示端口映射 |
@@ -115,7 +115,10 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
   `docker-rt` 启动时会自动检查/安装/更新 `~/.pyromind/bin/docker` wrapper；
   交互式确认时不同意会停止启动。卸载 wrapper 使用 `pyromind-docker-uninstall`。
 
-- Compose / `docker build`：本机 `buildctl` + 可连的 buildkitd；集群可 pull 的 registry；对 namespace 有 Service create/delete 权限
+- `docker build`：一个集群能拉到的 **kaniko executor（`-debug` 变体）** 镜像
+  （`DOCKER_RT_BUILD_IMAGE`），加上集群可 pull 的推送目标（`DOCKER_RT_BUILD_REGISTRY`）
+  和推送凭据。**不需要**本机 Docker daemon、不需要 buildkitd、不需要任何特权。
+  详见 `builder-image/kaniko/README.md`。
 
 ## 安装与启动
 
@@ -262,9 +265,30 @@ docker ps   # 仍能看到 sb1
 | `DOCKER_RT_CLEANUP_CONCURRENCY` | `4` | 同时执行 sandbox pause/delete 清理的最大并发数 |
 | `DOCKER_RT_DEFAULT_IMAGE` | `backend.kube` DEFAULT | `docker images` 默认条目 |
 | `DOCKER_RT_PORT_FORWARD_MODE` | `auto` | `-p` 后端：`auto` / `direct` / `api` |
-| `DOCKER_RT_BUILDKIT_ADDR` | （空） | buildctl 地址，如 `unix:///run/buildkit/buildkitd.sock` |
-| `DOCKER_RT_BUILD_REGISTRY` | （空） | 短 tag 推送前缀，如 `reg.example.com/docker-rt` |
-| `DOCKER_RT_BUILD_PUSH` | `true` | 是否 `push=true` |
+| `DOCKER_RT_BUILD_IMAGE` | （空） | **构建的硬前提**：集群能拉的 kaniko executor 镜像（必须 `-debug` 变体，见 `builder-image/kaniko/`） |
+| `DOCKER_RT_BUILD_REGISTRY` | （空） | 短 tag 推送前缀，如 `reg.example.com/docker-rt`；留空时按集群 profile 推导（见下） |
+| `DOCKER_RT_BUILD_PUSH` | `true` | 是否 push 到 registry（关掉则只在沙箱内留 tar，沙箱删掉就没了） |
+| `DOCKER_RT_BUILD_EXECUTOR` | `kaniko` | 构建器；目前只实现 `kaniko` |
+| `DOCKER_RT_BUILD_SANDBOX_CPU` / `_MEMORY` | `2` / `4Gi` | 构建沙箱资源；kaniko 单线程 + 全量解包，大镜像建议 ≥4CPU/≥8Gi |
+| `DOCKER_RT_BUILD_SANDBOX_READY_TIMEOUT` | `600` | 等构建沙箱 running 的秒数 |
+| `DOCKER_RT_BUILD_TIMEOUT` | `3600` | **整个构建的墙钟预算**，由 daemon 的轮询循环计时（构建是 nohup 分离跑 + 短 exec 轮询，所以单次 exec 的 600s 上限不再限制构建总时长）；超时后 daemon 报错 |
+| `DOCKER_RT_BUILD_POLL_INTERVAL_S` | `2` | 轮询构建状态的间隔秒数（下限 0.1，避免忙等） |
+| `DOCKER_RT_BUILD_LOG` | `collapsed` | 构建日志收敛模式。默认只保留 kaniko 的阶段行（`INFO[0004] …`）+ 每步输出的头几行与末行，中间折叠成一行统计；失败时自动回放原始日志尾部。设 `full` 原样输出全部字节 |
+| `DOCKER_RT_BUILD_CONTEXT_WARN_MB` | `256` | context 超过这个大小就打一条 `.dockerignore` 提示；`0` 关闭 |
+| `DOCKER_RT_BUILD_SANDBOX_KEEP` | `false` | `true` 时不删构建沙箱，**仅供排障**（注意：Running 状态删不掉，要先 `pause`） |
+| `DOCKER_RT_BUILD_CONTEXT_DIR` | `/kaniko/docker-rt-build` | 构建沙箱内的暂存目录。**必须在 `/kaniko` 下**：kaniko 多阶段构建切换 stage 时会删掉容器根文件系统（日志里的 `Deleting filesystem...`），只保留 `/kaniko`（它自己的二进制、`.docker/config.json` 和 `buildcontext`）。放到 `/tmp` 会在第一阶段结束时被删掉，poller 随后误报 "the launcher did not reach the fork" |
+| `DOCKER_RT_BUILD_CACHE` / `_CACHE_REPO` | `false` / （空） | kaniko `--cache=true --cache-repo=<repo>` |
+| `DOCKER_RT_BUILD_REGISTRY_INSECURE` | `false` | 明文 HTTP registry：加 `--insecure --skip-tls-verify --skip-tls-verify-pull` |
+| `DOCKER_RT_KANIKO_EXTRA_FLAGS` | （空） | 追加给 kaniko 的原始参数（shell 分词），如 `--verbosity=debug` |
+| `DOCKER_RT_REGISTRY_CLUSTER` | （空） | 集群标识，用于选推送 profile（`us-west-1` / `us-west-2` / `cn-east-1`）；未设时从 `DOCKER_RT_KUBE_CONTEXT` 猜 |
+| `DOCKER_RT_REGISTRY_NAMESPACE` | （空） | registry 里的命名空间；Docker Hub 集群**必填**，缺失直接拒绝构建 |
+| `DOCKER_RT_REGISTRY_USERNAME` / `_PASSWORD` | （空） | 推送凭据（优先于下面那个） |
+| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | `/etc/docker-image/.dockerconfigjson` | 现成的 dockerconfigjson（base64 或 JSON）——可直接复用平台挂载的 `imagePullSecrets` |
+| `DOCKER_RT_ACR_ACCESS_KEY_ID` / `_SECRET` | （空，回退 `ALIBABA_CLOUD_ACCESS_KEY_ID` / `_SECRET`） | 上海 ACR 建仓用 |
+| `DOCKER_RT_ACR_INSTANCE_ID` | （空） | ACR 企业版实例 ID（`cri-xxxx`），建仓必填 |
+| `DOCKER_RT_ACR_REGION_ID` | `cn-shanghai` | ACR POP endpoint 的 region |
+| `DOCKER_RT_ACR_AUTO_CREATE_REPO` | `true` | `false` 则完全不做建仓 |
+| `DOCKER_RT_ACR_REPO_PUBLIC` | `false` | 新建仓库是否公开。**默认私有即可**：上海集群 sandbox 挂的 `niqi-dev-secret` 含 ACR 凭据，私有仓库能正常拉（详见构建器 README §4） |
 | `DOCKER_RT_SERVICE_DNS` | `true` | 启动时创建 ClusterIP Service（Compose 服务名 DNS） |
 | `DOCKER_RT_SOCKET_WAIT_SECONDS` | `30` | `--daemon` 启动时等待 socket 就绪的超时（秒），启动 reconcile 慢时调大 |
 | `DOCKER_RT_RM_CONCURRENCY` | `20` | `docker rm` 一次删 >5 个时并发删除的 worker 数 |
@@ -346,16 +370,85 @@ docker ps --filter label.type=custom
 docker wrapper 生效后，`docker ps` 表头与标准 Docker 对齐（`CONTAINER ID / IMAGE / COMMAND / CREATED / STATUS / PORTS / NAMES`），列宽自适应终端、长内容按列宽缩略；`CREATED` 按标准 Docker 风格计算（如 `About a minute ago`、`3 days ago`）。
 STATUS 列只显示状态词（running 显示 `Up`、stopped 显示 `Exited`、pending 显示 `Created`、failed 显示 `Dead`，不带时长）；`--filter status=` 仍按内部状态 `running / stopped / pending / failed` 匹配。
 
-不支持：`docker build`、`docker buildx build`、`docker compose build`、
-`docker compose up --build`。请先用正常 Docker/BuildKit 构建并推送 registry。
+`docker build` 已支持（见下方「镜像构建」）。仍然不支持：`docker buildx build`、
+`docker compose build`、`docker compose up --build` —— 这三条还没接上，请先用
+`docker build`，或在本机用正常 Docker 构建好再推 registry。
+
+编译期只支持 kaniko 的语义，以下 BuildKit 专属参数会被 wrapper **直接拒绝**
+（不是静默忽略）：`--platform`、`--secret`、`--ssh`、`--output`、`--cache-to/from`、
+`--mount`、`--load`、`--push`、`--provenance`、`--sbom`、`--attest`、`--allow`。
+
+## 镜像构建
+
+```
+docker build -t myapp .
+  → wrapper 注入 DOCKER_BUILDKIT=0，经典 builder 把 context tar POST 到 /build
+  → 用 DOCKER_RT_BUILD_IMAGE 创建一个一次性 CUSTOM sandbox
+  → 把 gzip 后的 context 作为单个文件写进沙箱
+  → exec ["sh","-c", "<kaniko> --context=tar://… --destination=… --digest-file=…"]
+  → 读回 digest → 登记短名别名 → 删沙箱
+docker run <短名>   → 普通 sandbox，拉 registry 里刚推的镜像
+```
+
+注：`DOCKER_BUILDKIT=0` 会让真 docker CLI 往 stderr 打印 legacy builder 弃用横幅
+（`DEPRECATED: The legacy builder is deprecated … BuildKit is currently disabled …`）。
+那是 docker 在提示它自己的 builder、不是 docker-rt 的问题，且 docker 没有开关能关掉它，
+所以 wrapper 会把 CLI 的 stderr 过一层过滤器，只丢这两行横幅；stdout、其余 stderr 行
+和退出码都原样透传。
+
+**为什么必须是一个专门的沙箱**：kaniko 把 `FROM` 镜像的 rootfs 解包到**自己容器的
+`/`**，官方原话是 "may overwrite anything already there" —— 它只能跑在一次性容器里。
+所以构建沙箱与用户 `docker run` 起的容器是两回事，**不能**复用同一个。
+
+**为什么镜像必须是 `-debug` 变体**：executor 镜像 `FROM scratch`，没有 `sleep`、
+没有 shell；而 CUSTOM 模板硬编码 `command: ["sleep", "infinity"]`。
+详见 `builder-image/kaniko/README.md`。
+
+### 推送到哪里（按集群）
+
+| 集群 | 目标 | 建仓 | 凭据 |
+|---|---|---|---|
+| `us-west-1` / `us-west-2` | Docker Hub `docker.io/<ns>` | 首次 push 自动建仓 | 账号 + PAT |
+| `cn-east-1` | 阿里云 ACR 企业版 `pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind` | **必须先建仓** | registry 密码（push）+ AccessKey 对（建仓）+ 实例 ID，三样不同的东西 |
+| 其它 | 只认 `DOCKER_RT_BUILD_REGISTRY` | —— | —— |
+
+上海集群里镜像的长相（`host/namespace/repo:tag`；namespace 固定 `pyromind`，repo 是单段）：
+
+```
+pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/sweb.eval.x86_64.astropy_1776_astropy-12907
+```
+
+- 解析优先级：`DOCKER_RT_BUILD_REGISTRY`（显式）> 集群 profile（host + `DOCKER_RT_REGISTRY_NAMESPACE`）。
+  命名空间缺失时**拒绝构建而不是猜**，错误信息点名缺哪个变量。
+- 上海建仓在**创建沙箱之前**完成，按镜像引用逐个 `CreateRepository`
+  （仓库名只在镜像引用里，前缀里没有）；`REPO_ALREADY_EXISTS` 视为成功，
+  `NAMESPACE_NOT_EXIST` 会先建命名空间再重试一次；缺 AccessKey / 实例 ID 时
+  跳过并告警（假定仓库已人工建好）。
+- 凭据进沙箱的方式：渲染成 kaniko 读的 `/kaniko/.docker/config.json`
+  （**权限必须 0600，否则 kaniko 拒绝读取**），base64 一个参数送进去，原文不进命令行。
+
+### 构建失败怎么查
+
+1. 「构建器镜像未配置」→ 查 `DOCKER_RT_BUILD_IMAGE` 是否导出、docker-rt 是否重启过。
+2. 「短 tag 没有 registry 前缀」→ 查 `DOCKER_RT_BUILD_REGISTRY` 和 `DOCKER_RT_REGISTRY_NAMESPACE`。
+3. 沙箱**没起来**（`exec: "sleep": executable file not found`）→ 用了非 `-debug` 的
+   executor 镜像，见构建器 README 第 0 节。
+4. 沙箱起来了但 push 被拒（`401` / `unauthorized` / `insufficient_scope`）→
+   凭据没进沙箱或不对（`DOCKER_RT_REGISTRY_USERNAME` / `_PASSWORD`，或那份 dockerconfigjson）；
+   阿里云报 `repository does not exist` / `denied` → 仓库没建起来。
+5. 构建成功但 `docker run 短名` 拉不到 → 查集群侧 `imagePullSecrets`：sandbox 模板统一用
+   `niqi-dev-secret`，**这个 secret 是按命名空间存的**（西区内容 = Docker Hub 凭据，
+   上海内容含 ACR 凭据），所以两边都能拉自己 registry 上的镜像，通常不用改。
+6. 要进沙箱手查：`DOCKER_RT_BUILD_SANDBOX_KEEP=true docker build ...` 保留沙箱后再
+   `docker exec -it <id> sh`（debug 镜像里有 busybox）。
 
 ## Compose（OSM-style）
 
-支持类似 Rails + Postgres 的 compose：`build`、`named volumes`、匿名卷、`tmpfs`、`-p`、`depends_on`（客户端）、服务名 DNS（`db`）。
+支持类似 Rails + Postgres 的 compose：`named volumes`、匿名卷、`tmpfs`、`-p`、`depends_on`（客户端）、服务名 DNS（`db`）。
 
 | 能力 | 行为 |
 |------|------|
-| `build:` | `POST /build` → `buildctl` → push `{DOCKER_RT_BUILD_REGISTRY}/{tag}` |
+| `build:` | **暂不支持**（`docker compose build` / `up --build` 仍被拒绝）；先用 `docker build` |
 | named volume | JuiceFS subPath `{uid}/.docker-rt/volumes/{name}` |
 | 匿名卷 | Pod `emptyDir` |
 | `tmpfs` | `emptyDir` + `medium: Memory` |
@@ -369,11 +462,11 @@ STATUS 列只显示状态词（running 显示 `Up`、stopped 显示 `Exited`、p
 示例环境：
 
 ```bash
-export DOCKER_RT_BUILDKIT_ADDR=unix:///run/buildkit/buildkitd.sock
+export DOCKER_RT_BUILD_IMAGE=reg.example.com/docker-rt/kaniko-executor:v1.24.0-debug
 export DOCKER_RT_BUILD_REGISTRY=reg.example.com/docker-rt
 export DOCKER_RT_JUICEFS_HOST_PREFIXES="/path/to/osm-repo={uid}"
 # compose 目录需在上述 host 前缀下，或改用 /workspace/...
-docker compose up --build
+docker compose up
 ```
 
 ## 测试
