@@ -21,6 +21,8 @@ from typing import Any
 
 import pytest
 
+from ..backend import context_staging
+
 GOOD_DIGEST = "sha256:" + "a" * 64
 
 
@@ -51,6 +53,11 @@ def _clear(monkeypatch: pytest.MonkeyPatch) -> None:
         "DOCKER_RT_ACR_INSTANCE_ID",
     ):
         monkeypatch.delenv(name, raising=False)
+    # Staging is deliberately *not* left unset: the module default is ``auto``,
+    # which resolves storage credentials and opens a connection. The autouse
+    # fixture below pins these tests to the direct-upload path; tests that
+    # describe staging opt back in through ``_install_staging``.
+    monkeypatch.setenv("DOCKER_RT_BUILD_CONTEXT_MODE", "upload")
 
 
 def _set_push_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -63,6 +70,21 @@ def _set_push_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setenv("DOCKER_RT_REGISTRY_USERNAME", "lvniqi")
     monkeypatch.setenv("DOCKER_RT_REGISTRY_PASSWORD", "pat")
+
+
+@pytest.fixture(autouse=True)
+def _direct_upload_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the storage route out of every test unless it opts in.
+
+    Workspace staging is the production default (``auto``) and it resolves
+    credentials, then opens a connection. Pinning the mode keeps the real
+    accessors in play — the staging tests flip it back with
+    :func:`_install_staging`. This is deliberately an environment variable and
+    not a patched accessor, so ``staging_enabled`` / ``staging_required`` are
+    exercised as written. ``_clear()`` has to re-pin it for the same reason: it
+    deletes environment variables from inside test bodies.
+    """
+    monkeypatch.setenv("DOCKER_RT_BUILD_CONTEXT_MODE", "upload")
 
 
 def _hide_builder_image(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -85,6 +107,10 @@ class _FakeBuildSandbox:
     about the outcome can omit ``responses`` and get the conventional pair: a
     successful launch followed by a single poll that reports
     ``done rc=<returncode>`` with ``stdout`` as the build log.
+
+    ``staged_bytes`` inserts the storage-staging round trip in front of that
+    pair: the first exec is the "copy the staged context in" call, which answers
+    with the size its verification step expects.
     """
 
     def __init__(
@@ -95,8 +121,14 @@ class _FakeBuildSandbox:
         raise_on_exec: Exception | None = None,
         raise_on_put: Exception | None = None,
         responses: list[dict[str, Any]] | None = None,
+        staged_bytes: int | None = None,
+        stage_in_error: str = "",
+        raise_on_stage_in: Exception | None = None,
     ) -> None:
         self.sandbox_id = "sb-build-1"
+        self.staged_bytes = staged_bytes
+        self.stage_in_error = stage_in_error
+        self.raise_on_stage_in = raise_on_stage_in
         self.stdout = stdout
         self.returncode = returncode
         self.raise_on_exec = raise_on_exec
@@ -136,6 +168,10 @@ class _FakeBuildSandbox:
         self.calls.append({"script": cmd[2], "timeout": timeout})
         if self.raise_on_exec is not None:
             raise self.raise_on_exec
+        if self.raise_on_stage_in is not None and len(self.calls) == 1:
+            # Only the stage-in call dies (a dropped websocket / the exec
+            # deadline); the build itself must still be able to proceed.
+            raise self.raise_on_stage_in
 
         if self.responses is not None:
             if not self.responses:
@@ -144,6 +180,14 @@ class _FakeBuildSandbox:
                     f"({len(self.calls)} so far)"
                 )
             response = self.responses.pop(0)
+        elif self.staged_bytes is not None and len(self.calls) == 1:
+            # The "copy the staged context in" round trip, which carries the
+            # size its verification step compares against.
+            response = {
+                "stdout": f"{context_staging.SIZE_MARKER}{self.staged_bytes}\n",
+                "returncode": 9 if self.stage_in_error else 0,
+                "stderr": self.stage_in_error,
+            }
         elif len(self.calls) == 1:
             response = {"stderr": "docker-rt-status: launched\n"}
         else:
@@ -203,6 +247,91 @@ def _install_fake(
 
     monkeypatch.setattr(runtime, "start_kube_environment", fake_start)
     return captured
+
+
+class _FakeStager:
+    """Stands in for ``StorageStager``: records calls, never touches the network."""
+
+    def __init__(
+        self,
+        plan: Any,
+        *,
+        upload_error: Exception | None = None,
+        cleanup_ok: bool = True,
+    ) -> None:
+        self.plan = plan
+        self.upload_error = upload_error
+        self.cleanup_ok = cleanup_ok
+        self.payload: bytes | None = None
+        self.cleanup_calls = 0
+
+    def describe(self) -> str:
+        return self.plan.object_key
+
+    def upload(self, payload: bytes) -> None:
+        if self.upload_error is not None:
+            raise self.upload_error
+        self.payload = payload
+
+    def cleanup(self) -> bool:
+        self.cleanup_calls += 1
+        return self.cleanup_ok
+
+    @property
+    def cleaned(self) -> bool:
+        return self.cleanup_calls > 0
+
+    @property
+    def cleaned_ok(self) -> bool:
+        return self.cleanup_calls > 0 and self.cleanup_ok
+
+
+class _StagingRecorder:
+    """The stagers a build created, readable *after* the build has run.
+
+    A value would not do: ``build_in_sandbox`` constructs the stager itself, so
+    the object only exists once the generator has been driven far enough.
+    """
+
+    def __init__(self) -> None:
+        self.created: list[_FakeStager] = []
+
+    def add(self, stager: _FakeStager) -> _FakeStager:
+        self.created.append(stager)
+        return stager
+
+    @property
+    def stager(self) -> _FakeStager:
+        assert len(self.created) == 1, (
+            f"expected exactly one stager, got {len(self.created)}"
+        )
+        return self.created[0]
+
+    @property
+    def count(self) -> int:
+        return len(self.created)
+
+
+def _install_staging(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    mode: str = "auto",
+    upload_error: Exception | None = None,
+    cleanup_ok: bool = True,
+) -> _StagingRecorder:
+    """Turn workspace staging on; records every stager the build creates."""
+    from ..backend import context_staging as cs
+
+    monkeypatch.setenv("DOCKER_RT_BUILD_CONTEXT_MODE", mode)
+    recorder = _StagingRecorder()
+
+    def factory(plan: Any, **_kwargs: Any) -> _FakeStager:
+        return recorder.add(
+            _FakeStager(plan, upload_error=upload_error, cleanup_ok=cleanup_ok)
+        )
+
+    monkeypatch.setattr(cs, "StorageStager", factory)
+    return recorder
 
 
 async def _collect(agen: Any) -> list[dict[str, Any]]:
@@ -1256,3 +1385,370 @@ async def test_heartbeat_propagates_the_underlying_failure() -> None:
     _ = [event async for event in _heartbeat(task, label="x", interval=0.005)]
     with pytest.raises(RuntimeError, match="sandbox never started"):
         await task
+
+
+
+# --------------------------------------------------------------------------
+# workspace-storage context staging
+# --------------------------------------------------------------------------
+
+_STAGED_STDOUT = f"INFO built\ndocker-rt-digest: {GOOD_DIGEST}\n"
+
+
+def _staging_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The usual preconditions for reaching the sandbox at all."""
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
+    _set_push_credentials(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_context_is_staged_through_the_workspace_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No context bytes travel through the exec channel when staging works.
+
+    ``put_archive`` is the slow path this replaces, so "it was never called" is
+    the point of the test, not an implementation detail.
+    """
+    from ..backend import build_sandbox
+
+    _staging_ready(monkeypatch)
+    context = _context_tar()
+    packed = build_sandbox.pack_build_context(context)
+    staging = _install_staging(monkeypatch)
+    sandbox = _FakeBuildSandbox(stdout=_STAGED_STDOUT, staged_bytes=len(packed))
+    captured = _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(tar_bytes=context, tags=["myapp"], namespace="ns")
+    )
+    text = "".join(event.get("stream", "") for event in events)
+    stager = staging.stager
+
+    # What went to storage is the gzipped context, under the planned key.
+    assert stager.payload == packed
+
+    # The sandbox was created with that directory mounted, and writable.
+    assert captured["mounts"] == [context_staging.mount_spec(stager.plan)]
+
+    # The first exec is the stage-in copy — ahead of the launcher, so the mount
+    # only has to survive until the copy has been verified.
+    stage_in = sandbox.calls[0]["script"]
+    assert stager.plan.staged_path in stage_in
+    assert f'if [ "$n" != "{len(packed)}" ]' in stage_in
+    assert f"rm -rf {stager.plan.staged_dir}" in stage_in
+    assert "docker-rt-status" not in stage_in
+    assert sandbox.calls[0]["timeout"] == build_sandbox.STAGE_IN_TIMEOUT_S
+    # ...and nothing later in the build touches the mount again.
+    assert all(stager.plan.mount_path not in c["script"] for c in sandbox.calls[1:])
+
+    assert sandbox.archives == []
+    assert stager.cleaned_ok is True
+    assert any(event.get("docker_rt") for event in events)
+    assert "Build context copied in" in text
+    assert "Uploading the build context" not in text
+
+
+@pytest.mark.asyncio
+async def test_a_refused_mount_falls_back_to_a_direct_upload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The mount is the only cluster-dependent part, so it must not be fatal.
+
+    A subPath the CSI driver refuses (missing directory, a storage layout the
+    mount cannot express) would otherwise turn a working build into a failure
+    over an optimisation.
+    """
+    from ..backend import build_sandbox, runtime
+
+    _staging_ready(monkeypatch)
+    context = _context_tar()
+    staging = _install_staging(monkeypatch)
+    sandbox = _FakeBuildSandbox(stdout=_STAGED_STDOUT)
+    attempts: list[Any] = []
+
+    async def fake_start(**kwargs: Any) -> _FakeBuildSandbox:
+        attempts.append(kwargs.get("mounts"))
+        if kwargs.get("mounts"):
+            raise RuntimeError("subPath .docker-rt-build not found")
+        return sandbox
+
+    monkeypatch.setattr(runtime, "start_kube_environment", fake_start)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(tar_bytes=context, tags=["myapp"], namespace="ns")
+    )
+    text = "".join(event.get("stream", "") for event in events)
+    stager = staging.stager
+
+    assert attempts == [[context_staging.mount_spec(stager.plan)], None]
+    assert "retrying without it" in text
+    # The direct upload carried the context, and staging did not try again.
+    assert len(sandbox.archives) == 1
+    assert sandbox.archives[0][1]
+    # Whatever was already uploaded still has to go.
+    assert stager.cleaned_ok is True
+    assert any(event.get("docker_rt") for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sandbox_kwargs,expected_reason",
+    [
+        # The script's own size gate failed: rc=9 plus its stderr message.
+        (
+            {
+                "staged_bytes": 1,
+                "stage_in_error": "staged context truncated: got 3 bytes, expected 9",
+            },
+            "truncated",
+        ),
+        # The copy call answered with something unparseable — no size marker at
+        # all. Untrusted rather than assumed fine.
+        ({"staged_bytes": None}, "the copy reported no size"),
+        # The copy call itself died: dropped websocket or exec deadline.
+        ({"raise_on_stage_in": RuntimeError("websocket dropped")}, "did not complete"),
+    ],
+)
+async def test_an_unusable_staged_context_falls_back_to_a_direct_upload(
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_kwargs: dict[str, Any],
+    expected_reason: str,
+) -> None:
+    """A short file must be caught here, not hours later by kaniko."""
+    from ..backend import build_sandbox
+
+    _staging_ready(monkeypatch)
+    context = _context_tar()
+    staging = _install_staging(monkeypatch)
+    # ``staged_bytes=None`` means "not the stage-in call", which is exactly what
+    # the "no size marker" case wants: the fake answers with the launcher reply.
+    sandbox = _FakeBuildSandbox(stdout=_STAGED_STDOUT, **sandbox_kwargs)
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(tar_bytes=context, tags=["myapp"], namespace="ns")
+    )
+    text = "".join(event.get("stream", "") for event in events)
+
+    assert "Staged context unusable" in text
+    assert expected_reason in text
+    assert len(sandbox.archives) == 1
+    assert any(event.get("docker_rt") for event in events)
+    assert staging.stager.cleaned_ok is True
+
+
+@pytest.mark.asyncio
+async def test_staged_context_is_cleaned_up_when_the_build_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Six minutes of build must not leave a multi-GB object in the user's quota."""
+    from ..backend import build_sandbox
+
+    _staging_ready(monkeypatch)
+    context = _context_tar()
+    packed = build_sandbox.pack_build_context(context)
+    staging = _install_staging(monkeypatch)
+    sandbox = _FakeBuildSandbox(
+        stdout="error: failed to solve", returncode=1, staged_bytes=len(packed)
+    )
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(tar_bytes=context, tags=["myapp"], namespace="ns")
+    )
+
+    assert [event["error"] for event in events if event.get("error")]
+    assert staging.stager.cleaned_ok is True
+
+
+@pytest.mark.asyncio
+async def test_a_failed_cleanup_is_reported_and_does_not_lose_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Stage-2 cleanup runs in a ``finally``, so it must never raise."""
+    from ..backend import build_sandbox
+
+    _staging_ready(monkeypatch)
+    context = _context_tar()
+    packed = build_sandbox.pack_build_context(context)
+    staging = _install_staging(monkeypatch, cleanup_ok=False)
+    sandbox = _FakeBuildSandbox(stdout=_STAGED_STDOUT, staged_bytes=len(packed))
+    _install_fake(monkeypatch, sandbox)
+
+    with caplog.at_level("WARNING", logger="docker_rt.build_sandbox"):
+        events = await _collect(
+            build_sandbox.build_in_sandbox(
+                tar_bytes=context, tags=["myapp"], namespace="ns"
+            )
+        )
+
+    assert staging.stager.cleaned is True
+    assert any(event.get("docker_rt") for event in events)
+    assert "was left in storage" in caplog.text
+    assert staging.stager.plan.object_dir in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_storage_mode_fails_the_build_instead_of_falling_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``storage`` is the operator saying "the direct upload is unacceptable"."""
+    from ..backend import build_sandbox
+
+    _staging_ready(monkeypatch)
+    staging = _install_staging(
+        monkeypatch, mode="storage", upload_error=RuntimeError("credentials rejected")
+    )
+    sandbox = _FakeBuildSandbox()
+    captured = _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
+    )
+
+    errors = [event for event in events if event.get("error")]
+    assert len(errors) == 1
+    assert errors[0]["error"] == "cannot stage the build context: credentials rejected"
+    assert captured == {}
+    assert sandbox.calls == []
+    assert sandbox.archives == []
+    # Nothing reached storage, so there is nothing to clean up.
+    assert staging.count == 1
+    assert staging.stager.cleaned is False
+
+
+@pytest.mark.asyncio
+async def test_storage_mode_fails_when_the_mount_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``storage`` must not quietly fall back when the mount cannot be created.
+
+    ``auto`` treats a refused mount as an optimisation to give up on (see
+    :func:`test_a_refused_mount_falls_back_to_a_direct_upload`); ``storage`` is
+    the operator ruling that route out, so it has to surface as a failure.
+    """
+    from ..backend import build_sandbox, runtime
+
+    _staging_ready(monkeypatch)
+    staging = _install_staging(monkeypatch, mode="storage")
+    sandbox = _FakeBuildSandbox(stdout=_STAGED_STDOUT)
+    attempts: list[Any] = []
+
+    async def fake_start(**kwargs: Any) -> _FakeBuildSandbox:
+        attempts.append(kwargs.get("mounts"))
+        raise RuntimeError("subPath .docker-rt-build not found")
+
+    monkeypatch.setattr(runtime, "start_kube_environment", fake_start)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
+    )
+
+    errors = [event for event in events if event.get("error")]
+    assert len(errors) == 1
+    assert "cannot mount the staged build context" in errors[0]["error"]
+    # It never retried without the mount, and never queued a direct upload.
+    assert len(attempts) == 1
+    assert sandbox.archives == []
+    # What was already uploaded still has to go.
+    assert staging.stager.cleaned_ok is True
+
+
+@pytest.mark.asyncio
+async def test_storage_mode_fails_when_the_staged_copy_is_unusable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A staged context that did not survive the copy is fatal in ``storage``.
+
+    Quietly uploading it again would hide a broken mount behind a build that
+    happens to work.
+    """
+    from ..backend import build_sandbox
+
+    _staging_ready(monkeypatch)
+    staging = _install_staging(monkeypatch, mode="storage")
+    sandbox = _FakeBuildSandbox(stdout=_STAGED_STDOUT, staged_bytes=1)
+    captured = _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
+    )
+
+    errors = [event for event in events if event.get("error")]
+    assert len(errors) == 1
+    assert "cannot use the staged build context" in errors[0]["error"]
+    # The mount was still requested — that is how the context is meant to arrive.
+    assert captured.get("mounts")
+    assert sandbox.archives == []
+    assert staging.stager.cleaned_ok is True
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_falls_back_when_staging_the_context_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cluster without storage (or without the minio extra) must still build."""
+    from ..backend import build_sandbox
+
+    _staging_ready(monkeypatch)
+    staging = _install_staging(
+        monkeypatch, mode="auto", upload_error=RuntimeError("no such host")
+    )
+    sandbox = _FakeBuildSandbox(stdout=_STAGED_STDOUT)
+    captured = _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
+    )
+    text = "".join(event.get("stream", "") for event in events)
+
+    assert "Workspace staging unavailable" in text
+    assert "no such host" in text
+    assert captured["mounts"] is None
+    assert len(sandbox.archives) == 1
+    assert any(event.get("docker_rt") for event in events)
+    assert staging.stager.payload is None
+    # Nothing was uploaded, so cleanup is a no-op rather than a bogus delete.
+    assert staging.stager.cleaned is False
+
+
+@pytest.mark.asyncio
+async def test_upload_mode_never_creates_a_stager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``upload`` is the escape hatch back to the pre-staging behaviour."""
+    from ..backend import build_sandbox
+
+    _staging_ready(monkeypatch)  # leaves DOCKER_RT_BUILD_CONTEXT_MODE=upload
+    assert context_staging.staging_enabled() is False
+    staging = _install_staging(monkeypatch, mode="upload")
+    sandbox = _FakeBuildSandbox(stdout=_STAGED_STDOUT)
+
+    def _explode(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("upload mode must not construct a stager")
+
+    monkeypatch.setattr(context_staging, "StorageStager", _explode)
+    captured = _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
+    )
+
+    assert captured["mounts"] is None
+    assert len(sandbox.archives) == 1
+    assert any(event.get("docker_rt") for event in events)
+    assert staging.count == 0

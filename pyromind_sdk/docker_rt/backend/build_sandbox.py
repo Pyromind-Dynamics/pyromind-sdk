@@ -12,9 +12,12 @@ also means this module creates one sandbox per build and deletes it in a
 The control flow (see ``docker_rt/README.md`` for the operator-facing view)::
 
     POST /build  (context tar from the Docker CLI)
-      → create CUSTOM sandbox from DOCKER_RT_BUILD_IMAGE
+      → stage context.tar.gz in the user's workspace storage   # :mod:`.context_staging`
+      → create CUSTOM sandbox from DOCKER_RT_BUILD_IMAGE with that
+        workspace directory mounted read-write
       → wait_until_running()
-      → put_archive(context.tar.gz)                   # one file, not N
+      → exec: cp the staged tar into the workdir + verify its size + rm the
+        staged copy                                            # one file, not N
       → exec ["sh", "-c", launch]  → writes build.sh, forks it, returns
       → exec ["sh", "-c", status]  ↺ until done        # short polls, incremental log
       → read digest → register short-name alias → cleanup()
@@ -46,7 +49,7 @@ import tarfile
 import time
 from typing import Any, AsyncIterator, NamedTuple
 
-from . import buildkit, kaniko, registry_push
+from . import buildkit, context_staging, kaniko, registry_push
 from .registry_push import RegistryConfigError
 
 logger = logging.getLogger("docker_rt.build_sandbox")
@@ -95,6 +98,11 @@ SANDBOX_EXEC_CAP = 600
 # server on the way in, not for the build itself.
 START_TIMEOUT_S = 60
 POLL_TIMEOUT_S = 60
+
+# Copying the staged context out of the workspace mount and into kaniko's
+# workdir. It is a local filesystem-to-filesystem copy of a multi-GB file, so it
+# gets the whole per-exec budget rather than the short control-plane timeouts.
+STAGE_IN_TIMEOUT_S = SANDBOX_EXEC_CAP
 
 # Consecutive failed polls before the build is declared dead. A detached worker
 # survives a broken poll, so one failure is worth retrying; a run of them means
@@ -690,6 +698,41 @@ async def build_in_sandbox(
         f"in {time.monotonic() - pack_started:.1f}s"
     )
 
+    # Staging: hand the context to the sandbox through the user's workspace
+    # storage (parallel multipart, local read in the cluster) instead of pushing
+    # it down the exec channel (one websocket per 2 MiB part). See
+    # :mod:`context_staging`. ``stager`` outlives ``staging``: even when the
+    # mount turns out unusable, whatever we uploaded still has to be removed.
+    staging: context_staging.StagingPlan | None = None
+    stager: context_staging.StorageStager | None = None
+    if context_staging.staging_enabled():
+        stager = context_staging.StorageStager(
+            context_staging.plan_staging(archive=kaniko.context_archive_name())
+        )
+        upload_started = time.monotonic()
+        try:
+            yield stage(f"Staging the build context at {stager.describe()}…")
+            upload_task = asyncio.ensure_future(
+                asyncio.to_thread(stager.upload, packed)
+            )
+            async for event in _heartbeat(
+                upload_task, label="the build context to upload"
+            ):
+                yield event
+            await upload_task
+        except Exception as exc:
+            if context_staging.staging_required():
+                yield buildkit.error_event(f"cannot stage the build context: {exc}")
+                return
+            logger.warning("context staging unavailable: %s", exc)
+            yield stage(f"Workspace staging unavailable ({exc}); uploading directly")
+            stager = None
+        else:
+            staging = stager.plan
+            yield stage(
+                f"Build context staged in {time.monotonic() - upload_started:.1f}s"
+            )
+
     sandbox = None
     digest = ""
     try:
@@ -697,8 +740,11 @@ async def build_in_sandbox(
             f"Creating the build sandbox ({builder_image()}, "
             f"{sandbox_memory_limit()} / {sandbox_cpu_limit()} cpu)…"
         )
-        try:
-            sandbox = await start_kube_environment(
+
+        async def _create_sandbox_with(
+            mounts: list[dict[str, Any]] | None,
+        ) -> Any:
+            return await start_kube_environment(
                 image=builder_image(),
                 namespace=namespace,
                 env={},
@@ -707,12 +753,40 @@ async def build_in_sandbox(
                 memory_limit=sandbox_memory_limit(),
                 cpu_limit=sandbox_cpu_limit(),
                 sandbox_client=sandbox_client,
+                mounts=mounts,
+            )
+
+        try:
+            sandbox = await _create_sandbox_with(
+                [context_staging.mount_spec(staging)] if staging is not None else None
             )
         except Exception as exc:
-            yield buildkit.error_event(
-                f"cannot create build sandbox ({builder_image()}): {exc}"
-            )
-            return
+            if staging is None:
+                yield buildkit.error_event(
+                    f"cannot create build sandbox ({builder_image()}): {exc}"
+                )
+                return
+            if context_staging.staging_required():
+                # ``storage`` mode is the operator ruling the direct upload out;
+                # a mount that cannot be created is a staging failure, not an
+                # invitation to fall back to the route they rejected.
+                yield buildkit.error_event(
+                    f"cannot mount the staged build context ({exc})"
+                )
+                return
+            # The mount is the one part of this that depends on the cluster's
+            # storage layout; the direct upload is known to work, so give the
+            # build a second chance rather than failing on the optimisation.
+            logger.warning("build sandbox with a staged-context mount failed: %s", exc)
+            yield stage(f"Cannot mount the staged context ({exc}); retrying without it")
+            staging = None
+            try:
+                sandbox = await _create_sandbox_with(None)
+            except Exception as exc2:
+                yield buildkit.error_event(
+                    f"cannot create build sandbox ({builder_image()}): {exc2}"
+                )
+                return
         yield stage(
             f"Build sandbox {getattr(sandbox, 'sandbox_id', '?')} created; "
             "waiting for it to run…"
@@ -733,27 +807,86 @@ async def build_in_sandbox(
             f"Build sandbox ready after {time.monotonic() - ready_started:.1f}s"
         )
 
-        upload_started = time.monotonic()
-        try:
-            context_tar = _single_file_tar(kaniko.context_archive_name(), packed)
+        if staging is not None:
+            copy_started = time.monotonic()
+            yield stage(f"Copying the staged context into {kaniko.build_workdir()}…")
+            copy_task = asyncio.ensure_future(
+                _run_exec(
+                    sandbox,
+                    context_staging.stage_in_script(
+                        staging,
+                        workdir=kaniko.build_workdir(),
+                        expected_size=len(packed),
+                    ),
+                    timeout=STAGE_IN_TIMEOUT_S,
+                )
+            )
+            copied: _ExecResult | None = None
+            try:
+                async for event in _heartbeat(
+                    copy_task, label="the staged context to be copied"
+                ):
+                    yield event
+                copied = await copy_task
+            except Exception as exc:
+                logger.warning("staged context copy failed: %s", exc)
+            staged_bytes = (
+                context_staging.parse_staged_size(copied.stdout) if copied else None
+            )
+            # The size check is deliberate: a mount that is not actually writable
+            # or not actually the workspace produces a short file, and a
+            # truncated context.tar.gz would only surface much later as an
+            # unrelated kaniko error.
+            if copied is None:
+                reason = "the copy did not complete"
+            elif copied.returncode != 0:
+                reason = copied.stderr.strip() or f"exit code {copied.returncode}"
+            elif staged_bytes is None:
+                reason = "the copy reported no size"
+            elif staged_bytes != len(packed):
+                reason = f"size mismatch ({staged_bytes} of {len(packed)} bytes)"
+            else:
+                reason = ""
+            if reason:
+                if context_staging.staging_required():
+                    # Same reasoning as the refused mount above: in ``storage``
+                    # mode a staged context that did not survive the copy is a
+                    # failure, and quietly uploading it again would hide a
+                    # broken mount behind a build that happens to work.
+                    yield buildkit.error_event(
+                        f"cannot use the staged build context ({reason})"
+                    )
+                    return
+                logger.warning("staged context unusable (%s)", reason)
+                yield stage(f"Staged context unusable ({reason}); uploading directly")
+                staging = None
+            else:
+                yield stage(
+                    f"Build context copied in {time.monotonic() - copy_started:.1f}s"
+                )
+
+        if staging is None:
+            upload_started = time.monotonic()
+            try:
+                context_tar = _single_file_tar(kaniko.context_archive_name(), packed)
+                yield stage(
+                    f"Uploading the build context ({human_size(len(context_tar))}) "
+                    f"into {kaniko.build_workdir()}…"
+                )
+                upload_task = asyncio.ensure_future(
+                    sandbox.put_archive(kaniko.build_workdir(), context_tar)
+                )
+                async for event in _heartbeat(
+                    upload_task, label="the build context to upload"
+                ):
+                    yield event
+                await upload_task
+            except Exception as exc:
+                yield buildkit.error_event(f"cannot upload build context: {exc}")
+                return
             yield stage(
-                f"Uploading the build context ({human_size(len(context_tar))}) "
-                f"into {kaniko.build_workdir()}…"
+                f"Build context uploaded after {time.monotonic() - upload_started:.1f}s"
             )
-            upload_task = asyncio.ensure_future(
-                sandbox.put_archive(kaniko.build_workdir(), context_tar)
-            )
-            async for event in _heartbeat(
-                upload_task, label="the build context to upload"
-            ):
-                yield event
-            await upload_task
-        except Exception as exc:
-            yield buildkit.error_event(f"cannot upload build context: {exc}")
-            return
-        yield stage(
-            f"Build context uploaded after {time.monotonic() - upload_started:.1f}s"
-        )
 
         # Two phases: launch, then poll. Neither call covers the build, which is
         # what frees us from the 600 s ceiling on a single exec — and means a
@@ -913,6 +1046,19 @@ async def build_in_sandbox(
         yield {"stream": "Successfully built\n"}
         yield {"docker_rt": {"aliases": aliases, "digest": digest}}
     finally:
+        # Stage-2 cleanup. The sandbox already deleted its own staged directory
+        # right after the copy; this is for the paths where it never got that
+        # far (upload ok, sandbox never ready / mount refused / build aborted) —
+        # otherwise a multi-GB object would sit in the user's quota for good.
+        # Runs before the sandbox teardown so a hanging delete cannot leave it.
+        if stager is not None:
+            removed = await asyncio.to_thread(stager.cleanup)
+            if not removed:
+                logger.warning(
+                    "staged build context %s was left in storage; it will need "
+                    "cleaning up by hand",
+                    stager.plan.object_dir,
+                )
         if sandbox is not None:
             if keep_sandbox():
                 logger.warning(
