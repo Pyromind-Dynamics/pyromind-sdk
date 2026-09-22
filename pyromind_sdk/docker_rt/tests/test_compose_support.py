@@ -38,24 +38,37 @@ def test_normalize_image_ref_qualified() -> None:
     assert short == pullable == "docker.io/library/alpine:3.19"
 
 
-def test_buildctl_command_shape() -> None:
-    from pathlib import Path
+def test_normalize_image_ref_short_with_numeric_tag_gets_prefixed() -> None:
+    """A numeric tag is a tag, not a ``host:port``.
 
-    from ..backend.buildkit import buildctl_command
+    Regression: ``looks_fully_qualified("proj_web:1")`` used to return ``True``
+    because ``"1".isdigit()``, so the registry prefix was skipped and the push
+    went to ``index.docker.io/library/proj_web``.
+    """
+    from ..backend.buildkit import looks_fully_qualified, normalize_image_ref
 
-    cmd = buildctl_command(
-        context_dir=Path("/tmp/ctx"),
-        dockerfile="Dockerfile",
-        image_ref="reg.example.com/rt/proj_web:latest",
-        buildargs={"FOO": "bar"},
-        addr="unix:///run/buildkit/buildkitd.sock",
-        push=True,
-    )
-    assert cmd[0] == "buildctl"
-    assert "--addr" in cmd
-    assert "filename=Dockerfile" in " ".join(cmd)
-    assert "build-arg:FOO=bar" in " ".join(cmd)
-    assert "push=true" in " ".join(cmd)
+    assert looks_fully_qualified("proj_web:1") is False
+    assert looks_fully_qualified("proj_web:latest") is False
+
+    short, pullable = normalize_image_ref("proj_web:1", registry="reg.example.com/rt")
+    assert short == "proj_web:1"
+    assert pullable == "reg.example.com/rt/proj_web:1"
+
+
+def test_looks_fully_qualified_needs_a_path_separator() -> None:
+    from ..backend.buildkit import looks_fully_qualified
+
+    # No ``/`` => the single segment is the repository name, not a host.
+    assert looks_fully_qualified("myapp:5000") is False
+    assert looks_fully_qualified("myapp") is False
+    assert looks_fully_qualified("alpine@sha256:abc") is False
+    # With a ``/`` the first segment may name a host.
+    assert looks_fully_qualified("localhost:5000/app") is True
+    assert looks_fully_qualified("localhost/app") is True
+    assert looks_fully_qualified("registry.example.com/app") is True
+    assert looks_fully_qualified("myregistry:5000/app") is True
+    # A plain ``owner/name`` on Docker Hub is not a host.
+    assert looks_fully_qualified("library/ubuntu") is False
 
 
 def test_volume_store_crud() -> None:
@@ -233,22 +246,22 @@ async def test_volumes_networks_api(aiohttp_client: Any) -> None:
 
 @pytest.mark.asyncio
 async def test_build_registers_alias(aiohttp_client: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("DOCKER_RT_BUILDKIT_ADDR", "unix:///run/buildkit/buildkitd.sock")
     monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
 
-    def fake_build_from_tar(*_a: Any, **_k: Any):
+    async def fake_build_in_sandbox(**_kwargs: Any):
         yield {"stream": "Building…\n"}
         yield {
             "docker_rt": {
                 "aliases": {
                     "proj_web:latest": "reg.example.com/rt/proj_web:latest",
-                }
+                },
+                "digest": "sha256:" + "b" * 64,
             }
         }
 
-    from ..backend import buildkit as bk
+    from ..backend import build_sandbox
 
-    monkeypatch.setattr(bk, "build_from_tar", fake_build_from_tar)
+    monkeypatch.setattr(build_sandbox, "build_in_sandbox", fake_build_in_sandbox)
 
     from ..aio_server import create_aio_app
 
