@@ -140,6 +140,12 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 | `DOCKER_RT_BUILD_TIMEOUT` | `3600` | 单次构建（沙箱内命令）超时秒数 |
 | `DOCKER_RT_BUILD_SANDBOX_CPU` / `_MEMORY` | `2` / `4Gi` | 构建沙箱资源 |
 | `DOCKER_RT_BUILD_SANDBOX_KEEP` | `false` | `true` 时不删构建沙箱（仅供排障） |
+| `DOCKER_RT_BUILD_CONTEXT_MODE` | `auto` | context 进沙箱的路由：`auto`（先走 storage 挂载，失败自动回退直传）/ `storage`（只走 storage，失败即构建失败）/ `upload`（完全不碰 storage，回到旧的 HTTP 直传）。**默认走 storage**：直传是「每 2 MiB 一个 exec websocket」串行推，实测 61 MiB 要 631 s（≈110 KB/s），多 GB 的 ML context 基本不可用；storage 把 tar.gz 用并发分片传进用户工作区对象存储，集群侧再从挂载**本地读**（60 MiB：~59 s 上传 + 2.7 s 集群内拷贝）。详见 `pyromind_sdk/docker_rt/README.md` 的「context 怎么送进沙箱」 |
+| `DOCKER_RT_BUILD_STAGING_MOUNT` | `/kaniko/docker-rt-stage` | storage 路由的挂载目标（Pod 内路径）。**必须在 `/kaniko` 下**，理由同暂存目录：多阶段切 stage 时 kaniko 会删掉 `/` 只留 `/kaniko` |
+| `DOCKER_RT_BUILD_STAGING_PREFIX` | `.docker-rt-build` | 工作区里存放 staged context 的目录（工作区相对路径）；每次构建一个唯一 `<build-id>/` 子目录，构建结束（含失败）清掉 |
+| `DOCKER_RT_BUILD_STAGING_WORKSPACE` | `/workspace` | 挂载源根（平台视角的工作区 = JuiceFS subPath `<uid>`）。已实测：object key `<rel>` == Pod 内 `/workspace/<rel>` |
+| `DOCKER_RT_BUILD_STAGING_PARALLEL` | `8` | 并发分片上传连接数（越界夹到 1–32）。**实测膝盖在 8**：60 MiB 不可压缩 context 下 4 连接 2.3 MiB/s、8 连接 5.9 MiB/s、16 连接 6.4 MiB/s |
+| `DOCKER_RT_STORAGE_CLUSTER` / `DOCKER_RT_CLUSTER` / `PYROMIND_CLUSTER` | 空 | storage profile 查找用的集群键，按序取第一个非空值；都为空时用当前 profile |
 | `DOCKER_RT_REGISTRY_CLUSTER` | 空 | 推送 profile：`us-west-1` / `us-west-2` / `cn-east-1` |
 | `DOCKER_RT_REGISTRY_NAMESPACE` | 空 | registry 命名空间；Docker Hub 集群必填 |
 | `DOCKER_RT_REGISTRY_USERNAME` / `_PASSWORD` | 空 | 推送凭据 |
@@ -484,7 +490,11 @@ kaniko 构建并推送到 registry，不需要本机 Docker daemon，也不需�
 wrapper 注入 DOCKER_BUILDKIT=0
   → 经典 builder 把 context tar POST 到 docker-rt 的 /build
   → 用 DOCKER_RT_BUILD_IMAGE 创建一次性 CUSTOM sandbox
-  → context 以单个 gzip 文件写进沙箱
+  → context 进沙箱（两选一，默认 storage）：
+       storage：tar.gz 并发上传进工作区对象存储
+         → 带可写挂载建 sandbox（/workspace/.docker-rt-build → /kaniko/docker-rt-stage）
+         → 拷出 + 校验字节数 + 删掉挂载目录；构建后再由 daemon 清一遍 storage
+       upload：context 以单个 gzip 文件直传进沙箱
   → exec kaniko --context=tar://… --destination=… --digest-file=…
   → 读回 digest，登记短 tag 别名，删除沙箱
 docker run myapp   → 普通 sandbox 拉 registry 里刚推的镜像

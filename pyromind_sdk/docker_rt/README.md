@@ -277,6 +277,12 @@ docker ps   # 仍能看到 sb1
 | `DOCKER_RT_BUILD_CONTEXT_WARN_MB` | `256` | context 超过这个大小就打一条 `.dockerignore` 提示；`0` 关闭 |
 | `DOCKER_RT_BUILD_SANDBOX_KEEP` | `false` | `true` 时不删构建沙箱，**仅供排障**（注意：Running 状态删不掉，要先 `pause`） |
 | `DOCKER_RT_BUILD_CONTEXT_DIR` | `/kaniko/docker-rt-build` | 构建沙箱内的暂存目录。**必须在 `/kaniko` 下**：kaniko 多阶段构建切换 stage 时会删掉容器根文件系统（日志里的 `Deleting filesystem...`），只保留 `/kaniko`（它自己的二进制、`.docker/config.json` 和 `buildcontext`）。放到 `/tmp` 会在第一阶段结束时被删掉，poller 随后误报 "the launcher did not reach the fork" |
+| `DOCKER_RT_BUILD_CONTEXT_MODE` | `auto` | context 进沙箱的路由：`auto`（先走 storage 挂载，失败自动回退直传）/ `storage`（只走 storage，失败即构建失败，不静默降级）/ `upload`（完全不碰 storage，回到旧的 HTTP 直传）。**默认走 storage**：直传是「每 2 MiB 一个 exec websocket」串行推，实测 61 MiB 要 631 s（≈110 KB/s），多 GB 的 ML context 基本不可用；storage 走工作区对象存储的并发分片上传 + 集群侧本地读挂载，同样 60 MiB 只要 ~59 s 上传 + 集群内 2.7 s 拷贝。详见下方「context 怎么送进沙箱」 |
+| `DOCKER_RT_BUILD_STAGING_MOUNT` | `/kaniko/docker-rt-stage` | storage 路由的挂载目标（Pod 内路径）。**必须在 `/kaniko` 下**，理由同 `DOCKER_RT_BUILD_CONTEXT_DIR`（多阶段切 stage 会删掉 `/` 只留 `/kaniko`）；挂到别处会在 mid-build 被抹掉 |
+| `DOCKER_RT_BUILD_STAGING_PREFIX` | `.docker-rt-build` | 工作区里存放 staged context 的目录（工作区相对路径）。每次构建在其中用一个唯一 `<build-id>/` 子目录，构建结束（含失败）两段式清掉 |
+| `DOCKER_RT_BUILD_STAGING_WORKSPACE` | `/workspace` | 挂载源根（平台视角的工作区 = JuiceFS subPath `<uid>`）。已实测：object key `<rel>` == Pod 内 `/workspace/<rel>`；API 只接受绝对路径，`/` 会被拒（"path cannot be empty"） |
+| `DOCKER_RT_BUILD_STAGING_PARALLEL` | `8` | 并发分片上传的连接数（越界自动夹到 1–32）。**实测膝盖在 8**：60 MiB 不可压缩 context 下 4 连接 2.3 MiB/s、8 连接 5.9 MiB/s、16 连接 6.4 MiB/s；再往上只多占分片缓冲，带宽收益趋平 |
+| `DOCKER_RT_STORAGE_CLUSTER` / `DOCKER_RT_CLUSTER` / `PYROMIND_CLUSTER` | （空） | storage profile 查找用的集群键，按此顺序取第一个非空值；都为空时用当前 profile。storage 路由需要对象存储的 AK/SK/endpoint（来自 `ProfileClient.get_storage_info()`） |
 | `DOCKER_RT_BUILD_CACHE` / `_CACHE_REPO` | `false` / （空） | kaniko `--cache=true --cache-repo=<repo>` |
 | `DOCKER_RT_BUILD_REGISTRY_INSECURE` | `false` | 明文 HTTP registry：加 `--insecure --skip-tls-verify --skip-tls-verify-pull` |
 | `DOCKER_RT_KANIKO_EXTRA_FLAGS` | （空） | 追加给 kaniko 的原始参数（shell 分词），如 `--verbosity=debug` |
@@ -384,9 +390,13 @@ STATUS 列只显示状态词（running 显示 `Up`、stopped 显示 `Exited`、p
 docker build -t myapp .
   → wrapper 注入 DOCKER_BUILDKIT=0，经典 builder 把 context tar POST 到 /build
   → 用 DOCKER_RT_BUILD_IMAGE 创建一个一次性 CUSTOM sandbox
-  → 把 gzip 后的 context 作为单个文件写进沙箱
+  → context 进沙箱（两条路由，见下「context 怎么送进沙箱」）：
+       storage（默认）：tar.gz 并发上传进用户工作区对象存储
+         → 带一个可写挂载建 sandbox（/workspace/.docker-rt-build → /kaniko/docker-rt-stage）
+         → exec 把 context 拷到 kaniko 工作目录 + 校验字节数 + 删掉挂载里的整个目录
+       upload（回退）：把 gzip 后的 context 作为单个文件直传进沙箱
   → exec ["sh","-c", "<kaniko> --context=tar://… --destination=… --digest-file=…"]
-  → 读回 digest → 登记短名别名 → 删沙箱
+  → 读回 digest → 登记短名别名 → 删沙箱 →（storage 路由）清掉 storage 里的残留
 docker run <短名>   → 普通 sandbox，拉 registry 里刚推的镜像
 ```
 
@@ -403,6 +413,53 @@ docker run <短名>   → 普通 sandbox，拉 registry 里刚推的镜像
 **为什么镜像必须是 `-debug` 变体**：executor 镜像 `FROM scratch`，没有 `sleep`、
 没有 shell；而 CUSTOM 模板硬编码 `command: ["sleep", "infinity"]`。
 详见 `builder-image/kaniko/README.md`。
+
+### context 怎么送进沙箱
+
+context 要从**用户本机**（`docker build` 跑的地方）送进一个集群里的一次性沙箱。
+旧做法是 `put_archive`：把 tar 通过沙箱的 HTTP 文件 API 推过去，而 k8s-middleware
+把它拆成「每 2 MiB 一个 exec websocket」**串行**推——实测 61 MiB 的 context 用了
+**631 s**（≈110 KB/s）。gzip 已经在跑了，所以瓶颈是传输带宽不是往返次数，多 GB 的
+ML context（正常情况）基本不可用。
+
+平台还有第二条路，而且带宽本来就付过钱了：**用户自己的工作区对象存储**——它是一个
+S3 兼容网关，落在 JuiceFS PVC 挂的同一份文件系统上。从本机做**并发分片上传**，集群
+侧再从挂载**本地读**这个文件，而不是通过 exec 通道收。
+
+已实测确认的映射关系（在真实集群上探过）：
+
+```
+bucket 根                == JuiceFS subPath "<uid>"   即 /workspace
+object key "<rel>"       == Pod 里的 /workspace/<rel>
+VolumeMount("/workspace/<rel>")  ->  subPath "<uid>/<rel>"   （中间件归一化）
+```
+
+`host_path` 必须是绝对路径（API 拒绝相对路径），且 `"/"` 也被拒（"path cannot be
+empty"），所以 `/workspace` 是最外层的可挂载根。挂载是**可写**的（实测能 `touch`）。
+
+每次构建的目录布局：
+
+```
+<workspace>/<prefix>/<build-id>/context.tar.gz      # 上传目标
+  → 挂载成 /kaniko/docker-rt-stage/<build-id>/context.tar.gz
+  → cp 到 kaniko 自己的工作目录（DOCKER_RT_BUILD_CONTEXT_DIR）并校验字节数
+```
+
+挂载目标刻意放在 `/kaniko` 下，理由和 `DOCKER_RT_BUILD_CONTEXT_DIR` 一样：多阶段
+构建切 stage 时 kaniko 会 `Deleting filesystem...`，只留 `/kaniko`。挂在别处会被
+mid-build 抹掉——而如果挂的是 `/workspace`，那意味着把用户的文件删了。
+
+**两段式清理**（两种失败模式不一样，所以分成两段）：
+
+1. **数据**（可能好几 GB，且占用户配额）由沙箱自己在拷贝+校验字节数通过后立刻
+   `rm -rf` 掉；
+2. **目录**由 daemon 在 `finally` 里删——覆盖「上传成功但沙箱一直没 ready」这种
+   沙箱压根没走到第 1 步的情况，否则对象会永远留在那里。第二段是幂等的，从不抛异常。
+
+**回退**：`DOCKER_RT_BUILD_CONTEXT_MODE=auto`（默认）下，以下任一情况都会**自动退回**
+`put_archive` 直传，构建照常进行——storage 凭据缺失 / 上传失败、挂载被拒（API 报错）、
+沙箱内拷贝失败或校验字节数对不上。设 `storage` 则上述情况**直接失败**（不静默降级）；
+设 `upload` 则完全不碰 storage。
 
 ### 推送到哪里（按集群）
 
