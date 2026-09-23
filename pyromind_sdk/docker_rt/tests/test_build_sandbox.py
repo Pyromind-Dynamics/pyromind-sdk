@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from ..backend import context_staging
+from ..backend import build_sandbox, context_staging
 
 GOOD_DIGEST = "sha256:" + "a" * 64
 
@@ -43,6 +43,7 @@ def _clear(monkeypatch: pytest.MonkeyPatch) -> None:
         "DOCKER_RT_BUILD_SANDBOX_CPU",
         "DOCKER_RT_BUILD_SANDBOX_MEMORY",
         "DOCKER_RT_BUILD_SANDBOX_KEEP",
+        "DOCKER_RT_BUILD_SANDBOX_SWEEP",
         "DOCKER_RT_BUILD_TIMEOUT",
         "DOCKER_RT_BUILD_POLL_INTERVAL_S",
         "DOCKER_RT_BUILD_CONTEXT_WARN_MB",
@@ -1752,3 +1753,315 @@ async def test_upload_mode_never_creates_a_stager(
     assert len(sandbox.archives) == 1
     assert any(event.get("docker_rt") for event in events)
     assert staging.count == 0
+
+
+# --------------------------------------------------------------------------
+# build-sandbox identity, and sweeping what a `kill -9` leaves running
+# --------------------------------------------------------------------------
+
+
+class _FakeSandboxListing:
+    """A stand-in for ``AsyncSandboxClient`` covering only what the sweep uses."""
+
+    def __init__(
+        self,
+        sandboxes: list[Any] | None = None,
+        *,
+        list_error: Exception | None = None,
+        delete_error: Exception | None = None,
+    ) -> None:
+        self.sandboxes = list(sandboxes or [])
+        self.list_error = list_error
+        self.delete_error = delete_error
+        self.deleted: list[str] = []
+        self.closed = False
+
+    async def list(self) -> list[Any]:
+        if self.list_error is not None:
+            raise self.list_error
+        return list(self.sandboxes)
+
+    async def delete(self, sandbox_id: str, **_kwargs: Any) -> None:
+        if self.delete_error is not None:
+            raise self.delete_error
+        self.deleted.append(sandbox_id)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _sandbox(name: str) -> SimpleNamespace:
+    return SimpleNamespace(id=f"sb-{name}", name=name)
+
+
+def _build_name(suffix: str = "a1b2c3") -> str:
+    """A build-sandbox name shaped the way this module mints them."""
+    return f"{build_sandbox.BUILD_SANDBOX_NAME_STEM}{suffix}"
+
+
+def test_build_sandbox_names_are_unique_and_carry_the_prefix() -> None:
+    """The name is the only handle the post-crash cleanup has on a sandbox."""
+    name = build_sandbox.new_build_sandbox_name()
+    assert name != build_sandbox.new_build_sandbox_name()
+    assert build_sandbox.is_build_sandbox_name(name)
+
+
+def test_build_sandbox_names_are_dns_safe() -> None:
+    """It becomes a Pod name, so it has to survive the DNS-1123 rules."""
+    name = build_sandbox.new_build_sandbox_name()
+    assert re.fullmatch(r"[a-z0-9-]+", name)
+    assert len(name) <= 63
+
+
+def test_the_ownership_rule_is_the_prefix_and_nothing_else() -> None:
+    """What a sweep may delete is decided here, so both edges are pinned.
+
+    The user's own sandboxes are the case that matters: the platform labels a
+    nameless one ``SANDBOX-<uuid>``, and it must never look deletable.
+    """
+    ours = [
+        _build_name(),
+        _build_name("012345"),
+        _build_name("ABCdef"),
+        # Names minted by the previous scheme still carry the prefix — which is
+        # what lets this sweep reach leftovers from before it changed.
+        _build_name("old-4242-host-a1b2c3"),
+    ]
+    not_ours = [
+        "",
+        None,
+        "my-web-sandbox",
+        "SANDBOX-2f1a9c",
+        # The bare prefix, and a longer word that merely starts the same way.
+        build_sandbox.BUILD_SANDBOX_NAME_PREFIX,
+        f"{build_sandbox.BUILD_SANDBOX_NAME_PREFIX}x-a1b2c3",
+        f"other-{_build_name()}",
+    ]
+    for name in ours:
+        assert build_sandbox.is_build_sandbox_name(name) is True, name
+    for name in not_ours:
+        assert build_sandbox.is_build_sandbox_name(name) is False, name
+
+
+def test_the_ownership_rule_ignores_surrounding_whitespace() -> None:
+    """A padded name is still ours; the platform gives back what it stored."""
+    assert build_sandbox.is_build_sandbox_name(f"  {_build_name()}  ") is True
+
+
+@pytest.mark.asyncio
+async def test_build_in_sandbox_names_the_sandbox_it_creates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unnamed sandbox is never swept, so the create has to name it."""
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
+    _set_push_credentials(monkeypatch)
+    sandbox = _FakeBuildSandbox(stdout=f"docker-rt-digest: {GOOD_DIGEST}\n")
+    captured = _install_fake(monkeypatch, sandbox)
+
+    await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
+    )
+
+    assert build_sandbox.is_build_sandbox_name(captured["container_name"])
+    assert captured["container_name"] != build_sandbox.BUILD_SANDBOX_NAME_PREFIX
+
+
+
+@pytest.mark.asyncio
+async def test_sweep_deletes_every_build_sandbox_and_nothing_else(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prefix is the entire rule — which is exactly why it is pinned here."""
+    _clear(monkeypatch)
+    first = _build_name("a1b2c3")
+    second = _build_name("d4e5f6")
+    client = _FakeSandboxListing(
+        [
+            _sandbox(first),
+            _sandbox("my-web-sandbox"),
+            _sandbox("SANDBOX-2f1a9c"),
+            _sandbox(second),
+            SimpleNamespace(id="sb-9", name=None),
+        ]
+    )
+
+    removed = await build_sandbox.sweep_stale_build_sandboxes(client=client)
+
+    assert removed == [first, second]
+    assert client.deleted == [f"sb-{first}", f"sb-{second}"]
+
+
+@pytest.mark.asyncio
+async def test_sweep_deletes_a_sandbox_a_live_build_owns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cost of a prefix rule, stated on purpose rather than discovered later.
+
+    ``list()`` is scoped to the account, not to this machine, so the sweep
+    cannot tell a leaked sandbox from one a *live* build — here or on another
+    machine — is using. It deletes both. A build that loses its sandbox fails
+    visibly and can be re-run, whereas a leaked one burns quota for ever, and
+    that is the trade this rule is making.
+    """
+    _clear(monkeypatch)
+    name = _build_name()
+    client = _FakeSandboxListing([_sandbox(name)])
+
+    assert await build_sandbox.sweep_stale_build_sandboxes(client=client) == [name]
+    assert client.deleted == [f"sb-{name}"]
+
+
+@pytest.mark.asyncio
+async def test_sweep_ignores_names_it_cannot_attribute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Everything the user named — or the platform named for them — is left alone."""
+    _clear(monkeypatch)
+    client = _FakeSandboxListing(
+        [
+            _sandbox("my-own-sandbox"),
+            _sandbox("SANDBOX-2f1a9c"),
+            _sandbox(""),
+            SimpleNamespace(id="sb-1", name=None),
+        ]
+    )
+
+    assert await build_sandbox.sweep_stale_build_sandboxes(client=client) == []
+    assert client.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_reports_a_list_that_came_back_entirely_nameless(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unattributable list must be visible, because it looks like a clean one.
+
+    Every sandbox the platform returns carries a name — it mints a default label
+    when the caller gave none. So a list in which nothing is named means ``name``
+    is no longer reaching us, and the sweep would then delete nothing, for ever,
+    with no other trace of why.
+    """
+    _clear(monkeypatch)
+    client = _FakeSandboxListing(
+        [SimpleNamespace(id="sb-1", name=None), SimpleNamespace(id="sb-2", name="")]
+    )
+
+    with caplog.at_level("WARNING", logger="docker_rt.build_sandbox"):
+        removed = await build_sandbox.sweep_stale_build_sandboxes(client=client)
+
+    assert removed == []
+    assert "without a name" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_sweep_stays_quiet_when_the_list_is_merely_not_ours(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Named sandboxes belonging to the user are the ordinary case, not a fault."""
+    _clear(monkeypatch)
+    client = _FakeSandboxListing([_sandbox("my-own-sandbox")])
+
+    with caplog.at_level("WARNING", logger="docker_rt.build_sandbox"):
+        removed = await build_sandbox.sweep_stale_build_sandboxes(client=client)
+
+    assert removed == []
+    assert "without a name" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_sweep_is_disabled_by_the_knob(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_SANDBOX_SWEEP", "false")
+    client = _FakeSandboxListing([_sandbox(_build_name())])
+
+    assert await build_sandbox.sweep_stale_build_sandboxes(client=client) == []
+    assert client.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_honours_keep_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``KEEP`` leaves a sandbox behind on purpose — even after a crash.
+
+    It is also the escape hatch for the account-wide reach of the prefix rule: a
+    machine that must not touch anyone else's builds sets it.
+    """
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_SANDBOX_KEEP", "true")
+    client = _FakeSandboxListing([_sandbox(_build_name())])
+
+    assert await build_sandbox.sweep_stale_build_sandboxes(client=client) == []
+    assert client.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_survives_a_list_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unreachable API server must not turn into a watcher failure."""
+    _clear(monkeypatch)
+    client = _FakeSandboxListing(list_error=RuntimeError("no route to host"))
+
+    assert await build_sandbox.sweep_stale_build_sandboxes(client=client) == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_continues_after_a_delete_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear(monkeypatch)
+    first = _build_name("a1b2c3")
+    second = _build_name("d4e5f6")
+
+    class _Flaky(_FakeSandboxListing):
+        async def delete(self, sandbox_id: str, **_kwargs: Any) -> None:
+            if sandbox_id == f"sb-{first}":
+                raise RuntimeError("409 conflict")
+            self.deleted.append(sandbox_id)
+
+    client = _Flaky([_sandbox(first), _sandbox(second)])
+
+    assert await build_sandbox.sweep_stale_build_sandboxes(client=client) == [second]
+
+
+@pytest.mark.asyncio
+async def test_sweep_skips_a_sandbox_without_an_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear(monkeypatch)
+    client = _FakeSandboxListing([SimpleNamespace(id="", name=_build_name())])
+
+    assert await build_sandbox.sweep_stale_build_sandboxes(client=client) == []
+    assert client.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_closes_a_client_it_opened_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The watcher is a short-lived process: it must not leak its connection pool."""
+    from ..backend import pyromind_sdk_env
+
+    _clear(monkeypatch)
+    client = _FakeSandboxListing([_sandbox(_build_name())])
+    monkeypatch.setattr(pyromind_sdk_env, "get_sandbox_client", lambda: client)
+
+    removed = await build_sandbox.sweep_stale_build_sandboxes()
+
+    assert removed
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_sweep_leaves_a_client_it_was_given_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ownership is per-call: the daemon's long-lived client is not ours to close."""
+    _clear(monkeypatch)
+    client = _FakeSandboxListing([_sandbox(_build_name())])
+
+    await build_sandbox.sweep_stale_build_sandboxes(client=client)
+
+    assert client.closed is False

@@ -44,6 +44,7 @@ import io
 import logging
 import os
 import re
+import secrets
 import shlex
 import tarfile
 import time
@@ -143,6 +144,200 @@ def keep_sandbox() -> bool:
         "yes",
         "on",
     }
+
+
+# --------------------------------------------------------------------------
+# build-sandbox identity — so a crash can be cleaned up afterwards
+# --------------------------------------------------------------------------
+#
+# The sandbox the build runs in is deleted by the daemon's ``finally``, which
+# ``kill -9`` skips: that leaves a ``sleep infinity`` sandbox holding the user's
+# quota until somebody notices, and a restarted daemon cannot tell it apart from
+# a live build. The old code made this worse by creating those sandboxes
+# **unnamed**. So they carry a recognisable name instead:
+#
+#     sandbox-docker-build-<random>
+#
+# Cleanup keys on the prefix alone: :func:`sweep_stale_build_sandboxes` deletes
+# every sandbox whose name starts with it. Nothing else can collide with that
+# string — a sandbox the user created without asking for a name is given the
+# platform's own ``SANDBOX-<uuid>`` label, not ours — so "starts with the
+# prefix" is a complete ownership test, and the random suffix only has to be
+# unique among build sandboxes.
+#
+# This is the **API-level** name; it is stored in the platform's
+# ``t_instance.name`` and comes back from ``list()``. It is *not* the Pod name:
+# k8s objects are named from the server-generated sandbox id
+# (``sandbox-deployment-sb-<12hex>-…``), so only a change in k8s_middleware could
+# make the Pod itself carry this prefix.
+#
+# One consequence of a prefix-only rule, because it is easy to be surprised by:
+# ``list()`` is scoped to the *account*, not to this machine. Watching a daemon
+# die here therefore also clears build sandboxes of a **live** daemon elsewhere
+# on the same account — a build running on another machine, or in a second
+# ``docker-rt`` on another socket. That is a deliberate trade (a leaked sandbox
+# burns quota for ever; a killed in-flight build can simply be re-run), and
+# ``DOCKER_RT_BUILD_SANDBOX_SWEEP=false`` / ``DOCKER_RT_BUILD_SANDBOX_KEEP=true``
+# are the ways out.
+
+BUILD_SANDBOX_NAME_PREFIX = "sandbox-docker-build"
+
+# The prefix *plus* its separator — what a name actually starts with. Keeping
+# the dash means the rule will not match a longer word that merely begins the
+# same way (``sandbox-docker-buildx-…``), without weakening it for our names.
+BUILD_SANDBOX_NAME_STEM = f"{BUILD_SANDBOX_NAME_PREFIX}-"
+
+
+def new_build_sandbox_name() -> str:
+    """A unique, recognisable name for one build sandbox."""
+    return f"{BUILD_SANDBOX_NAME_STEM}{secrets.token_hex(3)}"
+
+
+def is_build_sandbox_name(name: str) -> bool:
+    """Whether ``name`` is a build sandbox of ours, i.e. one the sweep may delete.
+
+    The entire ownership rule, in one place, so the sweep and the tests that
+    describe it cannot drift apart. Names the user chose — and the platform's
+    default ``SANDBOX-<uuid>`` label — do not match.
+    """
+    return (name or "").strip().startswith(BUILD_SANDBOX_NAME_STEM)
+
+
+def sandbox_sweep_enabled() -> bool:
+    """``DOCKER_RT_BUILD_SANDBOX_SWEEP`` (``true`` by default)."""
+    return _env("DOCKER_RT_BUILD_SANDBOX_SWEEP", "true").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "disabled",
+    }
+
+
+async def sweep_stale_build_sandboxes(*, client: Any | None = None) -> list[str]:
+    """Delete the build sandboxes an abruptly-killed daemon left running.
+
+    The normal path — the daemon's ``finally`` calling ``sandbox.cleanup()`` —
+    covers every way a *build* can end, but only while the process is alive to
+    run it. After a ``kill -9`` nothing deletes it, and unlike the staged
+    context (see :func:`context_staging.sweep_stale_staging`) it is not just
+    wasted storage: the sandbox keeps running.
+
+    The rule is the whole of it: a sandbox whose name starts with
+    :data:`BUILD_SANDBOX_NAME_STEM` is ours, and ours are disposable — the only
+    ones the user can see are those a build is using right now, and a build that
+    loses its sandbox fails visibly and can be re-run.
+
+    Everything else is left alone: the user's own sandboxes, and the platform's
+    default ``SANDBOX-<uuid>`` label, do not carry the prefix.
+
+    ``DOCKER_RT_BUILD_SANDBOX_KEEP=true`` skips the sweep entirely, since that
+    flag exists to leave sandboxes behind on purpose; ``..._SWEEP=false`` turns
+    it off.
+
+    Two things this deliberately does *not* try to do:
+
+    * tell a *live* build from a leaked one. ``list()`` is scoped to the account
+      rather than to this machine, so a sandbox belonging to a build running
+      elsewhere — another machine, or a second daemon on another socket — is
+      swept too. Doing better needs an ownership marker that survives its owner,
+      which is a bigger change than this cleanup is worth; see the note above.
+    * report an empty result as proof of a clean machine. It rests on ``list()``
+      handing back the ``name`` a sandbox was created with (the platform stores
+      it in ``t_instance.name`` and does return it), and a platform that stopped
+      doing so would leave the sweep deleting nothing, silently. A non-empty list
+      in which *no* sandbox is named is therefore logged as a warning.
+
+    Never raises: the caller's real job is restoring the Docker context. Returns
+    the names removed.
+    """
+    if not sandbox_sweep_enabled():
+        logger.debug("build sandbox sweep disabled by DOCKER_RT_BUILD_SANDBOX_SWEEP")
+        return []
+    if keep_sandbox():
+        logger.warning(
+            "DOCKER_RT_BUILD_SANDBOX_KEEP=true — leaving leftover build sandboxes "
+            "alone"
+        )
+        return []
+
+    owns_client = client is None
+    try:
+        if client is None:
+            from .pyromind_sdk_env import get_sandbox_client
+
+            client = get_sandbox_client()
+        sandboxes = await client.list()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cannot list sandboxes to sweep build sandboxes: %s", exc)
+        return []
+
+    removed: list[str] = []
+    # The only diagnosis the return value cannot express: "nothing to clean" and
+    # "the platform stopped returning ``name``" both come back as ``[]``, and
+    # they want opposite responses. So count what came back and say so below.
+    seen = 0
+    named = 0
+    ours = 0
+    try:
+        for sandbox in sandboxes or []:
+            seen += 1
+            name = str(getattr(sandbox, "name", "") or "")
+            if name:
+                named += 1
+            if not is_build_sandbox_name(name):
+                continue
+            ours += 1
+            sandbox_id = str(getattr(sandbox, "id", "") or "")
+            if not sandbox_id:
+                logger.warning("leftover build sandbox %s has no id; skipping", name)
+                continue
+            try:
+                await client.delete(sandbox_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "failed to delete leftover build sandbox %s (%s): %s",
+                    name,
+                    sandbox_id,
+                    exc,
+                )
+                continue
+            removed.append(name)
+            logger.info("deleted leftover build sandbox %s (%s)", name, sandbox_id)
+        if seen and not named:
+            # Every sandbox the platform returns carries a name — it mints a
+            # default label when the caller gave none — so a list that comes
+            # back entirely nameless means ``name`` is not reaching us. The
+            # prefix rule would then match nothing, for ever, and the sweep would
+            # look exactly like a clean machine. Say so once, loudly.
+            logger.warning(
+                "build sandbox sweep: %d sandbox(es) came back without a name, so "
+                "none could be matched against the '%s' prefix; if a killed daemon "
+                "left a build sandbox running, the platform is probably not "
+                "returning 'name' from list()",
+                seen,
+                BUILD_SANDBOX_NAME_PREFIX,
+            )
+        else:
+            logger.debug(
+                "build sandbox sweep: %d seen, %d named, %d ours, %d removed",
+                seen,
+                named,
+                ours,
+                len(removed),
+            )
+        return removed
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("sweeping leftover build sandboxes failed: %s", exc)
+        return removed
+    finally:
+        if owns_client and client is not None:
+            try:
+                from .pyromind_sdk_env import close_sandbox_client
+
+                await close_sandbox_client(client)
+            except Exception:  # noqa: BLE001
+                logger.debug("closing the sandbox client failed", exc_info=True)
 
 
 def shell_argv(script: str) -> list[str]:
@@ -744,11 +939,16 @@ async def build_in_sandbox(
         async def _create_sandbox_with(
             mounts: list[dict[str, Any]] | None,
         ) -> Any:
+            # Named on purpose: a create that the server commits but never
+            # answers leaves an orphan that nothing else can attribute, and the
+            # watcher has to be able to find it after a `kill -9`. See
+            # `new_build_sandbox_name`.
             return await start_kube_environment(
                 image=builder_image(),
                 namespace=namespace,
                 env={},
                 working_dir="/",
+                container_name=new_build_sandbox_name(),
                 ready_timeout=sandbox_ready_timeout(),
                 memory_limit=sandbox_memory_limit(),
                 cpu_limit=sandbox_cpu_limit(),

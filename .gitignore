@@ -18,6 +18,11 @@ ENV/
 *.swp
 *.swo
 
+# macOS
+.DS_Store
+# Ignore all hidden files
+.*
+
 # Testing
 .pytest_cache/
 .coverage

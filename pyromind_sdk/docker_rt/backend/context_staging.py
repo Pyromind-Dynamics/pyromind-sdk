@@ -44,6 +44,11 @@ Two cleanup stages, because the two failure modes are different:
    far as step 1 — an upload that succeeds but a sandbox that never becomes
    ready would otherwise leave the object behind forever.
 
+Both of those need a living daemon. ``kill -9`` skips the ``finally`` entirely,
+so the watcher — which already runs after such a death to restore the Docker
+context — also calls :func:`sweep_stale_staging` to remove whatever the dead
+daemon left behind.
+
 Mount target is under ``/kaniko`` on purpose: kaniko deletes the container's
 root filesystem when a multi-stage build moves to the next stage, preserving
 only ``/kaniko`` (see :mod:`docker_rt.backend.kaniko`). A mount anywhere else
@@ -54,12 +59,14 @@ deleting the user's files.
 from __future__ import annotations
 
 import io
+import itertools
 import logging
 import os
 import re
 import secrets
 import shlex
 import time
+from datetime import datetime
 from typing import Any, NamedTuple
 
 logger = logging.getLogger("docker_rt.context_staging")
@@ -86,7 +93,21 @@ SIZE_MARKER = "docker-rt-staged-bytes:"
 #: The knee is at 8, so that is the default; more just multiplies part buffers.
 DEFAULT_PARALLEL_UPLOADS = 8
 
+#: How long a leftover staging directory may sit before it is removed even when
+#: its build id cannot be attributed to a process. Only reachable for directories
+#: this code did not name (see :func:`sweep_stale_staging`).
+DEFAULT_SWEEP_MAX_AGE_S = 24 * 3600
+
 _NAME_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+#: ``<stamp>-<pid>[-<seq>]-<salt>``. The pid is what the sweeper attributes a
+#: directory to; ``seq`` was added later, hence optional, so ids minted before
+#: it still parse.
+_BUILD_ID_PID = re.compile(r"^\d{8}-\d{6}-(\d+)(?:-\d+)?-[0-9A-Za-z]+$")
+
+#: Per-process build counter. The daemon serves every concurrent build from one
+#: process, so ``time + pid`` alone is not enough to tell two builds apart.
+_BUILD_SEQ = itertools.count()
 
 
 class StagingError(RuntimeError):
@@ -153,11 +174,38 @@ def new_build_id() -> str:
     Deliberately not the sandbox id: the id has to exist *before* the sandbox is
     created (the object must be in place for the mount to see it), and it has to
     survive a retry that re-creates the sandbox.
+
+    Uniqueness is built from three layers, because a collision here means one
+    build's ``rm -rf`` or ``delete_folder`` can hit another build's context:
+
+    ``stamp``
+        second-resolution UTC, the sortable part — and what the sweeper reads.
+    ``pid``
+        the daemon the build belongs to. The same for *every* concurrent build
+        (one daemon process serves them all), so on its own it proves nothing.
+    ``seq``
+        a process-wide counter. This is what actually makes concurrent builds in
+        one daemon safe: with it, two ids minted by the same process cannot be
+        equal, no matter how close together they are minted.
+    ``salt``
+        keeps two daemons that reuse a pid in the same second apart.
     """
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     pid = os.getpid()
+    seq = next(_BUILD_SEQ)
     salt = secrets.token_hex(3)
-    return _NAME_SAFE.sub("-", f"{stamp}-{pid}-{salt}")
+    return _NAME_SAFE.sub("-", f"{stamp}-{pid}-{seq}-{salt}")
+
+
+def parse_build_id_pid(build_id: str) -> int | None:
+    """The pid a :func:`new_build_id` value was minted in, or ``None``.
+
+    The sweeper uses this to decide whether a leftover directory can still
+    belong to a running daemon. ``None`` means "cannot attribute it", which is
+    treated as "leave it alone".
+    """
+    match = _BUILD_ID_PID.match((build_id or "").strip())
+    return int(match.group(1)) if match else None
 
 
 class StagingPlan(NamedTuple):
@@ -311,6 +359,34 @@ def resolve_bucket(storage: Any, info: Any) -> str:
     )
 
 
+def connect_storage(cluster: str | None = None) -> tuple[Any, str]:
+    """Open a storage client and resolve the bucket holding the workspace.
+
+    Shared by :class:`StorageStager` and :func:`sweep_stale_staging`. The
+    ``minio`` import lives in here so that merely importing this module — which
+    the ``upload`` staging mode and the sweeper both do — never needs it.
+
+    Raises :class:`StagingError` when the client or the credentials are
+    unavailable, or when the bucket cannot be determined.
+    """
+    try:
+        from ...client.profile import ProfileClient
+        from ...client.storage import StorageClient
+    except Exception as exc:  # noqa: BLE001 - minio missing / SDK trimmed
+        raise StagingError(f"storage client unavailable: {exc}") from exc
+    try:
+        info = ProfileClient(cluster=cluster).get_storage_info()
+        storage = StorageClient(
+            endpoint=getattr(info, "url", None),
+            access_key=info.access_key,
+            secret_key=info.secret_key,
+            cluster=cluster,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise StagingError(f"cannot resolve storage credentials: {exc}") from exc
+    return storage, resolve_bucket(storage, info)
+
+
 class StorageStager:
     """Upload one build context to the user's storage and clean it up again.
 
@@ -343,23 +419,9 @@ class StorageStager:
     def _connect(self) -> Any:
         if self._storage is not None:
             return self._storage
-        try:
-            from ...client.profile import ProfileClient
-            from ...client.storage import StorageClient
-        except Exception as exc:  # noqa: BLE001 - minio missing / SDK trimmed
-            raise StagingError(f"storage client unavailable: {exc}") from exc
-        try:
-            info = ProfileClient(cluster=self._cluster).get_storage_info()
-            storage = StorageClient(
-                endpoint=getattr(info, "url", None),
-                access_key=info.access_key,
-                secret_key=info.secret_key,
-                cluster=self._cluster,
-            )
-        except Exception as exc:  # noqa: BLE001
-            raise StagingError(f"cannot resolve storage credentials: {exc}") from exc
-        self._bucket = resolve_bucket(storage, info)
+        storage, bucket = connect_storage(self._cluster)
         self._storage = storage
+        self._bucket = bucket
         return storage
 
     @property
@@ -422,3 +484,170 @@ class StorageStager:
         self._uploaded = False
         logger.debug("staged build context %s removed", self.plan.object_dir)
         return True
+
+
+# --------------------------------------------------------------------------
+# leftovers from a daemon that died abruptly
+# --------------------------------------------------------------------------
+
+
+def sweep_enabled() -> bool:
+    """``DOCKER_RT_BUILD_STAGING_SWEEP`` (``true`` by default)."""
+    raw = _env("DOCKER_RT_BUILD_STAGING_SWEEP", "true").lower()
+    return raw not in ("0", "false", "no", "off", "disabled")
+
+
+def sweep_max_age_s() -> int:
+    """``DOCKER_RT_BUILD_STAGING_SWEEP_MAX_AGE_S``, clamped at 0 (disabled)."""
+    try:
+        value = int(
+            _env(
+                "DOCKER_RT_BUILD_STAGING_SWEEP_MAX_AGE_S",
+                str(DEFAULT_SWEEP_MAX_AGE_S),
+            )
+        )
+    except ValueError:
+        return DEFAULT_SWEEP_MAX_AGE_S
+    return max(0, value)
+
+
+def _pid_alive(pid: int | None) -> bool:
+    """Whether ``pid`` is still running. Unknowable is treated as "alive"."""
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Running, but owned by another user — never assume it is gone.
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _entry_age_s(entry: Any, now: float) -> float | None:
+    """Seconds since ``entry``'s ``last_modified``, or ``None`` if unreadable."""
+    raw = entry.get("last_modified") if isinstance(entry, dict) else None
+    if not raw:
+        return None
+    try:
+        when = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    try:
+        return now - when.timestamp()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def sweep_stale_staging(
+    *,
+    dead_pid: int | None = None,
+    cluster: str | None = None,
+    prefix: str | None = None,
+    max_age_s: int | None = None,
+    storage: Any | None = None,
+    bucket: str | None = None,
+    now: float | None = None,
+) -> list[str]:
+    """Remove staged build contexts left behind by a daemon that died abruptly.
+
+    The two-stage cleanup in :mod:`docker_rt.backend.build_sandbox` covers every
+    way a *build* can end, including failures — but only while the daemon is
+    alive to run its ``finally``. A ``kill -9`` skips that, and the staged
+    context (potentially several GB, and it counts against the user's quota)
+    would otherwise stay there forever. ``docker_rt.watcher`` already runs after
+    such a death to restore the Docker context, so this sweeps there too.
+
+    A directory is removed only when it provably belongs to no live build:
+
+    1. its build id names ``dead_pid`` — the process the caller watched exit, so
+       it is gone even if that pid has since been recycled by something else;
+    2. its build id names a pid that is no longer running (an older crash);
+    3. its build id cannot be attributed at all, and the object is older than
+       ``max_age_s``. This is the only case where naming is not enough, so the
+       age limit is deliberately generous.
+
+    A concurrent build — including one belonging to a *different* docker-rt
+    daemon serving the same workspace — always carries a live pid, so rule 2
+    skips it. Rule 3 cannot reach it either, because such a directory is either
+    freshly written or carries a live pid.
+
+    Never raises: the caller's real job is restoring the Docker context, and a
+    storage hiccup must not interfere with it. Returns the build ids removed.
+    """
+    if not sweep_enabled():
+        logger.debug("staging sweep disabled by DOCKER_RT_BUILD_STAGING_SWEEP")
+        return []
+
+    prefix = (prefix if prefix is not None else staging_prefix()).strip("/")
+    if not prefix:
+        return []
+    age_limit = sweep_max_age_s() if max_age_s is None else max(0, max_age_s)
+    now = time.time() if now is None else now
+
+    if storage is None:
+        try:
+            storage, bucket = connect_storage(
+                cluster if cluster is not None else storage_cluster()
+            )
+        except StagingError as exc:
+            logger.warning("cannot sweep staged build contexts: %s", exc)
+            return []
+    if not bucket:
+        logger.warning("cannot sweep staged build contexts: no bucket resolved")
+        return []
+
+    try:
+        entries = storage.list_files(prefix, bucket_name=bucket, recursive=False)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "cannot list %s/%s/ to sweep staged build contexts: %s", bucket, prefix, exc
+        )
+        return []
+
+    swept: list[str] = []
+    for entry in entries or []:
+        name = str(entry.get("object_name") or "") if isinstance(entry, dict) else ""
+        if not name or name.rstrip("/") == prefix:
+            continue
+        if not name.endswith("/"):
+            # This layout only ever creates directories. Anything else was not
+            # written by us, so deleting it would be guesswork.
+            logger.warning("leaving unexpected object %s/%s alone", bucket, name)
+            continue
+
+        build_id = name.rstrip("/").rsplit("/", 1)[-1]
+        pid = parse_build_id_pid(build_id)
+        if pid is not None:
+            if pid != dead_pid and _pid_alive(pid):
+                logger.debug(
+                    "keeping %s/%s: build id names live pid %s", bucket, name, pid
+                )
+                continue
+        else:
+            age = _entry_age_s(entry, now)
+            if age is None or age <= age_limit:
+                logger.warning(
+                    "leaving unattributable staging directory %s/%s "
+                    "(age %s, limit %ss)",
+                    bucket,
+                    name,
+                    "unknown" if age is None else f"{age:.0f}s",
+                    age_limit,
+                )
+                continue
+
+        try:
+            storage.delete_folder(name, bucket_name=bucket)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("could not remove staged context %s/%s: %s", bucket, name, exc)
+            continue
+        swept.append(build_id)
+        logger.info("removed leftover staged build context %s/%s", bucket, name)
+
+    if swept:
+        logger.info("%d leftover staged build context(s) removed", len(swept))
+    return swept
