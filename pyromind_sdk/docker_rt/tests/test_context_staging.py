@@ -26,6 +26,8 @@ _STAGING_VARS = (
     "DOCKER_RT_BUILD_STAGING_PREFIX",
     "DOCKER_RT_BUILD_STAGING_WORKSPACE",
     "DOCKER_RT_BUILD_STAGING_PARALLEL",
+    "DOCKER_RT_BUILD_STAGING_SWEEP",
+    "DOCKER_RT_BUILD_STAGING_SWEEP_MAX_AGE_S",
     "DOCKER_RT_STORAGE_CLUSTER",
     "DOCKER_RT_CLUSTER",
     "PYROMIND_CLUSTER",
@@ -381,6 +383,302 @@ def test_cleanup_deletes_the_build_directory(monkeypatch: pytest.MonkeyPatch) ->
     # Idempotent: a second call is a no-op, not a second delete.
     assert stager.cleanup() is True
     assert len(storage.deleted) == 1
+
+
+# --------------------------------------------------------------------------
+# build ids: what the sweeper relies on
+# --------------------------------------------------------------------------
+
+
+def test_build_ids_stay_unique_even_inside_one_frozen_second(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The counter, not the clock, is what keeps concurrent builds apart.
+
+    One daemon process serves every concurrent build, so ``time`` and ``pid``
+    are identical across them. Freezing the clock makes that explicit: if the
+    ids ever collide here, they can collide in production.
+    """
+    from ..backend import context_staging as cs
+
+    # Replace the module reference, not the global ``time`` module, so nothing
+    # else in the process sees a frozen clock.
+    frozen = SimpleNamespace(
+        strftime=lambda *_a, **_k: "20260923-023343",
+        gmtime=cs.time.gmtime,
+        time=cs.time.time,
+    )
+    monkeypatch.setattr(cs, "time", frozen)
+    ids = [cs.new_build_id() for _ in range(200)]
+
+    assert len(set(ids)) == 200
+    assert all(cs.parse_build_id_pid(value) == os.getpid() for value in ids)
+
+
+def test_build_id_names_the_pid_that_minted_it() -> None:
+    from ..backend import context_staging as cs
+
+    assert cs.parse_build_id_pid(cs.new_build_id()) == os.getpid()
+
+
+def test_build_id_without_the_counter_field_still_parses() -> None:
+    """Ids minted before the counter existed are already out in the wild."""
+    from ..backend import context_staging as cs
+
+    assert cs.parse_build_id_pid("20260923-023343-80566-cd92f9") == 80566
+    assert cs.parse_build_id_pid("20260923-023343-80566-0-cd92f9") == 80566
+
+
+def test_unattributable_build_ids_parse_to_none() -> None:
+    from ..backend import context_staging as cs
+
+    for value in (
+        "",
+        "garbage",
+        "20260923-023343-notapid-ab",  # pid is not digits
+        "20260923-023343-80566",  # no salt
+        "1234-123456-1-a",  # stamp is not 8+6 digits
+        "20260923-023343-80566-0-cd92f9-extra",  # trailing field
+    ):
+        assert cs.parse_build_id_pid(value) is None
+
+
+def test_pid_alive_sees_this_process() -> None:
+    from ..backend import context_staging as cs
+
+    assert cs._pid_alive(os.getpid()) is True
+    assert cs._pid_alive(0) is False
+    assert cs._pid_alive(None) is False
+
+
+# --------------------------------------------------------------------------
+# sweeping leftovers from a killed daemon
+# --------------------------------------------------------------------------
+
+
+class _FakeListingStorage:
+    """Just enough ``StorageClient`` for the sweeper: list + delete."""
+
+    def __init__(self, entries: list[dict[str, Any]], *, list_error: Exception | None = None) -> None:
+        self.entries = entries
+        self.list_error = list_error
+        self.raise_on_delete: Exception | None = None
+        self.deleted: list[tuple[str, str]] = []
+        self.listed: tuple[Any, ...] | None = None
+
+    def list_files(
+        self, folder: str, bucket_name: str | None = None, recursive: bool = True
+    ) -> list[dict[str, Any]]:
+        if self.list_error is not None:
+            raise self.list_error
+        self.listed = (folder, bucket_name, recursive)
+        return list(self.entries)
+
+    def delete_folder(
+        self, folder: str, bucket_name: str | None = None
+    ) -> dict[str, Any]:
+        if self.raise_on_delete is not None:
+            raise self.raise_on_delete
+        self.deleted.append((bucket_name or "", folder))
+        return {"deleted": 1}
+
+
+def _dir(name: str, *, age_s: float = 0.0, now: float = 1_800_000_000.0) -> dict[str, Any]:
+    """A listing entry for a directory, ``age_s`` seconds old."""
+    from datetime import datetime, timezone
+
+    stamp = datetime.fromtimestamp(now - age_s, tz=timezone.utc).isoformat()
+    return {"object_name": name, "type": "folder", "size": 0, "last_modified": stamp}
+
+
+_NOW = 1_800_000_000.0
+
+
+def _sweep(storage: _FakeListingStorage, **kwargs: Any) -> list[str]:
+    from ..backend import context_staging as cs
+
+    return cs.sweep_stale_staging(
+        storage=storage, bucket="1000001514", now=_NOW, **kwargs
+    )
+
+
+def test_sweep_removes_what_the_dead_daemon_left(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole point: a ``kill -9`` skips the daemon's ``finally``."""
+    from ..backend import context_staging as cs
+
+    stale = "20260923-023343-80566-0-cd92f9"
+    storage = _FakeListingStorage([_dir(f".docker-rt-build/{stale}/")])
+    monkeypatch.setattr(cs, "_pid_alive", lambda _pid: False)
+
+    assert _sweep(storage, dead_pid=80566) == [stale]
+    assert storage.deleted == [("1000001514", f".docker-rt-build/{stale}/")]
+    # Non-recursive: only the build directories themselves are candidates.
+    assert storage.listed == (".docker-rt-build", "1000001514", False)
+
+
+def test_sweep_keeps_a_directory_whose_daemon_is_still_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second docker-rt daemon on the same workspace is not ours to delete."""
+    from ..backend import context_staging as cs
+
+    other = "20260923-023343-99999-0-cd92f9"
+    storage = _FakeListingStorage([_dir(f".docker-rt-build/{other}/")])
+    monkeypatch.setattr(cs, "_pid_alive", lambda _pid: True)
+
+    assert _sweep(storage, dead_pid=80566) == []
+    assert storage.deleted == []
+
+
+def test_sweep_removes_an_older_crash_without_being_told_the_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead pid is proof enough, even if this watcher never watched it."""
+    from ..backend import context_staging as cs
+
+    old = "20260101-000000-4242-0-abcdef"
+    storage = _FakeListingStorage([_dir(f".docker-rt-build/{old}/")])
+    monkeypatch.setattr(cs, "_pid_alive", lambda _pid: False)
+
+    assert _sweep(storage) == [old]
+
+
+def test_sweep_trusts_the_watched_pid_over_a_recycled_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pid may be reused between the death and this sweep.
+
+    The caller watched that exact pid exit, so its directories are gone by
+    definition — even if ``os.kill`` now says the number is in use again.
+    """
+    from ..backend import context_staging as cs
+
+    mine = "20260923-023343-80566-0-cd92f9"
+    storage = _FakeListingStorage([_dir(f".docker-rt-build/{mine}/")])
+    monkeypatch.setattr(cs, "_pid_alive", lambda _pid: True)
+
+    assert _sweep(storage, dead_pid=80566) == [mine]
+
+
+def test_sweep_waits_for_an_unattributable_directory_to_age_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Naming is the only thing this can reason about; without it, be patient."""
+    from ..backend import context_staging as cs
+
+    fresh = _FakeListingStorage([_dir(".docker-rt-build/not-ours/", age_s=60)])
+    ancient = _FakeListingStorage([_dir(".docker-rt-build/not-ours/", age_s=48 * 3600)])
+    monkeypatch.setattr(cs, "_pid_alive", lambda _pid: False)
+
+    assert _sweep(fresh, max_age_s=3600) == []
+    assert fresh.deleted == []
+    assert _sweep(ancient, max_age_s=3600) == ["not-ours"]
+
+
+def test_sweep_leaves_things_alone_when_it_cannot_tell_their_age(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ..backend import context_staging as cs
+
+    entry = _dir(".docker-rt-build/not-ours/")
+    entry["last_modified"] = None
+    storage = _FakeListingStorage([entry])
+    monkeypatch.setattr(cs, "_pid_alive", lambda _pid: False)
+
+    assert _sweep(storage, max_age_s=0) == []
+
+
+def test_sweep_ignores_the_prefix_entry_and_stray_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only directories under the prefix are ours; never guess about the rest."""
+    from ..backend import context_staging as cs
+
+    stray = {"object_name": ".docker-rt-build/stray.txt", "type": "file", "size": 3,
+             "last_modified": "2026-01-01T00:00:00+00:00"}
+    storage = _FakeListingStorage([_dir(".docker-rt-build/"), stray])
+    monkeypatch.setattr(cs, "_pid_alive", lambda _pid: False)
+
+    assert _sweep(storage, max_age_s=0) == []
+    assert storage.deleted == []
+
+
+def test_sweep_is_disabled_by_the_knob(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disabled means "do not even talk to storage".
+
+    Asserting on a raised error would not prove that: the sweep swallows every
+    listing failure, so an exception would look exactly like a clean run.
+    """
+    from ..backend import context_staging as cs
+
+    monkeypatch.setenv("DOCKER_RT_BUILD_STAGING_SWEEP", "false")
+
+    assert cs.sweep_enabled() is False
+    assert _sweep(_FakeListingStorage([_dir(".docker-rt-build/whatever/")])) == []
+    assert cs.sweep_max_age_s() > 0  # the knob is only about the sweep itself
+
+
+def test_sweep_does_not_list_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ..backend import context_staging as cs
+
+    monkeypatch.setenv("DOCKER_RT_BUILD_STAGING_SWEEP", "off")
+    storage = _FakeListingStorage([_dir(".docker-rt-build/whatever/")])
+
+    cs.sweep_stale_staging(
+        storage=storage, bucket="1000001514", now=_NOW, dead_pid=80566
+    )
+
+    assert storage.listed is None
+    assert storage.deleted == []
+
+
+def test_sweep_never_raises_when_listing_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Storage unreachable is a warning, not a crash — the watcher must finish."""
+    storage = _FakeListingStorage([], list_error=OSError("AccessDenied"))
+
+    assert _sweep(storage) == []
+
+
+def test_sweep_keeps_going_when_one_delete_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ..backend import context_staging as cs
+
+    a = "20260923-023343-1-0-aaaaaa"
+    b = "20260923-023343-2-0-bbbbbb"
+    storage = _FakeListingStorage(
+        [_dir(f".docker-rt-build/{a}/"), _dir(f".docker-rt-build/{b}/")]
+    )
+    storage.raise_on_delete = OSError("quota locked")
+    monkeypatch.setattr(cs, "_pid_alive", lambda _pid: False)
+
+    assert _sweep(storage) == []
+
+
+def test_sweep_survives_a_storage_client_that_cannot_be_opened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No credentials (or no minio at all) must not break the watcher."""
+    from ..backend import context_staging as cs
+
+    def boom(_cluster: Any = None) -> Any:
+        raise cs.StagingError("cannot resolve storage credentials: no API key")
+
+    monkeypatch.setattr(cs, "connect_storage", boom)
+
+    assert cs.sweep_stale_staging(dead_pid=1) == []
+
+
+def test_sweep_max_age_defaults_and_clamps(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ..backend import context_staging as cs
+
+    assert cs.sweep_max_age_s() == cs.DEFAULT_SWEEP_MAX_AGE_S
+    monkeypatch.setenv("DOCKER_RT_BUILD_STAGING_SWEEP_MAX_AGE_S", "-5")
+    assert cs.sweep_max_age_s() == 0
+    monkeypatch.setenv("DOCKER_RT_BUILD_STAGING_SWEEP_MAX_AGE_S", "not-a-number")
+    assert cs.sweep_max_age_s() == cs.DEFAULT_SWEEP_MAX_AGE_S
 
 
 def test_cleanup_is_a_no_op_when_nothing_was_uploaded(

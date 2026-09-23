@@ -139,12 +139,15 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 | `DOCKER_RT_BUILD_EXECUTOR` | `kaniko` | Build executor; only kaniko is implemented |
 | `DOCKER_RT_BUILD_TIMEOUT` | `3600` | Timeout (seconds) for one build |
 | `DOCKER_RT_BUILD_SANDBOX_CPU` / `_MEMORY` | `2` / `4Gi` | Build sandbox resources |
-| `DOCKER_RT_BUILD_SANDBOX_KEEP` | `false` | Keep the build sandbox (troubleshooting only) |
+| `DOCKER_RT_BUILD_SANDBOX_KEEP` | `false` | Keep the build sandbox (troubleshooting only). It also skips the `kill -9` sweep below, otherwise the flag would defeat itself |
+| `DOCKER_RT_BUILD_SANDBOX_SWEEP` | `true` | On `kill -9` the sandbox teardown is skipped, leaving a `sleep infinity` sandbox **running** against the user's quota — more expensive than a staged context. Build sandboxes are named `sandbox-docker-build-<random>`, and after restoring the Docker context the watcher deletes every sandbox whose name carries that prefix. Set `false` to disable |
 | `DOCKER_RT_BUILD_CONTEXT_MODE` | `auto` | How the build context reaches the sandbox: `auto` (storage first, fall back to a direct upload) / `storage` (storage or fail) / `upload` (never touch storage — the old HTTP route). Storage is the default because the direct route pushes one exec websocket per 2 MiB **serially**: 631 s for 61 MiB (~110 KB/s), unusable for multi-GB ML contexts. Storage uploads the tar.gz to the user's workspace object store with parallel parts and the cluster reads it **locally** through a mount (60 MiB: ~59 s upload + 2.7 s in-cluster copy) |
 | `DOCKER_RT_BUILD_STAGING_MOUNT` | `/kaniko/docker-rt-stage` | Mount target (in-Pod path) for the storage route. Must stay under `/kaniko` for the same reason as the build context dir: kaniko wipes `/` on a multi-stage switch and keeps only `/kaniko` |
 | `DOCKER_RT_BUILD_STAGING_PREFIX` | `.docker-rt-build` | Workspace-relative directory holding staged contexts; each build gets a unique `<build-id>/` subdirectory, removed afterwards (success or failure) |
 | `DOCKER_RT_BUILD_STAGING_WORKSPACE` | `/workspace` | Mount source root (the workspace as the platform sees it = JuiceFS subPath `<uid>`). Verified: storage key `<rel>` == `/workspace/<rel>` inside the Pod |
 | `DOCKER_RT_BUILD_STAGING_PARALLEL` | `8` | Concurrent multipart uploads (clamped to 1–32). Measured knee is 8 (60 MiB incompressible: 4 conns → 2.3 MiB/s, 8 → 5.9, 16 → 6.4) |
+| `DOCKER_RT_BUILD_STAGING_SWEEP` | `true` | On `kill -9` the daemon's `finally` never runs, so a staged context would sit in the user's quota forever. The watcher — which already restores the Docker context after such a death — sweeps those leftovers. Set `false` to disable |
+| `DOCKER_RT_BUILD_STAGING_SWEEP_MAX_AGE_S` | `86400` | Only applies to directories that cannot be attributed to a process: they must be older than this to be removed. Directories whose build id names a pid are judged by whether that pid is still alive |
 | `DOCKER_RT_STORAGE_CLUSTER` / `DOCKER_RT_CLUSTER` / `PYROMIND_CLUSTER` | empty | Cluster key for the storage profile lookup, first non-empty wins; falls back to the current profile |
 | `DOCKER_RT_REGISTRY_CLUSTER` | empty | Push profile: `us-west-1` / `us-west-2` / `cn-east-1` |
 | `DOCKER_RT_REGISTRY_NAMESPACE` | empty | Registry namespace; required on Docker Hub clusters |

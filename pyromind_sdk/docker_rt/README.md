@@ -142,7 +142,9 @@ chmod +x scripts/register_context.sh
 DOCKER_RT_SOCK=/tmp/docker-rt.sock ./scripts/register_context.sh
 
 # docker-rt 启动前自动备份当前 Docker context 并切换到 docker-rt；
-# 退出（包括 kill -9）时由 watcher 从备份恢复，watcher 恢复完成后自己退出；
+# 退出（包括 kill -9）时由 watcher 从备份恢复：恢复成启动前那个原生 context
+# （previous → DOCKER_RT_PREVIOUS_CONTEXT → desktop-linux → default），
+# 然后顺带清扫 kill -9 留下的 staged context 和构建沙箱，做完自己退出；
 # 需要手动恢复时：
 docker-rt-context --restore
 ```
@@ -275,13 +277,16 @@ docker ps   # 仍能看到 sb1
 | `DOCKER_RT_BUILD_POLL_INTERVAL_S` | `2` | 轮询构建状态的间隔秒数（下限 0.1，避免忙等） |
 | `DOCKER_RT_BUILD_LOG` | `collapsed` | 构建日志收敛模式。默认只保留 kaniko 的阶段行（`INFO[0004] …`）+ 每步输出的头几行与末行，中间折叠成一行统计；失败时自动回放原始日志尾部。设 `full` 原样输出全部字节 |
 | `DOCKER_RT_BUILD_CONTEXT_WARN_MB` | `256` | context 超过这个大小就打一条 `.dockerignore` 提示；`0` 关闭 |
-| `DOCKER_RT_BUILD_SANDBOX_KEEP` | `false` | `true` 时不删构建沙箱，**仅供排障**（注意：Running 状态删不掉，要先 `pause`） |
+| `DOCKER_RT_BUILD_SANDBOX_KEEP` | `false` | `true` 时不删构建沙箱，**仅供排障**（注意：Running 状态删不掉，要先 `pause`）。同时会让 `kill -9` 后的沙箱清扫也跳过，否则这个旗子等于没设 |
+| `DOCKER_RT_BUILD_SANDBOX_SWEEP` | `true` | 守护进程被 `kill -9` 时沙箱的 `finally` 不会跑，构建沙箱会以 `sleep infinity` **一直跑着**占配额（比 staged context 更贵）。watcher 恢复完 Docker context 后，把名字以 `sandbox-docker-build-` 开头的沙箱**全部删掉**；设 `false` 关闭 |
 | `DOCKER_RT_BUILD_CONTEXT_DIR` | `/kaniko/docker-rt-build` | 构建沙箱内的暂存目录。**必须在 `/kaniko` 下**：kaniko 多阶段构建切换 stage 时会删掉容器根文件系统（日志里的 `Deleting filesystem...`），只保留 `/kaniko`（它自己的二进制、`.docker/config.json` 和 `buildcontext`）。放到 `/tmp` 会在第一阶段结束时被删掉，poller 随后误报 "the launcher did not reach the fork" |
 | `DOCKER_RT_BUILD_CONTEXT_MODE` | `auto` | context 进沙箱的路由：`auto`（先走 storage 挂载，失败自动回退直传）/ `storage`（只走 storage，失败即构建失败，不静默降级）/ `upload`（完全不碰 storage，回到旧的 HTTP 直传）。**默认走 storage**：直传是「每 2 MiB 一个 exec websocket」串行推，实测 61 MiB 要 631 s（≈110 KB/s），多 GB 的 ML context 基本不可用；storage 走工作区对象存储的并发分片上传 + 集群侧本地读挂载，同样 60 MiB 只要 ~59 s 上传 + 集群内 2.7 s 拷贝。详见下方「context 怎么送进沙箱」 |
 | `DOCKER_RT_BUILD_STAGING_MOUNT` | `/kaniko/docker-rt-stage` | storage 路由的挂载目标（Pod 内路径）。**必须在 `/kaniko` 下**，理由同 `DOCKER_RT_BUILD_CONTEXT_DIR`（多阶段切 stage 会删掉 `/` 只留 `/kaniko`）；挂到别处会在 mid-build 被抹掉 |
 | `DOCKER_RT_BUILD_STAGING_PREFIX` | `.docker-rt-build` | 工作区里存放 staged context 的目录（工作区相对路径）。每次构建在其中用一个唯一 `<build-id>/` 子目录，构建结束（含失败）两段式清掉 |
 | `DOCKER_RT_BUILD_STAGING_WORKSPACE` | `/workspace` | 挂载源根（平台视角的工作区 = JuiceFS subPath `<uid>`）。已实测：object key `<rel>` == Pod 内 `/workspace/<rel>`；API 只接受绝对路径，`/` 会被拒（"path cannot be empty"） |
 | `DOCKER_RT_BUILD_STAGING_PARALLEL` | `8` | 并发分片上传的连接数（越界自动夹到 1–32）。**实测膝盖在 8**：60 MiB 不可压缩 context 下 4 连接 2.3 MiB/s、8 连接 5.9 MiB/s、16 连接 6.4 MiB/s；再往上只多占分片缓冲，带宽收益趋平 |
+| `DOCKER_RT_BUILD_STAGING_SWEEP` | `true` | 守护进程被 `kill -9` 时 `finally` 不会跑，staged context 会永久占用户配额。watcher 本来就在这种场景下负责恢复 Docker context，所以顺带清扫遗留目录。设 `false` 完全关闭 |
+| `DOCKER_RT_BUILD_STAGING_SWEEP_MAX_AGE_S` | `86400` | **只对「无法归属到任何进程」的目录生效**：超过这个年龄才删，否则留着并告警。能解析出 build-id 里 pid 的目录按「pid 是否还活着」判断，不受这个值影响 |
 | `DOCKER_RT_STORAGE_CLUSTER` / `DOCKER_RT_CLUSTER` / `PYROMIND_CLUSTER` | （空） | storage profile 查找用的集群键，按此顺序取第一个非空值；都为空时用当前 profile。storage 路由需要对象存储的 AK/SK/endpoint（来自 `ProfileClient.get_storage_info()`） |
 | `DOCKER_RT_BUILD_CACHE` / `_CACHE_REPO` | `false` / （空） | kaniko `--cache=true --cache-repo=<repo>` |
 | `DOCKER_RT_BUILD_REGISTRY_INSECURE` | `false` | 明文 HTTP registry：加 `--insecure --skip-tls-verify --skip-tls-verify-pull` |
@@ -455,6 +460,43 @@ mid-build 抹掉——而如果挂的是 `/workspace`，那意味着把用户的
    `rm -rf` 掉；
 2. **目录**由 daemon 在 `finally` 里删——覆盖「上传成功但沙箱一直没 ready」这种
    沙箱压根没走到第 1 步的情况，否则对象会永远留在那里。第二段是幂等的，从不抛异常。
+
+这两段都要求 daemon 还活着。`kill -9` 会直接跳过 `finally`，所以还有第三层兜底：
+**watcher** 在确认 daemon 进程消失后（它本来就负责恢复 Docker context）调用
+`sweep_stale_staging()` 清掉遗留目录。判定「能不能删」只用一条规则——**这个目录还属不属于
+某个活着的进程**：build-id 里的 pid 还活着就跳过（另一个 daemon 正在用），已经死了就删；
+万一 pid 被回收了，watcher 知道自己盯的是哪个 pid，照样删得掉。解析不出 pid 的目录则要求
+年龄超过 `DOCKER_RT_BUILD_STAGING_SWEEP_MAX_AGE_S`（默认 1 天）才动——宁可留着也不猜。
+
+**构建沙箱同样要兜这一层**，而且它比 staged context 更贵：`kill -9` 跳过沙箱的 `finally` 之后，
+那个容器会带着 `sleep infinity` **一直跑着**。所以构建沙箱不再匿名创建，名字带一个一眼能认出的前缀：
+
+```
+sandbox-docker-build-<随机>
+# 例：sandbox-docker-build-a1b2c3
+```
+
+watcher 恢复完 context 后调 `sweep_stale_build_sandboxes()`，规则就一条：**名字以
+`sandbox-docker-build-` 开头就删**。用户自己的沙箱、以及平台给无名沙箱兜的默认标签
+`SANDBOX-<uuid>`，都不带这个前缀，所以不会被误碰。`DOCKER_RT_BUILD_SANDBOX_KEEP=true`
+时整个清扫跳过——那个旗子本来就是「故意留着」；`DOCKER_RT_BUILD_SANDBOX_SWEEP=false` 关闭。
+两步清扫互相独立，一步失败不影响另一步。
+
+⚠️ **纯前缀规则的代价是明知故犯的**：`client.list()` 按**账号**过滤、不区分机器，所以它分不出
+「遗留的沙箱」和「**正在跑的**构建沙箱」——同机另一个 daemon（一个 socket 一个 daemon）、
+或**另一台机器用同一账号**正在构建时，会被一起删掉，那个构建会半路报「沙箱没了」。
+取舍：遗留沙箱会一直烧配额，被误删的构建**立刻失败**、重跑一次就好。
+不该动别人构建的机器上，设 `DOCKER_RT_BUILD_SANDBOX_KEEP=true` 让整个清扫跳过。
+
+⚠️ **`sandbox-docker-build-*` 是这个沙箱在平台 API 里的 `name`（存在 `t_instance.name`，
+`list` 会回传），不是 k8s 里 Pod/Deployment 的名字**：k8s 对象名由服务端生成的 sandbox id 拼成
+（`sandbox-deployment-sb-<12hex>-…`）。想让 Pod 本身也叫这个前缀，得改 `k8s_middleware`，
+在 SDK 侧改不动。
+
+**并发构建不会互相干扰**：每个构建有自己的 `<build-id>/` 子目录，所有上传/删除动作都限定在
+自己那一层（挂载源是共享的前缀目录，但没人碰别人的子目录）。build-id =
+`<UTC 时间戳>-<pid>-<进程内计数器>-<随机 salt>`，其中**进程内计数器**是关键：一个 daemon
+进程服务所有并发构建，时间戳和 pid 都一样，只有计数器能保证同一进程内绝不重名。
 
 **回退**：`DOCKER_RT_BUILD_CONTEXT_MODE=auto`（默认）下，以下任一情况都会**自动退回**
 `put_archive` 直传，构建照常进行——storage 凭据缺失 / 上传失败、挂载被拒（API 报错）、
