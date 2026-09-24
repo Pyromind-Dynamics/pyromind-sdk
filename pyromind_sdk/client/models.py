@@ -483,8 +483,12 @@ class SandboxExecResponse(BaseModel):
             the command produced no output or could not start.
         stderr: stderr of the command.  Empty string when
             the command produced no error output or could not start.
-        returncode: Process exit code (``0`` = success).  ``-1`` indicates
-            that the exit code could not be determined (e.g. exec failure).
+        returncode: Process exit code (``0`` = success).  ``-1`` means the
+            server ran the command but could not determine its exit code.
+            A stream that ends *without* the server reporting an exit
+            (rejection, cross-account access, connection lost) raises
+            :class:`~pyromind_sdk.exec_stream.SandboxExecStreamError`
+            instead of returning a fabricated return code.
         exception_info: Human-readable error description when the execution
             failed at the infrastructure level (pod not found, timeout, etc.).
             Empty string on normal command execution (even when returncode ≠ 0).

@@ -536,6 +536,14 @@ class AsyncSandboxClient(PyroMindAsyncClient):
 
         Returns:
             SandboxExecResponse with output, stderr, returncode, and exception_info
+
+        Raises:
+            SandboxExecStreamError: When the command could not run to
+                completion — the stream was rejected or closed before the
+                server reported an exit (e.g. the sandbox belongs to another
+                account, the token is invalid, or the connection dropped
+                mid-command). A normal command failure (exit code ≠ 0) is
+                *not* an error and does not raise.
         """
         if isinstance(command, str):
             command = command.strip()
