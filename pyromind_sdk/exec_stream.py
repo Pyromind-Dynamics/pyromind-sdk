@@ -113,7 +113,6 @@ async def _iter_exec_stream_events(
             await ws.send_str(json.dumps(request, ensure_ascii=False))
             loop = asyncio.get_running_loop()
             last_ping = loop.time()
-            saw_exit = False
             while True:
                 if stop_event is not None and stop_event.is_set():
                     break
@@ -143,7 +142,6 @@ async def _iter_exec_stream_events(
                             yield {"type": event_type, "data": str(data)}
                         continue
                     if event_type == "exit":
-                        saw_exit = True
                         yield {
                             "type": "exit",
                             "returncode": int(
@@ -172,12 +170,33 @@ async def _iter_exec_stream_events(
                     aiohttp.WSMsgType.CLOSED,
                     aiohttp.WSMsgType.ERROR,
                 }:
-                    break
-
-            if not saw_exit and not (
-                stop_event is not None and stop_event.is_set()
-            ):
-                yield {"type": "exit", "returncode": -1}
+                    # The server only sends an "exit" event after the command
+                    # actually ran to completion in the container. Every
+                    # rejection path ends the stream *without* one: bad token
+                    # (close 4001), wrong sandbox type (4003), and — the trap —
+                    # a sandbox owned by someone else (4004 "Sandbox not
+                    # found"). Reporting those as returncode=-1 would dress a
+                    # permission denial up as a command result, so raise
+                    # instead. A consumer that asked us to stop keeps its
+                    # graceful break.
+                    if stop_event is not None and stop_event.is_set():
+                        break
+                    if message.type == aiohttp.WSMsgType.CLOSE:
+                        raise SandboxExecStreamError(
+                            "exec stream closed by server before any exit "
+                            "event — the command did not run to completion "
+                            f"(close code={message.data}, reason={message.extra!r})",
+                            str(message.data) if message.data else None,
+                        )
+                    if message.type == aiohttp.WSMsgType.CLOSED:
+                        raise SandboxExecStreamError(
+                            "exec stream connection lost before any exit "
+                            "event — the command did not run to completion",
+                            str(ws.close_code) if ws.close_code else None,
+                        )
+                    raise SandboxExecStreamError(
+                        f"exec stream connection error: {message.data}"
+                    )
         finally:
             await ws.close()
 

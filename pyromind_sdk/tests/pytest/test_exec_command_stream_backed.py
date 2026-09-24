@@ -7,6 +7,7 @@ import pytest
 from pyromind_sdk.client.async_sandbox import AsyncSandboxClient
 from pyromind_sdk.client.models import SandboxExecStreamChunk
 from pyromind_sdk.client.sandbox import SandboxClient
+from pyromind_sdk.exec_stream import SandboxExecStreamError
 
 
 def test_sync_exec_command_consumes_stream_and_aggregates_output() -> None:
@@ -66,3 +67,40 @@ async def test_async_exec_command_consumes_stream_and_aggregates_output() -> Non
     assert result.returncode == 0
     assert result.exception_info == ""
     client.post.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# A stream that ends without the server reporting an exit (cross-account
+# access closes 4004, bad token 4001, connection lost) must raise, not come
+# back disguised as a SandboxExecResponse with an empty output.
+# ---------------------------------------------------------------------------
+
+_REJECT = SandboxExecStreamError(
+    "exec stream closed by server before any exit event — the command did "
+    "not run to completion (close code=4004, reason='Sandbox not found')",
+    "4004",
+)
+
+
+def test_sync_exec_command_raises_when_the_stream_never_exits() -> None:
+    client = SandboxClient.__new__(SandboxClient)
+    client.exec_command_stream = MagicMock(side_effect=_REJECT)
+
+    with pytest.raises(SandboxExecStreamError) as excinfo:
+        client.exec_command(sandbox_id="sb-other-users", command="ls /")
+
+    assert excinfo.value.code == "4004"
+
+
+@pytest.mark.asyncio
+async def test_async_exec_command_raises_when_the_stream_never_exits() -> None:
+    client = AsyncSandboxClient.__new__(AsyncSandboxClient)
+
+    async def fake_stream(**kwargs):
+        raise _REJECT
+        yield  # pragma: no cover — makes this an async generator
+
+    client.exec_command_stream = fake_stream
+
+    with pytest.raises(SandboxExecStreamError):
+        await client.exec_command(sandbox_id="sb-other-users", command="ls /")
