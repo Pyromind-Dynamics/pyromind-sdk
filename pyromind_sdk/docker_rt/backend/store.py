@@ -127,6 +127,15 @@ class ExecRecord:
     running: bool = False
     exit_code: int | None = None
     created: float = field(default_factory=time.time)
+    # TTY size from ``POST /exec/{id}/resize``. The Docker CLI sends it right
+    # after ``exec create`` and *before* ``exec start``, so it is the only way
+    # an interactive session can open with the right geometry.
+    tty_cols: int = 0
+    tty_rows: int = 0
+    # Installed by the terminal bridge while an interactive session is live, so
+    # a late ``POST /exec/{id}/resize`` (the user dragging the terminal) reaches
+    # the platform PTY instead of being silently dropped.
+    resize_hook: Any = None
 
 
 def _docker_id() -> str:

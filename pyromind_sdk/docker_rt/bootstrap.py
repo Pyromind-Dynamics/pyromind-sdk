@@ -160,11 +160,15 @@ async def check_connection(
 ) -> int:
     """Verify PyroMind API access and return the number of visible sandboxes."""
     from pyromind_sdk.client.async_sandbox import AsyncSandboxClient
+    from pyromind_sdk.client.base import resolve_api_base_url
 
     owns_client = client is None
     client = client or AsyncSandboxClient(
         api_key=api_key or os.getenv("PYROMIND_API_KEY"),
         cluster=cluster or os.getenv("PYROMIND_CLUSTER"),
+        # Data plane: check the cluster the daemon will actually talk to,
+        # not the portal.
+        base_url=resolve_api_base_url(cluster),
     )
     try:
         return len(await client.list())

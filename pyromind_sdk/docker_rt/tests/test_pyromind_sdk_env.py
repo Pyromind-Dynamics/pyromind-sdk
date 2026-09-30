@@ -97,6 +97,33 @@ def test_shared_async_client_uses_256_connection_pool(
     asyncio.run(_check())
 
 
+def test_shared_async_client_targets_the_cluster_directly(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """``docker cp`` and friends are data plane: never through the portal."""
+    monkeypatch.setenv("PYROMIND_API_KEY", "test-key")
+    monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-1#pre")
+
+    client = env_mod.new_sandbox_client()
+
+    assert client.base_url == "https://pre-api.pyromind.ai/api/v1"
+    assert client.cluster == "us-west-1#pre"
+
+
+def test_shared_async_client_keeps_an_explicit_base_url(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """An operator pointing the daemon at their own deployment still wins."""
+    monkeypatch.setenv("PYROMIND_API_KEY", "test-key")
+    monkeypatch.setenv("PYROMIND_BASE_URL", "https://self-hosted.example.com/api/v1")
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-1#pre")
+
+    client = env_mod.new_sandbox_client()
+
+    assert client.base_url == "https://self-hosted.example.com/api/v1"
+
+
 def test_close_sandbox_client_clears_shared_singleton() -> None:
     client = MagicMock()
     client.close = AsyncMock()
@@ -1153,3 +1180,175 @@ def test_pyromind_terminal_url_uses_base_url(monkeypatch: MonkeyPatch) -> None:
         "wss://pre-api.pyromind.ai/api/v1/sandboxes/sb-1/terminal?"
     )
     assert "cols=80&rows=24" in url
+
+
+def test_pyromind_terminal_url_carries_command_and_size(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """``docker exec -it <cid> <cmd>`` must reach the PTY as an argv.
+
+    Without this the terminal side would open its login shell and the command
+    the user typed would be silently dropped.
+    """
+    from ..aio_server import _pyromind_terminal_url
+
+    adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.sandbox_id = "sb-1"
+    monkeypatch.setenv(
+        "PYROMIND_BASE_URL", "https://pre-api.pyromind.ai/api/v1"
+    )
+    monkeypatch.delenv("PYROMIND_API_KEY", raising=False)
+
+    url = _pyromind_terminal_url(
+        adapter, cols=132, rows=43, cmd=["bash", "-l"], cwd="/workspace"
+    )
+
+    assert "cols=132&rows=43" in url
+    assert "command=bash" in url
+    assert "command=-l" in url
+    assert "cwd=%2Fworkspace" in url
+
+
+# ---------------------------------------------------------------------------
+# docker inspect's internal IP. The SDK backend used to be skipped entirely,
+# which left NetworkSettings.*.IPAddress empty for every container. It is now
+# resolved through the batch endpoint (one request covers every sandbox asked
+# about). The platform keeps this value in the batch "aux" lookup
+# (`GET /api/v1/sandboxes/internal_ips`, same source as webapp list_aux).
+# The IP is stable for the sandbox's lifetime, so there is deliberately no
+# cache: the caller asks once and keeps the answer for its own lifetime.
+# ---------------------------------------------------------------------------
+
+
+class _FakeInternalIpClient:
+    def __init__(self, mapping: dict[str, str], *, fail: bool = False) -> None:
+        self.mapping = dict(mapping)
+        self.fail = fail
+        self.calls: list[list[str]] = []
+
+    async def get_internal_ips(self, sandbox_ids):
+        if self.fail:
+            raise RuntimeError("lookup failed")
+        batch = list(sandbox_ids)
+        self.calls.append(batch)
+        return {sid: self.mapping[sid] for sid in batch if sid in self.mapping}
+
+
+def _adapter(sandbox_id: str = "sb-demo") -> PyromindSDK:
+    adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.sandbox_id = sandbox_id
+    adapter.sandbox_status = "Running"
+    adapter.resources = {}
+    adapter.configuration = None
+    adapter.volume_mounts = []
+    adapter.port_mappings = []
+    adapter.created_at = None
+    adapter.updated_at = None
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_batch_pod_ips_covers_many_sandboxes_in_one_request() -> None:
+    client = _FakeInternalIpClient({"sb-1": "10.0.0.1", "sb-2": "10.0.0.2"})
+
+    resolved = await env_mod.batch_pod_ips(["sb-1", "sb-2"], client=client)
+
+    assert resolved == {"sb-1": "10.0.0.1", "sb-2": "10.0.0.2"}
+    assert client.calls == [["sb-1", "sb-2"]]
+
+
+@pytest.mark.asyncio
+async def test_batch_pod_ips_drops_blank_and_duplicate_ids() -> None:
+    client = _FakeInternalIpClient({"sb-1": "10.0.0.1"})
+
+    assert await env_mod.batch_pod_ips(["", "sb-1", "  "], client=client) == {
+        "sb-1": "10.0.0.1"
+    }
+    assert client.calls == [["sb-1"]]
+    assert await env_mod.batch_pod_ips([], client=client) == {}
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_pod_ips_returns_nothing_for_a_starting_sandbox() -> None:
+    """A sandbox with no IP yet is simply absent — and is asked again next time."""
+    client = _FakeInternalIpClient({})
+
+    assert await env_mod.batch_pod_ips(["sb-starting"], client=client) == {}
+    assert await env_mod.batch_pod_ips(["sb-starting"], client=client) == {}
+
+    # No negative caching: the IP shows up the moment the Service gets one.
+    assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_batch_pod_ips_never_raises_on_lookup_failure() -> None:
+    client = _FakeInternalIpClient({}, fail=True)
+
+    assert await env_mod.batch_pod_ips(["sb-1"], client=client) == {}
+
+
+@pytest.mark.asyncio
+async def test_get_pod_ip_goes_through_the_batch_lookup() -> None:
+    client = _FakeInternalIpClient({"sb-demo": "10.1.2.3"})
+    adapter = _adapter()
+    adapter._client = client
+
+    assert await adapter.get_pod_ip() == "10.1.2.3"
+    assert client.calls == [["sb-demo"]]
+
+
+@pytest.mark.asyncio
+async def test_resolve_inspect_pod_ip_works_for_the_sdk_backend(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    from ..aio_server import _resolve_inspect_pod_ip
+
+    client = _FakeInternalIpClient({"sb-demo": "10.9.9.9"})
+    monkeypatch.setattr(env_mod, "get_sandbox_client", lambda: client)
+
+    record = ContainerRecord(
+        id="local-id",
+        name="demo",
+        image="busybox:1.36",
+        state=ContainerState.RUNNING,
+        kube_env=_adapter(),
+    )
+
+    assert await _resolve_inspect_pod_ip(record) == "10.9.9.9"
+
+
+def test_inspect_reports_the_resolved_pod_ip(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.delenv("DOCKER_RT_INSPECT_MODE", raising=False)
+    record = ContainerRecord(
+        id="local-id",
+        name="demo",
+        image="busybox:1.36",
+        state=ContainerState.RUNNING,
+        kube_env=_adapter(),
+    )
+
+    result = _to_inspect(record, pod_ip="10.0.0.7")
+
+    assert result["NetworkSettings"]["IPAddress"] == "10.0.0.7"
+    assert (
+        result["NetworkSettings"]["Networks"]["bridge"]["IPAddress"] == "10.0.0.7"
+    )
+
+
+def test_inspect_without_a_resolved_ip_keeps_the_field_empty(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """No IP yet must still be a valid inspect payload, not an omitted key."""
+    monkeypatch.delenv("DOCKER_RT_INSPECT_MODE", raising=False)
+    record = ContainerRecord(
+        id="local-id",
+        name="demo",
+        image="busybox:1.36",
+        state=ContainerState.RUNNING,
+        kube_env=_adapter(),
+    )
+
+    result = _to_inspect(record, pod_ip="")
+
+    assert result["NetworkSettings"]["IPAddress"] == ""

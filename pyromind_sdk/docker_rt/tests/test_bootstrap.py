@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import os
 
+import pytest
 from pytest import MonkeyPatch
 
 from ..bootstrap import (
@@ -10,6 +11,30 @@ from ..bootstrap import (
     prepare_env,
     print_connected,
 )
+
+_PYROMIND_VARS = ("PYROMIND_API_KEY", "PYROMIND_CLUSTER")
+
+
+@pytest.fixture(autouse=True)
+def _restore_pyromind_env():
+    """``prepare_env()`` writes ``os.environ`` **directly**, so it escapes monkeypatch.
+
+    Without this, ``PYROMIND_CLUSTER=us-west-1#pre`` leaked out of this module
+    into the rest of the session. That used to be harmless, but once
+    ``registry_push.current_cluster()`` learned to read ``PYROMIND_CLUSTER`` it
+    made unrelated tests fail purely on file ordering (a ``us-west-1`` profile
+    needs ``DOCKER_RT_REGISTRY_NAMESPACE``, so the push prefix stopped
+    resolving). Restoring explicitly is order-independent, unlike
+    ``monkeypatch.delenv(..., raising=False)``, which records nothing when the
+    variable is already absent and therefore never undoes a later direct write.
+    """
+    saved = {name: os.environ.get(name) for name in _PYROMIND_VARS}
+    yield
+    for name, value in saved.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 def test_prepare_env_prompts_missing_values(monkeypatch: MonkeyPatch) -> None:

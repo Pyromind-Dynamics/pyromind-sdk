@@ -133,10 +133,27 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 | `DOCKER_RT_CLEANUP_CONCURRENCY` | `4` | Maximum concurrent sandbox pause/delete cleanups |
 | `DOCKER_RT_DEFAULT_IMAGE` | SWE-bench default image | `docker images` default entry |
 | `DOCKER_RT_PORT_FORWARD_MODE` | `auto` | `-p` backend: `auto` / `direct` / `api` |
-| `DOCKER_RT_BUILDKIT_ADDR` | empty | `buildctl` address, e.g. `unix:///run/buildkit/buildkitd.sock` |
-| `DOCKER_RT_BUILD_REGISTRY` | empty | Push prefix for short image tags |
+| `DOCKER_RT_BUILD_IMAGE` | empty | **Hard prerequisite** for builds: a cluster-pullable kaniko executor image (must be the `-debug` variant) |
+| `DOCKER_RT_BUILD_REGISTRY` | empty | Push prefix for short image tags; derived from the cluster profile when empty |
 | `DOCKER_RT_BUILD_PUSH` | `true` | Whether build pushes to the registry |
-| `DOCKER_RT_BUILD_TIMEOUT` | `3600` | `buildctl` timeout in seconds |
+| `DOCKER_RT_BUILD_EXECUTOR` | `kaniko` | Build executor; only kaniko is implemented |
+| `DOCKER_RT_BUILD_TIMEOUT` | `3600` | Timeout (seconds) for one build |
+| `DOCKER_RT_BUILD_SANDBOX_CPU` / `_MEMORY` | `2` / `4Gi` | Build sandbox resources |
+| `DOCKER_RT_BUILD_SANDBOX_KEEP` | `false` | Keep the build sandbox (troubleshooting only). It also skips the `kill -9` sweep below, otherwise the flag would defeat itself |
+| `DOCKER_RT_BUILD_SANDBOX_SWEEP` | `true` | On `kill -9` the sandbox teardown is skipped, leaving a `sleep infinity` sandbox **running** against the user's quota — more expensive than a staged context. Build sandboxes are named `sandbox-docker-build-<random>`, and after restoring the Docker context the watcher deletes every sandbox whose name carries that prefix. Set `false` to disable |
+| `DOCKER_RT_BUILD_CONTEXT_MODE` | `auto` | How the build context reaches the sandbox: `auto` (storage first, fall back to a direct upload) / `storage` (storage or fail) / `upload` (never touch storage — the old HTTP route). Storage is the default because the direct route pushes one exec websocket per 2 MiB **serially**: 631 s for 61 MiB (~110 KB/s), unusable for multi-GB ML contexts. Storage uploads the tar.gz to the user's workspace object store with parallel parts and the cluster reads it **locally** through a mount (60 MiB: ~59 s upload + 2.7 s in-cluster copy) |
+| `DOCKER_RT_BUILD_STAGING_MOUNT` | `/kaniko/docker-rt-stage` | Mount target (in-Pod path) for the storage route. Must stay under `/kaniko` for the same reason as the build context dir: kaniko wipes `/` on a multi-stage switch and keeps only `/kaniko` |
+| `DOCKER_RT_BUILD_STAGING_PREFIX` | `.docker-rt-build` | Workspace-relative directory holding staged contexts; each build gets a unique `<build-id>/` subdirectory, removed afterwards (success or failure) |
+| `DOCKER_RT_BUILD_STAGING_WORKSPACE` | `/workspace` | Mount source root (the workspace as the platform sees it = JuiceFS subPath `<uid>`). Verified: storage key `<rel>` == `/workspace/<rel>` inside the Pod |
+| `DOCKER_RT_BUILD_STAGING_PARALLEL` | `8` | Concurrent multipart uploads (clamped to 1–32). Measured knee is 8 (60 MiB incompressible: 4 conns → 2.3 MiB/s, 8 → 5.9, 16 → 6.4) |
+| `DOCKER_RT_BUILD_STAGING_SWEEP` | `true` | On `kill -9` the daemon's `finally` never runs, so a staged context would sit in the user's quota forever. The watcher — which already restores the Docker context after such a death — sweeps those leftovers. Set `false` to disable |
+| `DOCKER_RT_BUILD_STAGING_SWEEP_MAX_AGE_S` | `86400` | Only applies to directories that cannot be attributed to a process: they must be older than this to be removed. Directories whose build id names a pid are judged by whether that pid is still alive |
+| `DOCKER_RT_STORAGE_CLUSTER` / `DOCKER_RT_CLUSTER` / `PYROMIND_CLUSTER` | empty | Cluster key for the storage profile lookup, first non-empty wins; falls back to the current profile |
+| `DOCKER_RT_REGISTRY_CLUSTER` | empty | Push profile: `us-west-1` / `us-west-2` / `cn-east-1` |
+| `DOCKER_RT_REGISTRY_NAMESPACE` | empty | Registry namespace; required on Docker Hub clusters |
+| `DOCKER_RT_REGISTRY_USERNAME` / `DOCKER_RT_REGISTRY_PASSWORD` | empty | Registry username and password/token with push permission; both nonempty take precedence over dockerconfig; unrelated to `PYROMIND_API_KEY` |
+| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | `/etc/docker-image/.dockerconfigjson` | Credential file path readable by the daemon; contents may be JSON or base64-encoded JSON; see "Configure registry authentication before building" |
+| `DOCKER_RT_ACR_ACCESS_KEY_ID` / `_SECRET` / `_INSTANCE_ID` | empty | Used to pre-create ACR repositories in Shanghai |
 | `DOCKER_RT_SERVICE_DNS` | `true` | Create ClusterIP Service for Compose service DNS |
 | `DOCKER_RT_ORPHAN_POLICY` | `adopt` | `adopt` restores managed Pods; `reap` deletes them on startup |
 | `DOCKER_RT_CLEANUP_ON_EXIT` | `false` | Delete managed Pods on SIGINT/SIGTERM when `true` |
@@ -469,7 +486,6 @@ port-forward / NodePort.
 After starting docker-rt, these commands are not supported:
 
 ```text
-docker build
 docker buildx build
 docker compose build
 docker compose up --build
@@ -477,15 +493,122 @@ docker logs
 docker events
 ```
 
-They depend on a real Docker daemon / BuildKit container lifecycle. Build the
-image with normal Docker/BuildKit first and push it to a registry, then use
-`docker run` with that image. `docker logs` is not supported by the
-`k8s-middleware` backend; use `docker exec -it <container> bash` to view logs
-inside the container.
+`docker build` **is** supported (see "Image builds" below): it builds with kaniko
+inside a throwaway sandbox in the cluster and pushes to a registry, so it needs
+neither a local Docker daemon nor any privilege. `buildx build` / `compose build`
+are not wired up yet — use `docker build` or plain Docker for now.
+`docker logs` is not supported by the `k8s-middleware` backend; use
+`docker exec -it <container> bash` to view logs inside the container.
 
 Chain: `Docker CLI -> docker-rt daemon -> KubeEnvironment -> Kubernetes API`.
 The current implementation uses the official Kubernetes Python SDK directly; a
 future adapter can replace that hop with the `k8s_middleware` HTTP API.
+
+### Image builds
+
+#### Configure registry authentication before building
+
+`DOCKER_RT_BUILD_PUSH=true` by default, so kaniko pushes the image after building.
+Docker Hub, ACR, and similar registries require a registry username and password or
+a token with push permission; anonymous pulls do not imply anonymous pushes.
+`PYROMIND_API_KEY` authenticates the Sandbox platform API, not the image registry.
+
+**Option 1: registry username + password/token.** The example prompts without echoing
+the password/token so it does not enter shell history. Replace the image, namespace,
+and username first; the builder must be a kaniko debug image the cluster can pull.
+Configure the platform API key and cluster as described above.
+
+```bash
+export DOCKER_RT_BUILD_IMAGE="your-registry.example.com/builders/kaniko:v1.24.0-debug"
+export DOCKER_RT_BUILD_REGISTRY="docker.io/your-namespace"
+export DOCKER_RT_BUILD_PUSH=true
+export DOCKER_RT_REGISTRY_USERNAME="your-dockerhub-user"
+export DOCKER_RT_REGISTRY_PASSWORD="$(python3 -c 'import getpass; print(getpass.getpass("Registry password/token: "))')"
+
+pyromind docker-rt --daemon
+docker build -t myapp:latest .
+```
+
+This pushes to `docker.io/your-namespace/myapp:latest`. For another registry, set
+`DOCKER_RT_BUILD_REGISTRY` to its `registry-host/namespace` and supply that registry's
+username and password/token. When both credential variables are nonempty, they take
+precedence over the dockerconfig file.
+
+**Option 2: an existing dockerconfig file.** Choose this instead of the username/password
+variables before starting the daemon:
+
+```bash
+unset DOCKER_RT_REGISTRY_USERNAME DOCKER_RT_REGISTRY_PASSWORD
+export DOCKER_RT_REGISTRY_DOCKERCONFIG="/absolute/path/to/dockerconfig.json"
+```
+
+- The variable must contain a **file path on the daemon's machine**, not JSON or a
+  base64 string. File contents may be JSON or base64-encoded JSON; `auths` must
+  contain the registry's `auth` or `username`/`password` credentials.
+- The default mounted file is `/etc/docker-image/.dockerconfigjson`. Even when using
+  this file, explicitly set `DOCKER_RT_REGISTRY_DOCKERCONFIG` to pass the current
+  credential precheck for short-tag builds.
+- Builds do not automatically consume `docker login` authentication headers,
+  `~/.docker/config.json`, or system credential helpers. A config containing only
+  `credsStore` / `credHelpers` or `identitytoken` is insufficient; the explicitly
+  selected file must include the `auths` credentials described above.
+- The **docker-rt daemon** reads these variables, so configure them before startup.
+  If it is already running, stop it with `pyromind docker-rt --stop` and restart it
+  from the configured shell. Setting variables only on the `docker build` command
+  does not update an existing daemon's environment.
+- ACR repository creation uses separate `DOCKER_RT_ACR_ACCESS_KEY_ID`,
+  `DOCKER_RT_ACR_ACCESS_KEY_SECRET`, and `DOCKER_RT_ACR_INSTANCE_ID` settings;
+  these do not replace registry push credentials.
+
+Do not commit real passwords, tokens, or dockerconfig files, or copy them into a
+Dockerfile or build context. Base64 is not encryption; restrict access to credential files.
+
+#### Build flow and limitations
+
+How `docker build -t myapp .` works:
+
+```text
+wrapper exports DOCKER_BUILDKIT=0
+  → the classic builder POSTs the context tar to docker-rt's /build
+  → a throwaway CUSTOM sandbox is created from DOCKER_RT_BUILD_IMAGE
+  → the context is uploaded as a single gzipped file
+  → exec kaniko --context=tar://… --destination=… --digest-file=…
+  → read the digest, register the short-tag alias, delete the sandbox
+docker run myapp   → a normal sandbox pulls the image that was just pushed
+```
+
+Four things worth knowing:
+
+1. **The build sandbox must be disposable** and cannot be the container the user
+   already has: kaniko unpacks the `FROM` image's rootfs into **its own container
+   root** ("may overwrite anything already there"), so it can only ever run in a
+   throwaway container.
+2. **The builder image must be kaniko's `-debug` variant** (e.g.
+   `gcr.io/kaniko-project/executor:v1.24.0-debug`): the default executor image is
+   `FROM scratch` — no `sleep`, no shell — while the sandbox template pins
+   `command: ["sleep", "infinity"]`. Also, `gcr.io` is unreachable from some
+   clusters, so mirror it into a registry the cluster can pull and point
+   `DOCKER_RT_BUILD_IMAGE` at the mirror. See
+   `pyromind_sdk/docker_rt/builder-image/kaniko/README.md`.
+3. **The push target differs per cluster**: west pushes to Docker Hub, Shanghai
+   pushes to Aliyun ACR Enterprise Edition and **requires the repository to exist
+   first** (docker-rt creates it before spending a sandbox; missing AccessKey /
+   instance id is a skip-with-warning). Short tags need
+   `DOCKER_RT_BUILD_REGISTRY` (or a cluster profile plus
+   `DOCKER_RT_REGISTRY_NAMESPACE`); when it cannot be resolved the build is
+   **rejected rather than guessed**.
+4. **The legacy-builder deprecation banner is stripped by the wrapper.** Forcing
+   `DOCKER_BUILDKIT=0` (which is what routes the build to `POST /build`) makes the
+   real `docker` CLI print `DEPRECATED: The legacy builder is deprecated …` on
+   stderr. That notice is about docker's own builder — not a docker-rt problem —
+   and docker ships no switch to silence it, so the wrapper pipes the CLI's
+   stderr through a filter that drops exactly that banner. stdout, every other
+   stderr line and the CLI's exit code pass through untouched.
+
+kaniko does not implement BuildKit-only features: `RUN --mount=type=cache/secret/ssh`,
+heredocs, `--cache-to/from`, true multi-platform builds. BuildKit-only flags such
+as `--platform` / `--secret` / `--ssh` are rejected by the wrapper instead of
+being silently ignored.
 
 To run through `k8s_middleware` OpenAPI instead:
 

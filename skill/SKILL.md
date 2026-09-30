@@ -209,8 +209,8 @@ client.close()
 
 | Field | Type | Required | Description | Example |
 |-------|------|----------|-------------|---------|
-| `cpu` | int \| str | Yes | Number of CPU cores | `2`, `"4"` |
-| `memory` | int \| str | Yes | Memory in Gi — passing an int auto-appends `"Gi"` | `8` → `"8Gi"`, `"16Gi"` |
+| `cpu` | int \| float \| str | Yes | Number of CPU cores; custom sandboxes accept one decimal place | `2`, `0.1`, `"4"` |
+| `memory` | int \| float \| str | Yes | Memory in Gi; numeric values auto-append `"Gi"`, and sandboxes accept one decimal place | `8` → `"8Gi"`, `0.2` → `"0.2Gi"`, `"16Gi"` |
 | `gpu` | int \| str | Inference only | Number of GPUs | `1`, `"2"` |
 | `gpu_card` | str | Inference only | GPU card model | `"L40S"`, `"H100"` |
 
@@ -222,7 +222,7 @@ ResourceConfig(cpu="2", memory="8Gi")
 ResourceConfig(cpu="4", memory="16Gi", gpu="1", gpu_card="L40S")
 ```
 
-> The validators also accept plain integers as a shorthand: `cpu=2` → `"2"`, `memory=8` → `"8Gi"`, `gpu=1` → `"1"`.
+> The validators also accept plain numeric values as a shorthand: `cpu=2` → `"2"`, `memory=0.2` → `"0.2Gi"`, `gpu=1` → `"1"`.
 
 ### ⚠️ Instance Management Best Practices
 
@@ -320,4 +320,3 @@ Rules: In standard format, only **connected** inputs appear in the node `inputs`
 ## More detail
 
 - Imports and format summary: [reference.md](reference.md)
-

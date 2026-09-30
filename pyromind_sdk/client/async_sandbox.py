@@ -13,6 +13,7 @@ from typing import (
     IO,
     List,
     Optional,
+    Sequence,
     Union,
     Any,
 )
@@ -42,6 +43,8 @@ from ..exec_stream import (
 _DEFAULT_EXEC_TIMEOUT_S = 600
 _DEFAULT_CREATE_TIMEOUT_S = 300
 _DEFAULT_CREATE_CONCURRENCY_LIMIT = 128
+# Server-side cap of GET /sandboxes/internal_ips (see list_aux's[:200] rule).
+_INTERNAL_IPS_BATCH_SIZE = 200
 
 
 def _decode_exec_stream_data(data: Union[str, bytes]) -> str:
@@ -285,6 +288,40 @@ class AsyncSandboxClient(PyroMindAsyncClient):
             "internal_ip": data.get("internal_ip"),
         }
         return InternalIPResponse(**normalized)
+
+    async def get_internal_ips(self, sandbox_ids: Sequence[str]) -> Dict[str, str]:
+        """
+        Batch internal IP lookup for several sandboxes (async).
+
+        One request per 200 sandboxes instead of one request per sandbox. Only
+        sandboxes the caller owns and that are currently running are returned,
+        so a missing key means "not yours", "not running" or "no IP yet".
+
+        Args:
+            sandbox_ids: sandbox IDs to look up
+
+        Returns:
+            Mapping of ``sandbox_id -> internal_ip``; unresolved IDs are absent.
+        """
+        wanted = [str(sid).strip() for sid in sandbox_ids]
+        wanted = [sid for sid in wanted if sid]
+        if not wanted:
+            return {}
+
+        resolved: Dict[str, str] = {}
+        for start in range(0, len(wanted), _INTERNAL_IPS_BATCH_SIZE):
+            batch = wanted[start:start + _INTERNAL_IPS_BATCH_SIZE]
+            response = await self.get(
+                "/sandboxes/internal_ips", params={"codes": ",".join(batch)}
+            )
+            data = self._extract_data(response)
+            mapping = data.get("internal_ips") if isinstance(data, dict) else None
+            if not isinstance(mapping, dict):
+                continue
+            for sandbox_id, internal_ip in mapping.items():
+                if internal_ip:
+                    resolved[str(sandbox_id)] = str(internal_ip)
+        return resolved
 
     async def wait_for_sandbox_status(
         self,
