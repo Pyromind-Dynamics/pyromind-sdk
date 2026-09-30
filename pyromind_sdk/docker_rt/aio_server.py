@@ -1502,6 +1502,23 @@ async def create_container(request: web.Request) -> web.Response:
         return _err(400, "Image is required")
     image = store.resolve_image(image)
 
+    # Foreground attach (`docker run img` without -d / -i / -t) cannot be served
+    # by the k8s-middleware backend: there is no main-process stream to attach
+    # to. Reject HERE — before anything is created — instead of letting the CLI
+    # create+start a sandbox and only failing at the attach hijack (that used to
+    # leave a running instance the user never asked to keep).
+    # Interactive runs (-i / -t) ride the terminal PTY and stay allowed; -d does
+    # not attach at all.
+    if (
+        (body.get("AttachStdout") or body.get("AttachStderr"))
+        and not body.get("AttachStdin")
+        and not body.get("Tty")
+    ):
+        return _err(
+            400,
+            "foreground attach is not supported by k8s-middleware; use -d or -it",
+        )
+
     env = parse_env_list(body.get("Env"))
     cmd = body.get("Cmd") or []
     if isinstance(cmd, str):

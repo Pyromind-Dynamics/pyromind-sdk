@@ -1,8 +1,21 @@
-"""Parse Docker / label memory & CPU specs into Kubernetes resource quantities."""
+"""Parse Docker / label memory & CPU specs into the sandbox create-API quantities.
+
+The create endpoint (``POST /api/v1/sandboxes``) takes **unit-less cores** for CPU
+(``"0.1"``, ``"2"`` — K8s milli syntax like ``"100m"`` is rejected) and a **Gi
+number with ≤2 decimals** for memory (``"0.2Gi"``). Docker, on the other hand,
+speaks NanoCpus and byte counts. The ``resolve_*`` functions therefore translate
+everything into the create-API format; the ``*_to_k8s`` / ``quantity_to_*``
+helpers remain for label parsing and ``docker inspect``.
+
+Values the API cannot express are **rejected, never rounded**: ``--cpus=0.125``
+and ``-m 0.123g`` raise (surfaced as HTTP 400 by the create handler) instead of
+silently becoming 0.12/0.13 cores or 0.12Gi.
+"""
 
 from __future__ import annotations
 
 import re
+from decimal import Decimal, ROUND_CEILING
 from typing import Any
 
 # Docker CLI / Engine: Memory is bytes (int). Labels accept K8s-style strings.
@@ -208,7 +221,7 @@ def resolve_memory_resources(
     labels: dict[str, str] | None = None,
     host_config: dict[str, Any] | None = None,
 ) -> tuple[str | None, str | None]:
-    """Return ``(memory_limit, memory_request)`` K8s quantities.
+    """Return ``(memory_limit, memory_request)`` in **create-API** format (``…Gi``).
 
     Priority for limit:
       1. label ``docker-rt.memory``
@@ -218,6 +231,10 @@ def resolve_memory_resources(
       1. label ``docker-rt.memory-request``
       2. ``HostConfig.MemoryReservation``
       3. same as limit (when limit is set)
+
+    Values are normalised to Gi with ≤2 decimals: the create endpoint reads a
+    plain number as Gi, so ``--memory=0.2g`` (214748364 bytes) must be sent as
+    ``"0.2Gi"`` rather than raw bytes (which would be read as 214748364 Gi).
     """
     labels = labels or {}
     host_config = host_config or {}
@@ -232,7 +249,95 @@ def resolve_memory_resources(
     if request is None and limit is not None:
         request = limit
 
-    return limit, request
+    return quantity_to_api_memory(limit), quantity_to_api_memory(request)
+
+
+# ---------------------------------------------------------------------------
+# create-API format (§ the sandbox create endpoint contract)
+# ---------------------------------------------------------------------------
+
+
+def _plain(d: Decimal) -> str:
+    """``Decimal("0.10") -> "0.1"``, ``Decimal("4.00") -> "4"``."""
+    out = format(d.normalize(), "f")
+    return out
+
+
+_TWO_PLACES = Decimal("0.01")
+_GIB = Decimal(1024**3)
+# Docker truncates its own suffix math to whole bytes, so a genuine 2-decimal
+# input lands within a byte or two; anything off by more than this is a value the
+# create API cannot express (e.g. 0.123g is ~3 MiB away from 0.12Gi).
+_BYTE_SLACK = Decimal(1024**2)
+
+
+def cores_to_api_cpu(cores: float | str | Decimal) -> str:
+    """CPU cores → create-API cpu: a bare number, ≤2 decimals (``"0.1"``, ``"2"``).
+
+    The endpoint parses plain cores (:func:`parse_cpu_to_cores`) and rejects K8s
+    milli syntax — ``--cpus=0.1`` must **not** be sent as ``"100m"``.
+
+    Precision is **validated, not rounded**: ``--cpus=0.125`` raises instead of
+    silently becoming 0.12/0.13, so the caller never gets a different size than
+    the one they asked for.
+    """
+    d = cores if isinstance(cores, Decimal) else Decimal(str(cores))
+    if d <= 0:
+        raise ValueError(f"cpu must be positive, got {cores}")
+    if d != d.quantize(_TWO_PLACES):
+        raise ValueError(
+            f"cpu {cores} is not supported: at most two decimal places "
+            f"(e.g. --cpus=0.1 / --cpus=0.25 / --cpus=2)"
+        )
+    return _plain(d)
+
+
+def bytes_to_api_gi(n: int) -> str:
+    """Bytes → create-API memory: Gi with ≤2 decimals (``"0.2Gi"``, ``"8Gi"``).
+
+    Like :func:`cores_to_api_cpu` this **rejects** values that need more than two
+    decimals (``-m 0.123g``) instead of rounding them.
+    """
+    if n <= 0:
+        raise ValueError(f"memory must be positive, got {n}")
+    d = Decimal(n) / _GIB
+    stripped = d.quantize(_TWO_PLACES)
+    if d != stripped and abs(d - stripped) * _GIB > _BYTE_SLACK:
+        raise ValueError(
+            f"memory {n} bytes (~{d:.4f}Gi) is not supported: at most two decimal "
+            f"places of Gi (e.g. -m 0.2g / -m 512Mi / -m 4Gi)"
+        )
+    return f"{_plain(stripped)}Gi"
+
+
+def quantity_to_api_cpu(q: str | None) -> str | None:
+    """Any accepted cpu form (``2`` / ``500m`` / ``0.1``) → create-API cores."""
+    if not q:
+        return None
+    nano = quantity_to_nano_cpus(q)
+    if nano <= 0:
+        return None
+    try:
+        return cores_to_api_cpu(Decimal(nano) / Decimal(_NANO_CPUS))
+    except ValueError as exc:
+        raise ValueError(f"invalid cpu {q!r}: {exc}") from exc
+
+
+def quantity_to_api_memory(q: str | None) -> str | None:
+    """K8s-style memory quantity (``8Gi`` / ``512Mi`` / bytes int) → ``…Gi``.
+
+    Docker-style suffixes (``8g``) are normalised by :func:`parse_memory_to_k8s`
+    before they reach this function, so they never appear here.
+    """
+    if not q:
+        return None
+    b = quantity_to_bytes(q)
+    if b <= 0:
+        return None
+    try:
+        return bytes_to_api_gi(b)
+    except ValueError as exc:
+        raise ValueError(f"invalid memory {q!r}: {exc}") from exc
 
 
 def half_cpu_quantity(q: str) -> str:
@@ -251,12 +356,34 @@ def half_cpu_quantity(q: str) -> str:
     return f"{milli}m"
 
 
+def half_to_api_cpu(q: str) -> str | None:
+    """Half of a cpu quantity → create-API cores, rounded **up** to 2 decimals.
+
+    Only used for the *derived* request (no ``docker-rt.cpu-request`` given).
+    Rounding is fine here because the value is docker-rt's own default — and it
+    matches what the middleware computes for the pod
+    (``cpu_request = ceil2(cpu_limit / 2)``). A user-supplied request is still
+    validated strictly by :func:`quantity_to_api_cpu`.
+
+    Without the rounding, a perfectly legal ``--cpus=0.25`` would derive a
+    0.125 request and be rejected for precision it never asked for.
+    """
+    nano = quantity_to_nano_cpus(q)
+    if nano <= 0:
+        return None
+    half = (Decimal(nano) / Decimal(_NANO_CPUS)) / 2
+    rounded = half.quantize(_TWO_PLACES, rounding=ROUND_CEILING)
+    if rounded <= 0:
+        rounded = _TWO_PLACES
+    return _plain(rounded)
+
+
 def resolve_cpu_resources(
     *,
     labels: dict[str, str] | None = None,
     host_config: dict[str, Any] | None = None,
 ) -> tuple[str | None, str | None]:
-    """Return ``(cpu_limit, cpu_request)`` K8s quantities.
+    """Return ``(cpu_limit, cpu_request)`` in **create-API** format (bare cores).
 
     Priority for limit:
       1. label ``docker-rt.cpu``
@@ -264,8 +391,13 @@ def resolve_cpu_resources(
       3. ``HostConfig.CpuQuota`` / ``CpuPeriod``
 
     Priority for request:
-      1. label ``docker-rt.cpu-request``
-      2. **half of limit** (when limit is set)
+      1. label ``docker-rt.cpu-request`` (validated like the limit)
+      2. **half of limit**, rounded up to 2 decimals (when limit is set)
+
+    The create endpoint takes unit-less cores (``"0.1"``), so the K8s milli form
+    produced by the parsers (``"100m"``) is translated here — sending ``"100m"``
+    makes the API answer ``Invalid CPU format: 100m``. Values needing more than
+    two decimals (``--cpus=0.125``) are rejected, not rounded.
 
     Note: ``CpuShares`` is relative weight only and is ignored for hard limits.
     """
@@ -281,8 +413,12 @@ def resolve_cpu_resources(
             host_config.get("CpuPeriod"),
         )
 
-    request = parse_cpu_to_k8s(labels.get("docker-rt.cpu-request"))
-    if request is None and limit is not None:
-        request = half_cpu_quantity(limit)
+    explicit_request = parse_cpu_to_k8s(labels.get("docker-rt.cpu-request"))
+    if explicit_request is not None:
+        api_request = quantity_to_api_cpu(explicit_request)
+    elif limit is not None:
+        api_request = half_to_api_cpu(limit)
+    else:
+        api_request = None
 
-    return limit, request
+    return quantity_to_api_cpu(limit), api_request

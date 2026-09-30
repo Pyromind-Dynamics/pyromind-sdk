@@ -12,7 +12,7 @@ from pathlib import Path
 WRAPPER_DIR = Path.home() / ".pyromind" / "bin"
 WRAPPER_PATH = WRAPPER_DIR / "docker"
 PATH_LINE = 'export PATH="$HOME/.pyromind/bin:$PATH"'
-WRAPPER_VERSION = "17"
+WRAPPER_VERSION = "18"
 
 
 def _wrapper_version() -> str | None:
@@ -145,7 +145,35 @@ fi
 # Only for docker-rt: on a real Docker context the wrapper handed over above.
 export DOCKER_CLI_HINTS=false
 export DOCKER_CLI_HOOKS=false
+# A unit-less --memory / -m / --memory-reservation means **Gi** on docker-rt,
+# not bytes.
+#
+# The real CLI parses the flag with go-units' RAMInBytes, and for a value with no
+# suffix that function ends with `return int64(size), nil` - so "--memory=0.23"
+# is int64(0.23) = 0 bytes, which Docker reads as "no memory limit". The sandbox
+# then quietly falls back to docker-rt's default (2Gi): the user asked for 0.23
+# and silently got 2Gi, with no error anywhere. Docker cannot be made to tell the
+# two cases apart afterwards (a missing -m and "-m 0.23" both arrive as
+# HostConfig.Memory = 0), so the only place the original text still exists is
+# here, in the wrapper's argv.
+#
+# The create API reads a plain number as Gi, so hand the CLI the suffix the user
+# meant: in Docker's binary suffix map "g" is GiB, which is what the create API
+# calls Gi. Only run/create are touched - elsewhere (docker commit -m "123") the
+# flag does not mean memory and must pass through verbatim.
+docker_rt_mem() {{
+  local v="$1"
+  if [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    printf '%sg' "$v"
+  else
+    printf '%s' "$v"
+  fi
+}}
 args=()
+drt_mem_ok=0
+case "${{1:-}}" in
+  run|create) drt_mem_ok=1 ;;
+esac
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --gpu-card|--gpu_card)
@@ -154,6 +182,31 @@ while [[ $# -gt 0 ]]; do
       ;;
     --gpu-card=*|--gpu_card=*)
       args+=(--label "docker-rt.gpu-card=${{1#*=}}")
+      shift
+      ;;
+    --memory|--memory-reservation|-m)
+      if [[ $drt_mem_ok -eq 1 && $# -ge 2 ]]; then
+        args+=("$1" "$(docker_rt_mem "$2")")
+        shift 2
+      else
+        args+=("$1")
+        shift
+      fi
+      ;;
+    --memory=*|--memory-reservation=*)
+      if [[ $drt_mem_ok -eq 1 ]]; then
+        args+=("${{1%%=*}}=$(docker_rt_mem "${{1#*=}}")")
+      else
+        args+=("$1")
+      fi
+      shift
+      ;;
+    -m=*)
+      if [[ $drt_mem_ok -eq 1 ]]; then
+        args+=("-m=$(docker_rt_mem "${{1#*=}}")")
+      else
+        args+=("$1")
+      fi
       shift
       ;;
     *)
