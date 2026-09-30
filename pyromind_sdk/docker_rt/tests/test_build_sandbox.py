@@ -25,6 +25,11 @@ from ..backend import build_sandbox, context_staging
 
 GOOD_DIGEST = "sha256:" + "a" * 64
 
+#: The push password every test uses. Deliberately distinctive: tests assert it
+#: never reaches the sandbox argv in clear text, and "pat" is a substring of the
+#: ``--tar-path`` flag name, which made that assertion a false positive.
+PUSH_PASSWORD = "registry-pw-9c1f"
+
 
 def _clear(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
@@ -70,7 +75,7 @@ def _set_push_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     the code under test ever runs.
     """
     monkeypatch.setenv("DOCKER_RT_REGISTRY_USERNAME", "lvniqi")
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_PASSWORD", "pat")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_PASSWORD", PUSH_PASSWORD)
 
 
 @pytest.fixture(autouse=True)
@@ -98,6 +103,15 @@ def _hide_builder_image(monkeypatch: pytest.MonkeyPatch) -> None:
     from ..backend import build_sandbox
 
     monkeypatch.setattr(build_sandbox, "builder_image", lambda: "")
+
+
+def _images_mount() -> dict[str, Any]:
+    """The archive directory mount every build requests."""
+    return {
+        "Source": "/workspace/docker_images",
+        "Target": "/workspace/docker_images",
+        "ReadOnly": False,
+    }
 
 
 class _FakeBuildSandbox:
@@ -597,7 +611,7 @@ async def test_build_in_sandbox_happy_path(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1.24.0-debug")
     monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
     monkeypatch.setenv("DOCKER_RT_REGISTRY_USERNAME", "lvniqi")
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_PASSWORD", "pat")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_PASSWORD", PUSH_PASSWORD)
 
     sandbox = _FakeBuildSandbox(stdout=f"INFO building\ndocker-rt-digest: {GOOD_DIGEST}\n")
     captured = _install_fake(monkeypatch, sandbox)
@@ -637,11 +651,16 @@ async def test_build_in_sandbox_happy_path(monkeypatch: pytest.MonkeyPatch) -> N
     assert match, script
     auths = json.loads(base64.b64decode(match.group(1)))["auths"]
     assert "reg.example.com" in auths
-    assert "pat" not in script
+    assert PUSH_PASSWORD not in script
 
     assert events[-1]["docker_rt"]["digest"] == GOOD_DIGEST
     assert "--destination=reg.example.com/rt/myapp:latest" in script
-    assert "pat" not in script
+    # The same build also archives the image into the mounted workspace dir.
+    assert (
+        "--tar-path=/workspace/docker_images/reg.example.com_rt_myapp_latest.tar"
+        in script
+    )
+    assert PUSH_PASSWORD not in script
 
     final = events[-1]
     assert final["docker_rt"]["aliases"]["myapp:latest"] == "reg.example.com/rt/myapp:latest"
@@ -714,7 +733,7 @@ async def test_build_in_sandbox_fully_qualified_tag_without_a_prefix(
     assert match, script
     auths = json.loads(base64.b64decode(match.group(1)))["auths"]
     assert "docker.io" in auths
-    assert "pat" not in script  # the password is inlined only as base64
+    assert PUSH_PASSWORD not in script  # the password is inlined only as base64
 
     final = events[-1]
     assert (
@@ -1431,8 +1450,12 @@ async def test_context_is_staged_through_the_workspace_mount(
     # What went to storage is the gzipped context, under the planned key.
     assert stager.payload == packed
 
-    # The sandbox was created with that directory mounted, and writable.
-    assert captured["mounts"] == [context_staging.mount_spec(stager.plan)]
+    # The sandbox was created with that directory mounted, and writable — plus
+    # the archive directory the image is written to.
+    assert captured["mounts"] == [
+        _images_mount(),
+        context_staging.mount_spec(stager.plan),
+    ]
 
     # The first exec is the stage-in copy — ahead of the launcher, so the mount
     # only has to survive until the copy has been verified.
@@ -1471,8 +1494,11 @@ async def test_a_refused_mount_falls_back_to_a_direct_upload(
     attempts: list[Any] = []
 
     async def fake_start(**kwargs: Any) -> _FakeBuildSandbox:
-        attempts.append(kwargs.get("mounts"))
-        if kwargs.get("mounts"):
+        mounts = kwargs.get("mounts") or []
+        attempts.append(mounts)
+        # Only the staged-context mount is refused — that is the cluster-layout
+        # dependency; the archive directory is a plain workspace path.
+        if any(".docker-rt-build" in str(m.get("Source", "")) for m in mounts):
             raise RuntimeError("subPath .docker-rt-build not found")
         return sandbox
 
@@ -1484,7 +1510,13 @@ async def test_a_refused_mount_falls_back_to_a_direct_upload(
     text = "".join(event.get("stream", "") for event in events)
     stager = staging.stager
 
-    assert attempts == [[context_staging.mount_spec(stager.plan)], None]
+    # The retry drops the staged-context mount and keeps the archive directory:
+    # without the former the build still works, without the latter the image has
+    # nowhere to land.
+    assert attempts == [
+        [_images_mount(), context_staging.mount_spec(stager.plan)],
+        [_images_mount()],
+    ]
     assert "retrying without it" in text
     # The direct upload carried the context, and staging did not try again.
     assert len(sandbox.archives) == 1
@@ -1717,7 +1749,9 @@ async def test_auto_mode_falls_back_when_staging_the_context_fails(
 
     assert "Workspace staging unavailable" in text
     assert "no such host" in text
-    assert captured["mounts"] is None
+    # No staged-context mount, but the archive directory still is one: the image
+    # has to land somewhere even when the context takes the slow route.
+    assert captured["mounts"] == [_images_mount()]
     assert len(sandbox.archives) == 1
     assert any(event.get("docker_rt") for event in events)
     assert staging.stager.payload is None
@@ -1749,10 +1783,30 @@ async def test_upload_mode_never_creates_a_stager(
         )
     )
 
-    assert captured["mounts"] is None
+    assert captured["mounts"] == [_images_mount()]
     assert len(sandbox.archives) == 1
     assert any(event.get("docker_rt") for event in events)
     assert staging.count == 0
+
+
+def test_the_build_sandbox_mounts_the_images_directory() -> None:
+    """Mount source and target are the same path, and it is kaniko's constant.
+
+    Mounting it at the workspace path (rather than somewhere kaniko-ish) is safe:
+    kaniko adds every mount point from ``/proc/self/mountinfo`` to its ignore list,
+    and ``DeleteFilesystem`` skips those directories wholesale, so the wipe it does
+    between the stages of a multi-stage build cannot reach the user's images.
+    """
+    from ..backend import build_sandbox, kaniko
+
+    spec = build_sandbox.images_mount_spec()
+    assert spec == {
+        "Source": "/workspace/docker_images",
+        "Target": "/workspace/docker_images",
+        "ReadOnly": False,
+    }
+    # One path for both sides, so the write target needs no translation.
+    assert spec["Source"] == spec["Target"] == kaniko.DEFAULT_IMAGES_DIR
 
 
 # --------------------------------------------------------------------------

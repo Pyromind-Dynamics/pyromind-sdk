@@ -176,6 +176,64 @@ def test_build_script_echoes_digest_marker(monkeypatch: pytest.MonkeyPatch) -> N
     assert "set -eu" in script
 
 
+def test_tar_path_is_the_workspace_images_directory() -> None:
+    """One constant that means the same thing inside the sandbox and outside it.
+
+    The build sandbox mounts the user's images directory at exactly this path
+    (``build_sandbox.images_mount_spec``), so ``--tar-path`` needs no translation
+    between the two views.
+    """
+    from ..backend import kaniko
+
+    assert kaniko.DEFAULT_IMAGES_DIR == "/workspace/docker_images"
+    assert kaniko.tar_path(["pyromind-console:dev"]) == (
+        "/workspace/docker_images/pyromind-console_dev.tar"
+    )
+    assert kaniko.tar_path(["reg.example.com/rt/myapp:latest"]) == (
+        "/workspace/docker_images/reg.example.com_rt_myapp_latest.tar"
+    )
+    # A build with no destination is only reachable from a direct call here.
+    assert kaniko.tar_path([]) == "/workspace/docker_images/image.tar"
+
+
+def test_tar_path_names_are_filesystem_and_shell_safe() -> None:
+    """The path reaches both a shell command and a mounted filesystem."""
+    from ..backend import kaniko
+
+    path = kaniko.tar_path(["evil/../$(rm -rf /):1;echo x"])
+    name = path.rsplit("/", 1)[-1]
+    assert path.startswith("/workspace/docker_images/")
+    for char in ("$", "(", ")", ";", " "):
+        assert char not in name, name
+
+
+def test_kaniko_args_archives_with_and_without_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--tar-path` is not tied to `--no-push`: kaniko writes the tarball first.
+
+    Archiving is unconditional, so a build that pushes still leaves its image in
+    the workspace (``DoPush`` writes the tar before the push loop).
+    """
+    from ..backend import kaniko
+
+    _fresh(monkeypatch)
+    pushing = " ".join(
+        kaniko.kaniko_args(
+            destinations=["reg.example.com/rt/app:dev"], push=True, cache=False
+        )
+    )
+    assert "--no-push" not in pushing
+    assert "--destination=reg.example.com/rt/app:dev" in pushing
+    assert "--tar-path=/workspace/docker_images/reg.example.com_rt_app_dev.tar" in pushing
+
+    plain = " ".join(
+        kaniko.kaniko_args(destinations=["app:dev"], push=False, cache=False)
+    )
+    assert "--no-push" in plain
+    assert "--tar-path=/workspace/docker_images/app_dev.tar" in plain
+
+
 @pytest.mark.parametrize(
     "raw,expected",
     [
