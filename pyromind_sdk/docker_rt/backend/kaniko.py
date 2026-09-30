@@ -32,6 +32,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re
 import shlex
 
 logger = logging.getLogger("docker_rt.kaniko")
@@ -39,11 +40,16 @@ logger = logging.getLogger("docker_rt.kaniko")
 DEFAULT_KANIKO_BIN = "/kaniko/executor"
 # MUST stay under ``/kaniko``: kaniko deletes the container's root filesystem
 # when it moves on to the next stage of a multi-stage build
-# (``util.DeleteFilesystem``), and ``/kaniko`` is the one tree it preserves —
-# that is where it keeps its own binary, its ``.docker/config.json`` and the
-# extracted build context (``/kaniko/buildcontext``). A workdir under ``/tmp``
-# is wiped mid-build by design: the launcher's files vanish, and the poller
-# reports the misleading "the launcher did not reach the fork".
+# (``util.DeleteFilesystem``), and ``/kaniko`` is the one *plain directory* it
+# spares — it is in kaniko's hard-coded default ignore list, that is where kaniko
+# keeps its own binary, its ``.docker/config.json`` and the extracted build
+# context (``/kaniko/buildcontext``). A workdir under ``/tmp`` is wiped mid-build
+# by design: the launcher's files vanish, and the poller reports the misleading
+# "the launcher did not reach the fork".
+#
+# A *mount* needs no such care — kaniko adds every mount point from
+# ``/proc/self/mountinfo`` to its ignore list, so ``DeleteFilesystem`` skips those
+# trees wherever they are mounted (see ``build_sandbox.images_mount_spec``).
 DEFAULT_WORKDIR = "/kaniko/docker-rt-build"
 DEFAULT_DOCKER_CONFIG_DIR = "/kaniko/.docker"
 DEFAULT_CONTEXT_ARCHIVE = "context.tar.gz"
@@ -138,8 +144,43 @@ def launched_path() -> str:
     return f"{build_workdir()}/{DEFAULT_LAUNCHED}"
 
 
-def tar_path() -> str:
-    return f"{build_workdir()}/image.tar"
+#: Where the built image is archived, as **one** path that means the same thing
+#: on both sides: the build sandbox mounts the user's workspace images directory
+#: at exactly this path (see ``build_sandbox.images_mount_spec``), so the string
+#: is the workspace path *and* the path kaniko writes to — nothing to translate,
+#: and the sandbox can be inspected with the same path the user uses.
+DEFAULT_IMAGES_DIR = "/workspace/docker_images"
+
+#: Characters an archive file name may keep. Everything else — ``/``, ``:``,
+#: and anything a shell would treat specially — becomes ``_``.
+_UNSAFE_ARTIFACT_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def image_archive_name(ref: str) -> str:
+    """``pyromind-console:dev`` → ``pyromind-console_dev.tar``.
+
+    The tag is the user's handle on the image and ``docker load`` restores the
+    real name from inside the tarball, so the file name only has to be
+    recognisable, filesystem-safe, and **stable across rebuilds** — a rebuild of
+    the same tag replaces that tag's archive while other tags keep theirs.
+    """
+    raw = (ref or "").strip() or "image"
+    return f"{_UNSAFE_ARTIFACT_CHARS.sub('_', raw)}.tar"
+
+
+def tar_path(destinations: list[str] | None = None) -> str:
+    """The ``--tar-path`` value: the file kaniko archives the image to.
+
+    A *file*, not a directory: kaniko writes the tarball there itself, so it has
+    to be created by ``os.Create``. The name carries the first ``--destination``
+    so a rebuild of one tag replaces that tag's archive instead of everybody
+    sharing one file. (``destinations`` is empty only for a direct
+    :func:`kaniko_args` call — every real build has at least one ``-t``.)
+    """
+    names = [d for d in (destinations or []) if (d or "").strip()]
+    if not names:
+        return f"{DEFAULT_IMAGES_DIR}/image.tar"
+    return f"{DEFAULT_IMAGES_DIR}/{image_archive_name(names[0])}"
 
 
 def cache_enabled() -> bool:
@@ -195,6 +236,9 @@ def kaniko_args(
     """Assemble the ``kaniko`` argv for one build.
 
     ``dockerfile`` is interpreted by kaniko **relative to the build context**.
+
+    Every build also gets ``--tar-path`` (:func:`tar_path`), so the image lands in
+    the mounted workspace images directory whether or not it is pushed.
     """
     dests = [d for d in (destinations or []) if (d or "").strip()]
     if push and not dests:
@@ -215,7 +259,13 @@ def kaniko_args(
 
     if not push:
         args.append("--no-push")
-        args.append(f"--tar-path={tar_path()}")
+
+    # Archive the image into the mounted workspace directory. This applies with
+    # *and* without ``--no-push``: kaniko writes the tarball before it pushes
+    # (``DoPush``), so a build can push and leave a copy behind in one go. The
+    # value has to be a file path, and the name comes from ``--destination`` so
+    # each tag keeps its own archive.
+    args.append(f"--tar-path={tar_path(dests)}")
 
     if digest_file:
         args.append(f"--digest-file={digest_file}")

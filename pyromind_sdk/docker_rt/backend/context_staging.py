@@ -49,11 +49,15 @@ so the watcher — which already runs after such a death to restore the Docker
 context — also calls :func:`sweep_stale_staging` to remove whatever the dead
 daemon left behind.
 
-Mount target is under ``/kaniko`` on purpose: kaniko deletes the container's
-root filesystem when a multi-stage build moves to the next stage, preserving
-only ``/kaniko`` (see :mod:`docker_rt.backend.kaniko`). A mount anywhere else
-could be wiped mid-build — and with ``/workspace`` mounted that would mean
-deleting the user's files.
+Mount target is under ``/kaniko`` for consistency with the build workdir. Note
+that kaniko's between-stage ``DeleteFilesystem`` is *not* a reason to keep it
+there: kaniko adds every mount point it finds in ``/proc/self/mountinfo`` to its
+ignore list (``util.DetectFilesystemIgnoreList``) and ``DeleteFilesystem`` skips
+those directories wholesale (``filepath.SkipDir``), so a mount is protected
+wherever it lives. ``build_sandbox.images_mount_spec`` relies on exactly that and
+mounts the user's images directory under ``/workspace``. (The *workdir* is a
+different case — it is a plain directory, not a mount, which is why it has to be
+inside ``/kaniko``: that path is in kaniko's hard-coded default ignore list.)
 """
 
 from __future__ import annotations

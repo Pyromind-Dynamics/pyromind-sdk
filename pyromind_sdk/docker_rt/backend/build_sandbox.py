@@ -147,6 +147,36 @@ def keep_sandbox() -> bool:
 
 
 # --------------------------------------------------------------------------
+# the image archive
+# --------------------------------------------------------------------------
+#
+# Every build also leaves the image as a tarball in the user's workspace, at
+# ``/workspace/docker_images/<tag>.tar``. The sandbox mounts that directory at
+# **the same path** it has in the workspace, so ``kaniko.DEFAULT_IMAGES_DIR`` is
+# both the mount source and the path kaniko writes to — one string, nothing to
+# translate, and ``docker exec … ls /workspace/docker_images`` shows exactly what
+# the user sees.
+#
+# Mounting it under ``/workspace`` (rather than somewhere kaniko-ish like
+# ``/kaniko``) is safe: kaniko adds **every** mount point it finds in
+# ``/proc/self/mountinfo`` to its ignore list (``util.DetectFilesystemIgnoreList``),
+# and ``util.DeleteFilesystem`` skips those directories wholesale — so the wipe it
+# does between the stages of a multi-stage build cannot reach the user's images.
+
+
+def images_mount_spec() -> dict[str, Any]:
+    """The ``HostConfig.Mounts`` entry for the archive directory.
+
+    Writable, because the build writes the image there.
+    """
+    return {
+        "Source": kaniko.DEFAULT_IMAGES_DIR,
+        "Target": kaniko.DEFAULT_IMAGES_DIR,
+        "ReadOnly": False,
+    }
+
+
+# --------------------------------------------------------------------------
 # build-sandbox identity — so a crash can be cleaned up afterwards
 # --------------------------------------------------------------------------
 #
@@ -874,10 +904,11 @@ async def build_in_sandbox(
         docker_config_b64=docker_config_b64,
         platform=platform,
     )
-    # The destination is worth stating up front: with kaniko, build and push are
-    # one process, so "where does this end up" is the question the old one-liner
-    # never answered.
+    # The destinations are worth stating up front: with kaniko, build and output
+    # are one process, so "where does this end up" is the question the old
+    # one-liner never answered.
     yield stage(f"Building with kaniko — push target: {', '.join(destinations)}")
+    yield stage(f"This image is also archived to {kaniko.tar_path(destinations)}")
 
     # Pack once, before spending a sandbox: it is the slowest purely-local step,
     # and its failure should not cost a sandbox.
@@ -956,10 +987,20 @@ async def build_in_sandbox(
                 mounts=mounts,
             )
 
+        def _mounts_for(plan: context_staging.StagingPlan | None) -> list[dict[str, Any]]:
+            """The archive directory, plus the staged context when there is one.
+
+            The images mount is never the entry dropped on a retry: the archive
+            is the build's output, while the staged context can fall back to a
+            direct upload.
+            """
+            mounts = [images_mount_spec()]
+            if plan is not None:
+                mounts.append(context_staging.mount_spec(plan))
+            return mounts
+
         try:
-            sandbox = await _create_sandbox_with(
-                [context_staging.mount_spec(staging)] if staging is not None else None
-            )
+            sandbox = await _create_sandbox_with(_mounts_for(staging))
         except Exception as exc:
             if staging is None:
                 yield buildkit.error_event(
@@ -974,14 +1015,16 @@ async def build_in_sandbox(
                     f"cannot mount the staged build context ({exc})"
                 )
                 return
-            # The mount is the one part of this that depends on the cluster's
-            # storage layout; the direct upload is known to work, so give the
-            # build a second chance rather than failing on the optimisation.
+            # The staging mount is the one part of this that depends on the
+            # cluster's storage layout; the direct upload is known to work, so
+            # give the build a second chance rather than failing on the
+            # optimisation. The images mount stays: without it there is nowhere
+            # for the archive to go.
             logger.warning("build sandbox with a staged-context mount failed: %s", exc)
             yield stage(f"Cannot mount the staged context ({exc}); retrying without it")
             staging = None
             try:
-                sandbox = await _create_sandbox_with(None)
+                sandbox = await _create_sandbox_with(_mounts_for(None))
             except Exception as exc2:
                 yield buildkit.error_event(
                     f"cannot create build sandbox ({builder_image()}): {exc2}"

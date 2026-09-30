@@ -479,16 +479,38 @@ STATUS 列只显示状态词（running 显示 `Up`、stopped 显示 `Exited`、p
 ```
 docker build -t myapp .
   → wrapper 注入 DOCKER_BUILDKIT=0，经典 builder 把 context tar POST 到 /build
-  → 用 DOCKER_RT_BUILD_IMAGE 创建一个一次性 CUSTOM sandbox
+  → 用 DOCKER_RT_BUILD_IMAGE 创建一个一次性 CUSTOM sandbox，
+    并固定挂上用户的 /workspace/docker_images（源与容器内路径用同一个字符串）
   → context 进沙箱（两条路由，见下「context 怎么送进沙箱」）：
        storage（默认）：tar.gz 并发上传进用户工作区对象存储
          → 带一个可写挂载建 sandbox（/workspace/.docker-rt-build → /kaniko/docker-rt-stage）
          → exec 把 context 拷到 kaniko 工作目录 + 校验字节数 + 删掉挂载里的整个目录
        upload（回退）：把 gzip 后的 context 作为单个文件直传进沙箱
-  → exec ["sh","-c", "<kaniko> --context=tar://… --destination=… --digest-file=…"]
+  → exec ["sh","-c", "<kaniko> --context=tar://… --destination=… --tar-path=/workspace/docker_images/<tag>.tar --digest-file=…"]
   → 读回 digest → 登记短名别名 → 删沙箱 →（storage 路由）清掉 storage 里的残留
 docker run <短名>   → 普通 sandbox，拉 registry 里刚推的镜像
 ```
+
+**每次构建都会把镜像归档一份到 `/workspace/docker_images/`**（推送照旧进行）。
+kaniko 的 `--tar-path` 就是「直接写到对应位置」，**没有 cp 这一步**：
+
+- 容器内的 `/workspace/docker_images` 就是用户工作区里那个目录 —— 挂载的**源和目标用同一个
+  字符串**（`kaniko.DEFAULT_IMAGES_DIR`），所以不存在两套路径要对照；
+- 文件名由第一个 `-t` 推导：`pyromind-console:dev` → `pyromind-console_dev.tar`
+  （非 `[A-Za-z0-9._-]` 一律换成 `_`）。tarball 里带的镜像名就是那个 tag，
+  `docker load -i` 导回本机时 tag 一起恢复；**重建同名 tag 直接覆盖**该 tag 的产物，
+  别的 tag 各留各的。
+- `--tar-path` **必须在 push 与否两种情况下都给**：kaniko 是「先写 tar、再推送」
+  （源码 `DoPush` 里 `tarball.MultiWriteToFile` 在 `if opts.NoPush {return}` 之前），
+  一次构建两件事互不影响。
+- **挂到 `/workspace` 下是安全的**（不用非放在 `/kaniko`）：kaniko 的
+  `InitIgnoreList()` → `DetectFilesystemIgnoreList(/proc/self/mountinfo)` 会把
+  **每一个挂载点**自动加进忽略列表，`DeleteFilesystem` 对忽略列表里的目录直接
+  `filepath.SkipDir`（整棵子树跳过）。所以多阶段构建切 stage 时的清盘动不到这个挂载。
+  （`/kaniko` 之所以特殊，是因为它是 kaniko 硬编码的默认忽略项，用于保护**非挂载**的普通目录，
+  比如构建工作目录。）
+- 归档是构建的**最后**一步：目录不可写会白跑整场构建才失败。真机第一次跑时留意日志里的
+  `==> This image is also archived to …`；若报错，确认 `/workspace/docker_images` 可写。
 
 注：`DOCKER_BUILDKIT=0` 会让真 docker CLI 往 stderr 打印 legacy builder 弃用横幅
 （`DEPRECATED: The legacy builder is deprecated … BuildKit is currently disabled …`）。
