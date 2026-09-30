@@ -382,6 +382,120 @@ def test_generated_wrapper_forwards_build_argv_verbatim(
     assert "DOCKER_BUILDKIT=0" not in log.read_text()
 
 
+def test_wrapper_normalizes_unitless_memory_to_gi(
+    monkeypatch: MonkeyPatch,
+    tmp_path,
+) -> None:
+    """`--memory=0.23` must reach the real CLI as `--memory=0.23g`, not 0 bytes.
+
+    The real CLI parses the memory flag with go-units' RAMInBytes, whose final
+    branch for a suffix-less value is `return int64(size), nil`. So
+    ``--memory=0.23`` is ``int64(0.23)`` = 0 bytes, which Docker reads as "no
+    memory limit": the sandbox then quietly falls back to docker-rt's default of
+    2Gi, and the user who asked for 0.23 gets 2Gi with no error anywhere.
+
+    Docker cannot be made to tell the two apart afterwards - a missing ``-m`` and
+    ``-m 0.23`` both arrive as ``HostConfig.Memory = 0`` - so the wrapper's argv
+    is the last place the user's original text still exists. docker-rt's create
+    API reads a plain number as Gi, and "g" is GiB in Docker's binary suffix map,
+    so supplying "g" is exactly "unit-less means Gi".
+
+    Asserted by executing the generated wrapper, because the bug is in the bytes
+    the CLI actually receives.
+    """
+    if shutil.which("bash") is None:
+        pytest.skip("bash is not available")
+
+    wrapper = tmp_path / "docker"
+    fake_docker = tmp_path / "fake-docker"
+    log = tmp_path / "calls.log"
+    fake_docker.write_text(
+        "#!/usr/bin/env bash\n"
+        'for a in "$@"; do echo "ARG:$a"; done >> "$FAKE_LOG"\n',
+        encoding="utf-8",
+    )
+    fake_docker.chmod(fake_docker.stat().st_mode | stat.S_IXUSR)
+
+    monkeypatch.setattr(mod, "WRAPPER_PATH", wrapper)
+    monkeypatch.setattr(mod, "WRAPPER_DIR", tmp_path)
+    monkeypatch.setattr(mod, "find_real_docker", lambda: str(fake_docker))
+    monkeypatch.setattr(mod, "_shell_rc_path", lambda: tmp_path / "rc")
+    mod.install_wrapper()
+
+    def forwarded(*argv: str, docker_rt: bool = True) -> list[str]:
+        log.unlink(missing_ok=True)
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "FAKE_LOG": str(log),
+            "DOCKER_HOST": (
+                "unix:///tmp/docker-rt.sock" if docker_rt else "unix:///var/run/docker.sock"
+            ),
+        }
+        proc = subprocess.run(
+            ["bash", str(wrapper), *argv],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, proc.stderr
+        if not log.exists():
+            return []
+        return [ln[4:] for ln in log.read_text().splitlines() if ln.startswith("ARG:")]
+
+    # The user's exact shape: a fractional cpu next to a unit-less memory.
+    assert forwarded("run", "-d", "--cpus=0.12", "--memory=0.23", "img") == [
+        "run",
+        "-d",
+        "--cpus=0.12",
+        "--memory=0.23g",
+        "img",
+    ]
+    # The short flag, the separate-value form, -m=V and the reservation flag all
+    # feed the same contract (docker-rt reads HostConfig.Memory / .MemoryReservation).
+    assert forwarded("run", "-m", "0.23", "img") == ["run", "-m", "0.23g", "img"]
+    assert forwarded("run", "-m=2", "img") == ["run", "-m=2g", "img"]
+    assert forwarded("run", "--memory-reservation=0.5", "img") == [
+        "run",
+        "--memory-reservation=0.5g",
+        "img",
+    ]
+    # A bare integer means the same thing: 2 -> 2Gi, never 2 bytes.
+    assert forwarded("create", "--memory", "2", "img") == [
+        "create",
+        "--memory",
+        "2g",
+        "img",
+    ]
+
+    # Values that already carry a unit are handed over exactly as typed.
+    for argv in (
+        ["run", "--memory=512Mi", "img"],
+        ["run", "-m", "2g", "img"],
+        ["run", "--memory=2Gi", "img"],
+        ["run", "-m", "1G", "img"],
+        ["run", "--memory=100M", "img"],
+        ["run", "--memory=4gb", "img"],
+    ):
+        assert forwarded(*argv) == argv, argv
+
+    # 0 is still 0 bytes, i.e. still "no limit" - the suffix does not change that.
+    assert forwarded("run", "--memory=0", "img") == ["run", "--memory=0g", "img"]
+
+    # Only run/create are touched: `docker commit -m` is a message, not memory.
+    assert forwarded("commit", "-m", "123", "cid") == ["commit", "-m", "123", "cid"]
+    # A memory flag with no value must not be swallowed (the CLI will reject it
+    # itself, with its own wording).
+    assert forwarded("run", "img", "-m") == ["run", "img", "-m"]
+
+    # Outside docker-rt the wrapper is a pure passthrough - the rewrite is
+    # docker-rt's contract, not something to impose on a real Docker daemon.
+    assert forwarded("run", "--memory=0.23", "img", docker_rt=False) == [
+        "run",
+        "--memory=0.23",
+        "img",
+    ]
+
+
 def test_wrapper_still_gates_buildx_and_compose_build(
     monkeypatch: MonkeyPatch,
     tmp_path,

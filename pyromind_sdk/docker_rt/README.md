@@ -75,6 +75,13 @@ sandbox ID。
 | `docker exec -it` 里敲键盘没反应、Ctrl-D 退不出 | 交互式 exec 走了 exec-stream 命令通道（无 PTY） | 升级到把 `-i`/`-t` 路由到 terminal PTY 的版本 |
 | `docker exec -it` 退出后打印 `What's next: Try Docker Debug … → docker debug <cid>` | docker ≥27 在 stdout 是 TTY 时会执行已安装 CLI 插件（docker-debug）的 hook，内容输出到 **stderr**，看着像命令失败了 | 升级 wrapper（**v17** 起在 docker-rt 分支导出 `DOCKER_CLI_HINTS=false` / `DOCKER_CLI_HOOKS=false`，真 Docker context 不受影响） |
 | `docker rm <本地ID>` 提示不存在 | daemon 已不认识该本地 ID | 使用 `sb-...` ID 或重启 daemon |
+| 创建报 `SANDBOX_CREATION_FAILED: Invalid CPU format: 100m` | cpu 被按 K8s 毫核写法提交，而 create 接口只收不带单位的核数 | 升级 SDK（`--cpus=0.1` 现提交为 `"0.1"`） |
+| `docker run 镜像`（不带 `-d`/`-i`/`-t`）报 `foreground attach is not supported by k8s-middleware; use -d or -it` | 前台 run 没有可挂的主进程输出流 | 按提示加 `-d` 或 `-it`；**create 阶段直接拒绝，不会留下实例**（旧版本会先创建、attach 时才报错） |
+| 创建报 `cpu 0.125 is not supported: at most two decimal places` | cpu 超过两位小数 | 改成两位小数以内（`--cpus=0.12` / `0.13`） |
+| 创建报 `memory … is not supported: at most two decimal places of Gi` | 内存值无法用两位小数 Gi 精确表示（如 `0.123G`、`100Mi`） | 换成 `512Mi` / `0.5g` / `4Gi` 这类 |
+| 创建报 `Memory must be at least 0.2Gi` / `CPU cores must be at least 0.1` | custom 沙箱的最低规格 | 提高 `--cpus` / `--memory` |
+| `--memory=0.23`（**没写单位**）却创建出 2Gi 内存 | Docker CLI 把无单位的值当字节并截断：`int64(0.23)` = 0 = 「不限内存」，docker-rt 只能回落默认 `2Gi` | 升级 wrapper（**v18** 起在 `run`/`create` 里把无单位的 `-m`/`--memory` 补成 `g`），或自己写单位（`-m 0.23g`） |
+| `docker run -d …` 报 `sandbox failed to start: failed` | 多为**镜像名/标签写错**或私有镜像无 pull 权限：Pod 卡在 `ImagePullBackOff` | 看控制台提示，或查实例 feature 里的 `last_event_reason`（形如 `[Pod] BackOff: Back-off pulling image "…"`）；核对镜像名后再试 |
 | API 错误无 trace_id | 未请求到 k8s-middleware | 只有带 `x-trace-id` 的后端响应会显示 |
 
 ## 架构
@@ -252,6 +259,61 @@ docker run -it -v "$PWD:/workspace" -w /workspace ubuntu:22.04 bash
 CPU 也可通过：`docker run --cpus=2`（`HostConfig.NanoCpus`）或 `CpuQuota`/`CpuPeriod`。  
 k8s-middleware 后端不传 `--cpus` / `--memory` / `--gpus` 时，默认使用
 `1 CPU / 2Gi 内存`，且不带 GPU。
+
+**只给一边时不做联动**：`docker run --cpus=0.1`（不带 `-m`）提交的是
+`0.1 CPU / 2Gi`，`-m 8g`（不带 `--cpus`）提交的是 `1 CPU / 8Gi` —— 少的一边走
+各自的默认值，不会按 1:2 去补。要比例合规就两边都写（如 `--cpus=0.1 --memory=0.2g`）。
+
+### 单位换算（容易踩的坑）
+
+create 接口（`POST /api/v1/sandboxes`）的约定是：
+
+* **cpu 是不带单位的核数**（`"0.1"`、`"2"`）——K8s 毫核写法 `"100m"` 会被拒：
+  `Invalid CPU format: 100m. CPU must be a number with at most two decimal places`；
+* **memory 是 Gi 数值**（`"0.2Gi"`、`"8Gi"`），不带单位默认按 Gi 解释。
+
+docker-rt 会在提交前完成换算，所以下面这些写法都能用：
+
+| 你写的 | 实际提交 |
+|--------|----------|
+| `--cpus=0.1`（NanoCpus=100000000） | `cpu="0.1"`（request `0.05`） |
+| `docker-rt.cpu=500m` | `cpu="0.5"` |
+| `--cpus=2 --memory=4g` | `cpu="2"`、`memory="4Gi"` |
+| `--memory=0.2g`（214748364 字节） | `memory="0.2Gi"` |
+| `--memory=0.23`（**不带单位**） | `memory="0.23Gi"`（wrapper 先补成 `0.23g`） |
+| `-m 8g` / `docker-rt.memory=8g` | `memory="8Gi"` |
+| `docker-rt.memory=512Mi` | `memory="0.5Gi"` |
+
+**`-m` / `--memory` 不带单位时按 Gi 算 —— 这靠的是 wrapper，不是 Docker 本身。**
+`--memory` / `-m` / `--memory-reservation` 在 `run` / `create` 里会被 wrapper 补上 `g`
+后缀（Docker 后缀表里 `g` 就是 GiB，正好等于 create 接口的 Gi）；已经带单位的值、
+其他子命令（如 `docker commit -m "123"`，那是 commit message）以及非 docker-rt
+上下文都原样透传。
+
+为什么非补不可：Docker CLI 用 go-units 的 `RAMInBytes` 解析这个参数，它对没有后缀的
+值走的是 `return int64(size), nil` —— `0.23` 于是变成 `int64(0.23)` = **0 字节**，
+而 Docker 把 0 读成「不限内存」，docker-rt 只能回落到默认的 `2Gi`。
+**你要 0.23、拿到 2Gi，全程没有任何报错。** 到了服务端已经区分不出来（没写 `-m` 和
+`-m 0.23` 都是 `HostConfig.Memory = 0`），所以唯一能修的地方就是 wrapper 的 argv。
+
+**表达不了的值直接报错，不四舍五入**（`docker create` 返回 400）：
+
+| 你写的 | 结果 |
+|--------|------|
+| `--cpus=0.125` / `--cpus=0.001` | `invalid cpu '125m': cpu 0.125 is not supported: at most two decimal places` |
+| `--memory=0.123g` | `invalid memory '132070244': memory 132070244 bytes (~0.1230Gi) is not supported: at most two decimal places of Gi` |
+| `-m 100m`（=0.0977Gi，两位小数表示不了） | 同上（`-m 512m`、`-m 4g` 这类能精确表示的可以） |
+
+即：cpu 最多两位小数（`0.01` 粒度），memory 必须是能被**两位小数 Gi 精确表示**的值
+（`512Mi` / `0.5Gi` / `4Gi` 可以，`0.123G` / `100Mi` 不行）。宁可报错，也不悄悄给你
+一个和你要的不一样的规格。
+
+校验只针对**你显式写的值**。自动推导的 cpu request（limit 的一半）会向上取整到两位
+小数，规则与中间件给 Pod 算的 `ceil2(limit/2)` 一致 —— 所以 `--cpus=0.25` 是合法的，
+它的 request 变成 `0.13`（而不是被 0.125 卡住）。
+
+两个方向都要归一化：原始字节数不能直接发（会被当成 `214748364 Gi`），
+毫核也不能直接发（会被 cpu 解析器拒掉）。
 
 ## 重启恢复（adopt）
 
