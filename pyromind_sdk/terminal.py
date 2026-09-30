@@ -27,7 +27,8 @@ import os
 import signal
 import sys
 import time
-from typing import Optional
+from typing import Optional, Sequence
+from urllib.parse import urlencode
 
 import aiohttp
 
@@ -52,16 +53,31 @@ class TerminalError(RuntimeError):
     """Raised when an interactive terminal session cannot be established."""
 
 
-def _websocket_url(base_url: str, sandbox_id: str, api_key: str, cols: int, rows: int) -> str:
+def _websocket_url(
+    base_url: str,
+    sandbox_id: str,
+    api_key: str,
+    cols: int,
+    rows: int,
+    command: Optional[Sequence[str]] = None,
+    cwd: Optional[str] = None,
+) -> str:
     base = base_url.rstrip("/")
     for http_scheme, ws_scheme in (("https://", "wss://"), ("http://", "ws://")):
         if base.startswith(http_scheme):
             base = ws_scheme + base[len(http_scheme):]
             break
-    qs = f"cols={cols}&rows={rows}"
+    qs_params: list[tuple[str, str]] = [("cols", str(cols)), ("rows", str(rows))]
     if api_key:
-        qs = f"token={api_key}&" + qs
-    return f"{base}/sandboxes/{sandbox_id}/terminal?{qs}"
+        qs_params.insert(0, ("token", api_key))
+    if cwd:
+        qs_params.append(("cwd", cwd))
+    # Repeated ``command`` params carry the argv the caller asked for. The
+    # platform keeps a single PTY vocabulary: without them it opens its usual
+    # login shell, with them it execs *that* command under the same PTY.
+    for part in command or ():
+        qs_params.append(("command", str(part)))
+    return f"{base}/sandboxes/{sandbox_id}/terminal?{urlencode(qs_params)}"
 
 
 def build_terminal_websocket_url(
@@ -70,9 +86,18 @@ def build_terminal_websocket_url(
     api_key: str = "",
     cols: int = 80,
     rows: int = 24,
+    command: Optional[Sequence[str]] = None,
+    cwd: Optional[str] = None,
 ) -> str:
-    """Public helper used by docker-rt and the terminal CLI."""
-    return _websocket_url(base_url, sandbox_id, api_key, cols, rows)
+    """Public helper used by docker-rt and the terminal CLI.
+
+    ``command`` / ``cwd`` are optional: with neither, the server opens its
+    usual login shell. ``docker exec -it <cid> <cmd>`` passes them so the PTY
+    runs the requested command instead of silently falling back to a shell.
+    """
+    return _websocket_url(
+        base_url, sandbox_id, api_key, cols, rows, command, cwd
+    )
 
 
 async def _run_session(url: str) -> None:

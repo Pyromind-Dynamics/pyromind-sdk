@@ -224,6 +224,76 @@ def test_wrapper_rejects_buildkit_only_build_flags(
     assert '"$REAL_DOCKER" "${filtered_args[@]}"' in text
 
 
+def test_wrapper_disables_cli_next_steps_hooks(
+    monkeypatch: MonkeyPatch,
+    tmp_path,
+) -> None:
+    """`docker exec -it … ; exit` must not print Docker's "What's next" banner.
+
+    With a TTY attached, docker 27 runs every installed CLI plugin's hook after
+    the command (``cmd/docker/docker.go`` → ``manager.RunCLICommandHooks``); the
+    docker-debug plugin answers with
+
+        What's next:
+            Try Docker Debug … → docker debug <cid>
+
+    on stderr, which reads like the exec failed. ``DockerCli.HooksEnabled()``
+    honours DOCKER_CLI_HINTS (legacy) and DOCKER_CLI_HOOKS, so the wrapper must
+    export both before handing over — but only for docker-rt, so a real Docker
+    context keeps its hints.
+    """
+    if shutil.which("bash") is None:
+        pytest.skip("bash is not available")
+
+    wrapper = tmp_path / "docker"
+    fake_docker = tmp_path / "fake-docker"
+    log = tmp_path / "calls.log"
+    fake_docker.write_text(
+        "#!/usr/bin/env bash\n"
+        "{\n"
+        '  echo "HINTS=${DOCKER_CLI_HINTS:-<unset>}"\n'
+        '  echo "HOOKS=${DOCKER_CLI_HOOKS:-<unset>}"\n'
+        '} >> "$FAKE_LOG"\n',
+        encoding="utf-8",
+    )
+    fake_docker.chmod(fake_docker.stat().st_mode | stat.S_IXUSR)
+
+    monkeypatch.setattr(mod, "WRAPPER_PATH", wrapper)
+    monkeypatch.setattr(mod, "WRAPPER_DIR", tmp_path)
+    monkeypatch.setattr(mod, "find_real_docker", lambda: str(fake_docker))
+    monkeypatch.setattr(mod, "_shell_rc_path", lambda: tmp_path / "rc")
+    mod.install_wrapper()
+
+    def run(*argv: str, docker_rt: bool = True) -> str:
+        log.unlink(missing_ok=True)
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "FAKE_LOG": str(log),
+            "DOCKER_HOST": (
+                "unix:///tmp/docker-rt.sock"
+                if docker_rt
+                else "unix:///var/run/docker.sock"
+            ),
+        }
+        subprocess.run(
+            ["bash", str(wrapper), *argv],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return log.read_text(encoding="utf-8")
+
+    on_docker_rt = run("ps")
+    assert "HINTS=false" in on_docker_rt, on_docker_rt
+    assert "HOOKS=false" in on_docker_rt, on_docker_rt
+
+    # A real Docker context is handed over untouched: hints stay available.
+    off_docker_rt = run("ps", docker_rt=False)
+    assert "HINTS=<unset>" in off_docker_rt, off_docker_rt
+    assert "HOOKS=<unset>" in off_docker_rt, off_docker_rt
+
+
 def test_generated_wrapper_forwards_build_argv_verbatim(
     monkeypatch: MonkeyPatch,
     tmp_path,

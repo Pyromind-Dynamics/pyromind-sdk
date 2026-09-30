@@ -342,6 +342,39 @@ def _exec_chunk_bytes(data: Any) -> bytes:
     return str(data).encode("utf-8")
 
 
+async def _write_exec_error(
+    resp: web.StreamResponse, message: str, *, tty: bool
+) -> None:
+    """Best-effort: put an exec failure on the hijacked Docker stream.
+
+    Why this exists: by the time ``iter_exec_stream`` fails, the 101 Upgrade
+    has already been sent, so a status code is no longer available — and the
+    ``/exec/{id}/start`` handler cannot re-raise without tearing down the
+    server. Writing the reason onto the stream is the *only* way the user
+    finds out what went wrong.
+
+    Without it, ``docker exec -it cid -- bash`` (where the platform refuses to
+    exec a binary literally named ``--``) presents as the terminal returning
+    instantly with no output at all — indistinguishable from the container
+    silently ignoring the command. The logs showed exactly that signature:
+    ``out=0 err=0 code=-1`` and nothing else.
+
+    ``tty`` matters: under ``-t`` the CLI reads the stream as a raw terminal,
+    so the bytes must NOT carry Docker's stdio framing and need CRLF to move
+    the cursor. Without ``-t`` the usual stderr frame applies.
+    """
+    body = message.rstrip("\r\n") + ("\r\n" if tty else "\n")
+    raw = body.encode("utf-8", "replace")
+    if not tty:
+        raw = frame_stderr(raw)
+    try:
+        await resp.write(raw)
+        await resp.drain()
+    except (ConnectionResetError, ConnectionError, OSError, RuntimeError):
+        # The client is already gone; nothing left to report to.
+        pass
+
+
 async def _stream_pyromind_exec(
     *,
     resp: web.StreamResponse,
@@ -351,7 +384,13 @@ async def _stream_pyromind_exec(
     session_id: str = "",
     cwd: str = "",
 ) -> int:
-    """Stream a PyromindSDK command directly on the aiohttp event loop."""
+    """Stream a PyromindSDK command directly on the aiohttp event loop.
+
+    Output-only by design: this is the exec-stream *command* channel, used for
+    ``docker exec CID CMD``. Interactive ``-i``/``-t`` never lands here any
+    more — it rides the platform terminal PTY (see ``_hijack_pyromind_terminal``),
+    which is the only channel that can carry keystrokes.
+    """
     returncode = -1
     out_n = 0
     err_n = 0
@@ -383,12 +422,24 @@ async def _stream_pyromind_exec(
                 payload = frame_stdout(raw)
             await resp.write(payload)
             await resp.drain()
-    except (ConnectionResetError, ConnectionError, OSError, RuntimeError):
+    except (ConnectionResetError, ConnectionError):
+        # The docker client hung up. Nobody is left to receive a report.
         logger.debug(
-            "pyromind exec stream ended id=%s",
+            "pyromind exec stream aborted by client id=%s",
             session_id[:12] or "?",
-            exc_info=True,
         )
+    except Exception as exc:
+        # Never swallow this one. ``SandboxExecStreamError`` (a RuntimeError)
+        # lands here whenever the platform rejects the command — a missing
+        # binary, a bad cwd, a sandbox that is not started. Historically it
+        # was logged at DEBUG and dropped, so ``docker exec`` looked like it
+        # simply did nothing. Report it on the stream instead.
+        logger.warning(
+            "pyromind exec stream failed id=%s: %s",
+            session_id[:12] or "?",
+            exc,
+        )
+        await _write_exec_error(resp, f"docker-rt: {exc}", tty=tty)
     logger.info(
         "pyromind exec stream id=%s out=%d err=%d code=%s",
         session_id[:12] or "?",
@@ -1089,7 +1140,47 @@ def _matches_filters(c: Any, filters: dict[str, list[str]]) -> bool:
     return True
 
 
-def _to_inspect(c: Any) -> dict[str, Any]:
+async def _resolve_inspect_pod_ip(record: Any) -> str:
+    """Internal IP to show in ``docker inspect``, or ``""``.
+
+    The SDK backend used to be skipped here, which left every container's
+    ``NetworkSettings.*.IPAddress`` empty. Its lookup is async and batched (one
+    request covers all known sandboxes, cached briefly), so it is resolved here
+    in the async path instead of inside the synchronous inspect builder.
+    """
+    kube_env = getattr(record, "kube_env", None)
+    if kube_env is None:
+        return ""
+    if not isinstance(kube_env, PyromindSDK):
+        try:
+            return kube_env.get_pod_ip() or ""
+        except Exception:
+            return ""
+    sandbox_id = (
+        getattr(kube_env, "sandbox_id", None)
+        or getattr(record, "sandbox_id", None)
+        or getattr(record, "pod_name", None)
+    )
+    if not sandbox_id:
+        return ""
+    try:
+        from .backend.pyromind_sdk_env import batch_pod_ips
+
+        resolved = await batch_pod_ips([sandbox_id])
+    except Exception:
+        logger.debug("inspect pod ip lookup failed id=%s", str(sandbox_id)[:12])
+        return ""
+    return resolved.get(sandbox_id) or ""
+
+
+def _to_inspect(c: Any, *, pod_ip: str | None = None) -> dict[str, Any]:
+    """Build the ``docker inspect`` payload.
+
+    ``pod_ip`` is resolved by the async caller (see
+    :func:`_resolve_inspect_pod_ip`): the SDK backend needs an awaitable,
+    batched lookup, so it cannot happen here. When it is ``None`` the kube
+    backend keeps resolving it inline, as it always did.
+    """
     sandbox_id, sandbox_status = _sandbox_identity(c)
     state_status = sandbox_status or c.state.value
     running = state_status.lower() in {"running", "up"}
@@ -1180,9 +1271,10 @@ def _to_inspect(c: Any) -> dict[str, Any]:
     networks: dict[str, Any] = {}
     net_cfg = getattr(c, "networking_config", None) or {}
     endpoints = net_cfg.get("EndpointsConfig") or {}
-    pod_ip = ""
+    pod_ip = pod_ip or ""
     if (
         running
+        and not pod_ip
         and getattr(c, "kube_env", None) is not None
         and not isinstance(c.kube_env, PyromindSDK)
     ):
@@ -2268,7 +2360,7 @@ async def inspect_container(request: web.Request) -> web.Response:
                 await store.set_state(record, ContainerState.EXITED)
         except Exception:
             logger.debug("inspect refresh failed id=%s", cid[:12], exc_info=True)
-    return _json(_to_inspect(record))
+    return _json(_to_inspect(record, pod_ip=await _resolve_inspect_pod_ip(record)))
 
 
 async def container_logs(request: web.Request) -> web.StreamResponse:
@@ -2437,6 +2529,78 @@ async def stream_events(request: web.Request) -> web.StreamResponse:
     )
 
 
+# ``X-Docker-Container-Path-Stat`` carries a ``ContainerPathStat`` whose
+# ``Mode`` is a Go ``os.FileMode`` -- and that is *not* a Unix mode_t. Go packs
+# the type bits into the **most significant** bits of the uint32
+# (``io/fs.ModeDir = 1 << 31``), while the low nine bits are re-used verbatim
+# for rwxrwxrwx.
+#
+# The Docker CLI asks ``Mode.IsDir()``, which tests bit 31 only. Reporting the
+# Unix ``S_IFDIR`` (0o040000, bit 14) instead therefore makes every directory
+# look like a regular *file*: ``docker cp FILE CID:/`` then takes the
+# "destination exists as a file" branch of moby's ``PrepareArchiveCopy`` and
+# rewrites the upload archive (``RebaseArchiveEntries``) instead of streaming
+# it through untouched -- and that rewrite is where a tar header can fail to
+# encode, which crashes the CLI with
+# ``panic: comparing uncomparable type tar.headerError``.
+#
+# Keep the internal convention (Unix bits -- what ``stat -c %a`` prints, also
+# consumed by ``iter_archive_chunks``) and translate only when serialising.
+_GO_FILEMODE_BITS = (
+    (0o4000, 1 << 23),    # S_ISUID      -> fs.ModeSetuid
+    (0o2000, 1 << 22),    # S_ISGID      -> fs.ModeSetgid
+    (0o1000, 1 << 20),    # S_ISVTX      -> fs.ModeSticky
+    (0o040000, 1 << 31),  # S_IFDIR      -> fs.ModeDir
+)
+
+
+def _to_go_filemode(unix_mode: Any) -> int:
+    """Re-encode a Unix mode (e.g. ``0o040755``) as Go's ``os.FileMode``."""
+    raw = int(unix_mode or 0)
+    mode = raw & 0o777
+    for unix_bit, go_bit in _GO_FILEMODE_BITS:
+        if raw & unix_bit:
+            mode |= go_bit
+    return mode
+
+
+def _wire_path_stat(stat: dict[str, Any]) -> dict[str, Any]:
+    """The path-stat as the Docker API defines it (see ``_to_go_filemode``)."""
+    return {**stat, "mode": _to_go_filemode(stat.get("mode"))}
+
+
+async def _archive_path_stat(
+    record: Any, path: str
+) -> tuple[dict[str, Any] | None, Exception | None]:
+    """Path stat shared by the GET/HEAD archive handlers.
+
+    Returns ``(stat, error)``: ``error`` is the backend failure (a rejected
+    sandbox exec, a broken k8s-middleware, a stopped pod) so the caller can
+    answer 500, while a ``None`` stat with no error means "does not exist"
+    (404) — the two are very different for the Docker CLI.
+
+    The failure is logged here on purpose. The CLI blames *itself* for a
+    failed stat: ``docker cp FILE CID:/`` reports the misleading
+    ``no such directory`` (moby's ``ErrDirNotExists``, chosen once the dest
+    stat fails), so without this line the daemon log shows a bare 500 and the
+    real cause — e.g. ``SANDBOX_CREATION_FAILED: name 'instance_type' is not
+    defined`` coming back from k8s-middleware — is nowhere to be found.
+    """
+    try:
+        if isinstance(record.kube_env, PyromindSDK):
+            return await record.kube_env.archive_path_stat(path), None
+        return await asyncio.to_thread(path_stat, record.kube_env, path), None
+    except Exception as exc:
+        logger.warning(
+            "archive stat failed id=%s path=%s: %s: %s",
+            str(getattr(record, "id", ""))[:12],
+            path,
+            type(exc).__name__,
+            exc,
+        )
+        return None, exc
+
+
 async def get_container_archive(request: web.Request) -> web.StreamResponse | web.Response:
     """GET /containers/{id}/archive?path=... — docker cp FROM container (streamed)."""
     import base64
@@ -2453,17 +2617,15 @@ async def get_container_archive(request: web.Request) -> web.StreamResponse | we
     if record.kube_env is None or record.state != ContainerState.RUNNING:
         return _err(409, "Container is not running")
 
-    try:
-        if isinstance(record.kube_env, PyromindSDK):
-            stat = await record.kube_env.archive_path_stat(path)
-        else:
-            stat = await asyncio.to_thread(path_stat, record.kube_env, path)
-    except Exception as exc:
-        return _err(500, format_exception_message(exc))
+    stat, error = await _archive_path_stat(record, path)
+    if error is not None:
+        return _err(500, format_exception_message(error))
     if stat is None:
         return _err(404, f"Could not find the file {path} in container {cid}")
 
-    stat_b64 = base64.b64encode(json.dumps(stat).encode()).decode()
+    stat_b64 = base64.b64encode(
+        json.dumps(_wire_path_stat(stat)).encode()
+    ).decode()
     resp = web.StreamResponse(
         status=200,
         headers={
@@ -2479,10 +2641,26 @@ async def get_container_archive(request: web.Request) -> web.StreamResponse | we
             async for chunk in record.kube_env.iter_archive_chunks(path):
                 await resp.write(chunk)
             await resp.drain()
-        except (ConnectionResetError, ConnectionError, OSError):
-            pass
+        except (ConnectionResetError, ConnectionError):
+            # The docker client went away — there is nobody left to receive
+            # the result, so this is not worth raising over.
+            logger.debug("archive get aborted by client id=%s", cid[:12])
         except Exception as exc:
+            # ``resp.prepare()`` has already put "200 OK" on the wire, so we
+            # cannot turn this into an error status any more. Letting the
+            # exception propagate is the *only* way the client can learn the
+            # tar is incomplete: aiohttp then tears the connection down and
+            # the docker CLI fails loudly instead of writing a short file.
+            #
+            # Swallowing it here (the old behaviour) made aiohttp finish the
+            # chunked body normally, so the CLI saw a well-formed response
+            # containing a truncated tar and reported success.
+            #
+            # Note ``OSError`` is deliberately NOT in the tuple above: an
+            # upstream socket failure must be reported, not mistaken for the
+            # client hanging up.
             logger.error("archive get failed id=%s: %s", cid[:12], exc)
+            raise
         return resp
 
     loop = asyncio.get_running_loop()
@@ -2513,11 +2691,14 @@ async def get_container_archive(request: web.Request) -> web.StreamResponse | we
             await resp.drain()
         except Exception:
             pass
-    except (ConnectionResetError, ConnectionError, OSError):
-        pass
+    except (ConnectionResetError, ConnectionError):
+        logger.debug("archive get aborted by client id=%s", cid[:12])
     if err_box:
+        # Same reasoning as the PyromindSDK branch above: the 200 is already
+        # sent, so raising is the only way the client can tell the archive is
+        # incomplete. Do not fall through to a normal ``return resp``.
         logger.error("archive get failed id=%s: %s", cid[:12], err_box[0])
-        # Headers already sent; best-effort close.
+        raise err_box[0]
     return resp
 
 
@@ -2541,17 +2722,15 @@ async def head_container_archive(request: web.Request) -> web.Response:
     if record.kube_env is None or record.state != ContainerState.RUNNING:
         return _err(409, "Container is not running")
 
-    try:
-        if isinstance(record.kube_env, PyromindSDK):
-            stat = await record.kube_env.archive_path_stat(path)
-        else:
-            stat = await asyncio.to_thread(path_stat, record.kube_env, path)
-    except Exception as exc:
-        return _err(500, format_exception_message(exc))
+    stat, error = await _archive_path_stat(record, path)
+    if error is not None:
+        return _err(500, format_exception_message(error))
     if stat is None:
         return _err(404, f"Could not find the file {path} in container {cid}")
 
-    stat_b64 = base64.b64encode(json.dumps(stat).encode()).decode()
+    stat_b64 = base64.b64encode(
+        json.dumps(_wire_path_stat(stat)).encode()
+    ).decode()
     return web.Response(
         status=200,
         headers={
@@ -3126,9 +3305,49 @@ async def _hijack_session(
             _force_close_hijack(request, resp)
         return resp
 
-    # PyromindSDK command streaming is output-only. Docker's -i flag still
-    # selects the streaming path, but stdin is not forwarded to the sandbox.
+    # ``docker exec`` against a PyromindSDK sandbox has two very different
+    # shapes and they need different transports:
+    #
+    # * **Interactive** (``-i`` / ``-t``) must ride the platform *terminal*
+    #   WebSocket — a real PTY. The exec-stream WebSocket is a one-shot command
+    #   channel: no PTY, no job control, so Ctrl-C, arrow keys, ``sudo`` /
+    #   ``ssh`` prompts and full-screen TUIs never work there. That was the old
+    #   route and it presented exactly as "keys do nothing, Ctrl-D doesn't even
+    #   end it".
+    # * **Non-interactive** (``docker exec cid <cmd>``) stays on the exec
+    #   stream: it is a plain stdout/stderr channel, which is what SWE-bench
+    #   style automation drives.
     if isinstance(kube_env, PyromindSDK) and cmd is not None:
+        if stdin or tty:
+            handled = await _hijack_pyromind_terminal(
+                request,
+                resp,
+                protocol,
+                session,
+                kube_env,
+                tty,
+                cmd=cmd,
+                cwd=cwd,
+            )
+            if handled:
+                return resp
+            # The terminal could not be opened and nothing has reached the wire
+            # yet, so degrading is still safe: fall back to the output-only
+            # command channel instead of handing the user a dead terminal.
+            # Say it out loud — that channel cannot carry keystrokes, and
+            # silently eating them is the very symptom we are fixing.
+            logger.warning(
+                "terminal channel unavailable for id=%s; falling back to the "
+                "exec stream (no PTY, stdin is NOT forwarded)",
+                getattr(session, "id", "")[:12],
+            )
+            if stdin:
+                await _write_exec_error(
+                    resp,
+                    "docker-rt: interactive terminal unavailable; running the "
+                    "command without a PTY (stdin is not forwarded)",
+                    tty=tty,
+                )
         try:
             session.exit_code = await _stream_pyromind_exec(
                 resp=resp,
@@ -3161,7 +3380,9 @@ async def _hijack_session(
             session.exit_code = 0
             _force_close_hijack(request, resp)
             return resp
-        return await _hijack_pyromind_terminal(
+        # Attach has no command channel to fall back to: the terminal is the
+        # only way in, so a failure is reported on the stream itself.
+        await _hijack_pyromind_terminal(
             request,
             resp,
             protocol,
@@ -3169,6 +3390,7 @@ async def _hijack_session(
             kube_env,
             tty,
         )
+        return resp
 
     try:
         if cmd is None:
@@ -3311,26 +3533,29 @@ async def _hijack_session(
     return resp
 
 
-def _pyromind_terminal_url(kube_env: Any) -> str:
-    from pyromind_sdk.client.base import (
-        ENV_API_KEY,
-        ENV_BASE_URL,
-        ENV_CLUSTER,
-        resolve_base_url_from_cluster,
-    )
+def _pyromind_terminal_url(
+    kube_env: Any,
+    *,
+    cols: int = 80,
+    rows: int = 24,
+    cmd: list[str] | None = None,
+    cwd: str = "",
+) -> str:
+    # Same resolution as every other data-plane call this daemon makes: the
+    # terminal WebSocket lives on the cluster, and the portal does not proxy
+    # WebSocket at all.
+    from pyromind_sdk.client.base import ENV_API_KEY, resolve_api_base_url
     from pyromind_sdk.terminal import build_terminal_websocket_url
 
-    base_url = (os.getenv(ENV_BASE_URL) or "").strip()
-    cluster = (os.getenv(ENV_CLUSTER) or "").strip()
-    if not base_url and cluster:
-        base_url = resolve_base_url_from_cluster(cluster)
-    if not base_url:
-        base_url = "https://api-portal.pyromind.ai/api/v1"
     api_key = (os.getenv(ENV_API_KEY) or "").strip()
     return build_terminal_websocket_url(
-        base_url,
+        resolve_api_base_url(),
         kube_env.sandbox_id or "",
         api_key,
+        cols=cols,
+        rows=rows,
+        command=list(cmd) if cmd else None,
+        cwd=cwd or None,
     )
 
 
@@ -3341,27 +3566,71 @@ async def _hijack_pyromind_terminal(
     session: Any,
     kube_env: PyromindSDK,
     tty: bool,
-) -> web.StreamResponse:
-    """Bridge Docker exec/attach TCP upgrade to the platform terminal WebSocket."""
+    *,
+    cmd: list[str] | None = None,
+    cwd: str = "",
+) -> bool:
+    """Bridge a Docker TCP upgrade to the platform terminal WebSocket (a PTY).
+
+    Returns ``True`` once the session has been attempted. ``False`` means the
+    terminal could not be reached *and nothing was written to the hijacked
+    stream*, so the caller may still fall back to the exec-stream channel.
+    """
     import aiohttp
 
-    url = _pyromind_terminal_url(kube_env)
+    cols = int(getattr(session, "tty_cols", 0) or 0) or 80
+    rows = int(getattr(session, "tty_rows", 0) or 0) or 24
+    url = _pyromind_terminal_url(
+        kube_env, cols=cols, rows=rows, cmd=cmd, cwd=cwd
+    )
     session.running = True
     logger.info(
-        "pyromind terminal hijack start id=%s sandbox=%s",
+        "pyromind terminal hijack start id=%s sandbox=%s %dx%d cmd=%s",
         getattr(session, "id", "")[:12],
         kube_env.sandbox_id,
+        cols,
+        rows,
+        cmd or "(login shell)",
     )
     try:
         async with aiohttp.ClientSession() as client:
             try:
                 ws = await client.ws_connect(url, heartbeat=30)
-            except aiohttp.WSServerHandshakeError as exc:
-                raise RuntimeError(
-                    f"terminal connection rejected (HTTP {exc.status})"
-                ) from exc
+            except (aiohttp.ClientError, OSError) as exc:
+                session.running = False
+                if cmd is not None:
+                    # Interactive exec: the caller can still use the command
+                    # channel, so leave the stream untouched.
+                    logger.warning(
+                        "terminal connection failed for id=%s (%s: %s)",
+                        getattr(session, "id", "")[:12],
+                        type(exc).__name__,
+                        exc,
+                    )
+                    return False
+                # Attach: there is no alternative transport. Say so on the
+                # stream instead of leaving an empty terminal behind.
+                await _write_exec_error(
+                    resp,
+                    f"docker-rt: cannot open an interactive session for "
+                    f"{kube_env.sandbox_id}: {exc}",
+                    tty=tty,
+                )
+                return True
 
             session_over = asyncio.Event()
+
+            async def push_resize(width: int, height: int) -> None:
+                await ws.send_str(
+                    json.dumps(
+                        {"type": "resize", "cols": width, "rows": height}
+                    )
+                )
+
+            # ``docker exec -t`` sends its geometry *before* start, but a user
+            # dragging the window afterwards lands here through
+            # ``POST /exec/{id}/resize``.
+            session.resize_hook = push_resize
 
             async def pump_out() -> None:
                 async for msg in ws:
@@ -3461,25 +3730,60 @@ async def _hijack_pyromind_terminal(
                 except Exception:
                     pass
     except Exception:
+        # The 101 is already on the wire, so there is no status code left to
+        # report with — and re-raising would tear the server down. Report and
+        # close; never ask the caller to fall back here, the command may
+        # already have run.
         logger.exception("pyromind terminal hijack failed")
-        raise
     finally:
         session.running = False
-        session.exit_code = 0
+        session.resize_hook = None
+        if session.exit_code is None:
+            # The terminal API has no exit status to relay (the PTY is closed
+            # when the shell ends), so report success rather than a bogus
+            # failure code — ``docker exec -it`` then exits 0, like a shell
+            # that the user quit with ``exit``/Ctrl-D.
+            session.exit_code = 0
         _force_close_hijack(request, resp)
     logger.info("pyromind terminal hijack end id=%s", getattr(session, "id", "")[:12])
-    return resp
+    return True
 
 
 async def resize_exec(request: web.Request) -> web.Response:
-    """POST /exec/{id}/resize — Docker CLI sends this for -t; accept as no-op."""
+    """POST /exec/{id}/resize — TTY geometry for an interactive exec.
+
+    The Docker CLI sends this immediately after ``exec create`` and *before*
+    ``exec start``, so the size has to be remembered on the exec record: that
+    is what opens the platform PTY with usable geometry. A later call (the user
+    dragging the terminal window) is forwarded to the live session when there
+    is one.
+    """
     store: ContainerStore = request.app["store"]
     eid = request.match_info["id"]
     exec_rec = store.get_exec(eid)
     if exec_rec is None:
         return _err(404, f"No such exec: {eid}")
-    # Optional: forward TTY size to kube attach if we track the WS later.
-    _ = request.rel_url.query.get("h"), request.rel_url.query.get("w")
+
+    q = request.rel_url.query
+
+    def _dim(name: str) -> int:
+        try:
+            return max(int(q.get(name) or 0), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    rows, cols = _dim("h"), _dim("w")
+    if cols:
+        exec_rec.tty_cols = cols
+    if rows:
+        exec_rec.tty_rows = rows
+
+    hook = getattr(exec_rec, "resize_hook", None)
+    if hook is not None and cols and rows:
+        try:
+            await hook(cols, rows)
+        except Exception as exc:  # noqa: BLE001 — resize is best-effort
+            logger.debug("exec resize forward failed id=%s: %s", eid[:12], exc)
     return _empty(200)
 
 

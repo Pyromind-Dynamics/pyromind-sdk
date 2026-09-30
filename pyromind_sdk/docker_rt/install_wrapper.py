@@ -12,7 +12,7 @@ from pathlib import Path
 WRAPPER_DIR = Path.home() / ".pyromind" / "bin"
 WRAPPER_PATH = WRAPPER_DIR / "docker"
 PATH_LINE = 'export PATH="$HOME/.pyromind/bin:$PATH"'
-WRAPPER_VERSION = "16"
+WRAPPER_VERSION = "17"
 
 
 def _wrapper_version() -> str | None:
@@ -130,6 +130,21 @@ is_docker_rt() {{
 if ! is_docker_rt; then
   exec "$REAL_DOCKER" "$@"
 fi
+# Kill the CLI's "What's next:" upsell hooks. With a TTY attached, docker 27
+# runs every installed plugin's hook after the command finished
+# (``cmd/docker/docker.go`` → ``manager.RunCLICommandHooks``); the docker-debug
+# plugin then prints
+#   What's next:
+#       Try Docker Debug for seamless, persistent debugging tools in any
+#       container or image → docker debug <cid>
+# on stderr — so leaving ``docker exec -it <cid> bash`` with exit/Ctrl-D looks
+# like the command failed. Those hints advertise Docker Desktop features that
+# cannot exist behind docker-rt, so they are pure noise here.
+# ``DockerCli.HooksEnabled()`` reads DOCKER_CLI_HINTS first (legacy name), then
+# DOCKER_CLI_HOOKS; both are honoured, whichever the installed CLI knows.
+# Only for docker-rt: on a real Docker context the wrapper handed over above.
+export DOCKER_CLI_HINTS=false
+export DOCKER_CLI_HOOKS=false
 args=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
