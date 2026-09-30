@@ -13,10 +13,22 @@
 | `docker volume` / `network` | 命名卷 + 网络 stub（够 Compose 用） |
 | `docker run` / `create` / `start` | `run`=创建并启动；`create` 只建本地记录；`start` 才真正创建/启动 Pod |
 | `docker run -p` / `docker port` | kube 后端本机 TCP 转发；PyromindSDK 后端仅显示端口映射 |
-| `docker exec`（含 `-it`） | K8s exec + TCP Upgrade |
+| `docker exec`（含 `-it`） | 非交互（`docker exec CID CMD`）走 **exec-stream 命令通道**；`-i` / `-t` 走 **platform terminal PTY**（真正的交互终端，支持 Ctrl-C / 方向键 / TUI） |
 | `docker stop` / `kill` / `rm` / `restart` / `rename` | 生命周期 |
-| `docker cp` | tar via pod exec（**流式**，不整包进内存） |
+| `docker cp` | 下载（容器 → 宿主）走 pod exec 流式 tar；上传（宿主 → 容器）走 `write_file` 分片落盘 |
 | `docker compose up`（受限） | 见下方「Compose（OSM-style）」 |
+
+**交互式 exec 为什么必须走 terminal 通道：** exec-stream WebSocket 是
+「一条命令 → 一段 stdout/stderr」的命令通道，**没有 PTY、也不转发 stdin**
+（服务端与 SDK 里那条链路上的 stdin 支持已删除，别再往回加），所以 Ctrl-C、方向键、
+`sudo`/`ssh` 的密码提示、vim/top 这类全屏程序都不会工作 —— 过去的
+`docker exec -it` 就是走它，表现是「敲键盘毫无反应，Ctrl-D 也退不出来」。
+现在 `-i`/`-t` 桥接到 `/api/v1/sandboxes/{id}/terminal`（和 Web 控制台、`pyromind
+terminal` CLI 同一个端点）：本地按键 → 二进制帧，输出 → 二进制帧，
+`{"type":"resize"}` 转发窗口大小。命令本身通过重复的 `command=` 查询参数透传，
+所以 `docker exec -it CID python` 也能跑；terminal 建不起来时（老版本 middleware）
+会在流上写明原因，然后退回**只输出**的命令通道并打 warning，
+而不是给一个「假死」的终端。
 
 **语义：** `docker run IMAGE CMD` 会把 `CMD` 作为 Pod 主进程；短命令结束后容器为 `exited`。
 
@@ -59,6 +71,9 @@ sandbox ID。
 | 命令连到 Docker Desktop socket | context 不是 `docker-rt` | `docker-rt-context` 或 `DOCKER_HOST=unix:///tmp/docker-rt.sock` |
 | `docker logs` / `docker events` 等待或不支持 | k8s-middleware 不支持 | 用 `docker exec -it` / `docker ps` / `docker inspect` |
 | `docker cp` 无成功文案 | 旧 wrapper 重定向输出导致 Docker 不打印 | 升级 SDK/wrapper 并重启 docker-rt |
+| `docker cp FILE CID:/` 报 `panic: comparing uncomparable type tar.headerError`，服务端只看到 `ConnectionResetError` + 500 | `HEAD /archive` 的 `X-Docker-Container-Path-Stat` 里 `mode` 用了 Unix 模式位（`S_IFDIR`=bit14）。CLI 只认 Go `os.FileMode`（`ModeDir`=**bit31**），于是把目录当普通文件，走进 `PrepareArchiveCopy` 的「目标是已存在的文件」分支去改写 tar，而把文件名重写成 `/` 会让 `tar.WriteHeader` 返回 `headerError`（`headerError` 是 `[]string`，`net/http` 拿它和自己比较就 panic） | 升级到含 `_wire_path_stat`（`_to_go_filemode`：`S_IFDIR → 1<<31`）的版本；`GET`/`HEAD /archive` 两处都要经过它 |
+| `docker exec -it` 里敲键盘没反应、Ctrl-D 退不出 | 交互式 exec 走了 exec-stream 命令通道（无 PTY） | 升级到把 `-i`/`-t` 路由到 terminal PTY 的版本 |
+| `docker exec -it` 退出后打印 `What's next: Try Docker Debug … → docker debug <cid>` | docker ≥27 在 stdout 是 TTY 时会执行已安装 CLI 插件（docker-debug）的 hook，内容输出到 **stderr**，看着像命令失败了 | 升级 wrapper（**v17** 起在 docker-rt 分支导出 `DOCKER_CLI_HINTS=false` / `DOCKER_CLI_HOOKS=false`，真 Docker context 不受影响） |
 | `docker rm <本地ID>` 提示不存在 | daemon 已不认识该本地 ID | 使用 `sb-...` ID 或重启 daemon |
 | API 错误无 trace_id | 未请求到 k8s-middleware | 只有带 `x-trace-id` 的后端响应会显示 |
 
@@ -94,6 +109,14 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 
 默认 `k8s-middleware` 后端会检查 `PYROMIND_API_KEY` / `PYROMIND_CLUSTER`，
 缺失时逐个提示输入；连接成功后彩色打印参数，并同步一次 sandbox。
+
+**请求走哪个域名**：数据面（sandbox 增删查、exec、`docker cp` 的文件读写、
+内部 IP 批量查询、terminal/exec 的 WebSocket）一律走 `CLUSTER_RESOURCE` 里
+`PYROMIND_CLUSTER` 对应的**集群直连地址**（`us-west-1#pre` →
+`https://pre-api.pyromind.ai/api/v1`）。portal（`api-portal.pyromind.ai`）只留给
+控制面的 `ProfileClient`（`/user_info`、`/storage_info`、access key）。
+`PYROMIND_BASE_URL` 是显式覆盖，设了就压过上面的推导；两者都没配时才回落到
+portal 默认地址。解析入口是 `pyromind_sdk.client.base.resolve_api_base_url()`。
 
 ## 前置条件
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -306,8 +307,103 @@ async def test_exec_all_create_options_are_applied_and_inspected(
     _ = await start.read()
 
 
+@pytest.mark.parametrize(
+    "stdin,tty,expected",
+    [
+        (True, True, "terminal"),    # docker exec -it
+        (True, False, "terminal"),   # docker exec -i
+        (False, True, "terminal"),   # docker exec -t
+        (False, False, "oneshot"),   # docker exec cid <cmd>
+    ],
+)
 @pytest.mark.asyncio
-async def test_pyromind_exec_interactive_uses_command_stream(monkeypatch):
+async def test_pyromind_exec_transport_routing(
+    monkeypatch, stdin, tty, expected
+):
+    """Interactive exec must ride the PTY terminal WS, not the exec stream.
+
+    The exec-stream WebSocket is a one-shot command channel: no PTY, no job
+    control. Routing ``-i``/``-t`` there is what made keystrokes, Ctrl-C and
+    Ctrl-D look like they did nothing. Non-interactive ``docker exec`` keeps
+    using the command channel, which is what automation drives.
+    """
+    from .. import aio_server as mod
+    from ..backend.pyromind_sdk_env import PyromindSDK
+
+    class FakeRequest:
+        def __init__(self, protocol):
+            self.content = None
+            self.transport = None
+            self.protocol = protocol
+
+    class FakeProtocol:
+        def force_close(self):
+            return None
+
+    class FakeResp:
+        def force_close(self):
+            return None
+
+    kube_env = PyromindSDK.__new__(PyromindSDK)
+    calls: dict[str, dict] = {}
+
+    async def terminal(*args, **kwargs):
+        calls["terminal"] = kwargs
+        return True
+
+    async def stream(*args, **kwargs):
+        calls["stream"] = kwargs
+        return 0
+
+    async def oneshot(*args, **kwargs):
+        calls["oneshot"] = kwargs
+        return 0
+
+    monkeypatch.setattr(mod, "_hijack_pyromind_terminal", terminal)
+    monkeypatch.setattr(mod, "_stream_pyromind_exec", stream)
+    monkeypatch.setattr(mod, "_stream_ws_oneshot", oneshot)
+
+    resp = FakeResp()
+    session = SimpleNamespace(
+        id="exec-test", running=False, exit_code=None, tty_cols=100, tty_rows=30
+    )
+    protocol = FakeProtocol()
+    await asyncio.wait_for(
+        mod._hijack_session(
+            FakeRequest(protocol),
+            resp,
+            protocol,
+            session,
+            kube_env,
+            ["cat"],
+            tty,
+            stdin=stdin,
+            cwd="/workspace",
+        ),
+        timeout=2,
+    )
+
+    assert expected in calls, f"expected the {expected} transport, got {calls}"
+    assert len(calls) == 1, f"exactly one transport must be used, got {calls}"
+    if expected == "terminal":
+        # The requested argv has to reach the PTY, otherwise the terminal would
+        # quietly open a login shell instead of the command the user asked for.
+        assert calls["terminal"]["cmd"] == ["cat"]
+        assert calls["terminal"]["cwd"] == "/workspace"
+    else:
+        assert calls["oneshot"]["cmd"] == ["cat"]
+
+
+@pytest.mark.asyncio
+async def test_pyromind_terminal_bridge_pumps_stdin_and_resize(monkeypatch):
+    """The interactive bridge must forward keystrokes and swallow protocol frames.
+
+    This is the transport `docker exec -it` now uses: raw bytes both ways, no
+    Docker stdio framing, and `{"type":"pong"}` must never leak into the
+    user's terminal as text.
+    """
+    import aiohttp
+
     from .. import aio_server as mod
     from ..backend.pyromind_sdk_env import PyromindSDK
 
@@ -319,17 +415,53 @@ async def test_pyromind_exec_interactive_uses_command_stream(monkeypatch):
 
     class FakeProtocol:
         def __init__(self):
-            self._message_tail = b"echo ok\n"
+            self._message_tail = b"ls -l\r"
 
         def force_close(self):
             return None
 
+    class FakeWs:
+        def __init__(self, session_holder):
+            self.sent_bytes: list[bytes] = []
+            self.sent_text: list[str] = []
+            self.closed = False
+            self._session_holder = session_holder
+            self.resize_hook = None
+
+        def __aiter__(self):
+            async def gen():
+                yield SimpleNamespace(
+                    type=aiohttp.WSMsgType.BINARY, data=b"total 0\r\n"
+                )
+                yield SimpleNamespace(
+                    type=aiohttp.WSMsgType.TEXT,
+                    data='{"type": "pong"}',
+                )
+                yield SimpleNamespace(type=aiohttp.WSMsgType.CLOSE, data=None)
+
+            return gen()
+
+        async def send_bytes(self, data):
+            self.sent_bytes.append(data)
+            # Capture the hook while the session is still live (the bridge
+            # clears it on the way out).
+            self.live_resize_hook = self._session_holder[0].resize_hook
+
+        async def send_str(self, text):
+            self.sent_text.append(text)
+
+        async def close(self):
+            self.closed = True
+
     class FakeResp:
         def __init__(self):
-            self.written = []
+            self.written: list[bytes] = []
 
         async def write(self, data):
             self.written.append(data)
+            # Real suspension point: gives the stdin pump a turn (otherwise the
+            # output task could finish before it ever runs).
+            await asyncio.sleep(0.02)
 
         async def drain(self):
             return None
@@ -337,39 +469,118 @@ async def test_pyromind_exec_interactive_uses_command_stream(monkeypatch):
         def force_close(self):
             return None
 
+    captured: dict = {}
+    session_holder: list = []
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def ws_connect(self, url, heartbeat=None):
+            captured["url"] = url
+            captured["ws"] = FakeWs(session_holder)
+            return captured["ws"]
+
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: FakeSession())
+
     kube_env = PyromindSDK.__new__(PyromindSDK)
-    stream_kwargs = {}
-
-    async def fake_stream(cmd, **kwargs):
-        stream_kwargs["cmd"] = cmd
-        stream_kwargs.update(kwargs)
-        yield SimpleNamespace(type="stdout", data=b"hello\n")
-        yield SimpleNamespace(type="exit", returncode=0)
-
-    monkeypatch.setattr(kube_env, "iter_exec_stream", fake_stream)
+    kube_env.sandbox_id = "sb-terminal"
     resp = FakeResp()
-    session = SimpleNamespace(id="exec-test", running=False, exit_code=None)
-
+    session = SimpleNamespace(
+        id="exec-it", running=False, exit_code=None, tty_cols=100, tty_rows=30
+    )
+    session_holder.append(session)
     protocol = FakeProtocol()
-    await asyncio.wait_for(
-        mod._hijack_session(
+
+    handled = await asyncio.wait_for(
+        mod._hijack_pyromind_terminal(
             FakeRequest(protocol),
             resp,
             protocol,
             session,
             kube_env,
-            ["cat"],
             True,
-            stdin=True,
+            cmd=["cat"],
             cwd="/workspace",
         ),
-        timeout=2,
+        timeout=5,
     )
 
-    assert stream_kwargs["cmd"] == ["cat"]
-    assert stream_kwargs["tty"] is True
-    assert stream_kwargs["cwd"] == "/workspace"
-    assert resp.written == [b"hello\n"]
+    assert handled is True
+    assert "cols=100&rows=30" in captured["url"]
+    assert "command=cat" in captured["url"]
+    assert "cwd=%2Fworkspace" in captured["url"]
+    # Terminal output goes out verbatim (no Docker stdio framing) ...
+    assert resp.written == [b"total 0\r\n"]
+    # ... and the keep-alive pong is protocol, not terminal output.
+    assert b"pong" not in b"".join(resp.written)
+
+    ws = captured["ws"]
+    # Keystrokes reach the PTY ...
+    assert ws.sent_bytes == [b"ls -l\r"]
+    # ... and a window resize is pushed as the control frame the platform
+    # expects. The hook was captured while the session was live; the bridge
+    # clears it afterwards so a late resize cannot reach a dead PTY.
+    assert ws.live_resize_hook is not None
+    await ws.live_resize_hook(120, 40)
+    assert json.loads(ws.sent_text[-1]) == {
+        "type": "resize",
+        "cols": 120,
+        "rows": 40,
+    }
+    assert session.exit_code == 0
+    assert session.resize_hook is None
+
+
+@pytest.mark.asyncio
+async def test_exec_resize_is_stored_and_forwarded(aiohttp_client, fake_kube: FakeKubeEnv):
+    """`POST /exec/{id}/resize` must be kept, not dropped.
+
+    The Docker CLI sends the geometry *before* ``exec start``, so the record is
+    the only place the interactive bridge can pick it up; a later resize has to
+    reach the live PTY through the installed hook.
+    """
+    from ..aio_server import create_aio_app
+    from .. import aio_server as mod
+
+    app = create_aio_app(run_reconcile=False)
+    mod.start_kube_environment = lambda **kw: fake_kube  # type: ignore
+    client = await aiohttp_client(app)
+    cid = await create_started_container(client, name="exec-resize")
+
+    resp = await client.post(
+        f"/containers/{cid}/exec",
+        json={"Cmd": ["bash"], "AttachStdin": True, "Tty": True},
+    )
+    assert resp.status == 200
+    eid = (await resp.json())["Id"]
+
+    resp = await client.post(f"/exec/{eid}/resize?h=43&w=132")
+    assert resp.status == 200
+    record = app["store"].get_exec(eid)
+    assert (record.tty_cols, record.tty_rows) == (132, 43)
+
+    seen: list[tuple[int, int]] = []
+
+    async def hook(cols: int, rows: int) -> None:
+        seen.append((cols, rows))
+
+    record.resize_hook = hook
+    resp = await client.post(f"/exec/{eid}/resize?h=50&w=200")
+    assert resp.status == 200
+    assert seen == [(200, 50)]
+    assert (record.tty_cols, record.tty_rows) == (200, 50)
+
+    # A failing hook must never break the API call.
+    async def boom(cols: int, rows: int) -> None:
+        raise RuntimeError("pty gone")
+
+    record.resize_hook = boom
+    resp = await client.post(f"/exec/{eid}/resize?h=24&w=80")
+    assert resp.status == 200
 
 
 @pytest.mark.asyncio

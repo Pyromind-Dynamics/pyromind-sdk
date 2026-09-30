@@ -53,12 +53,12 @@ CLUSTER_RESOURCE = {
     },
     "cn-east-1": {
         "http": {
-            "prod": "https://api-cn-east-1.pyromind.ai",
-            "pre": "https://pre-api-cn-east-1.pyromind.ai",
-            "pre2": "https://pre2-api-cn-east-1.pyromind.ai",
+            "prod": "https://api-cn-east-1.pyromind-asia.cn",
+            "pre": "https://pre-api-cn-east-1.pyromind-asia.cn",
+            "pre2": "https://pre2-api-cn-east-1.pyromind-asia.cn",
             "dev": "http://localhost:8002",
         },
-        "storage": "https://storage-cn-east-1.pyromind.ai"
+        "storage": "https://storage-cn-east-1.pyromind-asia.cn"
     },
 }
 
@@ -95,6 +95,45 @@ def resolve_base_url_from_cluster(cluster: str) -> str:
         valid_envs = ", ".join(sorted(cfg.get("http", {})))
         raise ValueError(f"Unknown env {env!r} for cluster {code!r}. Valid envs: {valid_envs}")
     return base.rstrip("/") + "/api/v1"
+
+
+def resolve_api_base_url(cluster: Optional[str] = None) -> str:
+    """Resolve the base URL for a **cluster-direct** (data-plane) client.
+
+    Resolution order:
+
+    1. ``PYROMIND_BASE_URL`` — an explicit override always wins.
+    2. The per-cluster direct address from :data:`CLUSTER_RESOURCE`, keyed by
+       ``cluster`` or ``PYROMIND_CLUSTER`` (``us-west-1#pre`` style suffixes
+       included).
+    3. ``DEFAULT_API_BASE_URL`` — the portal, as a last resort only.
+
+    Sandbox operations (list/get/create, exec, and the file read/write behind
+    ``docker cp``) are data-plane calls and belong on the cluster, not on the
+    portal. The portal is the control plane: ``ProfileClient`` (``/user_info``,
+    ``/storage_info``, access keys) keeps using ``DEFAULT_API_BASE_URL`` and
+    never calls this.
+
+    When neither ``PYROMIND_BASE_URL`` nor a cluster is configured the portal
+    is still returned, so an unconfigured client keeps working exactly as
+    before.
+    """
+    explicit = (os.getenv(ENV_BASE_URL) or "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    code = (cluster or os.getenv(ENV_CLUSTER) or "").strip()
+    if code:
+        try:
+            return resolve_base_url_from_cluster(code)
+        except ValueError as exc:
+            logger.warning(
+                "cannot resolve a direct base URL for cluster %r (%s); "
+                "falling back to the portal %s",
+                code,
+                exc,
+                DEFAULT_API_BASE_URL,
+            )
+    return DEFAULT_API_BASE_URL.rstrip("/")
 
 ERROR_MESSAGE_MAX_LENGTH = 500
 _TRACE_ID_HEADER_KEYS = {

@@ -7,6 +7,7 @@ This module defines Pydantic models for request and response data structures.
 from typing import Optional, List, Dict, Any, Literal, Union
 from datetime import datetime, timedelta
 from enum import Enum
+from math import isfinite
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
@@ -33,33 +34,29 @@ class ResourceConfig(BaseModel):
 
     @field_validator('cpu', mode='before')
     @classmethod
-    def validate_cpu(cls, v: Optional[Union[int, str]]) -> Optional[str]:
-        """Validate and convert cpu field, accept integer or string, convert to string"""
+    def validate_cpu(cls, v: Optional[Union[int, float, str]]) -> Optional[str]:
         if v is None:
             return None
-        # If integer, convert to string
-        if isinstance(v, int):
+        if type(v) in (int, float):
+            if isinstance(v, float) and not isfinite(v):
+                raise ValueError("cpu must be finite")
             return str(v)
-        # If string, return as is
         if isinstance(v, str):
-            return v.strip() if v.strip() else None
-        # Other types raise error
-        raise ValueError(f"cpu must be an integer or string, got {type(v).__name__}")
+            return v.strip() or None
+        raise ValueError(f"cpu must be a number or string, got {type(v).__name__}")
 
     @field_validator('memory', mode='before')
     @classmethod
-    def validate_memory(cls, v: Optional[Union[int, str]]) -> Optional[str]:
-        """Validate and convert memory field, accept integer or string, convert to string with 'Gi' unit"""
+    def validate_memory(cls, v: Optional[Union[int, float, str]]) -> Optional[str]:
         if v is None:
             return None
-        # If integer, add 'Gi' unit
-        if isinstance(v, int):
+        if type(v) in (int, float):
+            if isinstance(v, float) and not isfinite(v):
+                raise ValueError("memory must be finite")
             return f"{v}Gi"
-        # If string, return as is
         if isinstance(v, str):
-            return v.strip() if v.strip() else None
-        # Other types raise error
-        raise ValueError(f"memory must be an integer or string, got {type(v).__name__}")
+            return v.strip() or None
+        raise ValueError(f"memory must be a number or string, got {type(v).__name__}")
 
     @field_validator('gpu', mode='before')
     @classmethod

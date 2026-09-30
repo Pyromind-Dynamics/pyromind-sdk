@@ -151,8 +151,8 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 | `DOCKER_RT_STORAGE_CLUSTER` / `DOCKER_RT_CLUSTER` / `PYROMIND_CLUSTER` | 空 | storage profile 查找用的集群键，按序取第一个非空值；都为空时用当前 profile |
 | `DOCKER_RT_REGISTRY_CLUSTER` | 空 | 推送 profile：`us-west-1` / `us-west-2` / `cn-east-1` |
 | `DOCKER_RT_REGISTRY_NAMESPACE` | 空 | registry 命名空间；Docker Hub 集群必填 |
-| `DOCKER_RT_REGISTRY_USERNAME` / `_PASSWORD` | 空 | 推送凭据 |
-| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | `/etc/docker-image/.dockerconfigjson` | 复用现成的 dockerconfigjson |
+| `DOCKER_RT_REGISTRY_USERNAME` / `DOCKER_RT_REGISTRY_PASSWORD` | 空 | 仓库账号及密码/有推送权限的 Token；两者均非空时优先于 dockerconfig，与 `PYROMIND_API_KEY` 无关 |
+| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | `/etc/docker-image/.dockerconfigjson` | daemon 可读取的凭据文件路径；文件内容可为 JSON 或 Base64 编码的 JSON，详见「构建前配置仓库认证」 |
 | `DOCKER_RT_ACR_ACCESS_KEY_ID` / `_SECRET` / `_INSTANCE_ID` | 空 | 上海 ACR 建仓用 |
 | `DOCKER_RT_SERVICE_DNS` | `true` | 创建 ClusterIP Service 支持 Compose 服务名 DNS |
 | `DOCKER_RT_ORPHAN_POLICY` | `adopt` | `adopt` 恢复受管 Pod；`reap` 启动时删除 |
@@ -486,6 +486,56 @@ kaniko 构建并推送到 registry，不需要本机 Docker daemon，也不需�
 `k8s_middleware` HTTP API 适配器。
 
 ### 镜像构建
+
+#### 构建前配置仓库认证
+
+默认 `DOCKER_RT_BUILD_PUSH=true`，kaniko 构建后会推送镜像。Docker Hub、ACR 等
+需要目标仓库的账号和密码或具有推送权限的 Token；公开镜像可匿名拉取不代表可匿名推送。
+`PYROMIND_API_KEY` 只认证 Sandbox 平台 API，不能替代镜像仓库凭据。
+
+**方式一：仓库账号 + 密码/Token。** 下例使用隐藏输入读取密码/Token，避免把真实凭据
+写入命令历史。先替换镜像地址、命名空间和账号；构建器必须是集群能拉取的 kaniko debug 镜像。
+平台 API Key 和集群参数仍按前文配置。
+
+```bash
+export DOCKER_RT_BUILD_IMAGE="your-registry.example.com/builders/kaniko:v1.24.0-debug"
+export DOCKER_RT_BUILD_REGISTRY="docker.io/your-namespace"
+export DOCKER_RT_BUILD_PUSH=true
+export DOCKER_RT_REGISTRY_USERNAME="your-dockerhub-user"
+export DOCKER_RT_REGISTRY_PASSWORD="$(python3 -c 'import getpass; print(getpass.getpass("Registry password/token: "))')"
+
+pyromind docker-rt --daemon
+docker build -t myapp:latest .
+```
+
+推送目标为 `docker.io/your-namespace/myapp:latest`。其他仓库将
+`DOCKER_RT_BUILD_REGISTRY` 改为对应的 `仓库主机/命名空间`，并提供该仓库的账号和密码/Token。
+两项凭据均非空时优先于 dockerconfig 文件。
+
+**方式二：使用已有 dockerconfig 文件。** 在启动 daemon 前选择此方式代替账号密码变量：
+
+```bash
+unset DOCKER_RT_REGISTRY_USERNAME DOCKER_RT_REGISTRY_PASSWORD
+export DOCKER_RT_REGISTRY_DOCKERCONFIG="/absolute/path/to/dockerconfig.json"
+```
+
+- 变量值必须是 **daemon 所在机器上的文件路径**，不是 JSON 或 Base64 字符串；文件内容
+  可为 JSON 或 Base64 编码的 JSON，`auths` 中需包含对应仓库的 `auth` 或 `username`/`password`。
+- 默认挂载文件是 `/etc/docker-image/.dockerconfigjson`；使用该文件时也请显式设置
+  `DOCKER_RT_REGISTRY_DOCKERCONFIG`，以通过当前短 tag 构建的凭据预检查。
+- 当前构建流程不会自动使用 `docker login` 的认证请求头、`~/.docker/config.json`
+  或系统 credential helper。只有 `credsStore` / `credHelpers` 或 `identitytoken` 的配置不够；
+  显式指定的文件必须包含上述 `auths` 凭据。
+- 这些变量由 **docker-rt daemon** 读取，必须在启动前设置。daemon 已运行时，先用
+  `pyromind docker-rt --stop` 停止，再从已配置变量的 shell 启动；只在 `docker build`
+  命令前设置变量不会更新已有 daemon 的环境。
+- ACR 自动建仓所需的 `DOCKER_RT_ACR_ACCESS_KEY_ID`、`DOCKER_RT_ACR_ACCESS_KEY_SECRET`
+  和 `DOCKER_RT_ACR_INSTANCE_ID` 是另一组配置，不能替代仓库推送凭据。
+
+不要把真实密码、Token 或 dockerconfig 提交到仓库、复制进 Dockerfile 或构建上下文；
+Base64 不是加密，凭据文件也需要限制访问权限。
+
+#### 构建流程与限制
 
 `docker build -t myapp .` 的链路：
 

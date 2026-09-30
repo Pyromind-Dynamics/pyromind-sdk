@@ -151,8 +151,8 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 | `DOCKER_RT_STORAGE_CLUSTER` / `DOCKER_RT_CLUSTER` / `PYROMIND_CLUSTER` | empty | Cluster key for the storage profile lookup, first non-empty wins; falls back to the current profile |
 | `DOCKER_RT_REGISTRY_CLUSTER` | empty | Push profile: `us-west-1` / `us-west-2` / `cn-east-1` |
 | `DOCKER_RT_REGISTRY_NAMESPACE` | empty | Registry namespace; required on Docker Hub clusters |
-| `DOCKER_RT_REGISTRY_USERNAME` / `_PASSWORD` | empty | Push credentials |
-| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | `/etc/docker-image/.dockerconfigjson` | Reuse an existing dockerconfigjson |
+| `DOCKER_RT_REGISTRY_USERNAME` / `DOCKER_RT_REGISTRY_PASSWORD` | empty | Registry username and password/token with push permission; both nonempty take precedence over dockerconfig; unrelated to `PYROMIND_API_KEY` |
+| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | `/etc/docker-image/.dockerconfigjson` | Credential file path readable by the daemon; contents may be JSON or base64-encoded JSON; see "Configure registry authentication before building" |
 | `DOCKER_RT_ACR_ACCESS_KEY_ID` / `_SECRET` / `_INSTANCE_ID` | empty | Used to pre-create ACR repositories in Shanghai |
 | `DOCKER_RT_SERVICE_DNS` | `true` | Create ClusterIP Service for Compose service DNS |
 | `DOCKER_RT_ORPHAN_POLICY` | `adopt` | `adopt` restores managed Pods; `reap` deletes them on startup |
@@ -505,6 +505,65 @@ The current implementation uses the official Kubernetes Python SDK directly; a
 future adapter can replace that hop with the `k8s_middleware` HTTP API.
 
 ### Image builds
+
+#### Configure registry authentication before building
+
+`DOCKER_RT_BUILD_PUSH=true` by default, so kaniko pushes the image after building.
+Docker Hub, ACR, and similar registries require a registry username and password or
+a token with push permission; anonymous pulls do not imply anonymous pushes.
+`PYROMIND_API_KEY` authenticates the Sandbox platform API, not the image registry.
+
+**Option 1: registry username + password/token.** The example prompts without echoing
+the password/token so it does not enter shell history. Replace the image, namespace,
+and username first; the builder must be a kaniko debug image the cluster can pull.
+Configure the platform API key and cluster as described above.
+
+```bash
+export DOCKER_RT_BUILD_IMAGE="your-registry.example.com/builders/kaniko:v1.24.0-debug"
+export DOCKER_RT_BUILD_REGISTRY="docker.io/your-namespace"
+export DOCKER_RT_BUILD_PUSH=true
+export DOCKER_RT_REGISTRY_USERNAME="your-dockerhub-user"
+export DOCKER_RT_REGISTRY_PASSWORD="$(python3 -c 'import getpass; print(getpass.getpass("Registry password/token: "))')"
+
+pyromind docker-rt --daemon
+docker build -t myapp:latest .
+```
+
+This pushes to `docker.io/your-namespace/myapp:latest`. For another registry, set
+`DOCKER_RT_BUILD_REGISTRY` to its `registry-host/namespace` and supply that registry's
+username and password/token. When both credential variables are nonempty, they take
+precedence over the dockerconfig file.
+
+**Option 2: an existing dockerconfig file.** Choose this instead of the username/password
+variables before starting the daemon:
+
+```bash
+unset DOCKER_RT_REGISTRY_USERNAME DOCKER_RT_REGISTRY_PASSWORD
+export DOCKER_RT_REGISTRY_DOCKERCONFIG="/absolute/path/to/dockerconfig.json"
+```
+
+- The variable must contain a **file path on the daemon's machine**, not JSON or a
+  base64 string. File contents may be JSON or base64-encoded JSON; `auths` must
+  contain the registry's `auth` or `username`/`password` credentials.
+- The default mounted file is `/etc/docker-image/.dockerconfigjson`. Even when using
+  this file, explicitly set `DOCKER_RT_REGISTRY_DOCKERCONFIG` to pass the current
+  credential precheck for short-tag builds.
+- Builds do not automatically consume `docker login` authentication headers,
+  `~/.docker/config.json`, or system credential helpers. A config containing only
+  `credsStore` / `credHelpers` or `identitytoken` is insufficient; the explicitly
+  selected file must include the `auths` credentials described above.
+- The **docker-rt daemon** reads these variables, so configure them before startup.
+  If it is already running, stop it with `pyromind docker-rt --stop` and restart it
+  from the configured shell. Setting variables only on the `docker build` command
+  does not update an existing daemon's environment.
+- ACR repository creation uses separate `DOCKER_RT_ACR_ACCESS_KEY_ID`,
+  `DOCKER_RT_ACR_ACCESS_KEY_SECRET`, and `DOCKER_RT_ACR_INSTANCE_ID` settings;
+  these do not replace registry push credentials.
+
+Do not commit real passwords, tokens, or dockerconfig files, or copy them into a
+Dockerfile or build context. Base64 is not encryption; restrict access to credential files.
+
+#### Build flow and limitations
 
 How `docker build -t myapp .` works:
 

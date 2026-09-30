@@ -26,7 +26,7 @@ from pyromind_sdk.client.async_base import (
     PyroMindAsyncAPIError,
 )
 from pyromind_sdk.client.async_sandbox import AsyncSandboxClient
-from pyromind_sdk.client.base import PyroMindAPIError
+from pyromind_sdk.client.base import PyroMindAPIError, resolve_api_base_url
 from pyromind_sdk.client.models import (
     PortMapping,
     ResourceConfig,
@@ -88,8 +88,94 @@ def _pod_status_cache_ttl(status: str) -> float:
         return default
 
 
+async def batch_pod_ips(
+    sandbox_ids: "list[str] | tuple[str, ...]",
+    *,
+    client: AsyncSandboxClient | None = None,
+) -> dict[str, str]:
+    """Internal IPs for many sandboxes in one round trip.
+
+    ``docker inspect`` wants the sandbox's internal IP, and asking per
+    container turns into one HTTP request plus one K8s Service read each. The
+    platform moved that value out of the instance list (webapp
+    ``/instance/list_aux``) into a batch, access-key authenticated endpoint
+    (``GET /api/v1/sandboxes/internal_ips``), so one call covers every sandbox
+    the caller asks about.
+
+    The IP is the sandbox's Service ClusterIP, assigned when the sandbox is
+    created and stable for its whole life, so there is nothing worth caching:
+    the one place that needs it (``docker inspect``) just asks once per call.
+
+    If the batch endpoint itself is unavailable — an older k8s_middleware that
+    predates ``GET /sandboxes/internal_ips`` answers 404 — it degrades to the
+    singular ``GET /sandboxes/{sandbox_id}/internal_ip`` rather than returning
+    nothing, so ``docker inspect`` still shows an IP, just at N round trips
+    instead of one. That failure is logged at ``warning``: silently yielding
+    ``{}`` is indistinguishable from "the sandbox has no IP" and was how a
+    missing endpoint used to go unnoticed.
+
+    A key missing from a *successful* batch response is left alone — that
+    means "not yours / not running / no IP yet", not "endpoint missing".
+
+    Never raises: an unreachable or failing lookup returns only what is already
+    known, and callers treat a missing key as "no IP".
+    """
+    wanted = [str(sid).strip() for sid in sandbox_ids]
+    unique = list(dict.fromkeys(sid for sid in wanted if sid))
+    if not unique:
+        return {}
+    if client is None:
+        client = get_sandbox_client()
+
+    resolved: dict[str, str] = {}
+    try:
+        mapping = await client.get_internal_ips(unique) or {}
+        resolved = {sid: str(mapping[sid]) for sid in unique if mapping.get(sid)}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "batch inner ip lookup failed (%s: %s); falling back to per-sandbox "
+            "lookup for %d sandbox(es) — is the deployed k8s_middleware missing "
+            "GET /sandboxes/internal_ips?",
+            type(exc).__name__,
+            exc,
+            len(unique),
+        )
+        resolved = await _per_sandbox_pod_ips(unique, client)
+    return resolved
+
+
+async def _per_sandbox_pod_ips(
+    sandbox_ids: "list[str] | tuple[str, ...]",
+    client: AsyncSandboxClient,
+) -> dict[str, str]:
+    """One request per sandbox. Only used when the batch endpoint is missing.
+
+    Sequential on purpose: the only caller (``get_pod_ip``) passes a single id,
+    and this is a degraded path — a few round trips beat a cache.
+    """
+    resolved: dict[str, str] = {}
+    for sandbox_id in sandbox_ids:
+        try:
+            ip = await client.get_internal_ip(sandbox_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("inner ip lookup failed for %s: %s", sandbox_id, exc)
+            continue
+        value = getattr(ip, "internal_ip", None)
+        if value:
+            resolved[sandbox_id] = str(value)
+    return resolved
+
+
 def new_sandbox_client() -> AsyncSandboxClient:
+    """Create the daemon's shared sandbox client.
+
+    Everything this client does is data-plane work — list/get/create, exec,
+    the file read/write behind ``docker cp``, and the internal-IP batch
+    lookup — so it talks to the cluster **directly** instead of going through
+    the portal. Only the profile/storage lookup stays on the portal.
+    """
     return AsyncSandboxClient(
+        base_url=resolve_api_base_url(),
         connector_limit=DEFAULT_CONNECTOR_LIMIT,
         connector_limit_per_host=DEFAULT_CONNECTOR_LIMIT,
     )
@@ -736,7 +822,11 @@ class PyromindSDK:
         cwd: str = "",
         timeout: int | None = None,
     ) -> AsyncIterator[SandboxExecStreamChunk]:
-        """Stream one exec command without leaving the running event loop."""
+        """Stream one exec command without leaving the running event loop.
+
+        Output-only: the exec-stream channel has no PTY and forwards no stdin.
+        Interactive work belongs on ``/sandboxes/{id}/terminal``.
+        """
         if not self.sandbox_id:
             raise RuntimeError("sandbox is not started")
         url = build_exec_stream_websocket_url(
@@ -775,10 +865,13 @@ class PyromindSDK:
         if not self.sandbox_id:
             return None
         try:
-            response = await self._client.get_internal_ip(self.sandbox_id)
-            return response.internal_ip or None
-        except _SDK_API_ERRORS:
+            resolved = await batch_pod_ips(
+                [self.sandbox_id], client=getattr(self, "_client", None)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("get_pod_ip failed id=%s: %s", self.sandbox_id, exc)
             return None
+        return resolved.get(self.sandbox_id) or None
 
     def _phase_lock(self) -> asyncio.Lock:
         if getattr(self, "_phase_refresh_lock", None) is None:
@@ -1063,6 +1156,17 @@ class PyromindSDK:
             return
 
         data = await self._client.read_file(self.sandbox_id, target)
+        # 对账：上面 archive_path_stat 已经拿到了文件的真实大小（容器里 wc -c），
+        # 而 tar 头若用 len(data) —— 即「实际收到的字节数」—— 来写，一旦上游
+        # 的流被截断，就会产出一个**自洽**的 tar：docker cp 解开它、安静地写出
+        # 一个缺尾的文件、退出码 0、两边日志都干净。所以先比大小再打包。
+        expected = int(stat.get("size") or 0)
+        if expected and len(data) < expected:
+            raise RuntimeError(
+                f"short read for {target}: got {len(data)} of {expected} bytes — "
+                "the file read stream was truncated; refusing to emit a "
+                "self-consistent truncated tar"
+            )
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w") as tar:
             info = tarfile.TarInfo(name=base or "/")
