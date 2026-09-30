@@ -88,6 +88,8 @@ async def _iter_exec_stream_events(
     stop_event: Optional[threading.Event] = None,
     ping_interval_s: float = 60.0,
 ) -> AsyncIterator[Dict[str, Any]]:
+    # Output-only channel: the server refused stdin support here (see the
+    # docker_rt README). Interactive sessions use the terminal WebSocket.
     request: Dict[str, Any] = {
         "command": command,
         "cwd": cwd or "",

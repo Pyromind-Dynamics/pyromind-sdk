@@ -12,7 +12,7 @@ from pathlib import Path
 WRAPPER_DIR = Path.home() / ".pyromind" / "bin"
 WRAPPER_PATH = WRAPPER_DIR / "docker"
 PATH_LINE = 'export PATH="$HOME/.pyromind/bin:$PATH"'
-WRAPPER_VERSION = "14"
+WRAPPER_VERSION = "17"
 
 
 def _wrapper_version() -> str | None:
@@ -130,6 +130,21 @@ is_docker_rt() {{
 if ! is_docker_rt; then
   exec "$REAL_DOCKER" "$@"
 fi
+# Kill the CLI's "What's next:" upsell hooks. With a TTY attached, docker 27
+# runs every installed plugin's hook after the command finished
+# (``cmd/docker/docker.go`` → ``manager.RunCLICommandHooks``); the docker-debug
+# plugin then prints
+#   What's next:
+#       Try Docker Debug for seamless, persistent debugging tools in any
+#       container or image → docker debug <cid>
+# on stderr — so leaving ``docker exec -it <cid> bash`` with exit/Ctrl-D looks
+# like the command failed. Those hints advertise Docker Desktop features that
+# cannot exist behind docker-rt, so they are pure noise here.
+# ``DockerCli.HooksEnabled()`` reads DOCKER_CLI_HINTS first (legacy name), then
+# DOCKER_CLI_HOOKS; both are honoured, whichever the installed CLI knows.
+# Only for docker-rt: on a real Docker context the wrapper handed over above.
+export DOCKER_CLI_HINTS=false
+export DOCKER_CLI_HOOKS=false
 args=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -287,15 +302,66 @@ if [[ "${{args[0]:-}}" == "events" ]]; then
   exit 1
 fi
 if [[ "${{args[0]:-}}" == "build" ]]; then
-  echo "docker-rt does not support docker build / buildx build." >&2
-  echo "Build the image with your normal Docker/BuildKit first, then use docker run." >&2
-  exit 1
+  # Filter out flags the classic builder doesn't understand but kaniko handles.
+  # --platform defaults to linux/amd64 in the backend if not passed through.
+  filtered_args=()
+  for arg in "${{args[@]}}"; do
+    case "$arg" in
+      --builder|--builder=*|--output|--output=*|-o|-o=*|--secret|--secret=*|--ssh|--ssh=*|--mount|--mount=*|--cache-to|--cache-to=*|--cache-from|--cache-from=*|--load|--push|--provenance|--provenance=*|--sbom|--sbom=*|--attest|--attest=*|--allow|--allow=*)
+        echo "docker-rt: $arg is not supported by the cluster build sandbox (kaniko)." >&2
+        echo "Remove it, or build outside docker-rt with 'docker --context default build'." >&2
+        exit 1
+        ;;
+      *)
+        filtered_args+=("$arg")
+        ;;
+    esac
+  done
+  # The sandbox builds through POST /build (context tar). BuildKit's client
+  # would instead try to reach buildkitd over the socket, so force the classic
+  # builder path here.
+  export DOCKER_BUILDKIT=0
+  # DOCKER_BUILDKIT=0 makes the real docker CLI print its own legacy-builder
+  # banner on stderr:
+  #   DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+  #               BuildKit is currently disabled; enable it by removing the DOCKER_BUILDKIT=0
+  #               environment-variable.
+  # That is docker's notice about docker's own builder, it is not a docker-rt
+  # problem, and docker ships no switch to silence it. So feed the CLI's stderr
+  # through a filter that drops exactly that banner - it always starts with the
+  # DEPRECATED line and continues on indented lines, followed by a blank
+  # separator - and passes every other line through unbuffered. The CLI's stdout
+  # is handed straight to ours, so its progress rendering stays intact.
+  _strip_legacy_builder_banner() {{
+    local line skip=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ $skip -eq 1 ]]; then
+        # Indented continuation of the banner, or the blank line that follows it.
+        if [[ -z "$line" || "$line" == [[:space:]]* ]]; then
+          continue
+        fi
+        skip=0
+      fi
+      if [[ "$line" == "DEPRECATED: The legacy builder is deprecated"* ]]; then
+        skip=1
+        continue
+      fi
+      printf '%s\\n' "$line"
+    done
+  }}
+  # 2>&1 first, so the CLI's stderr becomes the pipe while its stdout keeps the
+  # terminal; 1>&3 then points the CLI's stdout back at our stdout.
+  exec 3>&1
+  "$REAL_DOCKER" "${{filtered_args[@]}}" 2>&1 1>&3 | _strip_legacy_builder_banner >&2
+  _build_rc=${{PIPESTATUS[0]}}
+  exec 3>&-
+  exit $_build_rc
 fi
 if [[ "${{args[0]:-}}" == "buildx" ]]; then
   for arg in "${{args[@]:1}}"; do
     if [[ "$arg" == "build" ]]; then
-      echo "docker-rt does not support docker build / buildx build." >&2
-      echo "Build the image with your normal Docker/BuildKit first, then use docker run." >&2
+      echo "docker-rt does not support docker buildx build yet." >&2
+      echo "Use plain 'docker build -t <tag> .' — it builds in the cluster sandbox." >&2
       exit 1
     fi
   done
@@ -303,7 +369,7 @@ fi
 if [[ "${{args[0]:-}}" == "compose" ]]; then
   for arg in "${{args[@]:1}}"; do
     if [[ "$arg" == "--build" || "$arg" == "build" ]]; then
-      echo "docker-rt does not support docker compose build." >&2
+      echo "docker-rt does not support docker compose build yet." >&2
       echo "Use a pre-built image with docker compose up (without --build)." >&2
       exit 1
     fi
