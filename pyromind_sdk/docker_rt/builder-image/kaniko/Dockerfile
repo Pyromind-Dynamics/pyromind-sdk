@@ -21,7 +21,7 @@ ARG KANIKO_VERSION=v1.24.0
 ARG KANIKO_IMAGE=gcr.io/kaniko-project/executor
 
 # Version of this custom build (increment when modifying this Dockerfile)
-ARG BUILD_VERSION=0.0.2
+ARG BUILD_VERSION=0.0.3
 
 # ---- Builder image -----------------------------------------------------------
 FROM ${KANIKO_IMAGE}:${KANIKO_VERSION}-debug
