@@ -2894,3 +2894,43 @@ def test_the_prefix_is_used_verbatim_no_namespace_is_ever_appended() -> None:
         ["app:1"], registry="pyromind-registry.cn-shanghai.cr.aliyuncs.com"
     )
     assert aliases["app:1"] == "pyromind-registry.cn-shanghai.cr.aliyuncs.com/app:1"
+
+
+def test_push_rejected_hint_points_at_the_missing_acr_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ACR 对"仓库不存在"也回 401 —— 建仓被跳过时要把这条说出来。
+
+    2026-10-09 用户的第二类 401：他把 ``DOCKER_RT_ACR_ACCESS_KEY_SECRET`` 写成了
+    ``DOCKER_RT_ACR_SECRET``，建仓那步被静默跳过，构建跑完 216 秒后 ACR 回
+    ``UNAUTHORIZED: authentication required``（仓库 ``pyromind/pyromind-console-1`` 不存在）。
+    """
+    from ..backend.build_sandbox import push_rejected_hint
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1#pre")
+    monkeypatch.setenv(
+        "DOCKER_RT_BUILD_REGISTRY",
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind",
+    )
+    _set_push_credentials(monkeypatch)
+    # 名字写错了：ID 和实例 ID 都对，只有 secret 那个变量不存在
+    monkeypatch.setenv("DOCKER_RT_ACR_ACCESS_KEY_ID", "LTAI5tG5os7P4Dqyasfmnwhe")
+    monkeypatch.setenv("DOCKER_RT_ACR_INSTANCE_ID", "cri-3a7k1rh8eajwcae8")
+    monkeypatch.setenv("DOCKER_RT_ACR_SECRET", "typo")
+
+    raw = (
+        "error pushing image: failed to push to destination "
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/pyromind-console-1:dev-5: "
+        "POST https://pyromind-registry.cn-shanghai.cr.aliyuncs.com/v2/pyromind/"
+        "pyromind-console-1/blobs/uploads/: UNAUTHORIZED: authentication required\n"
+    )
+    hint = push_rejected_hint(
+        raw, ["pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/pyromind-console-1:dev-5"]
+    )
+    assert hint
+    assert "pyromind/pyromind-console-1:dev-5" in hint  # 精确指出推的是哪个仓库
+    assert "created *first*" in hint
+    assert "DOCKER_RT_ACR_ACCESS_KEY_SECRET" in hint
+    # 顺带把"你还有个变量是错的"也带上
+    assert "did you mean" in hint or "unrecognised" in hint

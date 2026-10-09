@@ -154,7 +154,9 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 | `DOCKER_RT_REGISTRY_NAMESPACE` | empty | Registry namespace; required on Docker Hub clusters |
 | `DOCKER_RT_REGISTRY_USERNAME` / `DOCKER_RT_REGISTRY_PASSWORD` | empty | Registry username and password/token with push permission; both nonempty take precedence over dockerconfig; unrelated to `PYROMIND_API_KEY` |
 | `DOCKER_RT_REGISTRY_DOCKERCONFIG` | `/etc/docker-image/.dockerconfigjson` (used only if it exists) | **Either/or with the pair above, and neither is required**: credential file path readable by the daemon; contents may be JSON or base64-encoded JSON; see "Configure registry authentication before building" |
-| `DOCKER_RT_ACR_ACCESS_KEY_ID` / `_SECRET` / `_INSTANCE_ID` | empty | Used to pre-create ACR repositories in Shanghai |
+| `DOCKER_RT_ACR_ACCESS_KEY_ID` | empty | AccessKey ID used to **pre-create** ACR repositories |
+| `DOCKER_RT_ACR_ACCESS_KEY_SECRET` | empty | AccessKey Secret used to **pre-create** ACR repositories. ⚠️ That is the whole name — **not** `DOCKER_RT_ACR_SECRET` |
+| `DOCKER_RT_ACR_INSTANCE_ID` | empty | ACR Enterprise instance ID (`cri-xxxx`), required for pre-creation |
 | `DOCKER_RT_SERVICE_DNS` | `true` | Create ClusterIP Service for Compose service DNS |
 | `DOCKER_RT_ORPHAN_POLICY` | `adopt` | `adopt` restores managed Pods; `reap` deletes them on startup |
 | `DOCKER_RT_CLEANUP_ON_EXIT` | `false` | Delete managed Pods on SIGINT/SIGTERM when `true` |
@@ -218,6 +220,22 @@ DOCKER_RT_BUILD_PUSH_CHECK=warn
 
 Without these the build is stopped **before it starts** (`DOCKER_RT_BUILD_PUSH_CHECK`
 defaults to `fail`), and the error prints exactly the lines above.
+
+There is also a **separate** group: when the ACR repository does not exist yet, these let
+the daemon pre-create it before the build. The names are spelled out in full — **do not
+abbreviate them**:
+
+```
+DOCKER_RT_ACR_ACCESS_KEY_ID=<AccessKey ID>
+DOCKER_RT_ACR_ACCESS_KEY_SECRET=<AccessKey Secret>
+DOCKER_RT_ACR_INSTANCE_ID=cri-xxxxxxxxxxxx
+```
+
+> ⚠️ `DOCKER_RT_ACR_SECRET` **does not exist** (the real name is
+> `DOCKER_RT_ACR_ACCESS_KEY_SECRET`). A misspelled variable is silently ignored — the
+> pre-creation step is skipped, and ACR answers a push to a **nonexistent** repository
+> with `401 UNAUTHORIZED: authentication required` too, which is easy to misread as a
+> credential problem. Skip this group if the repository was created by hand.
 
 `DOCKER_RT_READY_TIMEOUT` / `--ready-timeout` controls the docker-rt server's
 sandbox readiness wait. It does not change the Docker client's HTTP timeout.

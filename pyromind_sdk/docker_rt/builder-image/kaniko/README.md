@@ -169,8 +169,14 @@ registry 密码（push 用）、AccessKey 对（建仓用）、实例 ID（`cri-
 两种做法：
 
 - **控制台手工建**：ACR 控制台 → 实例 → 命名空间 `pyromind` → 仓库 `kaniko-executor-pyromind`
-- **让 docker-rt 自动建**：给 docker-rt 的 Deployment 配上
-  `DOCKER_RT_ACR_ACCESS_KEY_ID` / `DOCKER_RT_ACR_ACCESS_KEY_SECRET` / `DOCKER_RT_ACR_INSTANCE_ID`
+- **让 docker-rt 自动建**：给 docker-rt 的 Deployment 配上这三个（名字都是全的，**别简写**）
+  ```
+  DOCKER_RT_ACR_ACCESS_KEY_ID=<AccessKey ID>
+  DOCKER_RT_ACR_ACCESS_KEY_SECRET=<AccessKey Secret>
+  DOCKER_RT_ACR_INSTANCE_ID=cri-xxxxxxxxxxxx
+  ```
+  ⚠️ `DOCKER_RT_ACR_SECRET` **不存在**；写错的变量会被静默忽略，建仓就悄悄被跳过了，
+  而 ACR 对"仓库不存在"也是回 `401 UNAUTHORIZED`，很容易误判成凭据问题。
 
 ## 4. 部署：把地址告诉 docker-rt
 

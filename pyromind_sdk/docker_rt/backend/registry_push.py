@@ -26,6 +26,7 @@ from __future__ import annotations
 import base64
 import binascii
 import datetime as _dt
+import difflib
 import hashlib
 import hmac
 import json
@@ -33,7 +34,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from urllib.parse import quote
 
 logger = logging.getLogger("docker_rt.registry_push")
@@ -430,6 +431,65 @@ class AcrSettings:
     @property
     def endpoint(self) -> str:
         return ACR_API_ENDPOINT.format(region_id=self.region_id or "cn-shanghai")
+
+
+#: 我们**确实会读**的变量名。用来发现"拼错了"的那种 —— 拼错的变量会被静默忽略，
+#: 而后果往往是"某个前置步骤被跳过"：2026-10-09 用户把
+#: ``DOCKER_RT_ACR_ACCESS_KEY_SECRET`` 写成了 ``DOCKER_RT_ACR_SECRET``，
+#: 于是 ACR 建仓被跳过，构建跑完 216 秒后拿到一个毫无线索的 401。
+#: 只覆盖这两组（加 Aliyun 的那对）：数量少、稳定，误报代价小。
+KNOWN_ACR_ENV = (
+    "DOCKER_RT_ACR_ACCESS_KEY_ID",
+    "DOCKER_RT_ACR_ACCESS_KEY_SECRET",
+    "DOCKER_RT_ACR_INSTANCE_ID",
+    "DOCKER_RT_ACR_REGION_ID",
+    "DOCKER_RT_ACR_AUTO_CREATE_REPO",
+    "DOCKER_RT_ACR_REPO_PUBLIC",
+)
+KNOWN_REGISTRY_ENV = (
+    "DOCKER_RT_REGISTRY_CLUSTER",
+    "DOCKER_RT_REGISTRY_NAMESPACE",
+    "DOCKER_RT_REGISTRY_USERNAME",
+    "DOCKER_RT_REGISTRY_PASSWORD",
+    "DOCKER_RT_REGISTRY_DOCKERCONFIG",
+)
+KNOWN_ALIYUN_ENV = (
+    "ALIBABA_CLOUD_ACCESS_KEY_ID",
+    "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
+)
+#: 本模块会读的**其他**变量（不属于上面两组命名）。
+KNOWN_MISC_ENV = (
+    "DOCKER_RT_KUBE_CONTEXT",
+    "DOCKER_RT_BUILD_REGISTRY",
+    "DOCKER_RT_BUILD_REGISTRY_INSECURE",
+)
+#: 本模块**确实会读**的全部名字。自查测试盯着这张表：代码里新读一个变量就得加进来，
+#: 否则下面那个体检会把**正确**的变量名报成拼错的。
+KNOWN_ENV = KNOWN_ACR_ENV + KNOWN_REGISTRY_ENV + KNOWN_ALIYUN_ENV + KNOWN_MISC_ENV
+
+#: 只对这几个前缀做"拼错了"的体检。**故意不含** ``DOCKER_RT_BUILD_``：
+#: 那一组有几十个变量、而本模块只读其中两个，按前缀查会把 28 个正确的变量全报成拼错的。
+_TRACKED_ENV_PREFIXES = ("DOCKER_RT_ACR_", "DOCKER_RT_REGISTRY_", "ALIBABA_CLOUD_")
+
+
+def unknown_env_warnings(environ: Mapping[str, str] | None = None) -> list[str]:
+    """拼错的 ACR / registry 环境变量 —— 它们会被静默忽略，所以要点出来。
+
+    环境变量没有"未定义"这回事：写错一个字母就等于没设，而失败会出现在很远的地方
+    （一次 216 秒的构建 + 一个裸 401）。这里在**构建前**把可疑的名字连同
+    did-you-mean 一起打出来。
+    """
+    env = os.environ if environ is None else environ
+    out: list[str] = []
+    for name in sorted(env):
+        if name in KNOWN_ENV or not name.startswith(_TRACKED_ENV_PREFIXES):
+            continue
+        close = difflib.get_close_matches(name, KNOWN_ENV, n=1, cutoff=0.6)
+        hint = f"did you mean {close[0]}?" if close else "docker-rt never reads it"
+        out.append(
+            f"unrecognised environment variable {name} is set and ignored — {hint}"
+        )
+    return out
 
 
 def acr_settings(cluster: str | None = None) -> AcrSettings:

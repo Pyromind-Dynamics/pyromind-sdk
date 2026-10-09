@@ -562,7 +562,9 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 | `DOCKER_RT_REGISTRY_NAMESPACE` | 空 | registry 命名空间；Docker Hub 集群必填 |
 | `DOCKER_RT_REGISTRY_USERNAME` / `DOCKER_RT_REGISTRY_PASSWORD` | 空 | 仓库账号及密码/有推送权限的 Token；两者均非空时优先于 dockerconfig，与 `PYROMIND_API_KEY` 无关 |
 | `DOCKER_RT_REGISTRY_DOCKERCONFIG` | `/etc/docker-image/.dockerconfigjson`（存在才用） | 与上一组**二选一、且都非必填**：daemon 可读取的凭据文件路径；文件内容可为 JSON 或 Base64 编码的 JSON，详见「构建前配置仓库认证」 |
-| `DOCKER_RT_ACR_ACCESS_KEY_ID` / `_SECRET` / `_INSTANCE_ID` | 空 | 上海 ACR 建仓用 |
+| `DOCKER_RT_ACR_ACCESS_KEY_ID` | 空 | 上海 ACR **建仓**用的 AccessKey ID |
+| `DOCKER_RT_ACR_ACCESS_KEY_SECRET` | 空 | 上海 ACR **建仓**用的 AccessKey Secret。⚠️ 全名就是这样，**不是** `DOCKER_RT_ACR_SECRET` |
+| `DOCKER_RT_ACR_INSTANCE_ID` | 空 | ACR 企业版实例 ID（`cri-xxxx`），建仓必填 |
 | `DOCKER_RT_SERVICE_DNS` | `true` | 创建 ClusterIP Service 支持 Compose 服务名 DNS |
 | `DOCKER_RT_ORPHAN_POLICY` | `adopt` | `adopt` 恢复受管 Pod；`reap` 启动时删除 |
 | `DOCKER_RT_CLEANUP_ON_EXIT` | `false` | `true` 时退出删除受管 Pod |
@@ -619,6 +621,20 @@ DOCKER_RT_BUILD_PUSH_CHECK=warn
 
 不设的话，构建会在**开始之前**就被终止（`DOCKER_RT_BUILD_PUSH_CHECK` 默认 `fail`），
 报错里会把上面这几行原样列出来。
+
+还有一个**独立的**变量组：ACR 里**还没有这个仓库**时，让 daemon 在构建前自动建仓。
+三个名字都是全的，**别简写**：
+
+```
+DOCKER_RT_ACR_ACCESS_KEY_ID=<AccessKey ID>
+DOCKER_RT_ACR_ACCESS_KEY_SECRET=<AccessKey Secret>
+DOCKER_RT_ACR_INSTANCE_ID=cri-xxxxxxxxxxxx
+```
+
+> ⚠️ `DOCKER_RT_ACR_SECRET` **不存在**（真名是 `DOCKER_RT_ACR_ACCESS_KEY_SECRET`）。
+> 写错的环境变量会被**静默忽略** —— 后果是建仓被跳过，而 ACR 在**仓库不存在**时也是回
+> `401 UNAUTHORIZED: authentication required`，很容易误判成凭据问题。
+> 仓库已经人工建好的话，这三个可以不设。
 
 默认 `k8s-middleware` 后端会检查 `PYROMIND_API_KEY` 和 `PYROMIND_CLUSTER`，
 缺失时逐个提示输入。连接成功后会用彩色打印当前参数，并在启动时同步一次
