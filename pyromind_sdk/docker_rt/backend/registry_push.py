@@ -196,6 +196,57 @@ def registry_hosts_for(prefix: str, cluster: str | None = None) -> list[str]:
     return out
 
 
+def acr_namespace_of(prefix: str, cluster: str | None = None) -> str:
+    """The ``<namespace>`` segment of ``prefix``, or ``""`` if there is none."""
+    if "/" not in (prefix or ""):
+        return ""
+    return prefix.split("/", 1)[1].strip().strip("/")
+
+
+def registry_prefix_error(prefix: str, cluster: str | None = None) -> str | None:
+    """Reject a **host-only** prefix when the cluster's registry is ACR.
+
+    ACR 企业版 requires ``<host>/<namespace>/<repo>``. With only the host the
+    reference becomes ``<host>/<repo>``, and ACR reads that single segment as a
+    *namespace* — which does not exist — and answers a push with a bare
+    ``401 Unauthorized``, **after the whole build**.
+
+    实测（2026-10-09）：用户设 ``DOCKER_RT_BUILD_REGISTRY=pyromind-registry.cn-shanghai.cr.aliyuncs.com``，
+    于是推 ``…cn-shanghai.cr.aliyuncs.com/pyromind-console:dev-5``（少了 ``/pyromind``）——
+    kaniko 跑了 91 秒、构建全成功，最后一行才 401；而同一个 host
+    ``docker login`` 是成功的（登录成功说明不了任何关于**仓库路径**的事）。
+
+    所以这里在**构建之前**就拒绝，并给出该写什么。只在 prefix 的 host 确实是这个
+    集群自己那台 ACR 时生效：推别的 registry（自有 Harbor 等）不按 ACR 的规矩评判。
+    """
+    key = normalise_cluster(cluster if cluster is not None else current_cluster())
+    profile = registry_profile(key)
+    if profile.kind != "acr":
+        return None
+    host = (prefix or "").split("/", 1)[0].strip()
+    own_hosts = {h for h in (profile.host, profile.public_host) if h}
+    if host not in own_hosts:
+        return None
+    if acr_namespace_of(prefix):
+        return None
+    namespace = registry_namespace(profile, key)
+    if not namespace:
+        return None
+    return (
+        f"DOCKER_RT_BUILD_REGISTRY={prefix!r} carries no namespace, and cluster "
+        f"{key!r} pushes to ACR — whose paths are <host>/<namespace>/<repo>. "
+        "Without the namespace ACR reads the repo name as a namespace, finds "
+        "nothing, and rejects the push with a bare '401 Unauthorized' after the "
+        "whole build (a successful `docker login` to that host says nothing about "
+        "the repo path). "
+        "The namespace is entirely yours to choose — put it in the parameter, "
+        f"e.g. DOCKER_RT_BUILD_REGISTRY={host}/<your-namespace> "
+        f"(this cluster's profile default is {namespace!r}; DOCKER_RT_REGISTRY_NAMESPACE "
+        "overrides it when you let the profile supply the prefix). "
+        "Nothing is appended for you."
+    )
+
+
 # --------------------------------------------------------------------------
 # credentials
 # --------------------------------------------------------------------------
