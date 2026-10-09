@@ -62,13 +62,43 @@ def _env(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
 
 
-def builder_image() -> str:
-    """Image the build sandbox runs (``DOCKER_RT_BUILD_IMAGE``)."""
-    return _env("DOCKER_RT_BUILD_IMAGE", "docker.io/pyrominddynamics/kaniko-executor-pyromind:0.0.3")
-
-
 def build_executor() -> str:
-    return (_env("DOCKER_RT_BUILD_EXECUTOR", "kaniko") or "kaniko").lower()
+    """构建器用哪个镜像 —— 按集群选，**映射就写在这里（唯一一处）**。
+
+    要加集群、换版本或换 mirror，只改下面 ``images`` 这一张表。
+
+    为什么不写死：两个 mirror 互不可达 —— 上海那个是 **VPC 内网**地址（west 集群拉不到），
+    上海节点也拉不到 Docker Hub，所以写死任何一个都会让另一半集群的构建卡在
+    ``ImagePullBackOff``。``DOCKER_RT_BUILD_IMAGE`` 显式设置时覆盖整条镜像串。
+
+    集群只按本关注点自己的语义解析（这是「该集群的节点能拉到哪个 registry」，不是推送语义）：
+    看 ``DOCKER_RT_CLUSTER`` → ``PYROMIND_CLUSTER``（``bootstrap`` 会把 ``--cluster`` 写回这个
+    变量），去掉 ``#pre``/``#pre2`` 后缀；**不读** ``DOCKER_RT_REGISTRY_CLUSTER``（那是推送
+    profile 的事），也不猜 kube context。
+
+    执行器的**种类**由 ``DOCKER_RT_BUILD_EXECUTOR`` 决定（目前只实现 kaniko），
+    在 :func:`build_prerequisites_error` 里校验。
+    """
+    #: 集群 id（已去掉 ``#stage``）→ 完整镜像；``""`` 是其它集群的兜底。
+    images = {
+        "": "docker.io/pyrominddynamics/kaniko-executor-pyromind:0.0.4",
+        "cn-east-1": (
+            "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/"
+            "kaniko-executor-pyromind:0.0.4"
+        ),
+    }
+
+    explicit = _env("DOCKER_RT_BUILD_IMAGE")
+    if explicit:
+        return explicit
+
+    cluster = ""
+    for name in ("DOCKER_RT_CLUSTER", "PYROMIND_CLUSTER"):
+        value = _env(name)
+        if value:
+            cluster = value.split("#", 1)[0].strip()
+            break
+    return images.get(cluster, images[""])
 
 
 def sandbox_cpu_limit() -> str:
@@ -422,13 +452,15 @@ def build_prerequisites_error(
     """
     problems: list[str] = []
 
-    if not builder_image():
+    if not build_executor():
         problems.append(
             "DOCKER_RT_BUILD_IMAGE is not configured (the builder image that runs "
             "the build inside the cluster)"
         )
 
-    executor = build_executor()
+    # The executor *kind* (``DOCKER_RT_BUILD_EXECUTOR``); only kaniko is implemented.
+    # A plain env read, kept next to the check instead of behind another helper.
+    executor = (_env("DOCKER_RT_BUILD_EXECUTOR", "kaniko") or "kaniko").lower()
     if executor not in SUPPORTED_EXECUTORS:
         problems.append(
             f"DOCKER_RT_BUILD_EXECUTOR={executor!r} is not implemented "
@@ -460,6 +492,12 @@ def build_prerequisites_error(
             else:
                 if not registry:
                     problems.append(_build_registry_hint(short_tag))
+                else:
+                    # ACR needs <host>/<namespace>/<repo>; a host-only prefix costs a
+                    # whole build and then dies with a bare 401. See registry_prefix_error.
+                    prefix_error = registry_push.registry_prefix_error(registry)
+                    if prefix_error:
+                        problems.append(prefix_error)
 
     # Check credentials when push is enabled and a prefix was resolved.
     if push and registry:
@@ -646,6 +684,17 @@ LOG_HEAD_LINES = 3
 #: from a hung daemon.
 LOG_IDLE_HEARTBEAT_S = 15.0
 
+#: Once a build has been silent for this long, sample the sandbox so the log says
+#: *what* kaniko is doing rather than only that it is quiet. kaniko prints
+#: nothing while it snapshots, so the log alone cannot tell "busy" from "stuck"
+#: — see ``kaniko.probe_script`` for what the sample distinguishes.
+SILENCE_PROBE_AFTER_S = 45.0
+
+#: Minimum gap between two samples inside one long silence. The sample costs a
+#: few seconds, and a slow snapshot can legitimately run for many minutes, so
+#: this is about trend, not about polling.
+SILENCE_PROBE_INTERVAL_S = 120.0
+
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _KANIKO_LEVEL = re.compile(r"^(?:INFO|WARN|ERROR|ERRO|DEBUG|DBUG|FATA|PANIC)\[\d+\]")
 # Lines worth keeping even though they are not kaniko's own: losing them would
@@ -798,9 +847,340 @@ class _LogCollapser:
         return out
 
 
+#: What to actually dial for a destination's registry. ``docker.io`` is an alias
+#: for the index, and kaniko dials ``index.docker.io`` (that is the host in its
+#: own error messages), so the probe has to use the same name or it measures a
+#: different path.
+_REGISTRY_ALIASES = {
+    "docker.io": "index.docker.io",
+    "registry.hub.docker.com": "index.docker.io",
+}
+
+#: How an in-sandbox script finds a busybox tool.
+#:
+#: ``/bin`` is **not** the executor's: kaniko unpacks the *target* image over
+#: ``/`` (that is how it builds), so ``/bin`` belongs to the image being built —
+#: Debian, Alpine, whatever, and it changes between stages. Upstream's
+#: ``deploy/Dockerfile`` puts the whole busybox at ``/busybox``, adds it to
+#: ``PATH``, and even declares it a ``VOLUME`` "to get it automatically in the
+#: path to ignore" — precisely so it survives the filesystem being replaced.
+#:
+#: So try, in order: whatever ``busybox`` resolves to, then the two absolute
+#: candidates, then the bare applet and let ``PATH`` sort it out. Never hardcode
+#: one path: at probe time ``/bin`` really does contain only ``sh``.
+_BUSYBOX_SHIM = """\
+B=
+for c in busybox /busybox/busybox /bin/busybox; do
+  if command -v "$c" >/dev/null 2>&1; then B=$c; break; fi
+done
+run() { if [ -n "$B" ]; then "$B" "$@"; else "$@"; fi; }
+"""
+
+#: Seconds ``nc`` waits for the TCP handshake.
+PUSH_PROBE_CONNECT_TIMEOUT_S = 6
+
+#: How long the whole probe exec may take (per-registry timeout + DNS above it).
+PUSH_PROBE_TIMEOUT_S = 120
+
+#: What to do when a push target is provably unreachable *from the sandbox*.
+#: ``fail`` (default) refuses to spend a build on it; ``warn`` builds anyway;
+#: ``off`` skips the probe. See :func:`push_check_mode`.
+_PUSH_CHECK_MODES = {"fail", "warn", "off"}
+
+
+def push_check_mode() -> str:
+    """``DOCKER_RT_BUILD_PUSH_CHECK``: ``fail`` / ``warn`` / ``off``.
+
+    A destination that cannot be reached from the *cluster* is not a build
+    problem — it is a network/DNS property of that cluster. Without this probe
+    the only way to find out is to wait out the whole build and read kaniko's
+    very last line, which is how a perfectly successful build kept looking like
+    "the build hangs". Default is ``fail``: the push was asked for, so say so up
+    front instead of after the expensive part.
+    """
+    raw = (os.getenv("DOCKER_RT_BUILD_PUSH_CHECK") or "").strip().lower()
+    return raw if raw in _PUSH_CHECK_MODES else "fail"
+
+
+def push_registry_hosts(destinations: list[str]) -> list[str]:
+    """``["docker.io/user/img:tag"]`` → ``["index.docker.io:443"]``.
+
+    Only the first path segment counts as a registry, and only when it looks
+    like a host (a dot or a colon); anything else is an implicit Docker Hub
+    reference. Order follows the input, de-duplicated.
+    """
+    hosts: list[str] = []
+    for dest in destinations or []:
+        ref = (dest or "").strip()
+        if not ref:
+            continue
+        # A bare ``name:tag`` has no registry at all — the colon is the tag, not a
+        # port. Only a reference that actually has a path can carry a registry,
+        # and then the first segment must look like a host.
+        head, sep, _ = ref.partition("/")
+        if not sep or not ("." in head or ":" in head or head == "localhost"):
+            host = "docker.io"
+        else:
+            host = head
+        host = _REGISTRY_ALIASES.get(host, host)
+        if ":" not in host:
+            host = f"{host}:443"
+        if host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+def push_probe_script(hosts: list[str]) -> str:
+    """Dial each registry from inside the sandbox and report DNS + TCP.
+
+    Goes through :data:`_BUSYBOX_SHIM` rather than naming ``awk``/``nc`` directly:
+    ``/bin`` holds the *build image's* tools, not the executor's, so nothing
+    there can be relied on before the build even starts.
+    """
+    targets = " ".join(shlex.quote(h) for h in hosts)
+    return (
+        "set -u\n"
+        + _BUSYBOX_SHIM
+        + "\n".join(
+            [
+                f"for hp in {targets}; do",
+                "  h=${hp%:*}",
+                "  p=${hp##*:}",
+                '  echo "TARGET $h $p"',
+                # The answer (if any) is the Address line that follows a Name
+                # line; the first Address line is the resolver itself.
+                "  run nslookup \"$h\" 2>/dev/null | run awk "
+                "'/^Name:/{seen=1; next} seen && /^Address:/{print \"ADDR \" $2; exit}' || true",
+                "  if run nc -z -w " + str(PUSH_PROBE_CONNECT_TIMEOUT_S) + ' "$h" "$p" >/dev/null 2>&1; then',
+                '    echo "TCP $h $p ok"',
+                "  else",
+                '    echo "TCP $h $p fail"',
+                "  fi",
+                "done",
+            ]
+        )
+        + "\n"
+    )
+
+
+def parse_push_probe(raw: str | None) -> dict[str, dict[str, Any]]:
+    """``{"index.docker.io:443": {"host": …, "ip": …, "tcp": "ok"/"fail"}}``.
+
+    ``tcp`` is only ever set from an explicit ``TCP … ok|fail`` line, so a probe
+    that produced nothing can never be mistaken for "unreachable".
+    """
+    found: dict[str, dict[str, Any]] = {}
+    current: dict[str, Any] | None = None
+    for line in (raw or "").splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "TARGET" and len(parts) >= 3:
+            current = {"host": parts[1], "port": parts[2], "ip": ""}
+            found[f"{parts[1]}:{parts[2]}"] = current
+        elif parts[0] == "ADDR" and current is not None and len(parts) >= 2:
+            current["ip"] = parts[1]
+        elif parts[0] == "TCP" and len(parts) >= 4:
+            key = f"{parts[1]}:{parts[2]}"
+            entry = found.setdefault(key, {"host": parts[1], "port": parts[2], "ip": ""})
+            entry["tcp"] = parts[3]
+    return found
+
+
+def push_fix_hints() -> list[str]:
+    """一行一条：推得动的话该设哪些环境变量。
+
+    集群自己的 registry 就写在 profile 里（``registry_push``），所以这里能给出
+    **具体值**，而不是只说一句"换成自家 ACR 吧" —— 上海集群的报错原本就是这样，
+    用户拿到之后还得自己去翻文档才知道前缀该写什么。
+
+    2026-10-09 用户要求："推送需要更新哪些环境变量也要提示啊"。
+
+    **只生成提示，绝不抛异常**：解析不出集群就退化成通用说法，不能因为"写不出来
+    一句提示"把构建搞崩。
+    """
+    cluster = ""
+    reachable = ""
+    try:
+        cluster = registry_push.current_cluster()
+        profile = registry_push.registry_profile(cluster)
+        if profile.host:
+            namespace = registry_push.registry_namespace(profile, cluster).strip("/")
+            if namespace:
+                reachable = f"{profile.host.rstrip('/')}/{namespace}"
+    except Exception as exc:  # noqa: BLE001 - 提示失败不能影响构建
+        logger.debug("cannot resolve this cluster's own registry: %s", exc)
+
+    current = _env("DOCKER_RT_BUILD_REGISTRY").rstrip("/")
+    hints: list[str] = []
+
+    if reachable and reachable != current:
+        where = f"the cluster ({cluster})" if cluster else "this cluster"
+        hints.append(f"push to a registry {where} can reach — its own:")
+        hints.append(f"DOCKER_RT_BUILD_REGISTRY={reachable}")
+        if current:
+            hints.append(f"    (DOCKER_RT_BUILD_REGISTRY is currently {current})")
+        source = registry_push.credential_source()
+        if source:
+            hints.append(
+                "    plus credentials for THAT registry — the ones configured now "
+                f"({source}) belong to the current target."
+            )
+        else:
+            hints.append("    plus credentials for THAT registry.")
+        # 凭据是**二选一**，不是三行都得设 —— 2026-10-09 用户就误读成了"必须配"。
+        hints.append("    Give them either way; only one of the two is needed:")
+        hints.append("      DOCKER_RT_REGISTRY_USERNAME=<username for that registry>")
+        hints.append("      DOCKER_RT_REGISTRY_PASSWORD=<password or temporary token>")
+        hints.append("        -- or --")
+        hints.append(
+            "      DOCKER_RT_REGISTRY_DOCKERCONFIG=<path to a config.json already "
+            "logged in to it>"
+        )
+        hints.append(
+            "    Neither is mandatory: with neither set, the default "
+            f"{registry_push.DEFAULT_DOCKER_CONFIG_SECRET} is used if it exists."
+        )
+    elif reachable:
+        hints.append(
+            f"{reachable} is this cluster's own registry, so the unreachable "
+            "target came from somewhere else (a fully-qualified tag, or "
+            "DOCKER_RT_BUILD_PUSH_CHECK probing an extra host)."
+        )
+
+    hints.append("or build without pushing, archive only: DOCKER_RT_BUILD_PUSH=false")
+    hints.append("or skip this check and build anyway: DOCKER_RT_BUILD_PUSH_CHECK=warn")
+    hints.append(
+        "these are read when docker-rt starts — restart the daemon after changing them"
+    )
+    return hints
+
+
+def push_rejected_hint(raw_log: str) -> str | None:
+    """kaniko 的推送 401/403 什么信息都不给，这里把常见原因点出来。
+
+    kaniko 原文只有 ``unexpected status code 401 Unauthorized (HEAD responses have
+    no body, use GET for details)`` —— 不说哪个仓库，也不说凭据对不对。
+    2026-10-09 用户就是这样：构建 91 秒全成功，最后一行 401；而同一个 host
+    ``docker login`` 是成功的（登录成功和"仓库路径对不对"无关）。
+    """
+    if "error pushing image" not in raw_log:
+        return None
+    if "401 Unauthorized" not in raw_log and "403 Forbidden" not in raw_log:
+        return None
+
+    lines = [
+        "the registry rejected the push (401/403). kaniko can only report the status "
+        "code, so here is what actually causes it:",
+    ]
+    prefix = ""
+    try:
+        prefix = registry_push.build_registry()
+    except Exception as exc:  # noqa: BLE001 - 只是写提示
+        logger.debug("cannot resolve the push prefix for the hint: %s", exc)
+    if prefix:
+        lines.append(
+            "  * the repo path must exist and you must have push rights on it — "
+            f"target: {prefix}/<repo>:<tag>"
+        )
+    try:
+        profile = registry_push.registry_profile()
+        namespace = registry_push.registry_namespace(profile)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("cannot resolve the registry profile for the hint: %s", exc)
+        profile, namespace = None, ""
+    if profile is not None and profile.kind == "acr" and namespace:
+        lines.append(
+            "    ACR paths are <host>/<namespace>/<repo>, and here the namespace "
+            f"is {namespace!r} — e.g. {profile.public_host or profile.host}/{namespace}"
+        )
+    lines.append(
+        "  * the credentials must be valid for that host (configured: "
+        f"{registry_push.credential_source() or 'none'}). ACR wants its own instance "
+        "username + temporary token — a Docker Hub account will not do."
+    )
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------------
 # the build itself
 # --------------------------------------------------------------------------
+
+
+async def _check_push_targets(
+    sandbox: Any, destinations: list[str], *, push: bool
+) -> AsyncIterator[dict[str, Any]]:
+    """Refuse to spend a build on a push that provably cannot work.
+
+    The registry is reached from *inside the cluster*, so it is measured in the
+    sandbox: this host's network says nothing about it. That is precisely what
+    differs between two clusters running the same image and the same code — one
+    dials ``index.docker.io``, another gets a poisoned DNS answer and times out.
+
+    Without this check the only symptom is kaniko's very last log line, emitted
+    after the whole build — which is indistinguishable from "the build hung",
+    and is how a *successful* build kept being read as a stuck one.
+    """
+    mode = push_check_mode()
+    if not push or mode == "off":
+        return
+    hosts = push_registry_hosts(destinations)
+    if not hosts:
+        return
+
+    yield stage(f"Checking the push target from inside the cluster: {', '.join(hosts)}")
+    try:
+        result = await _run_exec(
+            sandbox, push_probe_script(hosts), timeout=PUSH_PROBE_TIMEOUT_S
+        )
+    except Exception as exc:
+        # A broken probe must never fail a build — it can only ever add a warning.
+        logger.warning("push reachability probe failed: %s", exc)
+        yield {
+            "stream": (
+                f"warning: could not check the push target ({exc}); building anyway\n"
+            )
+        }
+        return
+
+    probed = parse_push_probe(result.stdout)
+    if not probed:
+        yield {
+            "stream": (
+                "warning: could not check the push target (the probe returned "
+                f"nothing: {(result.stdout or '').strip()[:120]!r}); building anyway\n"
+            )
+        }
+        return
+
+    for key, info in probed.items():
+        yield stage(
+            f"  {key}: dns={info.get('ip') or 'did not resolve'} "
+            f"tcp={info.get('tcp') or 'unknown'}"
+        )
+
+    unreachable = [key for key, info in probed.items() if info.get("tcp") == "fail"]
+    if not unreachable:
+        return
+
+    detail = ", ".join(
+        f"{probed[key]['host']} (dns={probed[key].get('ip') or 'unresolved'})"
+        for key in unreachable
+    )
+    message = "\n".join(
+        [
+            f"the push target is unreachable from this build sandbox: {detail} — the "
+            "TCP connection never completed, so kaniko would build the whole image "
+            "and then fail on its very last step with the same error.",
+            "  This is a property of the cluster's network/DNS, not of the build.",
+            "  What to change (env vars for the docker-rt daemon):",
+            *[f"    {hint}" for hint in push_fix_hints()],
+        ]
+    )
+    if mode == "fail":
+        yield buildkit.error_event(message)
+        return
+    yield {"stream": f"warning: {message}\n"}
 
 
 async def build_in_sandbox(
@@ -963,7 +1343,7 @@ async def build_in_sandbox(
     digest = ""
     try:
         yield stage(
-            f"Creating the build sandbox ({builder_image()}, "
+            f"Creating the build sandbox ({build_executor()}, "
             f"{sandbox_memory_limit()} / {sandbox_cpu_limit()} cpu)…"
         )
 
@@ -975,7 +1355,7 @@ async def build_in_sandbox(
             # watcher has to be able to find it after a `kill -9`. See
             # `new_build_sandbox_name`.
             return await start_kube_environment(
-                image=builder_image(),
+                image=build_executor(),
                 namespace=namespace,
                 env={},
                 working_dir="/",
@@ -1004,7 +1384,7 @@ async def build_in_sandbox(
         except Exception as exc:
             if staging is None:
                 yield buildkit.error_event(
-                    f"cannot create build sandbox ({builder_image()}): {exc}"
+                    f"cannot create build sandbox ({build_executor()}): {exc}"
                 )
                 return
             if context_staging.staging_required():
@@ -1027,7 +1407,7 @@ async def build_in_sandbox(
                 sandbox = await _create_sandbox_with(_mounts_for(None))
             except Exception as exc2:
                 yield buildkit.error_event(
-                    f"cannot create build sandbox ({builder_image()}): {exc2}"
+                    f"cannot create build sandbox ({build_executor()}): {exc2}"
                 )
                 return
         yield stage(
@@ -1049,6 +1429,13 @@ async def build_in_sandbox(
         yield stage(
             f"Build sandbox ready after {time.monotonic() - ready_started:.1f}s"
         )
+
+        # Ask the sandbox — not this host — whether the push can ever work, and
+        # do it before the context copy and the build. See _check_push_targets.
+        async for event in _check_push_targets(sandbox, destinations, push=push):
+            yield event
+            if event.get("error"):
+                return
 
         if staging is not None:
             copy_started = time.monotonic()
@@ -1155,7 +1542,15 @@ async def build_in_sandbox(
 
         deadline = time.monotonic() + build_timeout()
         started_at = time.monotonic()
-        last_output_at = started_at
+        # The heartbeat is a *pacer*: it re-arms itself so the message keeps
+        # coming. ``silence_started_at`` is the measurement — it only moves when
+        # real output arrives. Deriving the reported silence from the pacer
+        # instead pins it at the heartbeat interval forever, which is worse than
+        # saying nothing: it reads as "output is still trickling in".
+        silence_started_at = started_at
+        next_heartbeat_at = started_at + LOG_IDLE_HEARTBEAT_S
+        last_probe_at: float | None = None
+        probe_sample: dict[str, int | str] = {}
         offset = 0
         poll_failures = 0
         gone_strikes = 0
@@ -1193,19 +1588,52 @@ async def build_in_sandbox(
             payload = kaniko.strip_status_lines(poll.stdout)
             if payload:
                 buffer.append(payload)
-                last_output_at = time.monotonic()
+                now = time.monotonic()
+                silence_started_at = now
+                next_heartbeat_at = now + LOG_IDLE_HEARTBEAT_S
+                # A new silence window gets its own sample, and its own baseline.
+                last_probe_at = None
+                probe_sample = {}
                 visible = collapser.feed(payload)
                 if visible:
                     yield {"stream": visible}
-            elif time.monotonic() - last_output_at >= LOG_IDLE_HEARTBEAT_S:
+            else:
+                now = time.monotonic()
+                silent_for = now - silence_started_at
                 # Long silence is normal (a big snapshot, a quiet install) — but
-                # indistinguishable from a hang unless we say something.
-                idle = time.monotonic() - last_output_at
-                last_output_at = time.monotonic()
-                yield stage(
-                    f"still building… {time.monotonic() - started_at:.0f}s elapsed, "
-                    f"no new log output for {idle:.0f}s"
-                )
+                # indistinguishable from a hang unless we say something. A sample
+                # is worth far more than a second "still building" line here.
+                if silent_for >= SILENCE_PROBE_AFTER_S and (
+                    last_probe_at is None
+                    or now - last_probe_at >= SILENCE_PROBE_INTERVAL_S
+                ):
+                    previous_at = last_probe_at
+                    last_probe_at = now
+                    fresh, why_empty = await _probe_sandbox(sandbox)
+                    if fresh:
+                        yield stage(
+                            f"kaniko has produced nothing for {silent_for:.0f}s; "
+                            "live sample: "
+                            + _describe_sample(
+                                fresh,
+                                probe_sample,
+                                seconds=now - previous_at if previous_at else 0.0,
+                            )
+                        )
+                        probe_sample = fresh
+                    elif why_empty:
+                        # Say so out loud: a silent probe is a broken sensor, and
+                        # that must never be mistaken for "nothing to report".
+                        yield stage(
+                            f"kaniko has produced nothing for {silent_for:.0f}s; "
+                            f"probe ran but produced no sample ({why_empty})"
+                        )
+                if now >= next_heartbeat_at:
+                    next_heartbeat_at = now + LOG_IDLE_HEARTBEAT_S
+                    yield stage(
+                        f"still building… {now - started_at:.0f}s elapsed, "
+                        f"no new log output for {silent_for:.0f}s"
+                    )
 
             state, rc = kaniko.parse_status(poll.stderr)
             if not state:
@@ -1278,6 +1706,16 @@ async def build_in_sandbox(
                 if tail:
                     yield stage(f"last {count} line(s) of raw build output:")
                     yield {"stream": tail}
+            # kaniko writes the archive before it pushes, so a failed *push* still
+            # left the image in the workspace. Check rather than assume — a failed
+            # Dockerfile produces no archive at all — and say where it is: without
+            # this the only visible outcome is a non-zero exit code.
+            archive = kaniko.tar_path(destinations)
+            if await _archive_written(sandbox, archive):
+                yield stage(f"The image was archived to {archive} before the failure")
+            hint = push_rejected_hint(raw_log)
+            if hint:
+                yield {"stream": f"{hint}\n"}
             yield buildkit.error_event(f"kaniko exited with code {returncode}")
             return
 
@@ -1368,6 +1806,75 @@ async def _run_exec(sandbox: Any, script: str, *, timeout: int) -> _ExecResult:
     return _ExecResult(returncode, "".join(stdout), "".join(stderr), stdout_bytes)
 
 
+async def _probe_sandbox(sandbox: Any) -> tuple[dict[str, int | str], str]:
+    """One best-effort ``/proc`` sample of the running executor.
+
+    Returns ``(sample, why_empty)``. It never fails the build: this runs *while*
+    a build is in flight, and a probing problem (a dropped websocket, a sandbox
+    that is already gone) must not be turned into an outcome.
+
+    ``why_empty`` matters more than it looks. A probe that quietly returns
+    nothing is indistinguishable from "the daemon did not probe", which is how
+    the first version of this shipped broken: it reached for ``awk``/``sleep``,
+    which the ``-debug`` executor image does not have. The caller always prints
+    the reason, so a dead probe is visible instead of invisible.
+    """
+    try:
+        result = await _run_exec(sandbox, kaniko.probe_script(), timeout=POLL_TIMEOUT_S)
+    except Exception as exc:
+        logger.debug("silence probe failed: %s", exc)
+        return {}, f"{type(exc).__name__}: {exc}"
+    sample = kaniko.parse_probe_sample(result.stdout)
+    if sample:
+        return sample, ""
+    stdout = " ".join(result.stdout.split())[:200]
+    stderr = " ".join(result.stderr.split())[:200]
+    return {}, (
+        f"rc={result.returncode} stdout={stdout!r} stderr={stderr!r}"
+    )
+
+
+#: Which of the probe's counters get a delta, and what to call them. The names
+#: are the ones a human reasons with: "cpu_ticks up, bytes flat ⇒ metadata walk".
+_SAMPLE_DELTAS = (
+    ("cpu_ticks", "cpu_ticks"),
+    ("rchar", "read"),
+    ("disk_read", "disk_read"),
+    ("write", "write"),
+)
+
+
+def _describe_sample(
+    sample: dict[str, int | str],
+    previous: dict[str, int | str],
+    *,
+    seconds: float,
+) -> str:
+    """Render one probe reading, with deltas against the previous one.
+
+    A single reading cannot separate "busy" from "stuck"; the *rate* between two
+    readings can. The subtraction lives here rather than in the sandbox because
+    the executor image has no ``awk``/``sleep`` to do it with.
+    """
+    pid = int(sample.get("pid") or 0)
+    if not pid:
+        return "the kaniko process was not found in the sandbox"
+    parts = [
+        f"pid={pid}",
+        f"state={sample.get('state') or '?'}",
+        f"wchan={sample.get('wchan') or '?'}",
+    ]
+    rss_kb = int(sample.get("rss_kb") or 0)
+    if rss_kb:
+        parts.append(f"rss={human_size(rss_kb * 1024)}")
+    if previous and seconds > 0:
+        parts.append(f"over {seconds:.0f}s:")
+        for key, label in _SAMPLE_DELTAS:
+            delta = int(sample.get(key) or 0) - int(previous.get(key) or 0)
+            parts.append(f"{label}={delta:+d}")
+    return " ".join(parts)
+
+
 async def _read_digest(sandbox: Any) -> str:
     """Best-effort read of kaniko's ``--digest-file``."""
     try:
@@ -1380,3 +1887,22 @@ async def _read_digest(sandbox: Any) -> str:
     if isinstance(result, dict):
         return str(result.get("output") or "")
     return ""
+
+
+async def _archive_written(sandbox: Any, path: str) -> bool:
+    """Whether the image archive exists in the sandbox — one short exec.
+
+    Only asked on the failure path. The archive is written before the push, so it
+    can be there even when the build reported a failure; but only when the failure
+    came after that point, which is why this is checked instead of assumed.
+    """
+    try:
+        result = await sandbox.execute(
+            {"command": f"test -s {shlex.quote(path)} && echo yes"}, cwd="/"
+        )
+    except Exception as exc:
+        logger.debug("archive check failed: %s", exc)
+        return False
+    if isinstance(result, dict):
+        return "yes" in str(result.get("output") or "")
+    return False
