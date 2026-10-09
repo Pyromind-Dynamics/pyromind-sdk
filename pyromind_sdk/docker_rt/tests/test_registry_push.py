@@ -725,3 +725,48 @@ def test_registry_prefix_error_is_acr_only(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setenv("DOCKER_RT_REGISTRY_CLUSTER", "us-west-2")
     monkeypatch.setenv("DOCKER_RT_REGISTRY_NAMESPACE", "lvniqi")
     assert registry_push.registry_prefix_error("docker.io") is None
+
+
+def test_unknown_env_warnings_name_the_typo() -> None:
+    """拼错的变量会被静默忽略 —— 必须连 did-you-mean 一起点出来。
+
+    2026-10-09 用户把 ``DOCKER_RT_ACR_ACCESS_KEY_SECRET`` 写成 ``DOCKER_RT_ACR_SECRET``，
+    后果不是"少了个配置"，而是**建仓那一步被跳过**，然后在 216 秒后拿到一个裸 401。
+    """
+    from ..backend import registry_push
+
+    warnings = registry_push.unknown_env_warnings(
+        {
+            "DOCKER_RT_ACR_SECRET": "oops",
+            "DOCKER_RT_REGISTRY_USERNMAE": "oops",
+            "DOCKER_RT_ACR_ACCESS_KEY_ID": "fine",
+            "PATH": "/usr/bin",
+            "SOMETHING_ELSE": "not ours",
+        }
+    )
+    text = "\n".join(warnings)
+    assert "DOCKER_RT_ACR_SECRET" in text
+    assert "did you mean DOCKER_RT_ACR_ACCESS_KEY_SECRET?" in text
+    assert "DOCKER_RT_REGISTRY_USERNMAE" in text
+    # 认识的、以及不是我们前缀的，都不该出现在报告里
+    assert "DOCKER_RT_ACR_ACCESS_KEY_ID" not in text
+    assert "PATH" not in text
+    assert "SOMETHING_ELSE" not in text
+
+
+def test_the_known_env_list_covers_every_name_the_code_reads() -> None:
+    """``KNOWN_*`` 必须覆盖代码真正读的那些名字，否则会有误报。
+
+    这条是自查：扫 ``registry_push.py`` 里的 ``_env("DOCKER_RT_...")`` 字面量，
+    任何一个不在白名单里都会让上面那个体检把**正确**的变量报成拼错的。
+    """
+    import re
+    from pathlib import Path
+
+    from ..backend import registry_push
+
+    source = Path(registry_push.__file__).read_text(encoding="utf-8")
+    read_names = set(re.findall(r'_env\(\s*"(DOCKER_RT_[A-Z0-9_]+)"', source))
+    assert read_names, "没扫到任何 _env(\"DOCKER_RT_...\") —— 正则或代码结构变了"
+    known = set(registry_push.KNOWN_ENV)
+    assert read_names <= known, f"这些变量代码会读但不在白名单里：{sorted(read_names - known)}"

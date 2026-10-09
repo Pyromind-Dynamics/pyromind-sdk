@@ -384,7 +384,8 @@ docker ps   # 仍能看到 sb1
 | `DOCKER_RT_REGISTRY_NAMESPACE` | （空） | registry 里的命名空间；Docker Hub 集群**必填**，缺失直接拒绝构建 |
 | `DOCKER_RT_REGISTRY_USERNAME` / `_PASSWORD` | （空） | 推送凭据（优先于下面那个） |
 | `DOCKER_RT_REGISTRY_DOCKERCONFIG` | `/etc/docker-image/.dockerconfigjson`（存在才用） | 与上一组**二选一、且都非必填**：现成的 dockerconfigjson（base64 或 JSON）——可直接复用平台挂载的 `imagePullSecrets` |
-| `DOCKER_RT_ACR_ACCESS_KEY_ID` / `_SECRET` | （空，回退 `ALIBABA_CLOUD_ACCESS_KEY_ID` / `_SECRET`） | 上海 ACR 建仓用 |
+| `DOCKER_RT_ACR_ACCESS_KEY_ID` | （空，回退 `ALIBABA_CLOUD_ACCESS_KEY_ID`） | 上海 ACR **建仓**用的 AccessKey ID |
+| `DOCKER_RT_ACR_ACCESS_KEY_SECRET` | （空，回退 `ALIBABA_CLOUD_ACCESS_KEY_SECRET`） | 上海 ACR **建仓**用的 AccessKey Secret。⚠️ 全名就是这样，**不是** `DOCKER_RT_ACR_SECRET` |
 | `DOCKER_RT_ACR_INSTANCE_ID` | （空） | ACR 企业版实例 ID（`cri-xxxx`），建仓必填 |
 | `DOCKER_RT_ACR_REGION_ID` | `cn-shanghai` | ACR POP endpoint 的 region |
 | `DOCKER_RT_ACR_AUTO_CREATE_REPO` | `true` | `false` 则完全不做建仓 |
@@ -442,9 +443,19 @@ DOCKER_RT_BUILD_PUSH_CHECK=warn
 
 **这几行都按"daemon 启动时读一次"处理，改完要重启 docker-rt。**
 
-> ⚠️ `DOCKER_RT_ACR_ACCESS_KEY_ID` / `_SECRET` / `DOCKER_RT_ACR_INSTANCE_ID` 是**建仓**用的
-> （另一套东西：AccessKey 对 + 企业版实例 ID），和上面这三个推送变量不是一回事。
-> 仓库已经人工建好的话可以不设。
+还有一个**独立的**变量组：ACR 里**还没有这个仓库**时，让 daemon 在构建前自动建仓。三个名字都是全的，**别简写**：
+
+```
+DOCKER_RT_ACR_ACCESS_KEY_ID=<AccessKey ID>
+DOCKER_RT_ACR_ACCESS_KEY_SECRET=<AccessKey Secret>
+DOCKER_RT_ACR_INSTANCE_ID=cri-xxxxxxxxxxxx
+```
+
+> ⚠️ `DOCKER_RT_ACR_SECRET` **不存在**（真名是 `DOCKER_RT_ACR_ACCESS_KEY_SECRET`）。
+> 写错的环境变量会被**静默忽略** —— 后果是建仓被跳过，而 ACR 在**仓库不存在**时也是回
+> `401 UNAUTHORIZED: authentication required`，于是你会以为是凭据问题。
+> daemon 现在会在构建前把这种拼错的变量连同 did-you-mean 一起打出来。
+> 仓库已经人工建好的话，这三个可以不设。
 
 ### `docker inspect` 返回结构
 
@@ -765,16 +776,21 @@ pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/sweb.eval.x86_64.astr
    DOCKER_RT_REGISTRY_PASSWORD=<ACR 密码 / 临时 token>
    ```
    或者 `DOCKER_RT_BUILD_PUSH=false` 只出归档。
-9. **构建全跑完，最后一行 `401 Unauthorized`（`error pushing image`）** —— 凭据或**仓库路径**不对，
-   两种都很常见：
+9. **构建全跑完，最后一行 `401 Unauthorized` / `UNAUTHORIZED: authentication required`** ——
+   凭据或**仓库**不对，三种都很常见：
    - **路径少了命名空间**（上海最常见的坑）：ACR 是 `<host>/<namespace>/<repo>`，只写主机名的话
      ACR 会把仓库名当成命名空间 ⇒ 401。daemon 现在会在**构建之前**拒绝这种前缀并提示
      （命名空间由 `DOCKER_RT_BUILD_REGISTRY` 给，是哪个都行）。
+   - **仓库还不存在**：ACR 要先建仓，而"仓库不存在"它**也回 401**（不是 404），所以很容易
+     误判成凭据问题。建仓是 daemon 在构建前做的（`ensure_repositories`），跳过时日志里会有
+     `ACR repository pre-creation skipped/disabled (missing …)` —— 照着补变量，或去控制台手工建。
+     最常见的"跳过原因"是**变量名打错**（例如写成 `DOCKER_RT_ACR_SECRET`，真名是
+     `DOCKER_RT_ACR_ACCESS_KEY_SECRET`）：打错的环境变量会被静默忽略，现在 daemon 会在
+     构建前把它连同 did-you-mean 一起打出来。
    - **凭据不是这个 host 的**：`docker login <host>` 成功**说明不了**仓库路径对不对，
      也说明不了它一定覆盖你要推的仓库。ACR 用的是企业版实例自己的用户名 + 临时 token；
      Docker Hub 的账号在这里没用。
-   失败时 daemon 会把这两条原因一起打出来（kaniko 自己只有一句 `401 Unauthorized`，
-   连是哪个仓库都不说）。
+   失败时 daemon 会把这几条原因一起打出来（kaniko 自己只有一句状态码，连是哪个仓库都不说）。
 
 ## Compose（OSM-style）
 

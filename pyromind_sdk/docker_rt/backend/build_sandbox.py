@@ -1056,44 +1056,90 @@ def push_fix_hints() -> list[str]:
     return hints
 
 
-def push_rejected_hint(raw_log: str) -> str | None:
+#: 推送被**鉴权**拒掉的几种写法。必须并列这么多，因为各家 registry 的措辞完全不同：
+#: Docker Hub 是 ``unexpected status code 401 Unauthorized``，而 ACR 企业版是
+#: ``UNAUTHORIZED: authentication required`` —— **里面根本没有 "401" 这个数字**
+#: （2026-10-09 实测，一开始的检测就漏了这一种）。
+_AUTH_FAILURE_MARKERS = (
+    "401",
+    "403",
+    "unauthorized",
+    "forbidden",
+    "authentication required",
+    "requested access to the resource is denied",
+)
+
+
+def push_rejected_hint(raw_log: str, destinations: list[str] | None = None) -> str | None:
     """kaniko 的推送 401/403 什么信息都不给，这里把常见原因点出来。
 
-    kaniko 原文只有 ``unexpected status code 401 Unauthorized (HEAD responses have
-    no body, use GET for details)`` —— 不说哪个仓库，也不说凭据对不对。
-    2026-10-09 用户就是这样：构建 91 秒全成功，最后一行 401；而同一个 host
-    ``docker login`` 是成功的（登录成功和"仓库路径对不对"无关）。
+    kaniko 原文只有一两句状态码 —— 不说哪个仓库，也不说凭据对不对。
+    2026-10-09 用户连续碰到两种：① 前缀少了命名空间（401，而同一个 host
+    ``docker login`` 成功 —— 登录成功和"仓库路径对不对"无关）；
+    ② **仓库根本不存在**：ACR 要先把仓库建出来，而建仓那步因为一个拼错的变量
+    （``DOCKER_RT_ACR_SECRET``）被静默跳过了。
     """
-    if "error pushing image" not in raw_log:
+    marker = "error pushing image"
+    if marker not in raw_log:
         return None
-    if "401 Unauthorized" not in raw_log and "403 Forbidden" not in raw_log:
+    # 只看报错那一段：整份日志里有几百行构建输出，别的地方出现 "401" 不该触发。
+    tail = raw_log[raw_log.index(marker) :].lower()
+    if not any(token in tail for token in _AUTH_FAILURE_MARKERS):
         return None
 
     lines = [
         "the registry rejected the push (401/403). kaniko can only report the status "
         "code, so here is what actually causes it:",
     ]
+    if destinations:
+        lines.append(f"  * target: {destinations[0]}")
     prefix = ""
     try:
         prefix = registry_push.build_registry()
     except Exception as exc:  # noqa: BLE001 - 只是写提示
         logger.debug("cannot resolve the push prefix for the hint: %s", exc)
-    if prefix:
-        lines.append(
-            "  * the repo path must exist and you must have push rights on it — "
-            f"target: {prefix}/<repo>:<tag>"
-        )
+    if prefix and not destinations:
+        lines.append(f"  * the repo path must exist and you must have push rights on it — "
+                     f"target: {prefix}/<repo>:<tag>")
     try:
         profile = registry_push.registry_profile()
         namespace = registry_push.registry_namespace(profile)
+        settings = registry_push.acr_settings()
     except Exception as exc:  # noqa: BLE001
         logger.debug("cannot resolve the registry profile for the hint: %s", exc)
-        profile, namespace = None, ""
+        profile, namespace, settings = None, "", None
     if profile is not None and profile.kind == "acr" and namespace:
         lines.append(
             "    ACR paths are <host>/<namespace>/<repo>, and here the namespace "
             f"is {namespace!r} — e.g. {profile.public_host or profile.host}/{namespace}"
         )
+        if settings is not None:
+            if not settings.auto_create:
+                lines.append(
+                    "    repository auto-creation is switched off "
+                    "(DOCKER_RT_ACR_AUTO_CREATE_REPO), so the repository must "
+                    "already exist in ACR"
+                )
+            elif not settings.can_create:
+                # 建仓被跳过 ⇒ 仓库很可能压根不存在，而 ACR 对"不存在的仓库"也回 401。
+                lines.append(
+                    "    ACR needs the repository created *first*, and auto-creation "
+                    "was skipped here because of: "
+                    + ", ".join(settings.missing)
+                )
+                lines.append(
+                    "    → create it in the ACR console, or set those variables so "
+                    "docker-rt creates it for you before the build"
+                )
+    # 拼错的变量是"某一步被跳过"的常见根因，值得在报错里再说一次 —— 构建前那条
+    # 警告这时候已经在几百行之外了。
+    try:
+        typos = registry_push.unknown_env_warnings()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("cannot list unrecognised env vars for the hint: %s", exc)
+        typos = []
+    for typo in typos:
+        lines.append(f"  * {typo}")
     lines.append(
         "  * the credentials must be valid for that host (configured: "
         f"{registry_push.credential_source() or 'none'}). ACR wants its own instance "
@@ -1242,6 +1288,11 @@ async def build_in_sandbox(
     credential_prefix = registry or (
         destinations[0].rsplit("/", 1)[0] if destinations and "/" in destinations[0] else ""
     )
+
+    # 先做环境变量体检：拼错的变量常常就是下面那些"缺失 / 跳过"告警的真正原因，
+    # 所以它必须排在它们**前面**（2026-10-09 用户 `DOCKER_RT_ACR_SECRET` → 建仓被跳过）。
+    for warning in registry_push.unknown_env_warnings():
+        yield {"stream": f"warning: {warning}\n"}
 
     # Create any ACR repository *before* spending a sandbox.
     try:
@@ -1713,7 +1764,7 @@ async def build_in_sandbox(
             archive = kaniko.tar_path(destinations)
             if await _archive_written(sandbox, archive):
                 yield stage(f"The image was archived to {archive} before the failure")
-            hint = push_rejected_hint(raw_log)
+            hint = push_rejected_hint(raw_log, destinations)
             if hint:
                 yield {"stream": f"{hint}\n"}
             yield buildkit.error_event(f"kaniko exited with code {returncode}")
