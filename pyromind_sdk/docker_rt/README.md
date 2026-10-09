@@ -352,9 +352,10 @@ docker ps   # 仍能看到 sb1
 | `DOCKER_RT_CLEANUP_CONCURRENCY` | `4` | 同时执行 sandbox pause/delete 清理的最大并发数 |
 | `DOCKER_RT_DEFAULT_IMAGE` | `backend.kube` DEFAULT | `docker images` 默认条目 |
 | `DOCKER_RT_PORT_FORWARD_MODE` | `auto` | `-p` 后端：`auto` / `direct` / `api` |
-| `DOCKER_RT_BUILD_IMAGE` | （空） | **构建的硬前提**：集群能拉的 kaniko executor 镜像（必须 `-debug` 变体，见 `builder-image/kaniko/`） |
-| `DOCKER_RT_BUILD_REGISTRY` | （空） | 短 tag 推送前缀，如 `reg.example.com/docker-rt`；留空时按集群 profile 推导（见下） |
-| `DOCKER_RT_BUILD_PUSH` | `true` | 是否 push 到 registry（关掉则只在沙箱内留 tar，沙箱删掉就没了） |
+| `DOCKER_RT_BUILD_IMAGE` | 按集群自动 | **构建的硬前提**：集群能拉的 kaniko executor 镜像（必须 `-debug` 变体，见 `builder-image/kaniko/`）。**默认值按当前集群自动选**：`cn-east-1`（含 `#pre` / `#pre2`）→ `pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/kaniko-executor-pyromind:0.0.4`；其它集群 → `docker.io/pyrominddynamics/kaniko-executor-pyromind:0.0.4`。两个 mirror 互不可达（上海那个是 VPC 内网地址，west 集群也拉不到），所以**只有要换版本或换自己的 mirror 时才需要设它** |
+| `DOCKER_RT_BUILD_REGISTRY` | （空） | 短 tag 推送前缀，如 `reg.example.com/docker-rt`；留空时按集群 profile 推导（见下）。**ACR 集群必须带命名空间**（`<host>/<namespace>`，命名空间由参数决定、代码不会替你补）—— 只写主机名会在构建**前**被拒绝 |
+| `DOCKER_RT_BUILD_PUSH` | `true` | 是否 push 到 registry。**关掉后构建仍会跑，归档照样落到工作区的 `/workspace/docker_images/<tag>.tar`**（那个目录是挂进来的 JuiceFS 路径，沙箱删掉也还在）—— 所以"集群到不了 registry、只想先要个 tar"时，这是最快的退路 |
+| `DOCKER_RT_BUILD_PUSH_CHECK` | `fail` | 构建**前**在沙箱里探一次推送目标能不能连通（`busybox nc -z` + `nslookup`，因为能不能连通是**集群网络**的属性，daemon 主机测不出来）。`fail`（默认）：不通就直接终止，省掉整次构建，报错里会**列出该改哪些环境变量**（按集群 profile 推出具体值，上海集群见下文那一小节）；`warn`：只在日志里警告后照常构建（tar 仍会落盘）；`off`：不检查。**这是 `docker.io` 在上海集群的典型症状**：DNS 被投毒成别人的 IP，TCP 连不上，kaniko 要等整次构建跑完才在最后一行报 `i/o timeout`，看起来就像"构建卡死" |
 | `DOCKER_RT_BUILD_EXECUTOR` | `kaniko` | 构建器；目前只实现 `kaniko` |
 | `DOCKER_RT_BUILD_SANDBOX_CPU` / `_MEMORY` | `2` / `4Gi` | 构建沙箱资源；kaniko 单线程 + 全量解包，大镜像建议 ≥4CPU/≥8Gi |
 | `DOCKER_RT_BUILD_SANDBOX_READY_TIMEOUT` | `600` | 等构建沙箱 running 的秒数 |
@@ -376,10 +377,13 @@ docker ps   # 仍能看到 sb1
 | `DOCKER_RT_BUILD_CACHE` / `_CACHE_REPO` | `false` / （空） | kaniko `--cache=true --cache-repo=<repo>` |
 | `DOCKER_RT_BUILD_REGISTRY_INSECURE` | `false` | 明文 HTTP registry：加 `--insecure --skip-tls-verify --skip-tls-verify-pull` |
 | `DOCKER_RT_KANIKO_EXTRA_FLAGS` | （空） | 追加给 kaniko 的原始参数（shell 分词），如 `--verbosity=debug` |
+| `DOCKER_RT_KANIKO_SNAPSHOT_MODE` | `redo` | kaniko `--snapshot-mode=`，决定**每个文件怎么比**。**默认 `redo`**：比 mtime/size/mode/owner uid+gid。**`full`**（kaniko 自己的默认）：按**文件内容**逐文件 hash。**`time`**：只看 mtime，文档明确说**可能整个漏掉 `RUN` 引入的改动**，**不要用**。⚠️ **它不减遍历**：kaniko 的 `stageBuilder.takeSnapshot` 在命令没给出文件清单时（`files == nil`，`RUN` 永远如此）一律走 `TakeSnapshotFS()` —— 整棵文件树**每种模式都要走一遍**，这个开关只换比较方式。所以「`Taking snapshot of full filesystem...` 后面很久没日志」在 `redo` 下**同样会发生**，别把它当解药 |
+| `DOCKER_RT_KANIKO_USE_NEW_RUN` | `false` | 加 `--use-new-run`（kaniko 的实验实现）。**这是唯一能让 `RUN` 不再全盘扫描的开关**：v2 的 `RUN` 自己跟踪改动的文件，快照因此走增量路径而不是 `TakeSnapshotFS()`。多阶段 + `node_modules` 的构建卡在快照时**优先试它**。官方标注实验性 |
+| `--single-snapshot`（经 `DOCKER_RT_KANIKO_EXTRA_FLAGS` 传） | — | kaniko 原生 flag：*"Take a single snapshot at the end of the build."* 把 N 次（现在是每个 `RUN` 一次）快照压成**每个 stage 最后一次**。代价是中间层不再分层、缓存粒度变粗（我们默认 `--cache=false`，影响有限）。⚠️ 它**仍然走全盘扫描**，所以并不能保证治好「某一次扫描本身卡住」 |
 | `DOCKER_RT_REGISTRY_CLUSTER` | （空） | 集群标识，用于选推送 profile（`us-west-1` / `us-west-2` / `cn-east-1`）；未设时从 `DOCKER_RT_KUBE_CONTEXT` 猜 |
 | `DOCKER_RT_REGISTRY_NAMESPACE` | （空） | registry 里的命名空间；Docker Hub 集群**必填**，缺失直接拒绝构建 |
 | `DOCKER_RT_REGISTRY_USERNAME` / `_PASSWORD` | （空） | 推送凭据（优先于下面那个） |
-| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | `/etc/docker-image/.dockerconfigjson` | 现成的 dockerconfigjson（base64 或 JSON）——可直接复用平台挂载的 `imagePullSecrets` |
+| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | `/etc/docker-image/.dockerconfigjson`（存在才用） | 与上一组**二选一、且都非必填**：现成的 dockerconfigjson（base64 或 JSON）——可直接复用平台挂载的 `imagePullSecrets` |
 | `DOCKER_RT_ACR_ACCESS_KEY_ID` / `_SECRET` | （空，回退 `ALIBABA_CLOUD_ACCESS_KEY_ID` / `_SECRET`） | 上海 ACR 建仓用 |
 | `DOCKER_RT_ACR_INSTANCE_ID` | （空） | ACR 企业版实例 ID（`cri-xxxx`），建仓必填 |
 | `DOCKER_RT_ACR_REGION_ID` | `cn-shanghai` | ACR POP endpoint 的 region |
@@ -390,6 +394,57 @@ docker ps   # 仍能看到 sb1
 | `DOCKER_RT_RM_CONCURRENCY` | `20` | `docker rm` 一次删 >5 个时并发删除的 worker 数 |
 | `DOCKER_RT_NODE_SELECTOR` | `none` | Pod `nodeSelector`（`key=val,...`；`none` 关闭） |
 | `LOG_LEVEL` | `INFO` | 日志 |
+
+#### cn-east-1（上海集群）推送需要设的环境变量
+
+上海节点的网络**到不了 `index.docker.io`**（DNS 被投毒成无关公司的 IP，TCP 443 不通；
+沙箱内实测 `index.docker.io:443 dns=80.87.199.46 tcp=fail`，而自家 ACR 是通的），
+所以推送目标必须换成**集群能到的自家 ACR**。不换的话构建会在**开始之前**就被终止
+（`DOCKER_RT_BUILD_PUSH_CHECK=fail`，默认），报错里会把下面这几行原样列出来 ——
+不用自己去翻文档猜前缀：
+
+```
+DOCKER_RT_BUILD_REGISTRY=pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind
+DOCKER_RT_REGISTRY_USERNAME=<ACR 用户名>
+DOCKER_RT_REGISTRY_PASSWORD=<ACR 密码 / 临时 token>
+```
+
+> ⚠️ **前缀里必须带命名空间**（上面那行末尾的 `/pyromind` 就是它，**换成别的命名空间也行**）。
+> ACR 企业版的路径是 `<host>/<namespace>/<repo>`；只写 `pyromind-registry.cn-shanghai.cr.aliyuncs.com`
+> 的话，ACR 会把仓库名当成命名空间、找不到，推送时回一个光秃秃的 `401 Unauthorized`
+> （而且构建已经全跑完了）。daemon 现在会在**构建之前**拒绝这种"只有 host"的前缀并提示。
+>
+> **命名空间永远由参数给，代码不会替你补**：`DOCKER_RT_BUILD_REGISTRY` 里的前缀是**逐字**使用的
+> （写什么就推什么，多级命名空间也原样保留）；如果你不设它、让集群 profile 来推导，那就用
+> `DOCKER_RT_REGISTRY_NAMESPACE` 换命名空间。两种情况都不需要改代码。
+
+（凭据是**二选一**，都不是必填：上面后两行给账号密码；或者不要那两行，改成指向一份已经
+登录好的 dockerconfigjson ——
+
+```
+DOCKER_RT_REGISTRY_DOCKERCONFIG=<该文件的路径>
+```
+
+连它也设的话就用它，不设就用默认的 `/etc/docker-image/.dockerconfigjson`（存在才用）。
+优先级：`DOCKER_RT_REGISTRY_USERNAME` + `_PASSWORD`（两个都非空）> 显式 dockerconfig > 默认文件。）
+
+只出归档、不推送：
+
+```
+DOCKER_RT_BUILD_PUSH=false
+```
+
+先跳过这个检查、照旧构建（kaniko 最后一步仍会失败，只是不会提前终止）：
+
+```
+DOCKER_RT_BUILD_PUSH_CHECK=warn
+```
+
+**这几行都按"daemon 启动时读一次"处理，改完要重启 docker-rt。**
+
+> ⚠️ `DOCKER_RT_ACR_ACCESS_KEY_ID` / `_SECRET` / `DOCKER_RT_ACR_INSTANCE_ID` 是**建仓**用的
+> （另一套东西：AccessKey 对 + 企业版实例 ID），和上面这三个推送变量不是一回事。
+> 仓库已经人工建好的话可以不设。
 
 ### `docker inspect` 返回结构
 
@@ -500,6 +555,12 @@ kaniko 的 `--tar-path` 就是「直接写到对应位置」，**没有 cp 这�
   （非 `[A-Za-z0-9._-]` 一律换成 `_`）。tarball 里带的镜像名就是那个 tag，
   `docker load -i` 导回本机时 tag 一起恢复；**重建同名 tag 直接覆盖**该 tag 的产物，
   别的 tag 各留各的。
+- **推送目标不通也不会丢产物**：argv 里恒带 `--skip-push-permission-check`。kaniko 原顺序是
+  `CheckPushPermissions`（**构建之前**，访问 registry 探测权限）→ `DoBuild` → `DoPush`；探测失败会
+  在第一行 Dockerfile 之前退出，**什么都不产出**。跳过探测后顺序变成 构建 → 写 tar → 推送，所以
+  推送目标（registry 不可达 / tag 写错 / 凭据不对）只会在**最后**失败，产物已经落在
+  `/workspace/docker_images/`；daemon 会在失败时额外打一行 `The image was archived to …`（会真的
+  去沙箱里 `test -s` 确认，不会瞎报）。
 - `--tar-path` **必须在 push 与否两种情况下都给**：kaniko 是「先写 tar、再推送」
   （源码 `DoPush` 里 `tarball.MultiWriteToFile` 在 `if opts.NoPush {return}` 之前），
   一次构建两件事互不影响。
@@ -635,7 +696,12 @@ pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/sweb.eval.x86_64.astr
 
 ### 构建失败怎么查
 
-1. 「构建器镜像未配置」→ 查 `DOCKER_RT_BUILD_IMAGE` 是否导出、docker-rt 是否重启过。
+1. 构建沙箱**卡在拉构建器镜像**（`ImagePullBackOff` / `manifest unknown`）→ 默认镜像是**按当前
+   集群**选的（`cn-east-1` 走上海 ACR 的 VPC 内网地址，其它集群走 Docker Hub），所以先确认
+   **daemon 服务的集群对不对**（`DOCKER_RT_CLUSTER` / `PYROMIND_CLUSTER` / `--cluster` —— 注意
+   构建镜像**不看** `DOCKER_RT_REGISTRY_CLUSTER`，那是推送 profile 的事）。要换版本或换自己的
+   mirror 就显式设 `DOCKER_RT_BUILD_IMAGE`（映射本身写在
+   `build_sandbox.build_executor()` 里，一处管理）。
 2. 「短 tag 没有 registry 前缀」→ 查 `DOCKER_RT_BUILD_REGISTRY` 和 `DOCKER_RT_REGISTRY_NAMESPACE`。
 3. 沙箱**没起来**（`exec: "sleep": executable file not found`）→ 用了非 `-debug` 的
    executor 镜像，见构建器 README 第 0 节。
@@ -646,7 +712,69 @@ pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/sweb.eval.x86_64.astr
    `niqi-dev-secret`，**这个 secret 是按命名空间存的**（西区内容 = Docker Hub 凭据，
    上海内容含 ACR 凭据），所以两边都能拉自己 registry 上的镜像，通常不用改。
 6. 要进沙箱手查：`DOCKER_RT_BUILD_SANDBOX_KEEP=true docker build ...` 保留沙箱后再
-   `docker exec -it <id> sh`（debug 镜像里有 busybox）。
+   **`docker exec -it <id> /bin/sh`（绝对路径，不是 `sh`）**。
+   原因（读上游 `deploy/Dockerfile` v1.24.0 核实）：`-debug` 变体是
+   `ENV PATH /usr/local/bin:/kaniko:/busybox` + `COPY --from=busybox /bin /busybox`
+   （**整个 busybox 放 `/busybox`**，`/busybox` 在 PATH 上）+ `VOLUME /busybox`
+   （「so it survives the filesystem being replaced」）+ **`/bin` 下只建一个 `sh` 软链**。
+   ⇒ **executor 自己的工具在 `/busybox`**，`/bin` 不是它的。
+   而 **kaniko 会把被构建的基础镜像解包到 `/`**（这就是它的构建方式），所以构建中/构建后
+   `/bin` 是**被构建镜像的**（Debian / Alpine…），且**每个 stage 会换**。
+   因此：想用 executor 的工具就写 **`/busybox/<applet>`**（或 `/bin/busybox <applet>`，
+   若当前 `/` 正好是 Alpine），不要假设 `/bin` 里有什么。
+   而 PTY 会话（`-it`）前面被 k8s_middleware 塞了一段 locale 探测（4 个 `elif` 各跑一次
+   `locale -a | grep -qx …`），用的是**裸名字** —— 在 PATH 只有
+   `/usr/local/bin:/kaniko:/busybox` 的情况下就容易扑空。**用 `/bin/sh` 绝对路径直接进就绕开了。**
+   ⚠️ 这些**只影响交互式排查**：构建主链路走非 TTY 的 `sh -c` exec，一直正常。
+7. **构建跑到一半"卡住"（十几分钟没有新日志）** —— 先看是**哪一种**，日志里已经给了判据：
+   - `still building… 734s elapsed, no new log output for 734s`：`no new log output` 是**累计静默**，
+     所以这个数字一路涨才是真的没输出。它**只涨到心跳间隔**就说明有输出在流动（旧版本就是这个
+     骗人的行为，已修）。
+   - `kaniko has produced nothing for Ns; live sample: pid=… state=… wchan=… rss=… over Ns:
+     cpu_ticks=+… read=+… disk_read=+… write=+…` —— 静默超过 45s 后 daemon 会自动进沙箱采一次
+     样（读 `/proc/<executor>`，两次读数间隔 ≥120s，差值由 daemon 算），按下面的表读：
+
+     | 采样特征 | 含义 | 试什么 |
+     |---|---|---|
+     | `cpu_ticks` 在涨，`read`/`disk_read` 基本不动 | 在**逐个 stat 遍历文件树**（`RUN` 的 `TakeSnapshotFS`） | `DOCKER_RT_KANIKO_USE_NEW_RUN=true`；或减少快照那一刻的文件数（见下） |
+     | `read` 涨得很快 | 在**读文件内容算哈希**（`--snapshot-mode=full` 才有） | 确认 `DOCKER_RT_KANIKO_SNAPSHOT_MODE=redo` 已生效 |
+     | 三个计数都不动、`state=D`、`wchan=sync_filesystem` 之类 | **阻塞在 I/O**（`scanFullFilesystem` 开头那次 `syncfs`） | 换 `--use-new-run`（它绕开 `scanFullFilesystem`）；否则查节点磁盘/JuiceFS 侧 |
+
+     探针本身只用 `cat` + shell 内建（`-debug` 镜像没有 `awk`/`grep`），也**不会失败构建**：
+     失败就静默退回纯心跳。
+
+   - **别拿"最终镜像很小"去推断快照代价**：快照对象是**构建中间态的整个容器文件系统**，
+     `node_modules` 这种"几万个小文件"才是成本来源（`pyromind-console-1` 本地就有 589MB）。
+     kaniko 没有 overlayfs，只能靠每步扫全盘算 layer；社区里同样的 node 多阶段 → nginx
+     形态有跑 32 分钟的案例（kaniko issue #875 / #970）。
+   - 减少"快照那一刻存在的文件数"是治本方向（例如最后一个 `RUN` 里
+     `rm -rf /workspace/node_modules /root/.npm`），但**要配合 `--single-snapshot`** 才有意义，
+     否则中间那几次快照照样要扫。
+   - kaniko 自己对快照有超时保护（`SNAPSHOT_TIMEOUT_DURATION`，默认 90 分钟）才 `Fatal`，
+     所以**别指望它自己快速失败**；`DOCKER_RT_BUILD_TIMEOUT`（默认 3600s）是 daemon 侧的兜底。
+8. **构建"成功"但最后一行报 `error pushing image: … dial tcp <别人的IP>:443: i/o timeout`** ——
+   这不是构建问题，是**集群到 registry 的网络/DNS** 问题，典型是 `docker.io` 被投毒解析成无关的公网 IP
+   （实测同一集群不同时间解析出 `69.171.224.36` / `173.244.217.42`，都属于别的公司）。
+   判据：`docker exec <cid> /bin/sh -c '<probe>'` 里 `busybox nc -z index.docker.io 443` 失败、
+   而 ACR 地址成功。现在这一步在构建**前**就会自动检查并直接终止（见 `DOCKER_RT_BUILD_PUSH_CHECK`），
+   不用再等整次构建跑完；报错里会**直接把该设的环境变量列出来**（上海集群见上文
+   「cn-east-1（上海集群）推送需要设的环境变量」）：
+   ```
+   DOCKER_RT_BUILD_REGISTRY=pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind
+   DOCKER_RT_REGISTRY_USERNAME=<ACR 用户名>
+   DOCKER_RT_REGISTRY_PASSWORD=<ACR 密码 / 临时 token>
+   ```
+   或者 `DOCKER_RT_BUILD_PUSH=false` 只出归档。
+9. **构建全跑完，最后一行 `401 Unauthorized`（`error pushing image`）** —— 凭据或**仓库路径**不对，
+   两种都很常见：
+   - **路径少了命名空间**（上海最常见的坑）：ACR 是 `<host>/<namespace>/<repo>`，只写主机名的话
+     ACR 会把仓库名当成命名空间 ⇒ 401。daemon 现在会在**构建之前**拒绝这种前缀并提示
+     （命名空间由 `DOCKER_RT_BUILD_REGISTRY` 给，是哪个都行）。
+   - **凭据不是这个 host 的**：`docker login <host>` 成功**说明不了**仓库路径对不对，
+     也说明不了它一定覆盖你要推的仓库。ACR 用的是企业版实例自己的用户名 + 临时 token；
+     Docker Hub 的账号在这里没用。
+   失败时 daemon 会把这两条原因一起打出来（kaniko 自己只有一句 `401 Unauthorized`，
+   连是哪个仓库都不说）。
 
 ## Compose（OSM-style）
 

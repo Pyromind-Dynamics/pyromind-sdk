@@ -196,11 +196,50 @@ def registry_insecure() -> bool:
 
 
 def use_new_run() -> bool:
+    """``--use-new-run``, **off by default — it makes this build slower, not faster.**
+
+    It was briefly turned on here on the theory that the v2 ``RUN`` avoids
+    kaniko's whole-filesystem walk. The v1.24 source says otherwise, and a live
+    build confirmed it:
+
+    * default: a ``RUN`` reports no file list, so ``takeSnapshot`` calls
+      ``TakeSnapshotFS()`` → ``scanFullFilesystem()`` → ``util.WalkFS`` — **one**
+      walk, and it logs ``Taking snapshot of full filesystem...`` first, and it
+      carries kaniko's own ``SNAPSHOT_TIMEOUT_DURATION`` (default 90m).
+    * ``--use-new-run``: ``commands.GetCommand`` builds a ``RunMarkerCommand``,
+      whose ``ExecuteCommand`` is
+
+          prevFilesMap, _ := util.GetFSInfoMap("/", nil)   // walk
+          runCommandInExec(...)                            // the RUN itself
+          _, r.Files = util.GetFSInfoMap("/", prevFilesMap) // walk again
+
+      i.e. **two** full walks per ``RUN``. ``GetFSInfoMap`` logs nothing at
+      ``Info`` level and has **no timeout at all**, so a build that gets stuck
+      there is indistinguishable from a hang *and* never reports one.
+
+    Keep it off. ``DOCKER_RT_KANIKO_USE_NEW_RUN=true`` still opts in for anyone
+    who wants to measure it.
+    """
     return _flag("DOCKER_RT_KANIKO_USE_NEW_RUN", "false")
 
 
 def snapshot_mode() -> str:
-    return (os.getenv("DOCKER_RT_KANIKO_SNAPSHOT_MODE") or "").strip()
+    """Snapshot mode, defaulting to ``redo``.
+
+    kaniko's own default is ``full``: it hashes **every file in the rootfs by
+    content** after each instruction. On a real frontend build (``node_modules``,
+    tens of thousands of small files) that is minutes of silence — kaniko logs
+    nothing while snapshotting, so the build looks hung.
+
+    ``redo`` only compares mtime / size / mode / owner uid+gid, which kaniko
+    documents as "up to 50% faster" while still catching every ``RUN`` change.
+    ``time`` is *not* an option: its own docs warn it may miss changes made by
+    ``RUN`` entirely, which would silently ship stale layers.
+
+    Set ``DOCKER_RT_KANIKO_SNAPSHOT_MODE=full`` to get kaniko's original
+    behaviour back, or ``time`` if you really know what you are doing.
+    """
+    return (os.getenv("DOCKER_RT_KANIKO_SNAPSHOT_MODE") or "redo").strip()
 
 
 def extra_flags() -> list[str]:
@@ -267,6 +306,19 @@ def kaniko_args(
     # each tag keeps its own archive.
     args.append(f"--tar-path={tar_path(dests)}")
 
+    # Skip kaniko's push-permission probe.
+    #
+    # kaniko's order is ``Run`` → ``CheckPushPermissions`` → ``DoBuild`` → ``DoPush``:
+    # the probe runs *before* the first Dockerfile instruction and aborts on an
+    # unreachable or misconfigured registry. That would leave the user with no image
+    # at all, even though the archive above is written before anything is pushed.
+    # With the probe skipped the order becomes build → archive → push, so a broken
+    # push target fails only at the very end, with the artifact already on disk.
+    #
+    # Trade-off: a wrong tag or bad credentials is now reported after a full build
+    # instead of within seconds. That is deliberate — the archive matters more.
+    args.append("--skip-push-permission-check")
+
     if digest_file:
         args.append(f"--digest-file={digest_file}")
 
@@ -292,7 +344,7 @@ def kaniko_args(
         args.append("--skip-tls-verify-pull")
 
     if platform:
-        args.append(f"--customPlatform={platform}")
+        args.append(f"--custom-platform={platform}")
 
     args.extend(extra if extra is not None else extra_flags())
     return args
@@ -446,6 +498,120 @@ def status_script(*, offset: int = 0) -> str:
             f"tail -c +{start} {shlex.quote(build_log_path())} 2>/dev/null || true",
         ]
     ) + "\n"
+
+
+#: The probe body. ``__COMM__`` is the executor's process name (``/proc/<pid>/comm``,
+#: truncated to 15 chars), ``__BIN__`` its path; both are substituted by
+#: :func:`probe_script`.
+#:
+#: Deliberately **tool-free**: nothing here needs ``cat``, ``awk`` or ``sleep``,
+#: only ``read``/``set``/arithmetic, so it cannot be broken by PATH. ``/bin``
+#: inside a build container is the *target* image's (kaniko unpacks it over
+#: ``/``), and it changes between stages — the executor's own busybox lives in
+#: ``/busybox``. One instantaneous reading; the daemon diffs two of them.
+_PROBE_TEMPLATE = """\
+set -u
+pid=
+line=
+for d in /proc/[0-9]*; do
+  IFS= read -r c < "$d/comm" 2>/dev/null || continue
+  if [ "$c" = "__COMM__" ]; then pid=${d#/proc/}; break; fi
+done
+if [ -z "$pid" ]; then
+  for d in /proc/[0-9]*; do
+    IFS= read -r c < "$d/cmdline" 2>/dev/null || continue
+    case "$c" in *"__BIN__"*) pid=${d#/proc/}; break ;; esac
+  done
+fi
+if [ -z "$pid" ]; then
+  echo "pid=0"
+  exit 0
+fi
+state=?
+cpu=0
+if [ -r "/proc/$pid/stat" ]; then
+  IFS= read -r line < "/proc/$pid/stat" || line=""
+  set -- ${line##*) }
+  state=${1:-?}
+  cpu=$(( ${12:-0} + ${13:-0} ))
+fi
+rchar=0
+disk_read=0
+write=0
+if [ -r "/proc/$pid/io" ]; then
+  exec 3< "/proc/$pid/io"
+  IFS= read -r line <&3; rchar=${line#* }
+  IFS= read -r line <&3
+  IFS= read -r line <&3
+  IFS= read -r line <&3
+  IFS= read -r line <&3; disk_read=${line#* }
+  IFS= read -r line <&3; write=${line#* }
+  exec 3<&-
+fi
+rss=0
+if [ -r "/proc/$pid/status" ]; then
+  while IFS= read -r line; do
+    case "$line" in
+      VmRSS:*) set -- $line; rss=${2:-0} ;;
+    esac
+  done < "/proc/$pid/status"
+fi
+wchan=0
+if [ -r "/proc/$pid/wchan" ]; then
+  IFS= read -r wchan < "/proc/$pid/wchan" || wchan=0
+fi
+[ -n "$wchan" ] || wchan=0
+echo "pid=$pid state=$state wchan=$wchan cpu_ticks=$cpu rss_kb=$rss rchar=$rchar disk_read=$disk_read write=$write"
+"""
+
+
+def probe_script(*, _bin: str | None = None) -> str:
+    """One instantaneous sample of the running executor's ``/proc`` entry.
+
+    kaniko prints nothing at all while it snapshots, which leaves three very
+    different situations looking identical in the build log. A single reading
+    cannot tell them apart, but *two* readings can — the daemon keeps the
+    previous one and diffs it:
+
+    * **walking** the filesystem entry by entry — ``cpu_ticks`` climbs while the
+      byte counters barely move. Every ``RUN`` step pays for this, in *every*
+      ``--snapshot-mode``: kaniko's ``stageBuilder.takeSnapshot`` calls
+      ``TakeSnapshotFS()`` whenever a command reports no file list
+      (``files == nil``), and ``RUN`` never reports one. ``--snapshot-mode``
+      only picks the hasher used *inside* that walk, so ``redo`` speeds up the
+      comparison, never the traversal.
+    * **hashing** file contents on top of that walk — ``rchar`` climbs fast.
+      Only ``--snapshot-mode=full`` adds this.
+    * **blocked** — state ``D`` with neither counter moving, and ``wchan`` names
+      the kernel function being waited on (``sync_filesystem`` ⇒ the ``syncfs``
+      at the top of ``scanFullFilesystem``, which no flag can skip).
+
+    Output is one line of ``key=value`` pairs; see :func:`parse_probe_sample`.
+    """
+    binary = _bin or kaniko_bin()
+    comm = binary.rsplit("/", 1)[-1][:15]
+    return _PROBE_TEMPLATE.replace("__COMM__", comm).replace("__BIN__", binary)
+
+
+def parse_probe_sample(raw: str | None) -> dict[str, int | str]:
+    """Split the probe's one line into ``{field: int | str}``.
+
+    Keeps ``state`` / ``wchan`` as text and everything else as an integer, so the
+    caller can subtract two samples without re-parsing.
+    """
+    sample: dict[str, int | str] = {}
+    for token in (raw or "").split():
+        key, sep, value = token.partition("=")
+        if not sep or not key:
+            continue
+        if key in {"state", "wchan"}:
+            sample[key] = value
+            continue
+        try:
+            sample[key] = int(value)
+        except ValueError:
+            sample[key] = 0
+    return sample
 
 
 def parse_status(raw: str | None) -> tuple[str, int | None]:

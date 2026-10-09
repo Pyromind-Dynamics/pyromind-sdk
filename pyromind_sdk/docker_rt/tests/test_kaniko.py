@@ -25,6 +25,33 @@ def _fresh(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
+def test_kaniko_does_not_use_new_run_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--use-new-run`` is off: it doubles kaniko's whole-filesystem walk.
+
+    It was tried as a fix for a build that hung inside kaniko's post-``RUN``
+    snapshot scan. The v1.24 source says it makes that *worse*:
+    ``RunMarkerCommand.ExecuteCommand`` runs ``util.GetFSInfoMap("/")`` before
+    **and** after the command, where the default path runs ``WalkFS`` once —
+    and ``GetFSInfoMap`` carries no timeout, so a stuck walk never reports.
+    A live build confirmed it: still hangs, and now with no log line at all.
+    """
+    from ..backend import kaniko
+
+    _fresh(monkeypatch)
+    assert kaniko.use_new_run() is False
+    assert "--use-new-run" not in kaniko.kaniko_args(
+        destinations=["reg.example.com/rt/a:1"], cache=False
+    )
+
+    _fresh(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_KANIKO_USE_NEW_RUN", "true")
+    assert "--use-new-run" in kaniko.kaniko_args(
+        destinations=["reg.example.com/rt/a:1"], cache=False
+    )
+
+
 def test_kaniko_args_shape(monkeypatch: pytest.MonkeyPatch) -> None:
     from ..backend import kaniko
 
@@ -117,10 +144,113 @@ def test_kaniko_extra_flags_are_shlex_split(monkeypatch: pytest.MonkeyPatch) -> 
     from ..backend import kaniko
 
     _fresh(monkeypatch)
-    monkeypatch.setenv("DOCKER_RT_KANIKO_EXTRA_FLAGS", "--snapshot-mode=redo --verbosity=debug")
+    # Deliberately flags that no default or other code path emits, so this test
+    # keeps testing the shlex split rather than the defaults.
+    monkeypatch.setenv("DOCKER_RT_KANIKO_EXTRA_FLAGS", "--verbosity=debug --log-timestamp=false")
+    args = kaniko.kaniko_args(destinations=["reg.example.com/rt/a:1"], cache=False, new_run=False)
+    assert "--verbosity=debug" in args
+    assert "--log-timestamp=false" in args
+
+
+def test_kaniko_defaults_to_redo_snapshots(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``redo`` is the default, like ``--skip-push-permission-check``.
+
+    kaniko's own default (``full``) hashes every file by content after each
+    instruction, which is minutes of *silent* work on a ``node_modules`` tree.
+    """
+    from ..backend import kaniko
+
+    _fresh(monkeypatch)
+    assert kaniko.snapshot_mode() == "redo"
+
     args = kaniko.kaniko_args(destinations=["reg.example.com/rt/a:1"], cache=False, new_run=False)
     assert "--snapshot-mode=redo" in args
-    assert "--verbosity=debug" in args
+    # No fallback to kaniko's full-filesystem scan.
+    assert "--snapshot-mode=full" not in args
+
+
+def test_kaniko_snapshot_mode_honours_the_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ..backend import kaniko
+
+    _fresh(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_KANIKO_SNAPSHOT_MODE", "full")
+    args = kaniko.kaniko_args(destinations=["reg.example.com/rt/a:1"], cache=False, new_run=False)
+    assert "--snapshot-mode=full" in args
+    assert "--snapshot-mode=redo" not in args
+
+
+def test_kaniko_snapshot_mode_can_be_disabled_per_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit empty string lets a caller drop the flag entirely."""
+    from ..backend import kaniko
+
+    _fresh(monkeypatch)
+    args = kaniko.kaniko_args(
+        destinations=["reg.example.com/rt/a:1"],
+        cache=False,
+        new_run=False,
+        snapshot="",
+    )
+    assert not [a for a in args if a.startswith("--snapshot-mode")]
+
+
+def test_probe_script_sticks_to_what_the_executor_image_has(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe must not depend on any external command.
+
+    ``/bin`` inside a build container is the *target* image's — kaniko unpacks
+    it over ``/`` — and it changes between stages; the executor's own busybox
+    lives in ``/busybox``. Rather than guess, the probe reads ``/proc`` with
+    ``read``/``set``/arithmetic only, so PATH cannot break it.
+    """
+    from ..backend import kaniko
+
+    _fresh(monkeypatch)
+    script = kaniko.probe_script()
+
+    for missing in ("grep", "awk", "tr ", "sed", "sleep", "ps ", "pidof", "cat "):
+        assert missing not in script, missing
+    # No external command either: the only ``$(`` left may be arithmetic ``$((``.
+    assert "$(" not in script.replace("$((", ""), script
+    for needed in ("/proc", "comm", "cmdline", "stat", "io", "status", "wchan"):
+        assert needed in script, needed
+    # One instantaneous reading; the daemon diffs two of them, so nothing here
+    # has to understand time.
+    assert "sleep" not in script
+    assert 'echo "pid=' in script
+
+
+def test_probe_script_matches_the_process_name_the_kernel_reports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ..backend import kaniko
+
+    _fresh(monkeypatch)
+    # /proc/<pid>/comm is truncated to 15 characters by the kernel.
+    script = kaniko.probe_script(_bin="/opt/my-very-long-executor-name")
+    assert '"my-very-long-ex"' in script
+    # ...and the full path still backs up the name match.
+    assert "/opt/my-very-long-executor-name" in script
+
+
+def test_parse_probe_sample_keeps_text_and_numbers_apart() -> None:
+    from ..backend import kaniko
+
+    assert kaniko.parse_probe_sample(
+        "pid=42 state=D wchan=sync_filesystem cpu_ticks=9 rss_kb=2048 "
+        "rchar=10 disk_read=20 write=30\n"
+    ) == {
+        "pid": 42,
+        "state": "D",
+        "wchan": "sync_filesystem",
+        "cpu_ticks": 9,
+        "rss_kb": 2048,
+        "rchar": 10,
+        "disk_read": 20,
+        "write": 30,
+    }
+    assert kaniko.parse_probe_sample("") == {}
+    assert kaniko.parse_probe_sample("pid=not-a-number\n") == {"pid": 0}
 
 
 def test_kaniko_extra_flags_with_bad_quotes_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -174,6 +304,26 @@ def test_build_script_echoes_digest_marker(monkeypatch: pytest.MonkeyPatch) -> N
     script = kaniko.build_script(args=["--dockerfile=Dockerfile"])
     assert "docker-rt-digest:" in script
     assert "set -eu" in script
+
+
+def test_kaniko_args_always_skips_the_push_permission_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe runs *before* the build, so skipping it is what keeps the archive.
+
+    kaniko's order is ``CheckPushPermissions`` → ``DoBuild`` → ``DoPush``: an
+    unreachable registry used to abort the whole thing before the first Dockerfile
+    instruction, leaving no image at all. With the flag, the order becomes build →
+    archive → push, and a broken push target only fails at the very end.
+    """
+    from ..backend import kaniko
+
+    _fresh(monkeypatch)
+    for push in (True, False):
+        joined = " ".join(
+            kaniko.kaniko_args(destinations=["app:dev"], push=push, cache=False)
+        )
+        assert "--skip-push-permission-check" in joined, push
 
 
 def test_tar_path_is_the_workspace_images_directory() -> None:

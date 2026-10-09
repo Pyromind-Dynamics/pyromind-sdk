@@ -542,9 +542,9 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 | `DOCKER_RT_INSPECT_MODE` | `sandbox` | `docker inspect` 返回结构：`sandbox` 或 `standard` |
 | `DOCKER_RT_DEFAULT_IMAGE` | SWE-bench 默认镜像 | `docker images` 默认条目 |
 | `DOCKER_RT_PORT_FORWARD_MODE` | `auto` | `-p` 后端：`auto` / `direct` / `api` |
-| `DOCKER_RT_BUILD_IMAGE` | `docker.io/pyrominddynamics/kaniko-executor-pyromind:0.0.3` | **构建的硬前提**：集群能拉的 kaniko executor 镜像（必须 `-debug` 变体）。默认值来自代码，gcr.io 在部分集群不可达，**实际部署建议 mirror 后显式指定** |
+| `DOCKER_RT_BUILD_IMAGE` | 按集群自动 | **构建的硬前提**：集群能拉的 kaniko executor 镜像（必须 `-debug` 变体，见 `builder-image/kaniko/`）。**默认值按当前集群自动选**：`cn-east-1`（含 `#pre` / `#pre2`）→ `pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/kaniko-executor-pyromind:0.0.4`；其它集群 → `docker.io/pyrominddynamics/kaniko-executor-pyromind:0.0.4`。两个 mirror 互不可达（上海那个是 VPC 内网地址，west 集群也拉不到），所以**只有要换版本或换自己的 mirror 时才需要设它** |
 | `DOCKER_RT_BUILD_REGISTRY` | 空 | 短镜像 tag 的推送前缀；留空时按集群 profile 推导 |
-| `DOCKER_RT_BUILD_PUSH` | `true` | build 后是否 push |
+| `DOCKER_RT_BUILD_PUSH` | `true` | build 后是否 push。**关掉后构建照跑，归档仍落到工作区 `/workspace/docker_images/<tag>.tar`**（挂进来的目录，沙箱删掉也还在） |
 | `DOCKER_RT_BUILD_EXECUTOR` | `kaniko` | 构建器；目前只实现 kaniko |
 | `DOCKER_RT_BUILD_TIMEOUT` | `3600` | 单次构建（沙箱内命令）超时秒数 |
 | `DOCKER_RT_BUILD_SANDBOX_CPU` / `_MEMORY` | `2` / `4Gi` | 构建沙箱资源 |
@@ -561,7 +561,7 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 | `DOCKER_RT_REGISTRY_CLUSTER` | 空 | 推送 profile：`us-west-1` / `us-west-2` / `cn-east-1` |
 | `DOCKER_RT_REGISTRY_NAMESPACE` | 空 | registry 命名空间；Docker Hub 集群必填 |
 | `DOCKER_RT_REGISTRY_USERNAME` / `DOCKER_RT_REGISTRY_PASSWORD` | 空 | 仓库账号及密码/有推送权限的 Token；两者均非空时优先于 dockerconfig，与 `PYROMIND_API_KEY` 无关 |
-| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | `/etc/docker-image/.dockerconfigjson` | daemon 可读取的凭据文件路径；文件内容可为 JSON 或 Base64 编码的 JSON，详见「构建前配置仓库认证」 |
+| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | `/etc/docker-image/.dockerconfigjson`（存在才用） | 与上一组**二选一、且都非必填**：daemon 可读取的凭据文件路径；文件内容可为 JSON 或 Base64 编码的 JSON，详见「构建前配置仓库认证」 |
 | `DOCKER_RT_ACR_ACCESS_KEY_ID` / `_SECRET` / `_INSTANCE_ID` | 空 | 上海 ACR 建仓用 |
 | `DOCKER_RT_SERVICE_DNS` | `true` | 创建 ClusterIP Service 支持 Compose 服务名 DNS |
 | `DOCKER_RT_ORPHAN_POLICY` | `adopt` | `adopt` 恢复受管 Pod；`reap` 启动时删除 |
@@ -574,6 +574,51 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 | `DOCKER_RT_JUICEFS_HOST_PREFIXES` | 空 | 宿主机路径到 JuiceFS subPath 的额外映射 |
 | `DOCKER_RT_CONTEXT` | `docker-rt` | `docker-rt-context` 使用的 Docker context 名 |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
+
+**上海集群（`cn-east-1`）push 需要设的环境变量**
+
+上海节点到不了 `index.docker.io`（DNS 被投毒成无关公司的 IP，TCP 443 不通；
+沙箱内实测 `index.docker.io:443 dns=80.87.199.46 tcp=fail`，而自家 ACR 是通的），
+所以推送目标必须换成**集群能到的自家 ACR**。下面这几行**一行一个**，加到 daemon 的环境里；
+改完**重启 docker-rt**（这些变量是进程启动时读的）：
+
+```
+DOCKER_RT_BUILD_REGISTRY=pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind
+DOCKER_RT_REGISTRY_USERNAME=<ACR 用户名>
+DOCKER_RT_REGISTRY_PASSWORD=<ACR 密码 / 临时 token>
+```
+
+> ⚠️ **前缀里必须带命名空间**（上面那行末尾的 `/pyromind`；**换成别的命名空间也行**）。
+> ACR 的路径是 `<host>/<namespace>/<repo>`；只写主机名的话 ACR 会把仓库名当成命名空间，
+> 推送时回一个 `401 Unauthorized`（构建已经全跑完）。daemon 会在**构建之前**就拒绝这种前缀。
+>
+> **命名空间永远由参数给，代码不会替你补**：`DOCKER_RT_BUILD_REGISTRY` 的前缀是逐字使用的
+> （写什么推什么）；不设它、让集群 profile 推导时，用 `DOCKER_RT_REGISTRY_NAMESPACE` 换命名空间。
+
+（凭据**二选一**，都不是必填：上面后两行给账号密码；或者不要那两行，改成指向一份已经登录好的
+dockerconfigjson ——
+
+```
+DOCKER_RT_REGISTRY_DOCKERCONFIG=<该文件的路径>
+```
+
+不设它就用默认的 `/etc/docker-image/.dockerconfigjson`（存在才用）。优先级：
+`DOCKER_RT_REGISTRY_USERNAME` + `_PASSWORD`（两个都非空）> 显式 dockerconfig > 默认文件。）
+
+只出归档、不推送：
+
+```
+DOCKER_RT_BUILD_PUSH=false
+```
+
+先跳过连通性检查、照旧构建：
+
+```
+DOCKER_RT_BUILD_PUSH_CHECK=warn
+```
+
+不设的话，构建会在**开始之前**就被终止（`DOCKER_RT_BUILD_PUSH_CHECK` 默认 `fail`），
+报错里会把上面这几行原样列出来。
 
 默认 `k8s-middleware` 后端会检查 `PYROMIND_API_KEY` 和 `PYROMIND_CLUSTER`，
 缺失时逐个提示输入。连接成功后会用彩色打印当前参数，并在启动时同步一次
@@ -922,7 +967,7 @@ daemon **启动前**就要设好（运行中的 daemon 不会读新变量；改�
 
 | 变量 | 必填性 | 说明 |
 |------|--------|------|
-| `DOCKER_RT_BUILD_IMAGE` | ✅ 必填 | **构建器镜像**。必须是 kaniko executor 的 **`-debug` 变体**：默认 executor 是 `FROM scratch`，没有 `sleep` 也没有 shell，而 sandbox 模板固定跑 `command: ["sleep","infinity"]`。代码里的默认值是 `docker.io/pyrominddynamics/kaniko-executor-pyromind:0.0.3`，但 `gcr.io` 在部分集群不可达 —— **实际部署请先 mirror 到集群能拉的地址再指过来** |
+| `DOCKER_RT_BUILD_IMAGE` | 按集群自动（一般不用设） | **构建器镜像**。必须是 kaniko executor 的 **`-debug` 变体**：默认 executor 是 `FROM scratch`，没有 `sleep` 也没有 shell，而 sandbox 模板固定跑 `command: ["sleep","infinity"]`。**不设时按当前集群自动选**（`cn-east-1` 及其 `#pre`/`#pre2` → 上海 ACR mirror；其它集群 → `docker.io/pyrominddynamics/…`），只有要换版本或换私有 mirror 才需要显式设置 |
 | `DOCKER_RT_BUILD_REGISTRY` | 短 tag 必填 | 短 tag（`-t myapp`）的**推送前缀**，如 `docker.io/your-namespace`。不设、且集群 profile 也推不出来时 → **拒绝构建而不是猜**。写成完整地址的 tag（`docker.io/you/app:1`）不需要它 |
 | `DOCKER_RT_REGISTRY_USERNAME`<br>`DOCKER_RT_REGISTRY_PASSWORD` | 推送必填 | 仓库账号 + 密码 / 有**推送**权限的 Token。两者都非空时优先于 dockerconfig 文件 |
 | `DOCKER_RT_REGISTRY_DOCKERCONFIG` | 与上一组二选一 | 复用已有的 dockerconfig：值是 **daemon 所在机器上的文件路径** |
@@ -1048,7 +1093,9 @@ docker load -i /workspace/docker_images/myapp_latest.tar
   （非 `[A-Za-z0-9._-]` 一律换成 `_`）。tarball 里带的镜像名就是那个 tag。
   **重建同名 tag 直接覆盖该 tag 的产物**，别的 tag 各留各的。
 - **前置条件**：这个目录必须已存在（它是挂载源，见上面「③ 平台侧前置」）。
-- 归档是构建的**最后一步**（kaniko 先写 tar、再推送），所以目录不可写会白跑一场构建才失败。
+- **推送失败不会丢产物**：构建先跑完、tar 先落盘，推送排在最后（我们给 kaniko 恒带
+  `--skip-push-permission-check`，否则它的推送权限预检会在**构建之前**就退出、什么都不产出）。
+  推送失败时日志会多一行 `The image was archived to …`。目录不可写则会白跑一场构建才失败。
 - 构建日志里会出现 `==> This image is also archived to …`，`docker build --quiet` 看不到。
 
 通过 `k8s_middleware` OpenAPI 运行：
@@ -1074,8 +1121,9 @@ PyromindSDK 后端本地端口转发暂不支持，
 | `docker logs` / `docker events` 一直等待或不支持 | k8s-middleware 后端不支持这两个命令 | 使用 `docker exec -it <container> bash`、`docker ps`、`docker inspect` |
 | `docker cp` 完成但没有 `Successfully copied` 文案 | 旧 wrapper 重定向了 Docker 输出，Docker CLI 检测到非 TTY 后不打印成功文案 | 升级 SDK/wrapper 并重启 docker-rt |
 | `docker rm <本地ID>` 提示不存在 | 当前 daemon 已不认识该本地 ID | 使用 `sb-...` sandbox ID，或重启 docker-rt 刷新本地记录 |
-| `docker build` 报 `DOCKER_RT_BUILD_IMAGE is not configured` | 构建器镜像没设（见「镜像构建 → ② 构建专用」） | 设好 `DOCKER_RT_BUILD_IMAGE` 后**重启 daemon**（`pyromind docker-rt --stop` 再启动）；运行中的 daemon 不会读新变量 |
+| 构建沙箱卡在拉构建器镜像（`ImagePullBackOff`） | 默认构建器镜像**按集群**选（`cn-east-1` 及其 `#pre`/`#pre2` → 上海 ACR 的 VPC 内网地址，其它集群 → Docker Hub）；daemon 的集群标识不对就会去拉一个拉不到的地址 | 确认 `PYROMIND_CLUSTER` / `--cluster` 与目标集群一致；要换版本或换自己的 mirror 就显式设 `DOCKER_RT_BUILD_IMAGE` 后**重启 daemon** |
 | `docker build` 报 `DOCKER_RT_BUILD_REGISTRY is required to push short tags` | 用了短 tag（`-t myapp`）但推不出前缀 | 设 `DOCKER_RT_BUILD_REGISTRY`（或在集群 profile 里配 `DOCKER_RT_REGISTRY_NAMESPACE`），或把 tag 写成完整地址 `docker.io/you/myapp:1` |
+| 构建全跑完，最后一行是 `401 Unauthorized`（`error pushing image`） | **仓库路径**或凭据不对。ACR 的路径是 `<host>/<namespace>/<repo>`：`DOCKER_RT_BUILD_REGISTRY` 只写主机名的话，ACR 会把仓库名当成命名空间。注意 `docker login <host>` 成功**说明不了**仓库路径对不对 | 在前缀里补上命名空间（哪个都行，由参数决定、代码不会替你补）；daemon 现在会在**构建之前**就拒绝只有 host 的前缀。凭据方面 ACR 要的是实例自己的用户名 + 临时 token，Docker Hub 账号在这里没用 |
 | `docker build` 报 `cannot create build sandbox (...)` 且提到挂载/subPath | 工作区里 `/workspace/docker_images` 目录不存在（它是产物归档的挂载源） | 先建好该目录（Jupyter / 工作区里 `mkdir -p docker_images`）再重试 |
 | 构建成功但没找到 tarball | 归档是构建**最后**一步；或目录不可写 | 看日志有没有 `==> This image is also archived to …`；没有就是归档那步失败了 |
 | API 错误没有 `trace_id` | 该操作没有真正请求到 k8s-middleware（本地校验直接返回） | 只有带 `x-trace-id` 响应头的后端请求错误才会显示 `trace_id=` |
