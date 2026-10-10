@@ -848,3 +848,116 @@ async def test_oneshot_output_is_streamed():
     )
     assert code == 0
     assert b"hello" in b"".join(written)
+
+
+@pytest.mark.asyncio
+async def test_a_pyromind_exec_with_no_output_and_no_exit_code_says_so(monkeypatch):
+    """**零输出 + 零退出码**不能静默结束 —— 那正是"命令根本没跑起来"的签名。
+
+    2026-10-10 用户实测：`docker exec 6540e6994bf8 "echo hello"`（**没有** -it）
+    daemon 侧只有 `out=0 err=0 code=-1`，客户端那什么都没有 —— 和"容器默默忽略了
+    这条命令"完全无法区分。`_write_exec_error` 就是为这种情形存在的（见它的 docstring），
+    但当时只有"抛异常"那条路会用它。
+    """
+    from .. import aio_server as mod
+    from ..backend.pyromind_sdk_env import PyromindSDK
+
+    kube_env = PyromindSDK.__new__(PyromindSDK)
+
+    async def empty_stream(cmd, **kwargs):
+        # 平台回了个空流：既没有 stdout/stderr，也没有 exit 事件。
+        return
+        yield  # pragma: no cover - 让它成为 async generator
+
+    monkeypatch.setattr(kube_env, "iter_exec_stream", empty_stream)
+
+    written: list[bytes] = []
+
+    class FakeResp:
+        async def write(self, chunk):
+            written.append(chunk)
+
+        async def drain(self):
+            return None
+
+    code = await mod._stream_ws_oneshot(
+        resp=FakeResp(),
+        kube_env=kube_env,
+        cmd=["echo hello"],
+        session_id="exec-silent",
+    )
+
+    text = b"".join(written).decode("utf-8", "replace")
+    assert 'executable file not found in $PATH' in text, text
+    # 点名真正的成因：argv 里的空格不会被拆开
+    assert "argv" in text and "sh -c 'echo hello'" in text, text
+    assert code == 127, "Docker 在命令没起来时退 127"
+
+
+@pytest.mark.asyncio
+async def test_a_pyromind_exec_that_prints_something_keeps_its_exit_code(monkeypatch):
+    """有输出 + 有退出码的正常路径：不许多插话、不许改退出码。"""
+    from .. import aio_server as mod
+    from ..backend.pyromind_sdk_env import PyromindSDK
+
+    kube_env = PyromindSDK.__new__(PyromindSDK)
+
+    async def stream(cmd, **kwargs):
+        yield SimpleNamespace(type="stdout", data="hello\n")
+        yield SimpleNamespace(type="exit", returncode=0)
+
+    monkeypatch.setattr(kube_env, "iter_exec_stream", stream)
+
+    written: list[bytes] = []
+
+    class FakeResp:
+        async def write(self, chunk):
+            written.append(chunk)
+
+        async def drain(self):
+            return None
+
+    code = await mod._stream_ws_oneshot(
+        resp=FakeResp(), kube_env=kube_env, cmd=["echo", "hello"], session_id="exec-ok"
+    )
+
+    assert code == 0
+    assert b"hello\n" in b"".join(written)
+    assert b"docker-rt" not in b"".join(written)
+
+
+@pytest.mark.asyncio
+async def test_a_pyromind_exec_that_produced_output_but_lost_its_exit_code(monkeypatch):
+    """输出有、退出码没有：照样要说（但不用"命令没跑起来"那套措辞）。"""
+    from .. import aio_server as mod
+    from ..backend.pyromind_sdk_env import PyromindSDK
+
+    kube_env = PyromindSDK.__new__(PyromindSDK)
+
+    async def stream(cmd, **kwargs):
+        yield SimpleNamespace(type="stdout", data="partial\n")
+        return
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(kube_env, "iter_exec_stream", stream)
+
+    written: list[bytes] = []
+
+    class FakeResp:
+        async def write(self, chunk):
+            written.append(chunk)
+
+        async def drain(self):
+            return None
+
+    code = await mod._stream_ws_oneshot(
+        resp=FakeResp(),
+        kube_env=kube_env,
+        cmd=["echo", "hello"],
+        session_id="exec-no-code",
+    )
+
+    text = b"".join(written).decode("utf-8", "replace")
+    assert "partial\n" in text
+    assert "cannot start" not in text, "有输出就不该说'命令没起来'"
+    assert code == 127
