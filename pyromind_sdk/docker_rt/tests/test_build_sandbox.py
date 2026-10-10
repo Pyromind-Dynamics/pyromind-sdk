@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import bz2
 import gzip
 import io
 import json
+import lzma
 import re
 import tarfile
 from types import SimpleNamespace
@@ -2934,3 +2936,74 @@ def test_push_rejected_hint_points_at_the_missing_acr_repository(
     assert "DOCKER_RT_ACR_ACCESS_KEY_SECRET" in hint
     # 顺带把"你还有个变量是错的"也带上
     assert "did you mean" in hint or "unrecognised" in hint
+
+
+# --------------------------------------------------------------------------
+# build context：客户端可能已经压过它
+# --------------------------------------------------------------------------
+
+
+def _a_real_tar() -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for name, content in (("Dockerfile", b"FROM scratch\n"), ("a.txt", b"hello\n")):
+            info = tarfile.TarInfo(name=name)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize(
+    "compress",
+    [
+        pytest.param(gzip.compress, id="gzip"),
+        pytest.param(bz2.compress, id="bzip2"),
+        pytest.param(lzma.compress, id="xz"),
+    ],
+)
+def test_pack_build_context_unwraps_a_compressed_context(compress) -> None:
+    """客户端发来的 context 可能**已经压过**，必须先解开再压给 kaniko。
+
+    2026-10-09/10 实测：`docker compose build`（classic builder + `--compress`，
+    或 context 写成 `.tar.gz` URL）发来一个 772 B 的 gzip 流，我们**又压了一层**，
+    kaniko 于是只报 `error resolving source context: archive/tar: invalid tar header`，
+    0.1 秒就挂 —— 看起来完全不像压缩问题。moby 的 daemon 是靠 magic 嗅探解压的
+    （`archive.DecompressStream`），我们也得这么做。
+    """
+    from ..backend.build_sandbox import pack_build_context
+
+    original = _a_real_tar()
+    packed = pack_build_context(compress(original))
+    # kaniko 拿到的是**单层** gzip 的真实 tar
+    assert gzip.decompress(packed) == original
+
+
+def test_pack_build_context_leaves_a_plain_tar_alone() -> None:
+    """没压过的 context 原样处理（别把正常路径弄坏）。"""
+    from ..backend.build_sandbox import pack_build_context
+
+    original = _a_real_tar()
+    assert gzip.decompress(pack_build_context(original)) == original
+
+
+def test_context_compression_sniffs_the_families_moby_supports() -> None:
+    from ..backend.build_sandbox import context_compression
+
+    assert context_compression(b"") == ""
+    assert context_compression(_a_real_tar()) == ""
+    assert context_compression(gzip.compress(b"x")) == "gzip"
+    assert context_compression(bz2.compress(b"x")) == "bzip2"
+    assert context_compression(lzma.compress(b"x")) == "xz"
+    assert context_compression(b"\x28\xb5\x2f\xfd" + b"junk") == "zstd"
+
+
+def test_an_unsupported_context_compression_fails_with_something_actionable() -> None:
+    """解不开的时候不能产出"坏 tar"，要直接说清怎么办。"""
+    from ..backend.build_sandbox import pack_build_context
+
+    # zstd：本仓库跑的 Python(<3.14) 没有自带支持时，报错必须点名这件事和退路
+    with pytest.raises(ValueError) as caught:
+        pack_build_context(b"\x28\xb5\x2f\xfd" + b"\x00" * 32)
+    text = str(caught.value)
+    assert "zstd" in text
+    assert "--compress=false" in text or "zstandard" in text

@@ -791,6 +791,15 @@ pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/sweb.eval.x86_64.astr
      也说明不了它一定覆盖你要推的仓库。ACR 用的是企业版实例自己的用户名 + 临时 token；
      Docker Hub 的账号在这里没用。
    失败时 daemon 会把这几条原因一起打出来（kaniko 自己只有一句状态码，连是哪个仓库都不说）。
+10. **kaniko 秒挂：`error resolving source context: archive/tar: invalid tar header`** ——
+   上下文不是合法 tar。最可能的原因是**客户端已经把 context 压过了**，而我们又压了一层，
+   kaniko 解开外层拿到一个压缩流。两个真实来源：classic builder 的 `--compress`（`docker compose build`
+   会走这条路），以及把 context 写成 `.tar.gz` URL。判据：日志里那句
+   `Packing the build context (N as received)` 后面会跟一条
+   `the client sent it gzip-compressed; unwrapping it, then re-gzipping for kaniko`。
+   moby 的 daemon 是靠 magic 嗅探解压的（`archive.DecompressStream`，支持 gzip/bzip2/xz/zstd），
+   daemon 现在也这么做。若格式是 zstd 且本机 Python < 3.14 又没有 `zstandard` 包，
+   会直接报错说明（不会产出坏 tar）。
 
 ## Compose（OSM-style）
 

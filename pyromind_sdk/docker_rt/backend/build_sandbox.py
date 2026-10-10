@@ -39,9 +39,11 @@ required. See ``docker_rt/builder-image/kaniko/README.md``.
 from __future__ import annotations
 
 import asyncio
+import bz2
 import gzip
 import io
 import logging
+import lzma
 import os
 import re
 import secrets
@@ -630,9 +632,74 @@ def _single_file_tar(name: str, payload: bytes) -> bytes:
     return buf.getvalue()
 
 
+#: 客户端**可能**发来已经压过的 build context —— moby 的 daemon 就是靠 magic 嗅探再解压的
+#: （``archive.DecompressStream``），所以我们也必须这么做。不这么做的话我们会把它**再压一层**，
+#: 于是 kaniko 解开外层后拿到一个压缩流，tar 直接报
+#: ``archive/tar: invalid tar header``（0.1 秒就挂，而且看起来完全不像压缩问题）。
+#: 两个真实来源：classic builder 的 ``--compress``；context 写成 ``.tar.gz`` URL 时。
+_CONTEXT_MAGIC: tuple[tuple[bytes, str], ...] = (
+    (b"\x1f\x8b", "gzip"),
+    (b"BZh", "bzip2"),
+    (b"\xfd7zXZ\x00", "xz"),
+    (b"\x28\xb5\x2f\xfd", "zstd"),
+)
+
+
+def context_compression(blob: bytes) -> str:
+    """这份 context 自己是什么压缩格式；``""`` 表示就是个裸 tar。"""
+    for magic, kind in _CONTEXT_MAGIC:
+        if blob[: len(magic)] == magic:
+            return kind
+    return ""
+
+
+def decompress_build_context(blob: bytes) -> bytes:
+    """把客户端压过的 context 解开。解不开就抛 ``ValueError``，而且信息要能照做。"""
+    kind = context_compression(blob)
+    if not kind:
+        return blob
+    try:
+        if kind == "gzip":
+            return gzip.decompress(blob)
+        if kind == "bzip2":
+            return bz2.decompress(blob)
+        if kind == "xz":
+            return lzma.decompress(blob)
+        if kind == "zstd":
+            try:
+                from compression import zstd  # Python 3.14+ 自带
+
+                return zstd.decompress(blob)
+            except ImportError:
+                pass
+            try:
+                import zstandard  # 第三方
+            except ImportError:
+                raise ValueError(
+                    "the build context arrived zstd-compressed, and this daemon has no "
+                    "zstd support (needs Python 3.14+ or the 'zstandard' package). "
+                    "Send it uncompressed instead: docker build --compress=false, or "
+                    f"build from a directory rather than a .tar.{kind} URL"
+                ) from None
+            return zstandard.ZstdDecompressor().decompress(blob)
+    except ValueError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 统一成一句能照做的话
+        raise ValueError(
+            f"the build context looks {kind}-compressed but cannot be unpacked: {exc}"
+        ) from exc
+    raise ValueError(f"unsupported build-context compression: {kind}")
+
+
 def pack_build_context(tar_bytes: bytes) -> bytes:
-    """Gzip the Docker build context — kaniko's ``tar://`` scheme needs gzip."""
-    return gzip.compress(tar_bytes, compresslevel=1, mtime=0)
+    """Gzip the Docker build context — kaniko's ``tar://`` scheme needs gzip.
+
+    客户端可能**已经压过**（见 :func:`context_compression`）；那就先解开再压。
+    直接压两层的话，kaniko 只会报 ``archive/tar: invalid tar header``。
+    """
+    return gzip.compress(
+        decompress_build_context(tar_bytes), compresslevel=1, mtime=0
+    )
 
 
 def context_warn_bytes() -> int:
@@ -1345,7 +1412,15 @@ async def build_in_sandbox(
     # and its failure should not cost a sandbox.
     try:
         pack_started = time.monotonic()
-        yield stage(f"Packing the build context ({human_size(len(tar_bytes))} raw)…")
+        yield stage(f"Packing the build context ({human_size(len(tar_bytes))} as received)…")
+        arrived_as = context_compression(tar_bytes)
+        if arrived_as:
+            # 这条很重要：否则"客户端压过"这件事在日志里完全看不出来，
+            # 而它的症状（archive/tar: invalid tar header）看起来像我们自己坏了。
+            yield stage(
+                f"  the client sent it {arrived_as}-compressed; unwrapping it, "
+                "then re-gzipping for kaniko"
+            )
         packed = pack_build_context(tar_bytes)
     except Exception as exc:
         yield buildkit.error_event(f"cannot pack the build context: {exc}")

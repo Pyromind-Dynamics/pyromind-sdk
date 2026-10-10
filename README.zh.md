@@ -1140,6 +1140,7 @@ PyromindSDK 后端本地端口转发暂不支持，
 | 构建沙箱卡在拉构建器镜像（`ImagePullBackOff`） | 默认构建器镜像**按集群**选（`cn-east-1` 及其 `#pre`/`#pre2` → 上海 ACR 的 VPC 内网地址，其它集群 → Docker Hub）；daemon 的集群标识不对就会去拉一个拉不到的地址 | 确认 `PYROMIND_CLUSTER` / `--cluster` 与目标集群一致；要换版本或换自己的 mirror 就显式设 `DOCKER_RT_BUILD_IMAGE` 后**重启 daemon** |
 | `docker build` 报 `DOCKER_RT_BUILD_REGISTRY is required to push short tags` | 用了短 tag（`-t myapp`）但推不出前缀 | 设 `DOCKER_RT_BUILD_REGISTRY`（或在集群 profile 里配 `DOCKER_RT_REGISTRY_NAMESPACE`），或把 tag 写成完整地址 `docker.io/you/myapp:1` |
 | 构建全跑完，最后一行是 `401 Unauthorized`（`error pushing image`） | **仓库路径**或凭据不对。ACR 的路径是 `<host>/<namespace>/<repo>`：`DOCKER_RT_BUILD_REGISTRY` 只写主机名的话，ACR 会把仓库名当成命名空间。注意 `docker login <host>` 成功**说明不了**仓库路径对不对 | 在前缀里补上命名空间（哪个都行，由参数决定、代码不会替你补）；daemon 现在会在**构建之前**就拒绝只有 host 的前缀。凭据方面 ACR 要的是实例自己的用户名 + 临时 token，Docker Hub 账号在这里没用 |
+| kaniko 秒挂：`error resolving source context: archive/tar: invalid tar header` | 上下文不是合法 tar —— 多数是**客户端已经把 context 压过**（`docker compose build` 走 classic builder 的 `--compress`，或 context 写成了 `.tar.gz` URL），再压一层就废了 | 已修：daemon 现在像 moby 一样先按 magic 嗅探、该解压就解压（gzip/bzip2/xz/zstd）。判据见日志里 `the client sent it …-compressed; unwrapping it…` 那行 |
 | `docker build` 报 `cannot create build sandbox (...)` 且提到挂载/subPath | 工作区里 `/workspace/docker_images` 目录不存在（它是产物归档的挂载源） | 先建好该目录（Jupyter / 工作区里 `mkdir -p docker_images`）再重试 |
 | 构建成功但没找到 tarball | 归档是构建**最后**一步；或目录不可写 | 看日志有没有 `==> This image is also archived to …`；没有就是归档那步失败了 |
 | API 错误没有 `trace_id` | 该操作没有真正请求到 k8s-middleware（本地校验直接返回） | 只有带 `x-trace-id` 响应头的后端请求错误才会显示 `trace_id=` |
