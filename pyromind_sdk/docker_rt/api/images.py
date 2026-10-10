@@ -9,6 +9,7 @@ from typing import Any, Iterable
 
 from fastapi import APIRouter, Request
 
+from ..backend.buildkit import normalize_for_registry
 from ..backend.runtime import DEFAULT_IMAGE
 
 router = APIRouter(tags=["images"])
@@ -104,6 +105,14 @@ def resolve_image_name(ref: str, names: Iterable[str]) -> str | None:
     for n in known:
         if ref == n or ref == _repo_tag(n):
             return n
+    # 名字可能被 registry 规范化过（ACR 不接受连续分隔符等，见
+    # buildkit.normalize_for_registry）—— 拿规范化后的形式再比一次，否则
+    # `docker inspect <用户写的原名>` 会在 404 和 200 之间飘。
+    normalized = normalize_for_registry(ref)
+    if normalized != ref:
+        for n in known:
+            if normalized == n or normalized == _repo_tag(n):
+                return n
     # Full or bare content digest
     bare = _strip_sha256(ref)
     for n in known:

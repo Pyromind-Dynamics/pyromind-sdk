@@ -15,6 +15,7 @@ import bz2
 import gzip
 import io
 import json
+import logging
 import lzma
 import re
 import tarfile
@@ -70,6 +71,10 @@ def _clear(monkeypatch: pytest.MonkeyPatch) -> None:
     # which would shift every scripted response queue. Tests that are about the
     # probe set this back to ``fail``/``warn`` themselves.
     monkeypatch.setenv("DOCKER_RT_BUILD_PUSH_CHECK", "off")
+    # 构建沙箱清扫是 **opt-in**（默认关，见 sandbox_sweep_enabled）：这里显式打开，
+    # 让清扫相关的测试测的是"打开之后"的行为；"默认必须是关"由
+    # test_the_build_sandbox_sweep_is_off_unless_asked 单独盯着。
+    monkeypatch.setenv("DOCKER_RT_BUILD_SANDBOX_SWEEP", "true")
 
 
 def _set_push_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2488,11 +2493,16 @@ class _FakeSandboxListing:
         *,
         list_error: Exception | None = None,
         delete_error: Exception | None = None,
+        status: str = "running",
+        fail_deletes: int = 0,
     ) -> None:
         self.sandboxes = list(sandboxes or [])
         self.list_error = list_error
         self.delete_error = delete_error
+        self.status = status
+        self.fail_deletes = fail_deletes
         self.deleted: list[str] = []
+        self.paused: list[str] = []
         self.closed = False
 
     async def list(self) -> list[Any]:
@@ -2500,9 +2510,22 @@ class _FakeSandboxListing:
             raise self.list_error
         return list(self.sandboxes)
 
+    async def get_sandbox(self, sandbox_id: str, **_kwargs: Any) -> Any:
+        return SimpleNamespace(id=sandbox_id, status=self.status)
+
+    async def pause(self, sandbox_id: str, **_kwargs: Any) -> Any:
+        self.paused.append(sandbox_id)
+        return SimpleNamespace(id=sandbox_id, status="stopped")
+
     async def delete(self, sandbox_id: str, **_kwargs: Any) -> None:
         if self.delete_error is not None:
             raise self.delete_error
+        if self.fail_deletes > 0:
+            self.fail_deletes -= 1
+            raise RuntimeError(
+                "INTERNAL_SERVER_ERROR: InstanceService.delete_instance-"
+                "instance`s status is Running, can not delete!"
+            )
         self.deleted.append(sandbox_id)
 
     async def close(self) -> None:
@@ -3007,3 +3030,113 @@ def test_an_unsupported_context_compression_fails_with_something_actionable() ->
     text = str(caught.value)
     assert "zstd" in text
     assert "--compress=false" in text or "zstandard" in text
+
+
+@pytest.mark.asyncio
+async def test_sweep_pauses_a_running_sandbox_before_deleting_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """平台的规矩：**Running 的实例删不掉**，必须先 pause。
+
+    2026-10-10 实测的报错就是这句 —— `docker rm` / `docker rm -f` 走的也是这套
+    （`PyromindSDK.cleanup()` → pause → delete）。而清扫里原来直接 `client.delete()`，
+    于是一个都没删掉过：构建沙箱的常态就是 Running（`sleep infinity`）。
+    """
+    _clear(monkeypatch)
+    name = _build_name()
+    client = _FakeSandboxListing([_sandbox(name)], status="running")
+
+    assert await build_sandbox.sweep_stale_build_sandboxes(client=client) == [name]
+    assert client.paused == [f"sb-{name}"], "Running 的沙箱必须先 pause"
+    assert client.deleted == [f"sb-{name}"]
+
+
+@pytest.mark.asyncio
+async def test_sweep_does_not_pause_a_sandbox_that_is_already_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非 Running 平台允许直接删 —— 少一次 pause 往返。"""
+    _clear(monkeypatch)
+    name = _build_name()
+    client = _FakeSandboxListing([_sandbox(name)], status="stopped")
+
+    assert await build_sandbox.sweep_stale_build_sandboxes(client=client) == [name]
+    assert client.paused == []
+    assert client.deleted == [f"sb-{name}"]
+
+
+@pytest.mark.asyncio
+async def test_sweep_retries_a_delete_that_races_the_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pause 的状态迁移要一会儿，delete 会先撞上"还在 Running" —— 退避重试。"""
+    _clear(monkeypatch)
+    monkeypatch.setattr(build_sandbox, "SWEEP_DELETE_RETRY_DELAY_S", 0.0)
+    name = _build_name()
+    client = _FakeSandboxListing([_sandbox(name)], status="running", fail_deletes=2)
+
+    assert await build_sandbox.sweep_stale_build_sandboxes(client=client) == [name]
+    assert client.paused == [f"sb-{name}"]
+    assert client.deleted == [f"sb-{name}"]      # 第三次成功
+
+
+@pytest.mark.asyncio
+async def test_sweep_reports_a_sandbox_that_simply_will_not_delete(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """一直删不掉就 warning 一次、继续下一个，绝不能把清扫整个带崩。"""
+    _clear(monkeypatch)
+    monkeypatch.setattr(build_sandbox, "SWEEP_DELETE_ATTEMPTS", 2)
+    monkeypatch.setattr(build_sandbox, "SWEEP_DELETE_RETRY_DELAY_S", 0.0)
+    name = _build_name()
+    client = _FakeSandboxListing([_sandbox(name)], status="running", fail_deletes=99)
+
+    with caplog.at_level(logging.WARNING):
+        removed = await build_sandbox.sweep_stale_build_sandboxes(client=client)
+
+    assert removed == [], "删不掉就不能报成删了"
+    assert "failed to delete leftover build sandbox" in caplog.text
+    assert client.paused == [f"sb-{name}"]
+
+
+def test_the_build_sandbox_sweep_is_off_unless_asked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**默认不清理**：``kill -9`` 漏下的沙箱交给用户自己删。
+
+    用户 2026-10-10：「我感觉你这个最后清理的有问题啊，不要清理了，用户自己停，
+    或者自己删除吧」。理由：前缀 + 账号级的 ``list()`` 分不出"崩溃漏下的"和
+    "另一台机器上正在跑的构建"的沙箱，清错就把别人的构建删了。
+    所以默认关，只有 ``DOCKER_RT_BUILD_SANDBOX_SWEEP=true`` 才开。
+    """
+    monkeypatch.delenv("DOCKER_RT_BUILD_SANDBOX_SWEEP", raising=False)
+    assert build_sandbox.sandbox_sweep_enabled() is False
+
+    for value in ("true", "1", "on", "yes"):
+        monkeypatch.setenv("DOCKER_RT_BUILD_SANDBOX_SWEEP", value)
+        assert build_sandbox.sandbox_sweep_enabled() is True, value
+
+    # 空值 / 乱七八糟的值 = 关（不能因为拼错就变成"悄悄开始删")
+    for value in ("", "false", "0", "no", "maybe"):
+        monkeypatch.setenv("DOCKER_RT_BUILD_SANDBOX_SWEEP", value)
+        assert build_sandbox.sandbox_sweep_enabled() is False, value
+
+
+@pytest.mark.asyncio
+async def test_a_disabled_sweep_deletes_nothing_and_says_how_to_do_it_by_hand(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """关掉之后：一个都不删、一次 ``list()`` 都不发，只留一条"自己怎么删"的提示。"""
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_SANDBOX_SWEEP", "false")
+    name = _build_name()
+    client = _FakeSandboxListing([_sandbox(name)])
+
+    with caplog.at_level(logging.INFO):
+        removed = await build_sandbox.sweep_stale_build_sandboxes(client=client)
+
+    assert removed == []
+    assert client.deleted == []
+    assert client.paused == []
+    assert "sweep is off" in caplog.text
+    assert "docker rm -f" in caplog.text

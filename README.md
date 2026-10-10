@@ -141,7 +141,7 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 | `DOCKER_RT_BUILD_TIMEOUT` | `3600` | Timeout (seconds) for one build |
 | `DOCKER_RT_BUILD_SANDBOX_CPU` / `_MEMORY` | `2` / `4Gi` | Build sandbox resources |
 | `DOCKER_RT_BUILD_SANDBOX_KEEP` | `false` | Keep the build sandbox (troubleshooting only). It also skips the `kill -9` sweep below, otherwise the flag would defeat itself |
-| `DOCKER_RT_BUILD_SANDBOX_SWEEP` | `true` | On `kill -9` the sandbox teardown is skipped, leaving a `sleep infinity` sandbox **running** against the user's quota — more expensive than a staged context. Build sandboxes are named `sandbox-docker-build-<random>`, and after restoring the Docker context the watcher deletes every sandbox whose name carries that prefix. Set `false` to disable |
+| `DOCKER_RT_BUILD_SANDBOX_SWEEP` | `false` | On `kill -9` the sandbox teardown is skipped, leaving a `sleep infinity` sandbox **running** against the user's quota. **Nothing is cleaned up automatically by default** (opt-in): the rule is "name starts with `sandbox-docker-build-`" over an **account-scoped** `list()`, so it cannot tell a leaked sandbox from one a *live* build on another machine is using — deleting the wrong one kills that build. Set `true` to re-enable; otherwise remove leftovers yourself (`docker ps \| grep sandbox-docker-build`, `docker rm -f`) — the watcher prints a reminder |
 | `DOCKER_RT_BUILD_CONTEXT_MODE` | `auto` | How the build context reaches the sandbox: `auto` (storage first, fall back to a direct upload) / `storage` (storage or fail) / `upload` (never touch storage — the old HTTP route). Storage is the default because the direct route pushes one exec websocket per 2 MiB **serially**: 631 s for 61 MiB (~110 KB/s), unusable for multi-GB ML contexts. Storage uploads the tar.gz to the user's workspace object store with parallel parts and the cluster reads it **locally** through a mount (60 MiB: ~59 s upload + 2.7 s in-cluster copy) |
 | `DOCKER_RT_BUILD_STAGING_MOUNT` | `/kaniko/docker-rt-stage` | Mount target (in-Pod path) for the storage route. It sits under `/kaniko` for consistency with the workdir; **mounts are not affected by kaniko's wipe** — kaniko adds every mount point from `/proc/self/mountinfo` to its ignore list, so `DeleteFilesystem` skips those trees wholesale |
 | `DOCKER_RT_BUILD_STAGING_PREFIX` | `.docker-rt-build` | Workspace-relative directory holding staged contexts; each build gets a unique `<build-id>/` subdirectory, removed afterwards (success or failure) |
@@ -236,6 +236,13 @@ DOCKER_RT_ACR_INSTANCE_ID=cri-xxxxxxxxxxxx
 > pre-creation step is skipped, and ACR answers a push to a **nonexistent** repository
 > with `401 UNAUTHORIZED: authentication required` too, which is easy to misread as a
 > credential problem. Skip this group if the repository was created by hand.
+
+**Repository names are normalized automatically.** ACR's rules are stricter than the
+general Docker ones (length 2–120, only lowercase letters/digits and `_ - . /`, no
+separator at either end and no two in a row), so the name is normalized when the build
+composes the push ref (`__`→`_`, …) and the same function runs on `docker create`/`run`,
+so the original name still resolves. Only applies to *this* cluster's ACR — Docker Hub and
+generic registries are left untouched.
 
 `DOCKER_RT_READY_TIMEOUT` / `--ready-timeout` controls the docker-rt server's
 sandbox readiness wait. It does not change the Docker client's HTTP timeout.

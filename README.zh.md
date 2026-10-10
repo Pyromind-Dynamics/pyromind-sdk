@@ -549,7 +549,7 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 | `DOCKER_RT_BUILD_TIMEOUT` | `3600` | 单次构建（沙箱内命令）超时秒数 |
 | `DOCKER_RT_BUILD_SANDBOX_CPU` / `_MEMORY` | `2` / `4Gi` | 构建沙箱资源 |
 | `DOCKER_RT_BUILD_SANDBOX_KEEP` | `false` | `true` 时不删构建沙箱（仅供排障）。同时会让 `kill -9` 后的沙箱清扫跳过，否则这个旗子等于没设 |
-| `DOCKER_RT_BUILD_SANDBOX_SWEEP` | `true` | `kill -9` 时沙箱的 `finally` 不会跑，构建沙箱会以 `sleep infinity` **一直跑着**占配额（比 staged context 更贵）。watcher 恢复完 Docker context 后把名字以 `sandbox-docker-build-` 开头的沙箱**全部删掉**；设 `false` 关闭 |
+| `DOCKER_RT_BUILD_SANDBOX_SWEEP` | `false` | `kill -9` 时沙箱的 `finally` 不会跑，构建沙箱会以 `sleep infinity` **一直跑着**占配额。**默认不自动清理**：这条规则是"名字以 `sandbox-docker-build-` 开头就删"+ 账号级 `list()`，分不出"崩溃漏下的"和"另一台机器上正在跑的构建"，清错就删了别人的构建。设 `true` 才开启；默认下漏下的沙箱由用户自己 `docker ps` + `docker rm -f` 清 |
 | `DOCKER_RT_BUILD_CONTEXT_MODE` | `auto` | context 进沙箱的路由：`auto`（先走 storage 挂载，失败自动回退直传）/ `storage`（只走 storage，失败即构建失败）/ `upload`（完全不碰 storage，回到旧的 HTTP 直传）。**默认走 storage**：直传是「每 2 MiB 一个 exec websocket」串行推，实测 61 MiB 要 631 s（≈110 KB/s），多 GB 的 ML context 基本不可用；storage 把 tar.gz 用并发分片传进用户工作区对象存储，集群侧再从挂载**本地读**（60 MiB：~59 s 上传 + 2.7 s 集群内拷贝）。详见 `pyromind_sdk/docker_rt/README.md` 的「context 怎么送进沙箱」 |
 | `DOCKER_RT_BUILD_STAGING_MOUNT` | `/kaniko/docker-rt-stage` | storage 路由的挂载目标（Pod 内路径）。放在 `/kaniko` 下是为了和工作目录保持一致；**挂载本身不受 kaniko 清盘影响**（kaniko 会把 `/proc/self/mountinfo` 里的每个挂载点自动加进忽略列表，切 stage 时整棵子树跳过） |
 | `DOCKER_RT_BUILD_STAGING_PREFIX` | `.docker-rt-build` | 工作区里存放 staged context 的目录（工作区相对路径）；每次构建一个唯一 `<build-id>/` 子目录，构建结束（含失败）清掉 |
@@ -635,6 +635,11 @@ DOCKER_RT_ACR_INSTANCE_ID=cri-xxxxxxxxxxxx
 > 写错的环境变量会被**静默忽略** —— 后果是建仓被跳过，而 ACR 在**仓库不存在**时也是回
 > `401 UNAUTHORIZED: authentication required`，很容易误判成凭据问题。
 > 仓库已经人工建好的话，这三个可以不设。
+
+**仓库名会自动规范化。** ACR 的仓库名限制比通用 Docker 规则严（长度 2–120、只允许小写字母/数字与
+`_ - . /`、分隔符不能在首尾也不能连续），所以构建时会按这套规则规范化一次（`__`→`_` 等），
+`docker create`/`run` 时也会过同一个函数 —— 拿原来的名字照样能找到镜像。
+只对本集群那台 ACR 生效，Docker Hub / 通用 registry 的名字一字不改。
 
 默认 `k8s-middleware` 后端会检查 `PYROMIND_API_KEY` 和 `PYROMIND_CLUSTER`，
 缺失时逐个提示输入。连接成功后会用彩色打印当前参数，并在启动时同步一次
