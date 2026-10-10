@@ -652,3 +652,121 @@ def test_push_plan_reports_missing_credentials(monkeypatch: pytest.MonkeyPatch) 
     plan = registry_push.push_plan()
     assert not plan.has_credentials
     assert plan.credential_source == ""
+
+
+def test_registry_prefix_error_catches_a_host_only_acr_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ACR 必须 ``<host>/<namespace>/<repo>``；只给 host 会把 repo 名当成 namespace。
+
+    2026-10-09 实测：用户设 ``DOCKER_RT_BUILD_REGISTRY=pyromind-registry.cn-shanghai.cr.aliyuncs.com``，
+    推 ``…/pyromind-console:dev-5``（少了 ``/pyromind``）→ kaniko 构建 91 秒全成功，
+    最后一行才 ``401 Unauthorized``；而同一个 host 的 ``docker login`` 是成功的。
+    这条要在**构建之前**拒绝，并告诉用户该写什么。
+    """
+    from ..backend import registry_push
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1#pre")
+
+    # 用户当时那个值（公网 host，profile 里是 public_host）
+    error = registry_push.registry_prefix_error(
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com"
+    )
+    assert error
+    assert "401" in error
+    # 措辞不能读成"代码要替你填 pyromind" —— 命名空间由参数给，且哪个都行
+    assert "entirely yours to choose" in error
+    assert "Nothing is appended for you" in error
+
+    # VPC host 也一样
+    assert registry_push.registry_prefix_error(
+        "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com"
+    )
+
+    # 带命名空间就没事；推**别的** registry 也不按 ACR 的规矩评判
+    assert (
+        registry_push.registry_prefix_error(
+            "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind"
+        )
+        is None
+    )
+    assert registry_push.registry_prefix_error("myharbor.example.com") is None
+    assert registry_push.registry_prefix_error("") is None
+
+
+def test_registry_prefix_error_accepts_any_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """命名空间是**参数**里给的东西，用户可以随便换 —— 换命名空间不该改代码。
+
+    用户原话（2026-10-09）："你不要默认加吧，还像以前一样，在参数中，
+    不然这样以后换命名空间或者推送不同的命名空间还要改代码，很麻烦"。
+    所以这个检查只做一件事：**前缀里得有命名空间**；是哪个、有几个，都由参数决定。
+    """
+    from ..backend import registry_push
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1#pre")
+
+    for prefix in (
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/other-ns",
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/team/sub",
+        "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/a",
+    ):
+        assert registry_push.registry_prefix_error(prefix) is None, prefix
+
+
+def test_registry_prefix_error_is_acr_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Docker Hub / 未知 registry 集群不做这个判断（各有各的规矩）。"""
+    from ..backend import registry_push
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_CLUSTER", "us-west-2")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_NAMESPACE", "lvniqi")
+    assert registry_push.registry_prefix_error("docker.io") is None
+
+
+def test_unknown_env_warnings_name_the_typo() -> None:
+    """拼错的变量会被静默忽略 —— 必须连 did-you-mean 一起点出来。
+
+    2026-10-09 用户把 ``DOCKER_RT_ACR_ACCESS_KEY_SECRET`` 写成 ``DOCKER_RT_ACR_SECRET``，
+    后果不是"少了个配置"，而是**建仓那一步被跳过**，然后在 216 秒后拿到一个裸 401。
+    """
+    from ..backend import registry_push
+
+    warnings = registry_push.unknown_env_warnings(
+        {
+            "DOCKER_RT_ACR_SECRET": "oops",
+            "DOCKER_RT_REGISTRY_USERNMAE": "oops",
+            "DOCKER_RT_ACR_ACCESS_KEY_ID": "fine",
+            "PATH": "/usr/bin",
+            "SOMETHING_ELSE": "not ours",
+        }
+    )
+    text = "\n".join(warnings)
+    assert "DOCKER_RT_ACR_SECRET" in text
+    assert "did you mean DOCKER_RT_ACR_ACCESS_KEY_SECRET?" in text
+    assert "DOCKER_RT_REGISTRY_USERNMAE" in text
+    # 认识的、以及不是我们前缀的，都不该出现在报告里
+    assert "DOCKER_RT_ACR_ACCESS_KEY_ID" not in text
+    assert "PATH" not in text
+    assert "SOMETHING_ELSE" not in text
+
+
+def test_the_known_env_list_covers_every_name_the_code_reads() -> None:
+    """``KNOWN_*`` 必须覆盖代码真正读的那些名字，否则会有误报。
+
+    这条是自查：扫 ``registry_push.py`` 里的 ``_env("DOCKER_RT_...")`` 字面量，
+    任何一个不在白名单里都会让上面那个体检把**正确**的变量报成拼错的。
+    """
+    import re
+    from pathlib import Path
+
+    from ..backend import registry_push
+
+    source = Path(registry_push.__file__).read_text(encoding="utf-8")
+    read_names = set(re.findall(r'_env\(\s*"(DOCKER_RT_[A-Z0-9_]+)"', source))
+    assert read_names, "没扫到任何 _env(\"DOCKER_RT_...\") —— 正则或代码结构变了"
+    known = set(registry_push.KNOWN_ENV)
+    assert read_names <= known, f"这些变量代码会读但不在白名单里：{sorted(read_names - known)}"

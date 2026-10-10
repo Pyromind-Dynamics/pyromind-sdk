@@ -342,6 +342,45 @@ def _exec_chunk_bytes(data: Any) -> bytes:
     return str(data).encode("utf-8")
 
 
+#: Docker 在"命令根本没启动起来"时用的退出码（`executable file not found in $PATH`）。
+#: 用 127 而不是 1：脚本和 agent 判断"命令不存在"看的就是这个数，Docker 也是这样。
+EXEC_CANNOT_START_CODE = 127
+
+
+def _silent_exec_message(cmd: list[str]) -> str:
+    """用户看到"什么都没有"时，按 Docker 的措辞把成因说出来。
+
+    平台对这个通道**不收 argv 里的空格**：``docker exec cid "echo hello"`` 是**一个**
+    argv 元素（和 Docker 一样，CLI 不拆分引号里的空格），沙箱里没有叫 ``echo hello``
+    的可执行文件，于是流里一个字节都没有、退出码也拿不到 —— 和"容器默默忽略了这条
+    命令"无法区分。
+
+    真 Docker 这时说的是
+    ``OCI runtime exec failed: … exec: "echo hello": executable file not found in $PATH``
+    并退 127。这里保留那句**可被 grep 的原文**（工具/agent 认的是它），
+    再补一条怎么改。
+    """
+    joined = " ".join(cmd)
+    spaced = next((part for part in cmd if " " in part), "")
+    if spaced:
+        lines = [
+            f'docker-rt: exec: "{spaced}": executable file not found in $PATH',
+            "  The command is passed as argv (same as Docker), so a single argument "
+            "containing spaces is NOT split — there is no executable with that name.",
+            "  For shell syntax use an explicit shell: "
+            f"docker exec <cid> sh -c '{joined}'",
+        ]
+        return "\n".join(lines)
+    return "\n".join(
+        [
+            f"docker-rt: cannot start {joined!r} in the container: it produced no "
+            "output and the platform reported no exit code",
+            "  The command most likely never ran — check that the binary exists in "
+            "the container and that the sandbox is still running.",
+        ]
+    )
+
+
 async def _write_exec_error(
     resp: web.StreamResponse, message: str, *, tty: bool
 ) -> None:
@@ -428,6 +467,7 @@ async def _stream_pyromind_exec(
             "pyromind exec stream aborted by client id=%s",
             session_id[:12] or "?",
         )
+        returncode = -2
     except Exception as exc:
         # Never swallow this one. ``SandboxExecStreamError`` (a RuntimeError)
         # lands here whenever the platform rejects the command — a missing
@@ -440,6 +480,21 @@ async def _stream_pyromind_exec(
             exc,
         )
         await _write_exec_error(resp, f"docker-rt: {exc}", tty=tty)
+        returncode = 1
+    if returncode < 0:
+        # 平台把退出码丢了（它自己的哨兵值 -1）。**零输出 + 零退出码**是"命令根本
+        # 没跑起来"的签名，而它在客户端看起来和"容器默默无视了这条命令"一模一样 ——
+        # 2026-10-10 用户就是被这个卡住的。按 Docker 的规矩：说清楚，并退 127
+        # （`executable file not found` 的码），让脚本/agent 能判断"命令不存在"。
+        logger.warning(
+            "pyromind exec stream id=%s ended without an exit code (out=%d err=%d)",
+            session_id[:12] or "?",
+            out_n,
+            err_n,
+        )
+        if out_n == 0 and err_n == 0:
+            await _write_exec_error(resp, _silent_exec_message(cmd), tty=tty)
+        returncode = EXEC_CANNOT_START_CODE
     logger.info(
         "pyromind exec stream id=%s out=%d err=%d code=%s",
         session_id[:12] or "?",
