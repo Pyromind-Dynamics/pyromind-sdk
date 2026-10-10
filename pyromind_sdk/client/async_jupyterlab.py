@@ -48,6 +48,11 @@ class AsyncJupyterLabClient(PyroMindAsyncClient):
             "resources": instance_data.get("resources"),
             "created_at": instance_data.get("created_at"),
             "updated_at": instance_data.get("updated_at") or instance_data.get("last_activity"),
+            "ssh_user": instance_data.get("ssh_user"),
+            "ssh_port": instance_data.get("ssh_port"),
+            "ssh_ip": instance_data.get("ssh_ip"),
+            "namespace": instance_data.get("namespace"),
+            "uid": instance_data.get("uid"),
         }
         converted_instance = {
             k: v for k, v in converted_instance.items()
