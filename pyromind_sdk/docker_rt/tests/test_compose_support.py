@@ -336,3 +336,184 @@ async def test_create_with_compose_labels_and_mounts(
     data = await insp.json()
     assert data["Config"]["Hostname"] == "db"
     assert "proj_default" in data["NetworkSettings"]["Networks"]
+
+
+# --------------------------------------------------------------------------
+# 仓库名规范化（上海 ACR 的命名限制）
+# --------------------------------------------------------------------------
+
+
+def _acr_cluster(monkeypatch: pytest.MonkeyPatch) -> None:
+    """把环境钉成上海集群（规范化只对 ACR 生效）。"""
+    for name in ("DOCKER_RT_REGISTRY_CLUSTER", "DOCKER_RT_CLUSTER", "DOCKER_RT_KUBE_CONTEXT"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1#pre")
+
+
+def test_normalize_repository_name_follows_the_acr_rules() -> None:
+    """ACR：长度 2–120、只允许小写字母数字和 `_ - . /`、分隔符不能在首尾也不能连续。
+
+    2026-10-10 用户给出的规则。benchmark 生成的
+    `wasmi-trap-coredumps__3xyt67d-pier-egress-proxy` 里那个 `__` 正好非法。
+    """
+    from ..backend.buildkit import normalize_repository_name as norm
+
+    # 双下划线（pier 的 `<task>__<hash>` 命名）收敛成一个
+    assert norm("wasmi-trap-coredumps__3xyt67d-pier-egress-proxy") == (
+        "wasmi-trap-coredumps_3xyt67d-pier-egress-proxy"
+    )
+    assert norm("a--b") == "a-b"
+    assert norm("a//b") == "a/b"
+    assert norm("a..b") == "a.b"
+    # 大写 → 小写；非法字符 → `-`
+    assert norm("MyApp") == "myapp"
+    assert norm("app@1") == "app-1"
+    assert norm("app name") == "app-name"
+    # 首尾的分隔符要去掉（`datacurve/wasmi-trap-coredumps` 那种带 `/` 的名字）
+    assert norm("_app_") == "app"
+    assert norm("/app/") == "app"
+    assert norm("app.") == "app"
+
+
+def test_normalize_repository_name_is_idempotent() -> None:
+    """必须幂等：构建时拼的 ref 和 create/run 时给的名字都会过一遍。"""
+    from ..backend.buildkit import normalize_repository_name as norm
+
+    for raw in (
+        "wasmi-trap-coredumps__3xyt67d-pier-egress-proxy",
+        "My__App",
+        "a--b//c..d",
+        "x" * 300,
+        "sweb.eval.x86_64.astropy_1776_astropy-12907",
+    ):
+        once = norm(raw)
+        assert norm(once) == once, raw
+
+
+def test_normalize_repository_name_keeps_the_length_limit() -> None:
+    """超过 120 要截断，但**不能**让两个长名字撞进同一个仓库（贴短指纹）。"""
+    from ..backend.buildkit import ACR_NAME_MAX, normalize_repository_name as norm
+
+    long_a = "task-" + "a" * 200
+    long_b = "task-" + "b" * 200
+    a, b = norm(long_a), norm(long_b)
+    assert len(a) == len(b) == ACR_NAME_MAX
+    assert a != b
+    # 结尾不能是分隔符（贴的是 8 位十六进制指纹）
+    assert a[-8:].isalnum()
+    assert not a.endswith(("-", "_", ".", "/"))
+
+
+def test_normalize_image_name_leaves_host_and_tag_alone() -> None:
+    from ..backend.buildkit import normalize_image_name as norm
+
+    assert norm("pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/App__1:Dev-5") == (
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/app_1:Dev-5"
+    )
+    # host 带端口时不能把端口当成 tag、更不能动 host
+    assert norm("reg.example.com:5000/ns/My__App:1") == "reg.example.com:5000/ns/my_app:1"
+    # digest 原样保留
+    assert norm("reg.example.com/ns/My__App@sha256:abc") == (
+        "reg.example.com/ns/my_app@sha256:abc"
+    )
+
+
+def test_normalize_for_registry_only_touches_acr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """只有"本集群那台 ACR 上的名字"才动；别的 registry 一个字都不改。
+
+    Docker Hub / 通用 registry 的规则更宽（`a__b` 合法），在那里改名反而拉不到。
+    """
+    from ..backend.buildkit import normalize_for_registry as norm
+
+    acr_ref = "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/My__App:1"
+
+    _acr_cluster(monkeypatch)
+    assert norm(acr_ref) == "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/my_app:1"
+    # 别人的 registry：不动
+    assert norm("docker.io/lvniqi/My__App:1") == "docker.io/lvniqi/My__App:1"
+
+    # 西部集群（Docker Hub profile）：连 ACR 地址都不当成自己的
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2#pre")
+    assert norm(acr_ref) == acr_ref
+    assert norm("docker.io/lvniqi/My__App:1") == "docker.io/lvniqi/My__App:1"
+
+
+def test_the_pushed_ref_is_normalized_on_an_acr_cluster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """构建时拼出来的 ref 就得是规范化过的 —— 建仓和推送都从它取名。"""
+    from ..backend.buildkit import normalize_image_ref
+
+    _acr_cluster(monkeypatch)
+    _short, pullable = normalize_image_ref(
+        "wasmi-trap-coredumps__3xyt67d-pier-egress-proxy:latest",
+        registry="pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind",
+    )
+    assert pullable == (
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/"
+        "wasmi-trap-coredumps_3xyt67d-pier-egress-proxy:latest"
+    )
+
+
+def test_create_and_run_resolve_a_name_that_was_normalized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """推上去的是规范化过的名字；用户（compose/benchmark）拿原名来 create/run 也要能找到。
+
+    这是用户明确要求的那一半：「在 create 或者 run 的时候也需要将镜像名称中
+    也需要这样处理下，不然会拉取不到」。
+    """
+    from ..backend.store import ContainerStore
+
+    _acr_cluster(monkeypatch)
+    store = ContainerStore()
+    raw = (
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/"
+        "wasmi-trap-coredumps__3xyt67d-pier-egress-proxy:latest"
+    )
+    normalized = (
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/"
+        "wasmi-trap-coredumps_3xyt67d-pier-egress-proxy:latest"
+    )
+    # 别名表里存的是**规范化后**的 pullable ref（构建时写进去的）
+    store.register_image_alias("wasmi-trap-coredumps__3xyt67d-pier-egress-proxy:latest", normalized)
+
+    # 原名来查 → 解析到规范化后的那个（不然会去拉一个不存在的仓库）
+    assert store.resolve_image(raw) == normalized
+    # 规范化的名字来查 → 一样
+    assert store.resolve_image(normalized) == normalized
+    # 短名字（compose 用的那个 tag）照旧
+    assert (
+        store.resolve_image("wasmi-trap-coredumps__3xyt67d-pier-egress-proxy:latest")
+        == normalized
+    )
+
+
+def test_inspect_finds_an_image_under_its_normalized_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ..api.images import resolve_image_name
+
+    _acr_cluster(monkeypatch)
+    host = "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind"
+    assert resolve_image_name(f"{host}/app__x", [f"{host}/app_x"]) == f"{host}/app_x"
+
+
+def test_a_fully_qualified_acr_ref_is_normalized_but_other_registries_are_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """集群是 ACR 时：指向**这台 ACR** 的全限定 ref 也要守 ACR 的规矩；别人的不动。"""
+    from ..backend.buildkit import normalize_for_registry as norm
+
+    _acr_cluster(monkeypatch)
+    assert norm("pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/App__1:1") == (
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/app_1:1"
+    )
+    # VPC 入口也是同一台
+    assert norm("pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/App__1:1") == (
+        "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/app_1:1"
+    )
+    # 别人的 registry：一个字都不动
+    untouched = "docker.io/lvniqi/My__App:1"
+    assert norm(untouched) == untouched
+    assert norm("myharbor.example.com/ns/My__App:1") == "myharbor.example.com/ns/My__App:1"
