@@ -92,6 +92,7 @@ class SandboxClient(PyroMindClient):
             "resources": sandbox_data.get("resources"),
             "volume_mounts": sandbox_data.get("volume_mounts"),
             "port_mappings": sandbox_data.get("port_mappings"),
+            "uid": sandbox_data.get("uid"),
             "mount_public_dir": sandbox_data.get("mount_public_dir"),
         }
         
