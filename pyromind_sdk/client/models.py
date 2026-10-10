@@ -526,6 +526,11 @@ class JupyterResponse(BaseModel):
     url: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    ssh_user: Optional[str] = None
+    ssh_port: Optional[int] = None
+    ssh_ip: Optional[str] = None
+    namespace: Optional[str] = None
+    uid: Optional[str] = None
 
 
 class JupyterListAPIResponse(BaseModel):
@@ -639,6 +644,7 @@ class InferenceJobResponse(BaseModel):
     model_length: Optional[int] = None
     inf_image: Optional[str] = None
     startup_args: Optional[List[str]] = None
+    inf_sk: Optional[str] = None  # API key for calling the inference endpoint_url
 
 
 class InferenceJobListAPIResponse(BaseModel):
