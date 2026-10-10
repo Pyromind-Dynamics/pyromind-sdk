@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import bz2
 import gzip
 import io
 import json
+import logging
+import lzma
 import re
 import tarfile
 from types import SimpleNamespace
@@ -64,12 +67,20 @@ def _clear(monkeypatch: pytest.MonkeyPatch) -> None:
     # fixture below pins these tests to the direct-upload path; tests that
     # describe staging opt back in through ``_install_staging``.
     monkeypatch.setenv("DOCKER_RT_BUILD_CONTEXT_MODE", "upload")
+    # The push-reachability probe adds an exec right after the sandbox is ready,
+    # which would shift every scripted response queue. Tests that are about the
+    # probe set this back to ``fail``/``warn`` themselves.
+    monkeypatch.setenv("DOCKER_RT_BUILD_PUSH_CHECK", "off")
+    # 构建沙箱清扫是 **opt-in**（默认关，见 sandbox_sweep_enabled）：这里显式打开，
+    # 让清扫相关的测试测的是"打开之后"的行为；"默认必须是关"由
+    # test_the_build_sandbox_sweep_is_off_unless_asked 单独盯着。
+    monkeypatch.setenv("DOCKER_RT_BUILD_SANDBOX_SWEEP", "true")
 
 
 def _set_push_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     """Satisfy the push-credential precondition.
 
-    ``builder_image()`` has a default and the credential check is a hard
+    ``build_executor()`` has a default and the credential check is a hard
     pre-sandbox error, so any test that wants to reach the sandbox at all must
     call this — otherwise it aborts on "No push credentials configured" before
     the code under test ever runs.
@@ -96,13 +107,12 @@ def _direct_upload_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
 def _hide_builder_image(monkeypatch: pytest.MonkeyPatch) -> None:
     """Force the "no builder image" branch.
 
-    ``DOCKER_RT_BUILD_IMAGE`` now ships with a default, and ``_env`` treats an
-    empty value as "unset", so the only way to exercise the guard is to patch
-    the accessor.
+    ``build_executor()`` always resolves something (a per-cluster default), so the
+    only way to exercise that guard is to patch the accessor itself.
     """
     from ..backend import build_sandbox
 
-    monkeypatch.setattr(build_sandbox, "builder_image", lambda: "")
+    monkeypatch.setattr(build_sandbox, "build_executor", lambda: "")
 
 
 def _images_mount() -> dict[str, Any]:
@@ -491,6 +501,86 @@ def test_resolve_targets_does_not_re_resolve_an_empty_registry(
     assert aliases["myapp:latest"] == "myapp:latest"
 
 
+def test_build_executor_follows_the_cluster(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The default must be per cluster, not one hard-coded registry.
+
+    A node can only start a sandbox from an image it can pull, and the two mirrors
+    are mutually unreachable: the Shanghai ACR address is VPC-internal, Docker Hub
+    cannot be reached from Shanghai. One hard-coded default therefore breaks every
+    build on the other cluster with an image-pull failure.
+
+    The mapping lives in ``build_executor`` itself (one function, one place).
+    """
+    from ..backend import build_sandbox
+
+    hub = "docker.io/pyrominddynamics/kaniko-executor-pyromind:0.0.4"
+    acr = (
+        "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/"
+        "kaniko-executor-pyromind:0.0.4"
+    )
+
+    for cluster, expected in (
+        ("", hub),  # unknown cluster: the Docker Hub mirror
+        ("us-west-1", hub),
+        ("us-west-1#pre", hub),
+        ("us-west-2", hub),
+        ("cn-east-1", acr),
+        ("cn-east-1#pre", acr),
+        ("cn-east-1#pre2", acr),
+    ):
+        _clear(monkeypatch)
+        if cluster:
+            monkeypatch.setenv("PYROMIND_CLUSTER", cluster)
+        assert build_sandbox.build_executor() == expected, cluster
+
+    # The daemon-level variable wins over the platform one, and the stage suffix
+    # is dropped in both.
+    _clear(monkeypatch)
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-1#pre")
+    monkeypatch.setenv("DOCKER_RT_CLUSTER", "cn-east-1#pre2")
+    assert build_sandbox.build_executor() == acr
+
+
+def test_the_build_executor_ignores_the_push_cluster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Picking the builder image is not a registry concern.
+
+    ``DOCKER_RT_REGISTRY_CLUSTER`` exists to choose a push profile; the builder
+    image answers a different question ("which registry can this cluster's nodes
+    pull from"). Sharing that variable would make a push-profile tweak silently
+    move every build onto an image the cluster cannot reach.
+    """
+    from ..backend import build_sandbox
+
+    hub = "docker.io/pyrominddynamics/kaniko-executor-pyromind:0.0.4"
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_CLUSTER", "cn-east-1")
+    assert build_sandbox.build_executor() == hub  # not the ACR mirror
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_CLUSTER", "cn-east-1")
+    monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1")
+    assert "cn-shanghai" in build_sandbox.build_executor()  # the platform cluster decides
+
+    # A kube context is not a cluster identity here either.
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_KUBE_CONTEXT", "arn:aws:eks:cn-east-1:1:cluster/x")
+    assert build_sandbox.build_executor() == hub
+
+
+def test_build_executor_still_honours_the_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ..backend import build_sandbox
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1")
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "my.registry/builders/kaniko:v9-debug")
+    assert build_sandbox.build_executor() == "my.registry/builders/kaniko:v9-debug"
+
+
 def test_prerequisites_error_lists_every_missing_item(monkeypatch: pytest.MonkeyPatch) -> None:
     from ..backend.build_sandbox import build_prerequisites_error
 
@@ -741,6 +831,73 @@ async def test_build_in_sandbox_fully_qualified_tag_without_a_prefix(
         == "docker.io/lvniqi/pyromind-console:dev"
     )
     assert sandbox.cleaned
+
+
+@pytest.mark.asyncio
+async def test_a_failed_push_still_reports_the_archive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A push failure must not look like "nothing was produced".
+
+    kaniko writes the tarball before it pushes, so the image is on disk even when
+    the push fails (which, with ``--skip-push-permission-check``, is now where a
+    broken push target surfaces). The daemon checks and says where it is.
+    """
+    from ..backend import build_sandbox
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
+    _set_push_credentials(monkeypatch)
+
+    sandbox = _FakeBuildSandbox(
+        stdout="error checking push permission for \"reg.example.com\": i/o timeout\n",
+        returncode=1,
+    )
+    sandbox.exec_output = "yes\n"  # the archive is on disk
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
+    )
+    text = "".join(event.get("stream") or "" for event in events)
+
+    assert [event for event in events if event.get("error")]
+    assert (
+        "was archived to /workspace/docker_images/reg.example.com_rt_myapp_latest.tar"
+        in text
+    )
+    # The failure still fails the build: the alias must not be registered.
+    assert not any(event.get("docker_rt") for event in events)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_build_does_not_claim_an_archive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Dockerfile that failed wrote no tarball, so no archive line may appear."""
+    from ..backend import build_sandbox
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
+    _set_push_credentials(monkeypatch)
+
+    sandbox = _FakeBuildSandbox(stdout="error: no space left on device\n", returncode=1)
+    sandbox.exec_output = ""  # nothing was written
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
+    )
+    text = "".join(event.get("stream") or "" for event in events)
+
+    assert [event for event in events if event.get("error")]
+    assert "was archived to" not in text
 
 
 @pytest.mark.asyncio
@@ -1242,6 +1399,519 @@ def test_raw_tail_bounds_the_slice() -> None:
     assert "line 499" in tail
     assert "line 489" not in tail
     assert _raw_tail("") == ("", 0)
+
+
+class _Clock:
+    """A hand-wound ``time.monotonic``, so silence can be asserted exactly."""
+
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+class _TickingSandbox(_FakeBuildSandbox):
+    """Advances the fake clock once per exec, so the poll loop sees time pass.
+
+    The real clock cannot be used: the heartbeat and probe thresholds are tens
+    of seconds apart, and a test must not wait for them.
+    """
+
+    def __init__(self, clock: _Clock, step: float, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._clock = clock
+        self._step = step
+
+    async def iter_exec_stream(self, cmd: Any, **kwargs: Any):
+        async for chunk in super().iter_exec_stream(cmd, **kwargs):
+            yield chunk
+        self._clock.now += self._step
+
+
+async def _build_with_clock(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    step: float,
+    responses: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]], _TickingSandbox]:
+    """Drive one build on a fake clock and return its emitted text."""
+    from ..backend import build_sandbox
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
+    monkeypatch.setenv("DOCKER_RT_BUILD_POLL_INTERVAL_S", "0.001")
+    _set_push_credentials(monkeypatch)
+
+    clock = _Clock()
+    monkeypatch.setattr(build_sandbox, "time", clock)
+    sandbox = _TickingSandbox(clock, step, responses=list(responses))
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
+    )
+    return "".join(event.get("stream") or "" for event in events), events, sandbox
+
+
+@pytest.mark.asyncio
+async def test_silence_heartbeat_reports_total_silence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The heartbeat must report how long the log has really been quiet.
+
+    Regression: the message used to re-arm its own timer on every print, so it
+    always said "15-16s" — a build silent for twelve minutes read as "output is
+    still trickling in". That is what got a genuine hang misdiagnosed.
+    """
+    from ..backend import build_sandbox
+
+    monkeypatch.setattr(build_sandbox, "SILENCE_PROBE_AFTER_S", 1e9)  # probe off
+    text, events, _ = await _build_with_clock(
+        monkeypatch,
+        step=20.0,
+        responses=[
+            _launch(),
+            _poll(""),
+            _poll(""),
+            _poll(f"docker-rt-digest: {GOOD_DIGEST}\n", state="done rc=0"),
+        ],
+    )
+
+    # First heartbeat: silence has crossed the threshold once.
+    assert "no new log output for 20s" in text, text
+    # Second heartbeat: a *larger* total, not the interval all over again.
+    assert "no new log output for 40s" in text, text
+    assert not [event for event in events if event.get("error")], events
+
+
+@pytest.mark.asyncio
+async def test_a_silent_build_is_sampled_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Silence alone cannot tell "busy" from "stuck" — so the daemon measures.
+
+    kaniko writes nothing while it snapshots, so the verdict has to come from
+    somewhere other than its log: a ``/proc`` sample of the executor itself.
+    """
+    from ..backend import build_sandbox
+
+    monkeypatch.setattr(build_sandbox, "SILENCE_PROBE_AFTER_S", 0.0)
+    sample = "pid=42 state=R wchan=0 cpu_ticks=298 rss_kb=831488 rchar=0 disk_read=0 write=0\n"
+    text, events, sandbox = await _build_with_clock(
+        monkeypatch,
+        step=20.0,
+        responses=[
+            _launch(),
+            _poll(""),
+            {"stdout": sample},
+            _poll(f"docker-rt-digest: {GOOD_DIGEST}\n", state="done rc=0"),
+        ],
+    )
+
+    assert "live sample: pid=42 state=R" in text, text
+    assert "kaniko has produced nothing for 20s" in text, text
+    # A first sample has nothing to diff against, so it stays a plain reading...
+    assert "over " not in text.split("live sample:")[-1], text
+    # ...and the sample must come from the probe, not be invented by the daemon.
+    assert any("cpu_ticks=" in script for script in sandbox.scripts), sandbox.scripts
+    assert not [event for event in events if event.get("error")], events
+
+
+def test_describe_sample_reports_rates_not_counters() -> None:
+    """Two readings become a rate; the subtraction cannot live in the sandbox.
+
+    The executor image has no ``awk`` and no ``sleep``, so the probe takes one
+    instantaneous reading and the daemon does the arithmetic.
+    """
+    from ..backend.build_sandbox import _describe_sample
+
+    first = {
+        "pid": 42,
+        "state": "R",
+        "wchan": "0",
+        "rss_kb": 1024,
+        "cpu_ticks": 100,
+        "rchar": 10,
+        "disk_read": 20,
+        "write": 30,
+    }
+    walking = dict(first, cpu_ticks=140, rchar=12, disk_read=20, write=30)
+    line = _describe_sample(walking, first, seconds=60)
+
+    assert line.startswith("pid=42 state=R wchan=0 rss=1.0 MiB over 60s:"), line
+    assert "cpu_ticks=+40" in line, line
+    assert "read=+2" in line, line
+    assert "disk_read=+0" in line, line
+    assert "write=+0" in line, line
+
+    # A single reading still has to say something useful on its own.
+    alone = _describe_sample(first, {}, seconds=0)
+    assert alone == "pid=42 state=R wchan=0 rss=1.0 MiB", alone
+
+    # And "no executor" must not look like a hung one.
+    missing = _describe_sample({"pid": 0}, first, seconds=60)
+    assert "not found" in missing, missing
+
+
+@pytest.mark.asyncio
+async def test_a_failing_probe_does_not_fail_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe runs mid-build; it must never be able to change the outcome."""
+    from ..backend import build_sandbox
+
+    monkeypatch.setattr(build_sandbox, "SILENCE_PROBE_AFTER_S", 0.0)
+
+    class _ProbeExplodes(_TickingSandbox):
+        async def iter_exec_stream(self, cmd: Any, **kwargs: Any):
+            if "cpu_ticks" in cmd[2]:
+                raise RuntimeError("websocket went away")
+            async for chunk in super().iter_exec_stream(cmd, **kwargs):
+                yield chunk
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
+    monkeypatch.setenv("DOCKER_RT_BUILD_POLL_INTERVAL_S", "0.001")
+    _set_push_credentials(monkeypatch)
+
+    clock = _Clock()
+    monkeypatch.setattr(build_sandbox, "time", clock)
+    sandbox = _ProbeExplodes(
+        clock,
+        20.0,
+        responses=[
+            _launch(),
+            _poll(""),
+            _poll(f"docker-rt-digest: {GOOD_DIGEST}\n", state="done rc=0"),
+        ],
+    )
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
+    )
+    text = "".join(event.get("stream") or "" for event in events)
+
+    assert not [event for event in events if event.get("error")], events
+    # The plain heartbeat still gets through...
+    assert "still building" in text, text
+    # ...and the dead probe says so, instead of looking like "nothing to report".
+    assert "probe ran but produced no sample" in text, text
+    assert "RuntimeError" in text, text
+
+
+def test_push_registry_hosts_finds_the_registry_to_dial() -> None:
+    from ..backend.build_sandbox import push_registry_hosts
+
+    # ``docker.io`` is an alias: kaniko dials the index, so the probe must too.
+    assert push_registry_hosts(["docker.io/u/i:t"]) == ["index.docker.io:443"]
+    # A bare ``name:tag`` has no registry at all — that colon is the tag.
+    assert push_registry_hosts(["myimg:latest"]) == ["index.docker.io:443"]
+    assert push_registry_hosts(["reg.example.com:5000/a/b:1"]) == ["reg.example.com:5000"]
+    assert push_registry_hosts(["localhost:5000/x"]) == ["localhost:5000"]
+    # De-duplicated, order preserved.
+    assert push_registry_hosts(["a/r:1", "b/r:1", "a/r:2"]) == ["index.docker.io:443"]
+    assert push_registry_hosts([]) == []
+
+
+def test_push_probe_script_never_hardcodes_one_busybox_path() -> None:
+    """``/bin`` in a build sandbox is the *target* image's, not the executor's.
+
+    kaniko unpacks the image being built over ``/``; the executor's own busybox
+    is at ``/busybox`` (upstream even declares it a ``VOLUME`` so it survives).
+    At probe time ``/bin`` contains only ``sh``, so a hardcoded ``/bin/busybox``
+    would silently produce nothing.
+    """
+    from ..backend.build_sandbox import push_probe_script
+
+    script = push_probe_script(["index.docker.io:443"])
+    assert "for c in busybox /busybox/busybox /bin/busybox" in script
+    assert "run() {" in script
+    # Applets go through the shim, never by bare name.
+    assert "run nc -z -w " in script
+    assert "run awk " in script
+    assert "run nslookup " in script
+    assert "BB=" not in script
+    assert "index.docker.io:443" in script
+
+
+def test_parse_push_probe_never_invents_a_verdict() -> None:
+    from ..backend.build_sandbox import parse_push_probe
+
+    # A probe that produced nothing must never read as "unreachable".
+    assert parse_push_probe("") == {}
+    assert parse_push_probe("/bin/sh: nc: not found\n") == {}
+
+    got = parse_push_probe(
+        "TARGET index.docker.io 443\n"
+        "ADDR 69.171.224.36\n"
+        "TCP index.docker.io 443 fail\n"
+    )
+    assert got["index.docker.io:443"] == {
+        "host": "index.docker.io",
+        "port": "443",
+        "ip": "69.171.224.36",
+        "tcp": "fail",
+    }
+
+
+def _hints_text(lines: list[str]) -> str:
+    return "\n".join(lines)
+
+
+def test_push_fix_hints_name_the_clusters_own_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """上海集群的报错必须直接给出该设的**具体值**，而不是"换成自家 ACR 吧"。
+
+    用户原话（2026-10-09）："上海集群，推送需要更新哪些环境变量也要提示啊"。
+    集群自己的 registry 本来就在 profile 里，所以这里没有理由让用户自己去猜前缀。
+    """
+    from ..backend.build_sandbox import push_fix_hints
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1#pre")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "docker.io/jiangwc3439")
+
+    text = _hints_text(push_fix_hints())
+    assert (
+        "DOCKER_RT_BUILD_REGISTRY=pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind"
+        in text
+    )
+    # 说清"现在是什么"，否则用户不知道自己错在哪
+    assert "docker.io/jiangwc3439" in text
+    assert "DOCKER_RT_REGISTRY_USERNAME" in text
+    assert "DOCKER_RT_REGISTRY_PASSWORD" in text
+    assert "DOCKER_RT_REGISTRY_DOCKERCONFIG" in text
+    # 两个退路 + 改完要重启
+    assert "DOCKER_RT_BUILD_PUSH=false" in text
+    assert "DOCKER_RT_BUILD_PUSH_CHECK=warn" in text
+    assert "restart" in text
+
+
+def test_push_fix_hints_do_not_re_suggest_the_registry_already_in_use(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """已经推自家 ACR 了就别再让人"换成自家 ACR"。"""
+    from ..backend.build_sandbox import push_fix_hints
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1#pre")
+    monkeypatch.setenv(
+        "DOCKER_RT_BUILD_REGISTRY",
+        "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind",
+    )
+
+    text = _hints_text(push_fix_hints())
+    assert "DOCKER_RT_BUILD_REGISTRY=" not in text
+    assert "DOCKER_RT_BUILD_PUSH=false" in text
+
+
+def test_push_fix_hints_warn_that_the_credentials_may_belong_elsewhere(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """凭据是**按 registry** 的：账号是 Docker Hub 的，换到 ACR 就得换一份。"""
+    from ..backend.build_sandbox import push_fix_hints
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1#pre")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "docker.io/jiangwc3439")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_USERNAME", "jiangwc3439")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_PASSWORD", "hunter2")
+
+    text = _hints_text(push_fix_hints())
+    assert "belong to the current target" in text
+    assert "username_password" in text  # registry_push 给的来源标识
+
+
+def test_push_fix_hints_mark_the_dockerconfig_as_optional(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``DOCKER_RT_REGISTRY_DOCKERCONFIG`` 是**二选一**的备选，不是必填项。
+
+    2026-10-09 用户把三行读成了"都得配"，原话："这个是可选的吧，，，不用必须配置这个吧"。
+    代码里的优先级是 ``USERNAME+PASSWORD`` > 显式 dockerconfig > 默认的
+    ``/etc/docker-image/.dockerconfigjson``（存在就用），所以三种情况都不需要全设。
+    """
+    from ..backend.build_sandbox import push_fix_hints
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1#pre")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "docker.io/jiangwc3439")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_USERNAME", "u")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_PASSWORD", "p")
+
+    text = _hints_text(push_fix_hints())
+    assert "DOCKER_RT_REGISTRY_DOCKERCONFIG" in text
+    assert "only one of the two is needed" in text
+    assert "Neither is mandatory" in text
+    assert "/etc/docker-image/.dockerconfigjson" in text
+
+
+def test_push_fix_hints_always_offer_the_escape_hatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """就算集群解析不出来（或推的就是自家 registry），退路也必须在。"""
+    from ..backend.build_sandbox import push_fix_hints
+
+    _clear(monkeypatch)  # 完全没有集群信息
+
+    text = _hints_text(push_fix_hints())
+    assert "DOCKER_RT_BUILD_PUSH=false" in text
+    assert "DOCKER_RT_BUILD_PUSH_CHECK=warn" in text
+
+
+def test_push_fix_hints_never_raise(monkeypatch: pytest.MonkeyPatch) -> None:
+    """写不出提示不能把构建带崩 —— 这只该是"多给一行信息"。"""
+    from ..backend import registry_push
+    from ..backend.build_sandbox import push_fix_hints
+
+    _clear(monkeypatch)
+
+    def boom(*args: object, **kwargs: object) -> str:
+        raise RuntimeError("cluster lookup exploded")
+
+    monkeypatch.setattr(registry_push, "current_cluster", boom)
+    text = _hints_text(push_fix_hints())
+    assert "DOCKER_RT_BUILD_PUSH=false" in text
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_push_target_stops_before_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two clusters, same image, same code — one just cannot dial the registry.
+
+    That has to be said before the build, not by kaniko's very last line: waiting
+    for it makes a *successful* build look like a hung one.
+    """
+    from ..backend import build_sandbox
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "docker.io/jiangwc3439")
+    monkeypatch.setenv("DOCKER_RT_BUILD_PUSH_CHECK", "fail")
+    # 上海集群这个形状：推 Docker Hub，而集群只到得了自家 ACR。
+    monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1#pre")
+    _set_push_credentials(monkeypatch)
+
+    sandbox = _FakeBuildSandbox(
+        responses=[
+            # The reachability probe execs *before* the launcher.
+            {
+                "stdout": (
+                    "TARGET index.docker.io 443\n"
+                    "ADDR 69.171.224.36\n"
+                    "TCP index.docker.io 443 fail\n"
+                )
+            },
+        ]
+    )
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
+    )
+    errors = [event for event in events if event.get("error")]
+    text = "".join(event.get("stream") or "" for event in events)
+
+    assert errors, events
+    assert "unreachable from this build sandbox" in errors[0]["error"], errors[0]
+    assert "index.docker.io" in errors[0]["error"]
+    assert "69.171.224.36" in errors[0]["error"]
+    # 报错里要**直接给出该改的环境变量**，不能只说"换成能通的 registry"。
+    assert (
+        "DOCKER_RT_BUILD_REGISTRY=pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind"
+        in errors[0]["error"]
+    ), errors[0]
+    assert "DOCKER_RT_REGISTRY_USERNAME" in errors[0]["error"]
+    assert "DOCKER_RT_BUILD_PUSH=false" in errors[0]["error"]
+    assert "DOCKER_RT_BUILD_PUSH_CHECK=warn" in errors[0]["error"]
+    # Fail *before* the expensive part: no context copy, no kaniko.
+    assert "Starting kaniko" not in text, text
+
+
+@pytest.mark.asyncio
+async def test_a_reachable_push_target_lets_the_build_proceed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ..backend import build_sandbox
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
+    monkeypatch.setenv("DOCKER_RT_BUILD_PUSH_CHECK", "fail")
+    _set_push_credentials(monkeypatch)
+
+    sandbox = _FakeBuildSandbox(
+        responses=[
+            # probe (before the launcher), then launch, then one poll.
+            {
+                "stdout": (
+                    "TARGET reg.example.com 443\n"
+                    "ADDR 10.0.0.1\n"
+                    "TCP reg.example.com 443 ok\n"
+                )
+            },
+            _launch(),
+            _poll(f"docker-rt-digest: {GOOD_DIGEST}\n", state="done rc=0"),
+        ]
+    )
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
+    )
+    text = "".join(event.get("stream") or "" for event in events)
+
+    assert "tcp=ok" in text, text
+    assert "Starting kaniko" in text, text
+    assert not [event for event in events if event.get("error")], events
+
+
+@pytest.mark.asyncio
+async def test_warn_mode_builds_even_when_the_push_target_is_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The archive is still worth having, so there has to be a way to say so."""
+    from ..backend import build_sandbox
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "docker.io/jiangwc3439")
+    monkeypatch.setenv("DOCKER_RT_BUILD_PUSH_CHECK", "warn")
+    _set_push_credentials(monkeypatch)
+
+    sandbox = _FakeBuildSandbox(
+        responses=[
+            {"stdout": "TARGET index.docker.io 443\nTCP index.docker.io 443 fail\n"},
+            _launch(),
+            _poll(f"docker-rt-digest: {GOOD_DIGEST}\n", state="done rc=0"),
+        ]
+    )
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
+    )
+    text = "".join(event.get("stream") or "" for event in events)
+
+    assert not [event for event in events if event.get("error")], events
+    assert "unreachable from this build sandbox" in text, text
+    assert "Starting kaniko" in text, text
 
 
 @pytest.mark.asyncio
@@ -1823,11 +2493,16 @@ class _FakeSandboxListing:
         *,
         list_error: Exception | None = None,
         delete_error: Exception | None = None,
+        status: str = "running",
+        fail_deletes: int = 0,
     ) -> None:
         self.sandboxes = list(sandboxes or [])
         self.list_error = list_error
         self.delete_error = delete_error
+        self.status = status
+        self.fail_deletes = fail_deletes
         self.deleted: list[str] = []
+        self.paused: list[str] = []
         self.closed = False
 
     async def list(self) -> list[Any]:
@@ -1835,9 +2510,22 @@ class _FakeSandboxListing:
             raise self.list_error
         return list(self.sandboxes)
 
+    async def get_sandbox(self, sandbox_id: str, **_kwargs: Any) -> Any:
+        return SimpleNamespace(id=sandbox_id, status=self.status)
+
+    async def pause(self, sandbox_id: str, **_kwargs: Any) -> Any:
+        self.paused.append(sandbox_id)
+        return SimpleNamespace(id=sandbox_id, status="stopped")
+
     async def delete(self, sandbox_id: str, **_kwargs: Any) -> None:
         if self.delete_error is not None:
             raise self.delete_error
+        if self.fail_deletes > 0:
+            self.fail_deletes -= 1
+            raise RuntimeError(
+                "INTERNAL_SERVER_ERROR: InstanceService.delete_instance-"
+                "instance`s status is Running, can not delete!"
+            )
         self.deleted.append(sandbox_id)
 
     async def close(self) -> None:
@@ -2119,3 +2807,336 @@ async def test_sweep_leaves_a_client_it_was_given_open(
     await build_sandbox.sweep_stale_build_sandboxes(client=client)
 
     assert client.closed is False
+
+
+def test_a_host_only_acr_prefix_is_rejected_before_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ACR 的推送前缀少了命名空间 → **构建之前**就拒绝，别等构建跑完才 401。
+
+    2026-10-09 用户的真实场景：`DOCKER_RT_BUILD_REGISTRY` 只给了 host，
+    于是推 `…/pyromind-console:dev-5`（少了 `/pyromind`），kaniko 91 秒全成功、
+    最后一行 `401 Unauthorized`；同一个 host 的 `docker login` 却是成功的。
+    """
+    from ..backend.build_sandbox import build_prerequisites_error
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:v1-debug")
+    monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1#pre")
+    monkeypatch.setenv(
+        "DOCKER_RT_BUILD_REGISTRY", "pyromind-registry.cn-shanghai.cr.aliyuncs.com"
+    )
+    _set_push_credentials(monkeypatch)
+
+    message = build_prerequisites_error(["pyromind-console:dev-5"], push=True)
+    assert message
+    assert "carries no namespace" in message
+    assert "401" in message
+    # 命名空间由**参数**给，代码不替用户填
+    assert "Nothing is appended for you" in message
+
+    # 补上命名空间就该放行
+    monkeypatch.setenv(
+        "DOCKER_RT_BUILD_REGISTRY",
+        "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind",
+    )
+    assert build_prerequisites_error(["pyromind-console:dev-5"], push=True) is None
+
+
+def test_push_rejected_hint_explains_an_acr_401(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """kaniko 的推送 401 只有状态码，这里要把可能的原因点出来。"""
+    from ..backend.build_sandbox import push_rejected_hint
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1#pre")
+    monkeypatch.setenv(
+        "DOCKER_RT_BUILD_REGISTRY",
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind",
+    )
+    _set_push_credentials(monkeypatch)
+
+    raw = (
+        "INFO[0090] Pushing image to pyromind-registry.cn-shanghai.cr.aliyuncs.com"
+        "/pyromind/pyromind-console:dev-5 \n"
+        "error pushing image: failed to push to destination …: unexpected status "
+        "code 401 Unauthorized (HEAD responses have no body, use GET for details)\n"
+    )
+    hint = push_rejected_hint(raw)
+    assert hint
+    assert "401/403" in hint
+    # 说清"仓库路径"和"凭据属于哪个 host"这两件事
+    assert "repo path must exist" in hint
+    assert "the namespace is 'pyromind'" in hint
+    assert "credentials must be valid for that host" in hint
+    assert "username_password" in hint
+
+
+def test_push_rejected_hint_stays_quiet_otherwise() -> None:
+    """不是推送 401/403 就别插话。"""
+    from ..backend.build_sandbox import push_rejected_hint
+
+    assert push_rejected_hint("") is None
+    # Dockerfile 自己失败：没有推送失败这回事
+    assert push_rejected_hint("INFO[0012] error building image: exit status 1") is None
+    # 推送失败但不是鉴权问题（比如超时）—— 那条由预检/网络提示管，别抢话
+    assert (
+        push_rejected_hint(
+            "error pushing image: … dial tcp 104.244.46.5:443: i/o timeout"
+        )
+        is None
+    )
+
+
+def test_the_prefix_is_used_verbatim_no_namespace_is_ever_appended() -> None:
+    """``registry`` 是逐字用的：告诉我们前缀是什么，我们就拼什么。
+
+    用户 2026-10-09 明确要求："不要默认加吧，还像以前一样，在参数中，不然这样以后
+    换命名空间或者推送不同的命名空间还要改代码"。所以这里把"代码不会替你补命名空间"
+    钉成断言 —— 检查只负责**拒绝**一个没有命名空间的 ACR 前缀，绝不改写它。
+    """
+    from ..backend.build_sandbox import resolve_targets
+
+    # 自定义命名空间：原样用，不会被换成 profile 的默认值
+    aliases, error = resolve_targets(
+        ["app:1"], registry="pyromind-registry.cn-shanghai.cr.aliyuncs.com/other-ns"
+    )
+    assert error is None
+    assert aliases["app:1"] == (
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/other-ns/app:1"
+    )
+
+    # 多级命名空间也原样保留
+    aliases, error = resolve_targets(
+        ["app:1"], registry="reg.example.com/team/sub"
+    )
+    assert aliases["app:1"] == "reg.example.com/team/sub/app:1"
+
+    # 就算前缀里**没有**命名空间，这里也照样原样拼 —— 是 build_prerequisites_error
+    # 负责在构建之前把它拦下来，而不是这一层偷偷补上
+    aliases, error = resolve_targets(
+        ["app:1"], registry="pyromind-registry.cn-shanghai.cr.aliyuncs.com"
+    )
+    assert aliases["app:1"] == "pyromind-registry.cn-shanghai.cr.aliyuncs.com/app:1"
+
+
+def test_push_rejected_hint_points_at_the_missing_acr_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ACR 对"仓库不存在"也回 401 —— 建仓被跳过时要把这条说出来。
+
+    2026-10-09 用户的第二类 401：他把 ``DOCKER_RT_ACR_ACCESS_KEY_SECRET`` 写成了
+    ``DOCKER_RT_ACR_SECRET``，建仓那步被静默跳过，构建跑完 216 秒后 ACR 回
+    ``UNAUTHORIZED: authentication required``（仓库 ``pyromind/pyromind-console-1`` 不存在）。
+    """
+    from ..backend.build_sandbox import push_rejected_hint
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1#pre")
+    monkeypatch.setenv(
+        "DOCKER_RT_BUILD_REGISTRY",
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind",
+    )
+    _set_push_credentials(monkeypatch)
+    # 名字写错了：ID 和实例 ID 都对，只有 secret 那个变量不存在
+    monkeypatch.setenv("DOCKER_RT_ACR_ACCESS_KEY_ID", "LTAI5tG5os7P4Dqyasfmnwhe")
+    monkeypatch.setenv("DOCKER_RT_ACR_INSTANCE_ID", "cri-3a7k1rh8eajwcae8")
+    monkeypatch.setenv("DOCKER_RT_ACR_SECRET", "typo")
+
+    raw = (
+        "error pushing image: failed to push to destination "
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/pyromind-console-1:dev-5: "
+        "POST https://pyromind-registry.cn-shanghai.cr.aliyuncs.com/v2/pyromind/"
+        "pyromind-console-1/blobs/uploads/: UNAUTHORIZED: authentication required\n"
+    )
+    hint = push_rejected_hint(
+        raw, ["pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/pyromind-console-1:dev-5"]
+    )
+    assert hint
+    assert "pyromind/pyromind-console-1:dev-5" in hint  # 精确指出推的是哪个仓库
+    assert "created *first*" in hint
+    assert "DOCKER_RT_ACR_ACCESS_KEY_SECRET" in hint
+    # 顺带把"你还有个变量是错的"也带上
+    assert "did you mean" in hint or "unrecognised" in hint
+
+
+# --------------------------------------------------------------------------
+# build context：客户端可能已经压过它
+# --------------------------------------------------------------------------
+
+
+def _a_real_tar() -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for name, content in (("Dockerfile", b"FROM scratch\n"), ("a.txt", b"hello\n")):
+            info = tarfile.TarInfo(name=name)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize(
+    "compress",
+    [
+        pytest.param(gzip.compress, id="gzip"),
+        pytest.param(bz2.compress, id="bzip2"),
+        pytest.param(lzma.compress, id="xz"),
+    ],
+)
+def test_pack_build_context_unwraps_a_compressed_context(compress) -> None:
+    """客户端发来的 context 可能**已经压过**，必须先解开再压给 kaniko。
+
+    2026-10-09/10 实测：`docker compose build`（classic builder + `--compress`，
+    或 context 写成 `.tar.gz` URL）发来一个 772 B 的 gzip 流，我们**又压了一层**，
+    kaniko 于是只报 `error resolving source context: archive/tar: invalid tar header`，
+    0.1 秒就挂 —— 看起来完全不像压缩问题。moby 的 daemon 是靠 magic 嗅探解压的
+    （`archive.DecompressStream`），我们也得这么做。
+    """
+    from ..backend.build_sandbox import pack_build_context
+
+    original = _a_real_tar()
+    packed = pack_build_context(compress(original))
+    # kaniko 拿到的是**单层** gzip 的真实 tar
+    assert gzip.decompress(packed) == original
+
+
+def test_pack_build_context_leaves_a_plain_tar_alone() -> None:
+    """没压过的 context 原样处理（别把正常路径弄坏）。"""
+    from ..backend.build_sandbox import pack_build_context
+
+    original = _a_real_tar()
+    assert gzip.decompress(pack_build_context(original)) == original
+
+
+def test_context_compression_sniffs_the_families_moby_supports() -> None:
+    from ..backend.build_sandbox import context_compression
+
+    assert context_compression(b"") == ""
+    assert context_compression(_a_real_tar()) == ""
+    assert context_compression(gzip.compress(b"x")) == "gzip"
+    assert context_compression(bz2.compress(b"x")) == "bzip2"
+    assert context_compression(lzma.compress(b"x")) == "xz"
+    assert context_compression(b"\x28\xb5\x2f\xfd" + b"junk") == "zstd"
+
+
+def test_an_unsupported_context_compression_fails_with_something_actionable() -> None:
+    """解不开的时候不能产出"坏 tar"，要直接说清怎么办。"""
+    from ..backend.build_sandbox import pack_build_context
+
+    # zstd：本仓库跑的 Python(<3.14) 没有自带支持时，报错必须点名这件事和退路
+    with pytest.raises(ValueError) as caught:
+        pack_build_context(b"\x28\xb5\x2f\xfd" + b"\x00" * 32)
+    text = str(caught.value)
+    assert "zstd" in text
+    assert "--compress=false" in text or "zstandard" in text
+
+
+@pytest.mark.asyncio
+async def test_sweep_pauses_a_running_sandbox_before_deleting_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """平台的规矩：**Running 的实例删不掉**，必须先 pause。
+
+    2026-10-10 实测的报错就是这句 —— `docker rm` / `docker rm -f` 走的也是这套
+    （`PyromindSDK.cleanup()` → pause → delete）。而清扫里原来直接 `client.delete()`，
+    于是一个都没删掉过：构建沙箱的常态就是 Running（`sleep infinity`）。
+    """
+    _clear(monkeypatch)
+    name = _build_name()
+    client = _FakeSandboxListing([_sandbox(name)], status="running")
+
+    assert await build_sandbox.sweep_stale_build_sandboxes(client=client) == [name]
+    assert client.paused == [f"sb-{name}"], "Running 的沙箱必须先 pause"
+    assert client.deleted == [f"sb-{name}"]
+
+
+@pytest.mark.asyncio
+async def test_sweep_does_not_pause_a_sandbox_that_is_already_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非 Running 平台允许直接删 —— 少一次 pause 往返。"""
+    _clear(monkeypatch)
+    name = _build_name()
+    client = _FakeSandboxListing([_sandbox(name)], status="stopped")
+
+    assert await build_sandbox.sweep_stale_build_sandboxes(client=client) == [name]
+    assert client.paused == []
+    assert client.deleted == [f"sb-{name}"]
+
+
+@pytest.mark.asyncio
+async def test_sweep_retries_a_delete_that_races_the_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pause 的状态迁移要一会儿，delete 会先撞上"还在 Running" —— 退避重试。"""
+    _clear(monkeypatch)
+    monkeypatch.setattr(build_sandbox, "SWEEP_DELETE_RETRY_DELAY_S", 0.0)
+    name = _build_name()
+    client = _FakeSandboxListing([_sandbox(name)], status="running", fail_deletes=2)
+
+    assert await build_sandbox.sweep_stale_build_sandboxes(client=client) == [name]
+    assert client.paused == [f"sb-{name}"]
+    assert client.deleted == [f"sb-{name}"]      # 第三次成功
+
+
+@pytest.mark.asyncio
+async def test_sweep_reports_a_sandbox_that_simply_will_not_delete(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """一直删不掉就 warning 一次、继续下一个，绝不能把清扫整个带崩。"""
+    _clear(monkeypatch)
+    monkeypatch.setattr(build_sandbox, "SWEEP_DELETE_ATTEMPTS", 2)
+    monkeypatch.setattr(build_sandbox, "SWEEP_DELETE_RETRY_DELAY_S", 0.0)
+    name = _build_name()
+    client = _FakeSandboxListing([_sandbox(name)], status="running", fail_deletes=99)
+
+    with caplog.at_level(logging.WARNING):
+        removed = await build_sandbox.sweep_stale_build_sandboxes(client=client)
+
+    assert removed == [], "删不掉就不能报成删了"
+    assert "failed to delete leftover build sandbox" in caplog.text
+    assert client.paused == [f"sb-{name}"]
+
+
+def test_the_build_sandbox_sweep_is_off_unless_asked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**默认不清理**：``kill -9`` 漏下的沙箱交给用户自己删。
+
+    用户 2026-10-10：「我感觉你这个最后清理的有问题啊，不要清理了，用户自己停，
+    或者自己删除吧」。理由：前缀 + 账号级的 ``list()`` 分不出"崩溃漏下的"和
+    "另一台机器上正在跑的构建"的沙箱，清错就把别人的构建删了。
+    所以默认关，只有 ``DOCKER_RT_BUILD_SANDBOX_SWEEP=true`` 才开。
+    """
+    monkeypatch.delenv("DOCKER_RT_BUILD_SANDBOX_SWEEP", raising=False)
+    assert build_sandbox.sandbox_sweep_enabled() is False
+
+    for value in ("true", "1", "on", "yes"):
+        monkeypatch.setenv("DOCKER_RT_BUILD_SANDBOX_SWEEP", value)
+        assert build_sandbox.sandbox_sweep_enabled() is True, value
+
+    # 空值 / 乱七八糟的值 = 关（不能因为拼错就变成"悄悄开始删")
+    for value in ("", "false", "0", "no", "maybe"):
+        monkeypatch.setenv("DOCKER_RT_BUILD_SANDBOX_SWEEP", value)
+        assert build_sandbox.sandbox_sweep_enabled() is False, value
+
+
+@pytest.mark.asyncio
+async def test_a_disabled_sweep_deletes_nothing_and_says_how_to_do_it_by_hand(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """关掉之后：一个都不删、一次 ``list()`` 都不发，只留一条"自己怎么删"的提示。"""
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_SANDBOX_SWEEP", "false")
+    name = _build_name()
+    client = _FakeSandboxListing([_sandbox(name)])
+
+    with caplog.at_level(logging.INFO):
+        removed = await build_sandbox.sweep_stale_build_sandboxes(client=client)
+
+    assert removed == []
+    assert client.deleted == []
+    assert client.paused == []
+    assert "sweep is off" in caplog.text
+    assert "docker rm -f" in caplog.text

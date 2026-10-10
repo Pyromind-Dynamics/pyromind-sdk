@@ -133,16 +133,17 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 | `DOCKER_RT_CLEANUP_CONCURRENCY` | `4` | Maximum concurrent sandbox pause/delete cleanups |
 | `DOCKER_RT_DEFAULT_IMAGE` | SWE-bench default image | `docker images` default entry |
 | `DOCKER_RT_PORT_FORWARD_MODE` | `auto` | `-p` backend: `auto` / `direct` / `api` |
-| `DOCKER_RT_BUILD_IMAGE` | empty | **Hard prerequisite** for builds: a cluster-pullable kaniko executor image (must be the `-debug` variant) |
+| `DOCKER_RT_BUILD_IMAGE` | per cluster (see below) | **Hard prerequisite** for builds: a cluster-pullable kaniko executor image (must be the `-debug` variant). The **default is chosen by the current cluster**: `cn-east-1` (including `#pre` / `#pre2`) → `pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/kaniko-executor-pyromind:0.0.4`; every other cluster → `docker.io/pyrominddynamics/kaniko-executor-pyromind:0.0.4`. The two mirrors cannot reach each other (the Shanghai one is a VPC-internal address), so **you only set this to pick another version or your own mirror** |
 | `DOCKER_RT_BUILD_REGISTRY` | empty | Push prefix for short image tags; derived from the cluster profile when empty |
-| `DOCKER_RT_BUILD_PUSH` | `true` | Whether build pushes to the registry |
+| `DOCKER_RT_BUILD_PUSH` | `true` | Whether the build pushes to the registry. **With it off the build still runs and the archive still lands in the workspace at `/workspace/docker_images/<tag>.tar`** (a mounted directory, so it outlives the sandbox) |
+| `DOCKER_RT_BUILD_PUSH_CHECK` | `fail` | Probe the push target's reachability **from inside the build sandbox** before building (`busybox nc -z` + `nslookup` — reachability is a property of the *cluster's* network, which the daemon host cannot measure). `fail` (default): stop before the build and **print the env vars to change**; `warn`: log a warning and build anyway; `off`: skip. This is the `docker.io`-on-the-Shanghai-cluster symptom: poisoned DNS, TCP never connects, and kaniko only says `i/o timeout` in its very last line — which looks like a hung build |
 | `DOCKER_RT_BUILD_EXECUTOR` | `kaniko` | Build executor; only kaniko is implemented |
 | `DOCKER_RT_BUILD_TIMEOUT` | `3600` | Timeout (seconds) for one build |
 | `DOCKER_RT_BUILD_SANDBOX_CPU` / `_MEMORY` | `2` / `4Gi` | Build sandbox resources |
 | `DOCKER_RT_BUILD_SANDBOX_KEEP` | `false` | Keep the build sandbox (troubleshooting only). It also skips the `kill -9` sweep below, otherwise the flag would defeat itself |
-| `DOCKER_RT_BUILD_SANDBOX_SWEEP` | `true` | On `kill -9` the sandbox teardown is skipped, leaving a `sleep infinity` sandbox **running** against the user's quota — more expensive than a staged context. Build sandboxes are named `sandbox-docker-build-<random>`, and after restoring the Docker context the watcher deletes every sandbox whose name carries that prefix. Set `false` to disable |
+| `DOCKER_RT_BUILD_SANDBOX_SWEEP` | `false` | On `kill -9` the sandbox teardown is skipped, leaving a `sleep infinity` sandbox **running** against the user's quota. **Nothing is cleaned up automatically by default** (opt-in): the rule is "name starts with `sandbox-docker-build-`" over an **account-scoped** `list()`, so it cannot tell a leaked sandbox from one a *live* build on another machine is using — deleting the wrong one kills that build. Set `true` to re-enable; otherwise remove leftovers yourself (`docker ps \| grep sandbox-docker-build`, `docker rm -f`) — the watcher prints a reminder |
 | `DOCKER_RT_BUILD_CONTEXT_MODE` | `auto` | How the build context reaches the sandbox: `auto` (storage first, fall back to a direct upload) / `storage` (storage or fail) / `upload` (never touch storage — the old HTTP route). Storage is the default because the direct route pushes one exec websocket per 2 MiB **serially**: 631 s for 61 MiB (~110 KB/s), unusable for multi-GB ML contexts. Storage uploads the tar.gz to the user's workspace object store with parallel parts and the cluster reads it **locally** through a mount (60 MiB: ~59 s upload + 2.7 s in-cluster copy) |
-| `DOCKER_RT_BUILD_STAGING_MOUNT` | `/kaniko/docker-rt-stage` | Mount target (in-Pod path) for the storage route. Must stay under `/kaniko` for the same reason as the build context dir: kaniko wipes `/` on a multi-stage switch and keeps only `/kaniko` |
+| `DOCKER_RT_BUILD_STAGING_MOUNT` | `/kaniko/docker-rt-stage` | Mount target (in-Pod path) for the storage route. It sits under `/kaniko` for consistency with the workdir; **mounts are not affected by kaniko's wipe** — kaniko adds every mount point from `/proc/self/mountinfo` to its ignore list, so `DeleteFilesystem` skips those trees wholesale |
 | `DOCKER_RT_BUILD_STAGING_PREFIX` | `.docker-rt-build` | Workspace-relative directory holding staged contexts; each build gets a unique `<build-id>/` subdirectory, removed afterwards (success or failure) |
 | `DOCKER_RT_BUILD_STAGING_WORKSPACE` | `/workspace` | Mount source root (the workspace as the platform sees it = JuiceFS subPath `<uid>`). Verified: storage key `<rel>` == `/workspace/<rel>` inside the Pod |
 | `DOCKER_RT_BUILD_STAGING_PARALLEL` | `8` | Concurrent multipart uploads (clamped to 1–32). Measured knee is 8 (60 MiB incompressible: 4 conns → 2.3 MiB/s, 8 → 5.9, 16 → 6.4) |
@@ -152,8 +153,10 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 | `DOCKER_RT_REGISTRY_CLUSTER` | empty | Push profile: `us-west-1` / `us-west-2` / `cn-east-1` |
 | `DOCKER_RT_REGISTRY_NAMESPACE` | empty | Registry namespace; required on Docker Hub clusters |
 | `DOCKER_RT_REGISTRY_USERNAME` / `DOCKER_RT_REGISTRY_PASSWORD` | empty | Registry username and password/token with push permission; both nonempty take precedence over dockerconfig; unrelated to `PYROMIND_API_KEY` |
-| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | `/etc/docker-image/.dockerconfigjson` | Credential file path readable by the daemon; contents may be JSON or base64-encoded JSON; see "Configure registry authentication before building" |
-| `DOCKER_RT_ACR_ACCESS_KEY_ID` / `_SECRET` / `_INSTANCE_ID` | empty | Used to pre-create ACR repositories in Shanghai |
+| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | `/etc/docker-image/.dockerconfigjson` (used only if it exists) | **Either/or with the pair above, and neither is required**: credential file path readable by the daemon; contents may be JSON or base64-encoded JSON; see "Configure registry authentication before building" |
+| `DOCKER_RT_ACR_ACCESS_KEY_ID` | empty | AccessKey ID used to **pre-create** ACR repositories |
+| `DOCKER_RT_ACR_ACCESS_KEY_SECRET` | empty | AccessKey Secret used to **pre-create** ACR repositories. ⚠️ That is the whole name — **not** `DOCKER_RT_ACR_SECRET` |
+| `DOCKER_RT_ACR_INSTANCE_ID` | empty | ACR Enterprise instance ID (`cri-xxxx`), required for pre-creation |
 | `DOCKER_RT_SERVICE_DNS` | `true` | Create ClusterIP Service for Compose service DNS |
 | `DOCKER_RT_ORPHAN_POLICY` | `adopt` | `adopt` restores managed Pods; `reap` deletes them on startup |
 | `DOCKER_RT_CLEANUP_ON_EXIT` | `false` | Delete managed Pods on SIGINT/SIGTERM when `true` |
@@ -165,6 +168,81 @@ pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
 | `DOCKER_RT_JUICEFS_HOST_PREFIXES` | empty | Extra host path to JuiceFS subPath mappings |
 | `DOCKER_RT_CONTEXT` | `docker-rt` | Docker context name used by `docker-rt-context` |
 | `LOG_LEVEL` | `INFO` | Log level |
+
+**Env vars needed to push from the Shanghai cluster (`cn-east-1`)**
+
+Nodes there cannot reach `index.docker.io` (DNS is poisoned to unrelated company
+IPs and TCP 443 never connects — measured inside the sandbox:
+`index.docker.io:443 dns=80.87.199.46 tcp=fail`, while the cluster's own ACR
+does connect). So the push target has to be that ACR. Set these on the daemon —
+**one per line** — and restart docker-rt afterwards (they are read at startup):
+
+```
+DOCKER_RT_BUILD_REGISTRY=pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind
+DOCKER_RT_REGISTRY_USERNAME=<ACR username>
+DOCKER_RT_REGISTRY_PASSWORD=<ACR password / temporary token>
+```
+
+> ⚠️ **The prefix must carry a namespace** (the trailing `/pyromind` above — **any
+> namespace you have rights on will do**). An ACR path is `<host>/<namespace>/<repo>`;
+> with the host alone ACR reads the repo name as a namespace, finds nothing, and
+> answers the push with a bare `401 Unauthorized` (after the whole build has run).
+> The daemon refuses a host-only prefix **before** building.
+>
+> **The namespace always comes from the parameter — nothing is appended for you.**
+> The prefix in `DOCKER_RT_BUILD_REGISTRY` is used verbatim; if you leave it unset
+> and let the cluster profile derive it, use `DOCKER_RT_REGISTRY_NAMESPACE` to pick
+> the namespace instead.
+
+(Credentials are **either/or** and neither is mandatory: the last two lines above
+give an account; or leave those out and point at a dockerconfig.json you are
+already logged in with —
+
+```
+DOCKER_RT_REGISTRY_DOCKERCONFIG=<path to that file>
+```
+
+— and if even that is unset, the default `/etc/docker-image/.dockerconfigjson` is
+used when it exists. Precedence: `DOCKER_RT_REGISTRY_USERNAME` + `_PASSWORD`
+(both nonempty) > explicit dockerconfig > the default file.)
+
+Archive only, do not push:
+
+```
+DOCKER_RT_BUILD_PUSH=false
+```
+
+Skip this reachability check and build anyway:
+
+```
+DOCKER_RT_BUILD_PUSH_CHECK=warn
+```
+
+Without these the build is stopped **before it starts** (`DOCKER_RT_BUILD_PUSH_CHECK`
+defaults to `fail`), and the error prints exactly the lines above.
+
+There is also a **separate** group: when the ACR repository does not exist yet, these let
+the daemon pre-create it before the build. The names are spelled out in full — **do not
+abbreviate them**:
+
+```
+DOCKER_RT_ACR_ACCESS_KEY_ID=<AccessKey ID>
+DOCKER_RT_ACR_ACCESS_KEY_SECRET=<AccessKey Secret>
+DOCKER_RT_ACR_INSTANCE_ID=cri-xxxxxxxxxxxx
+```
+
+> ⚠️ `DOCKER_RT_ACR_SECRET` **does not exist** (the real name is
+> `DOCKER_RT_ACR_ACCESS_KEY_SECRET`). A misspelled variable is silently ignored — the
+> pre-creation step is skipped, and ACR answers a push to a **nonexistent** repository
+> with `401 UNAUTHORIZED: authentication required` too, which is easy to misread as a
+> credential problem. Skip this group if the repository was created by hand.
+
+**Repository names are normalized automatically.** ACR's rules are stricter than the
+general Docker ones (length 2–120, only lowercase letters/digits and `_ - . /`, no
+separator at either end and no two in a row), so the name is normalized when the build
+composes the push ref (`__`→`_`, …) and the same function runs on `docker create`/`run`,
+so the original name still resolves. Only applies to *this* cluster's ACR — Docker Hub and
+generic registries are left untouched.
 
 `DOCKER_RT_READY_TIMEOUT` / `--ready-timeout` controls the docker-rt server's
 sandbox readiness wait. It does not change the Docker client's HTTP timeout.
@@ -184,6 +262,7 @@ and syncs the sandbox list once during startup.
 | `docker ps` / `docker ps -a` | Container list; CUSTOM only by default | `-a`, `--filter name/id/status/ancestor/label`, `--no-trunc`, `--format` |
 | `docker inspect` | Container details | `--format`, `DOCKER_RT_INSPECT_MODE` |
 | `docker images` / `docker pull` | Image list; pull is a stub | image reference |
+| `docker build` | **Builds with kaniko inside a throwaway sandbox in the cluster** (see "Image builds"); pushes the image *and* archives a tarball to `/workspace/docker_images/` | `-t` / `--tag` (repeatable), `-f` / `--file`, `--target`, `--build-arg`, `--label`, `--platform`, `--quiet`. **BuildKit-only flags are rejected** (`--secret` / `--ssh` / `--cache-from` / `--cache-to` / `--load` / `--push`…); caching is controlled by `DOCKER_RT_BUILD_CACHE`, **`--no-cache` is not read** |
 | `docker run` | Create and start a sandbox | `-d`, `-it`, `--name`, `--cpus`, `--memory`, `--gpus`, `--gpu-card` / `--gpu_card`, `--label docker-rt.gpu-card=`, `-p` / `--publish`, `-v` / `--volume`, `-e` / `--env`, `-w` / `--workdir`, `--tmpfs` |
 | `docker create` | Create a local record | `--name`, `--cpus`, `--memory`, `--gpus`, `--gpu-card` / `--gpu_card`, `--label docker-rt.gpu-card=`, `-p`, `-v`, `-e`, `-w`, `--tmpfs` |
 | `docker start` | Create/start the Pod | none |
@@ -494,7 +573,8 @@ docker events
 ```
 
 `docker build` **is** supported (see "Image builds" below): it builds with kaniko
-inside a throwaway sandbox in the cluster and pushes to a registry, so it needs
+inside a throwaway sandbox in the cluster, pushes the image to a registry and
+archives a tarball to `/workspace/docker_images/`, so it needs
 neither a local Docker daemon nor any privilege. `buildx build` / `compose build`
 are not wired up yet — use `docker build` or plain Docker for now.
 `docker logs` is not supported by the `k8s-middleware` backend; use
@@ -506,33 +586,79 @@ future adapter can replace that hop with the `k8s_middleware` HTTP API.
 
 ### Image builds
 
-#### Configure registry authentication before building
+`docker build` **is supported**: it builds with kaniko inside a **throwaway sandbox** in
+the cluster. It needs neither a local Docker daemon nor any privilege (`buildx build` /
+`compose build` are not wired up yet). Every build has **two outputs**:
 
-`DOCKER_RT_BUILD_PUSH=true` by default, so kaniko pushes the image after building.
-Docker Hub, ACR, and similar registries require a registry username and password or
-a token with push permission; anonymous pulls do not imply anonymous pushes.
-`PYROMIND_API_KEY` authenticates the Sandbox platform API, not the image registry.
+1. a **push** to a registry (the default, `DOCKER_RT_BUILD_PUSH=true`);
+2. an image tarball in your workspace: `/workspace/docker_images/<tag>.tar`
+   (see "Artifact archive" below).
 
-**Option 1: registry username + password/token.** The example prompts without echoing
-the password/token so it does not enter shell history. Replace the image, namespace,
-and username first; the builder must be a kaniko debug image the cluster can pull.
-Configure the platform API key and cluster as described above.
+#### Before you start: these must be set
+
+Set them **before** starting the daemon — a running daemon does not pick up new
+variables; stop it (`pyromind docker-rt --stop`) and start it again. When something from
+the second group is missing, docker-rt **rejects the build before creating a sandbox**
+and names the variable, instead of burning a build.
+
+**① Platform connection** — needed by every docker-rt command, builds included:
+
+| Variable | Description |
+|----------|-------------|
+| `PYROMIND_API_KEY` | Platform API key (also available as `--apikey`) |
+| `PYROMIND_BASE_URL` | Platform API URL, e.g. `https://pre-api.pyromind.ai/api/v1` |
+| `PYROMIND_CLUSTER` | Target cluster, e.g. `us-west-1#pre` (also `--cluster`) |
+
+**② Build-specific**:
+
+| Variable | Required? | Description |
+|----------|-----------|-------------|
+| `DOCKER_RT_BUILD_IMAGE` | per cluster (usually no) | **Builder image.** Must be the kaniko executor's **`-debug` variant**: the default executor is `FROM scratch` — no `sleep`, no shell — while the sandbox template pins `command: ["sleep","infinity"]`. When unset the image is **chosen by the current cluster** (`cn-east-1` and its `#pre`/`#pre2 variants → the Shanghai ACR mirror; every other cluster → `docker.io/pyrominddynamics/…`); only set it to change the version or use a private mirror |
+| `DOCKER_RT_BUILD_REGISTRY` | short tags | The **push prefix** for a short tag (`-t myapp`), e.g. `docker.io/your-namespace`. Without it (and without a resolvable cluster profile) the build is **rejected rather than guessed**. A fully-qualified tag (`docker.io/you/app:1`) does not need it |
+| `DOCKER_RT_REGISTRY_USERNAME`<br>`DOCKER_RT_REGISTRY_PASSWORD` | pushing | Registry account plus a password / token with **push** permission. Both nonempty take precedence over the dockerconfig file |
+| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | either/or | Reuse an existing dockerconfig: the value is a **file path on the daemon's machine** |
+
+**③ Platform side**: the directory **`/workspace/docker_images` must already exist** in the
+user's workspace — it is the mount source for the artifact archive. Without it the build
+sandbox cannot be created.
+
+**④ What you do *not* need** (common misconception): `docker login` credentials,
+`~/.docker/config.json` and system credential helpers are **never read**, and no local
+Docker daemon takes part in the build.
+
+#### Minimal working example
 
 ```bash
+# ① platform connection
+export PYROMIND_API_KEY=XXXXXXXXX
+export PYROMIND_BASE_URL=https://pre-api.pyromind.ai/api/v1
+export PYROMIND_CLUSTER='us-west-1#pre'
+
+# ② build-specific (the prompt keeps the password out of shell history)
 export DOCKER_RT_BUILD_IMAGE="your-registry.example.com/builders/kaniko:v1.24.0-debug"
 export DOCKER_RT_BUILD_REGISTRY="docker.io/your-namespace"
-export DOCKER_RT_BUILD_PUSH=true
 export DOCKER_RT_REGISTRY_USERNAME="your-dockerhub-user"
 export DOCKER_RT_REGISTRY_PASSWORD="$(python3 -c 'import getpass; print(getpass.getpass("Registry password/token: "))')"
 
 pyromind docker-rt --daemon
-docker build -t myapp:latest .
+docker-rt-context                      # point the Docker CLI at docker-rt
+
+docker build -t myapp:latest .          # build
+ls /workspace/docker_images             # → myapp_latest.tar and friends (see "Artifact archive")
 ```
 
 This pushes to `docker.io/your-namespace/myapp:latest`. For another registry, set
 `DOCKER_RT_BUILD_REGISTRY` to its `registry-host/namespace` and supply that registry's
-username and password/token. When both credential variables are nonempty, they take
-precedence over the dockerconfig file.
+username and password/token.
+
+#### Registry authentication: two options
+
+**Option 1: registry username + password/token** (this is what the minimal example above
+does). Docker Hub, ACR and similar registries require the target registry's account and
+password, or a token with push permission; **anonymous pulls do not imply anonymous
+pushes**. `PYROMIND_API_KEY` authenticates the Sandbox platform API and **cannot** replace
+registry credentials. When both credential variables are nonempty, they take precedence
+over the dockerconfig file.
 
 **Option 2: an existing dockerconfig file.** Choose this instead of the username/password
 variables before starting the daemon:
@@ -570,9 +696,10 @@ How `docker build -t myapp .` works:
 ```text
 wrapper exports DOCKER_BUILDKIT=0
   → the classic builder POSTs the context tar to docker-rt's /build
-  → a throwaway CUSTOM sandbox is created from DOCKER_RT_BUILD_IMAGE
+  → a throwaway CUSTOM sandbox is created from DOCKER_RT_BUILD_IMAGE,
+    with your /workspace/docker_images mounted (for the artifact archive)
   → the context is uploaded as a single gzipped file
-  → exec kaniko --context=tar://… --destination=… --digest-file=…
+  → exec kaniko --context=tar://… --destination=… --tar-path=/workspace/docker_images/<tag>.tar --digest-file=…
   → read the digest, register the short-tag alias, delete the sandbox
 docker run myapp   → a normal sandbox pulls the image that was just pushed
 ```
@@ -610,6 +737,32 @@ heredocs, `--cache-to/from`, true multi-platform builds. BuildKit-only flags suc
 as `--platform` / `--secret` / `--ssh` are rejected by the wrapper instead of
 being silently ignored.
 
+#### Artifact archive: `/workspace/docker_images/<tag>.tar`
+
+**Besides pushing, every build leaves a tarball of the image in your workspace**, so you
+can use it without a registry or hand it around:
+
+```bash
+# load it wherever the workspace is visible (Jupyter, or a machine with it mounted);
+# the tag comes back with it
+docker load -i /workspace/docker_images/myapp_latest.tar
+```
+
+- `/workspace/docker_images` inside the sandbox **is** that workspace directory — the
+  mount's source and target are the same string, so there is only one path to reason about.
+- The file name comes from the first `-t`: `pyromind-console:dev` →
+  `pyromind-console_dev.tar` (anything outside `[A-Za-z0-9._-]` becomes `_`). The image name
+  inside the tarball is that tag. **Rebuilding the same tag replaces that tag's archive**;
+  other tags keep theirs.
+- **Prerequisite**: the directory must already exist (it is the mount source — see "③
+  Platform side" above).
+- **A failed push does not lose the artifact**: the build runs first, the tarball is written,
+  and only then is the image pushed (every build carries `--skip-push-permission-check` —
+  without it kaniko's push-permission probe runs *before* the build and produces nothing at all).
+  On a push failure the log gains a `The image was archived to …` line. An unwritable directory
+  still wastes the whole build before it fails.
+- The build log prints `==> This image is also archived to …`; `docker build --quiet` hides it.
+
 To run through `k8s_middleware` OpenAPI instead:
 
 ```bash
@@ -635,6 +788,12 @@ changes.
 | `docker logs` / `docker events` wait forever or return unsupported | These commands are not supported by the `k8s-middleware` backend | Use `docker exec -it <container> bash`, `docker ps`, and `docker inspect` |
 | `docker cp` finishes but no `Successfully copied` message | An old wrapper redirected Docker output, and Docker CLI suppressed the message when stdout/stderr was not a TTY | Update the SDK/wrapper and restart docker-rt |
 | `docker rm <local-id>` returns no such container | The current daemon does not know that local ID | Use the `sb-...` sandbox ID, or restart docker-rt to refresh local records |
+| The build sandbox is stuck pulling the builder image (`ImagePullBackOff`) | The default builder image is **per cluster** (`cn-east-1` and its `#pre`/`#pre2` → the Shanghai ACR VPC address, every other cluster → Docker Hub); a wrong cluster identity makes docker-rt pull an unreachable address | Check that `PYROMIND_CLUSTER` / `--cluster` matches the target cluster; to change the version or use your own mirror, set `DOCKER_RT_BUILD_IMAGE` and **restart the daemon** |
+| `docker build` says `DOCKER_RT_BUILD_REGISTRY is required to push short tags` | A short tag (`-t myapp`) was used but no prefix could be resolved | Set `DOCKER_RT_BUILD_REGISTRY` (or configure `DOCKER_RT_REGISTRY_NAMESPACE` in the cluster profile), or use a fully-qualified tag such as `docker.io/you/myapp:1` |
+| The build runs to the end and the last line is `401 Unauthorized` (`error pushing image`) | Wrong **repo path** or wrong credentials for that host. On ACR the path must be `<host>/<namespace>/<repo>`: a host-only `DOCKER_RT_BUILD_REGISTRY` makes ACR read the repo name as a namespace. Note `docker login <host>` succeeding says nothing about the repo path | Add a namespace to the prefix (any namespace — it comes from the parameter, nothing is appended for you); the daemon refuses a host-only prefix **before** building. For credentials, ACR wants its own instance username + temporary token — a Docker Hub account will not do |
+| kaniko dies instantly with `error resolving source context: archive/tar: invalid tar header` | The context is not a valid tar — usually because the **client already compressed it** (`docker compose build` goes through the classic builder's `--compress`, or the context is a `.tar.gz` URL) and we compressed it a second time | Fixed: the daemon now sniffs and decompresses like moby does (gzip/bzip2/xz/zstd). Look for the `the client sent it …-compressed; unwrapping it…` line in the log |
+| `docker build` says `cannot create build sandbox (...)` and mentions a mount/subPath | `/workspace/docker_images` does not exist in the workspace (it is the archive's mount source) | Create it first (in Jupyter / the workspace: `mkdir -p docker_images`) and retry |
+| The build succeeded but there is no tarball | Archiving is the build's **last** step, or the directory is not writable | Check the log for `==> This image is also archived to …`; if it is missing, that step failed |
 | An API error has no `trace_id` | The operation did not reach k8s-middleware (local validation only) | Only backend responses carrying `x-trace-id` will include `trace_id=` |
 
 ## Configuration
@@ -689,14 +848,15 @@ Pass `tty=True` when the command needs a pseudo-terminal for its output.
 
 ```
 pyromind_sdk/
-├── client/                          # API clients
-│   ├── base.py                      # Base HTTP client
-│   ├── client.py                    # PyroMindAPIClient (unified entry)
-│   ├── async_client.py              # PyroMindAsyncAPIClient (async entry)
-│   ├── studio.py / async_studio.py  # Studio / Training tasks
-│   ├── jupyterLab.py / async_jupyterlab.py  # Jupyter instances
-│   ├── inference.py / async_inference.py    # Inference jobs
-│   ├── echomind.py / async_echomind.py      # EchoMind instances
+├── __init__.py                      # Package exports
+├── client/                          # Sync and async API clients
+│   ├── base.py / async_base.py      # Base HTTP clients
+│   ├── client.py / async_client.py  # Unified sync/async entries
+│   ├── sandbox.py / async_sandbox.py # Sandbox instances
+│   ├── studio.py / async_studio.py  # Studio / training tasks
+│   ├── jupyterLab.py / async_jupyterlab.py # Jupyter instances
+│   ├── inference.py / async_inference.py   # Inference jobs
+│   ├── echomind.py / async_echomind.py     # EchoMind instances
 │   ├── storage.py                   # File storage
 │   ├── profile.py                   # User profile & SSH keys
 │   ├── models.py                    # Pydantic models
@@ -705,15 +865,31 @@ pyromind_sdk/
 │   ├── function_call_wrapper.py     # Python function → node
 │   ├── python_function_executor.py  # Python node executor
 │   ├── python_to_yaml.py            # Convert Python to YAML
-│   └── yaml_loader.py               # YAML node loader
+│   ├── yaml_loader.py               # YAML node loader
+│   ├── node_validator.py            # Node validation
+│   ├── command_executor.py          # Command template execution
+│   └── type_converter.py            # Node type conversion
 ├── common/                          # Shared utilities
 │   ├── constants.py
 │   └── node_sdk.py
-├── cli.py                           # CLI entry points
+├── docker_rt/                       # Docker-compatible Kubernetes runtime
+│   ├── api/                         # Docker Engine API endpoints
+│   ├── backend/                     # Runtime, build, storage & K8s adapters
+│   ├── scripts/                     # Context registration helpers
+│   ├── builder-image/               # Kaniko builder assets
+│   ├── server.py / aio_server.py    # Sync/async daemon entry points
+│   └── tests/                       # docker-rt test suite
+├── cli.py                           # Unified CLI entry
 ├── python_function_to_yaml_cli.py   # Python → YAML CLI tool
+├── test_run_workflow_cli.py         # Workflow submission CLI
+├── exec_stream.py                   # Sandbox exec streaming helpers
+├── terminal.py                      # Interactive sandbox terminal
 ├── examples/                        # Usage examples
+│   ├── nodes/                       # YAML node examples
 │   └── openapi/                     # API usage examples
-└── tests/                           # Test suite
+└── tests/                           # SDK test suite
+    ├── pytest/                      # Unit and integration tests
+    └── test_yaml_nodes.py           # YAML node validation helper
 ```
 
 ## Services

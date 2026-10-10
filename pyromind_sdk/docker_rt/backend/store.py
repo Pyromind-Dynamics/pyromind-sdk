@@ -10,6 +10,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from .buildkit import normalize_for_registry as _normalize_image
+
+
+def _with_latest(name: str) -> str:
+    """``app`` → ``app:latest``；已经有 tag/digest 就原样返回。"""
+    if not name or "@" in name:
+        return name
+    return name if ":" in name.rsplit("/", 1)[-1] else f"{name}:latest"
+
 
 class ContainerState(str, Enum):
     CREATED = "created"
@@ -371,17 +380,36 @@ class ContainerStore:
             self._extra_images.add(pullable)
 
     def resolve_image(self, name: str) -> str:
-        """Resolve build aliases to the pullable registry ref."""
+        """Resolve build aliases to the pullable registry ref.
+
+        名字会按目标 registry 的规则**规范化一遍再查**：ACR 上我们推的是规范化过的
+        名字，用户（compose / benchmark）拿原来的名字来 `create`/`run`，
+        不比这一遍就会"推上去一个名字、拉的时候找另一个名字"⇒ 拉不到。
+        :func:`~docker_rt.backend.buildkit.normalize_for_registry` 是幂等的，
+        所以两条路上过几遍都一样。
+        """
         if not name:
             return name
-        if name in self._image_aliases:
-            return self._image_aliases[name]
-        # Also try without implicit :latest
-        if ":" not in name.rsplit("/", 1)[-1]:
-            alt = f"{name}:latest"
-            if alt in self._image_aliases:
-                return self._image_aliases[alt]
+        for candidate in self._image_lookup_candidates(name):
+            if candidate in self._image_aliases:
+                return self._image_aliases[candidate]
+        # 别名表里可能存的是**规范化过**的键/值，再把两边都规范化了比一次。
+        target = _normalize_image(name)
+        if target != name:
+            for short, pullable in self._image_aliases.items():
+                if _normalize_image(pullable) == target:
+                    return pullable
         return name
+
+    @staticmethod
+    def _image_lookup_candidates(name: str) -> list[str]:
+        """``name`` 本身、补上 ``:latest`` 的版本，以及两者规范化后的形式。"""
+        out: list[str] = []
+        for base in (name, _with_latest(name)):
+            for variant in (base, _normalize_image(base)):
+                if variant and variant not in out:
+                    out.append(variant)
+        return out
 
     def unregister_image(self, name: str) -> bool:
         """Drop a stub-registered image. Returns True if it was known."""

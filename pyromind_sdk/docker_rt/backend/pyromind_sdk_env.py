@@ -1238,4 +1238,106 @@ class PyromindSDK:
         await self.resume()
 
 
-__all__ = ["PyromindSDK"]
+# --------------------------------------------------------------------------
+# 删掉一个沙箱的正确顺序：**先 pause，再 delete**
+# --------------------------------------------------------------------------
+#
+# 平台只允许删**非 Running** 的实例，否则回：
+#
+#     INTERNAL_SERVER_ERROR: InstanceService.delete_instance-instance`s status is
+#     Running, can not delete!
+#
+# 所以 `docker rm` 和 `docker rm -f` 是**同一套行为**（``api/containers.py`` 里写着
+# "intentionally share the same behavior"），走的都是
+# ``PyromindSDK.cleanup()`` → ``_prepare_for_cleanup()``（只有 Running 才 pause）→
+# ``_cleanup_once()``（delete，并对"delete 撞上 pause 过渡"退避重试）。
+#
+# 但"手里只有一个 sandbox id、没有 env 对象"的地方（watcher 的构建沙箱清扫）曾经
+# 自己写了一句 ``client.delete(id)`` —— 于是**一次都没成功过**：构建沙箱的常态就是
+# Running（``sleep infinity``），配额一直漏，还每停一次 daemon 刷一遍 SDK 的 [ERROR]。
+#
+# 下面这个函数就是同一套语义的独立版本。**任何地方要删一个沙箱都走它，别再自己写
+# ``client.delete()``。**
+_RUNNING_DELETE_MESSAGE_TOKENS = ("status is running", "can not delete", "cannot delete")
+
+
+def is_running_delete_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is the platform's "it is still running, cannot delete".
+
+    与 :meth:`PyromindSDK._is_running_delete_error` 同一判据（那是个实例方法，
+    这里需要能被没有 env 对象的调用方用到）。
+    """
+    message = str(getattr(exc, "message", exc)).lower()
+    return any(token in message for token in _RUNNING_DELETE_MESSAGE_TOKENS)
+
+
+def _status_code_of(exc: BaseException) -> int:
+    code = getattr(exc, "status_code", None)
+    try:
+        return int(code) if code is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+async def stop_then_delete_sandbox(
+    client: Any,
+    sandbox_id: str,
+    *,
+    attempts: int = _CLEANUP_RETRY_ATTEMPTS,
+    delay_s: float = _CLEANUP_DELETE_RETRY_DELAY_S,
+) -> None:
+    """Pause a running sandbox, then delete it — the only order the platform accepts.
+
+    一路上的 ``404`` 都当"已经没了"，也就是成功。真的删不掉时把 SDK 的异常抛出去，
+    由调用方决定怎么报（watcher 的清扫是 warning 后继续下一个）。
+    """
+    status = ""
+    try:
+        sandbox = await client.get_sandbox(
+            sandbox_id, timeout=_CLEANUP_STATUS_TIMEOUT_S
+        )
+    except Exception as exc:  # noqa: BLE001 - 读不到状态不等于删不掉，往下按 Running 处理
+        if _status_code_of(exc) == 404:
+            return
+        logger.debug(
+            "cannot read the status of sandbox %s before deleting it: %s", sandbox_id, exc
+        )
+    else:
+        status = str(getattr(sandbox, "status", "") or "").lower()
+
+    if status and status != _CLEANUP_RUNNING_STATUS:
+        # 平台允许直接删非 Running 的实例，少一次 pause 往返。
+        await client.delete(sandbox_id, timeout=_CLEANUP_DELETE_TIMEOUT_S, retry=False)
+        return
+
+    try:
+        await client.pause(
+            sandbox_id, timeout=_CLEANUP_PAUSE_REQUEST_TIMEOUT_S, retry=False
+        )
+    except Exception as exc:  # noqa: BLE001 - pause 失败也试着删，让 delete 说话
+        if _status_code_of(exc) == 404:
+            return
+        logger.debug("pause before delete failed for %s: %s", sandbox_id, exc)
+
+    for attempt in range(1, attempts + 1):
+        try:
+            await client.delete(
+                sandbox_id, timeout=_CLEANUP_DELETE_TIMEOUT_S, retry=False
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            if _status_code_of(exc) == 404:
+                return
+            if not is_running_delete_error(exc) or attempt >= attempts:
+                raise
+            # pause 的状态迁移要一会儿 —— delete 会先撞上"还在 Running"。
+            logger.debug(
+                "delete of %s raced with the pause transition (attempt %d/%d)",
+                sandbox_id,
+                attempt,
+                attempts,
+            )
+            await asyncio.sleep(delay_s)
+
+
+__all__ = ["PyromindSDK", "stop_then_delete_sandbox"]

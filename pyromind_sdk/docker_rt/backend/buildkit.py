@@ -12,6 +12,7 @@ credentials or its build capacity.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -23,6 +24,93 @@ logger = logging.getLogger("docker_rt.buildkit")
 _TAG_SAFE = re.compile(r"[^a-zA-Z0-9._/:@-]+")
 
 _TRUTHY = {"1", "true", "yes", "on"}
+
+# --------------------------------------------------------------------------
+# 仓库名规范化（上海 ACR 的规则比通用 Docker 规则严）
+# --------------------------------------------------------------------------
+#
+# 2026-10-10 用户给出上海集群的限制：**长度 2–120**、只能用小写英文字母/数字和
+# `_` `-` `.` `/`、分隔符不能在首尾、**也不能连续出现两个**。
+# benchmark 生成的 `wasmi-trap-coredumps__3xyt67d-pier-egress-proxy` 里那个 `__`
+# 正好非法 —— 建仓会失败，推送更拉不到。
+#
+# ⚠️ 规范化必须**幂等**：构建时拼出的 ref 和 create/run 时用户给的名字都会过一遍
+#   （不过同一遍就会"推上去一个名字、拉的时候找另一个名字"）。
+_ACR_ILLEGAL = re.compile(r"[^a-z0-9_./-]+")
+_ACR_SEPARATOR_RUN = re.compile(r"[_./-]{2,}")
+_ACR_SEPARATOR_EDGE = re.compile(r"^[_./-]+|[_./-]+$")
+
+ACR_NAME_MIN = 2
+ACR_NAME_MAX = 120
+
+
+def normalize_repository_name(name: str) -> str:
+    """把仓库名压成 ACR 能接受的样子。**幂等**（``f(f(x)) == f(x)``）。
+
+    只动名字，别把它用在 tag 上 —— tag 大小写敏感、规则也不一样。
+    """
+    out = _ACR_ILLEGAL.sub("-", (name or "").lower())
+    # 连续分隔符（`a__b` / `a--b` / `a//b`，混着来也算）收成一个：留第一个。
+    out = _ACR_SEPARATOR_RUN.sub(lambda m: m.group()[0], out)
+    out = _ACR_SEPARATOR_EDGE.sub("", out)
+    if len(out) > ACR_NAME_MAX:
+        # 直接截断会让不同任务撞进同一个仓库 —— 拿规范化后的名字算个短指纹贴后面保唯一。
+        # 指纹基于**截断前**的名字，所以第二次调用（已经 ≤120）不会再截，幂等成立。
+        digest = hashlib.sha256(out.encode("utf-8")).hexdigest()[:8]
+        head = _ACR_SEPARATOR_EDGE.sub("", out[: ACR_NAME_MAX - len(digest) - 1])
+        out = f"{head}_{digest}"
+    return out
+
+
+def _split_ref_suffix(raw: str) -> tuple[str, str]:
+    """``(name, suffix)``；suffix 是 ``:tag`` 或 ``@sha256:…``（可能为空）。
+
+    只看**最后一段**有没有冒号 —— 否则 ``reg.example.com:5000/app`` 里的端口会被
+    当成 tag，整个 host 会被送去规范化。
+    """
+    if "@" in raw:
+        name, _, digest = raw.partition("@")
+        return name, "@" + digest
+    last = raw.rsplit("/", 1)[-1]
+    if ":" in last:
+        name, _, tag = raw.rpartition(":")
+        return name, ":" + tag
+    return raw, ""
+
+
+def normalize_image_name(ref: str) -> str:
+    """规范化一个镜像引用里的**仓库名**部分；host 与 tag/digest 原样保留。"""
+    raw = (ref or "").strip()
+    if not raw:
+        return raw
+    name, suffix = _split_ref_suffix(raw)
+    host = ""
+    rest = name
+    if looks_fully_qualified(name):
+        host, _, rest = name.partition("/")
+        host += "/"
+    return f"{host}{normalize_repository_name(rest)}{suffix}"
+
+
+def normalize_for_registry(ref: str, *, cluster: str | None = None) -> str:
+    """按**目标 registry** 的规则规范化仓库名；不需要动的 registry 原样返回。
+
+    目前只有 ACR 需要：Docker Hub / 通用 registry 的规则更宽（``a__b`` 完全合法），
+    在那里改名会把本来能用的镜像名改掉、反而对不上。
+
+    另外**只动指向这台 ACR 的名字**：集群是 ACR，但 ref 明明写着
+    ``docker.io/...``（全限定）时，那是别人的规矩，不按 ACR 改。
+    """
+    from .registry_push import registry_profile
+
+    profile = registry_profile(cluster)
+    if profile.kind != "acr":
+        return ref
+    if looks_fully_qualified(ref):
+        host = (ref or "").split("/", 1)[0]
+        if host not in {h for h in (profile.host, profile.public_host) if h}:
+            return ref
+    return normalize_image_name(ref)
 
 
 def error_event(message: str) -> dict[str, Any]:
@@ -82,6 +170,11 @@ def normalize_image_ref(tag: str, *, registry: str | None = None) -> tuple[str, 
     Short tags like ``proj_web`` become ``{registry}/proj_web:latest``.
     Fully-qualified refs (the first segment looks like a host) are returned
     unchanged as pullable.
+
+    The composed ref goes through :func:`normalize_for_registry`: on a cluster
+    whose registry has naming rules of its own (上海 ACR：不能有连续分隔符等)
+    the name we push, the name we **create**, and the name ``create``/``run``
+    later resolves must all be the same string.
     """
     raw = (tag or "").strip()
     if not raw:
@@ -99,10 +192,11 @@ def normalize_image_ref(tag: str, *, registry: str | None = None) -> tuple[str, 
         return raw, raw
 
     if looks_fully_qualified(raw):
-        return raw, raw
+        # 全限定：不动它的 host，但如果指的正是本集群那台 ACR，名字仍要守 ACR 的规矩。
+        return raw, normalize_for_registry(raw)
 
     safe = _TAG_SAFE.sub("-", raw)
-    return raw, f"{reg}/{safe}"
+    return raw, normalize_for_registry(f"{reg}/{safe}")
 
 
 def parse_buildargs_query(raw: str | None) -> dict[str, str]:
