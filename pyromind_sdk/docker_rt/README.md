@@ -364,7 +364,7 @@ docker ps   # 仍能看到 sb1
 | `DOCKER_RT_BUILD_LOG` | `collapsed` | 构建日志收敛模式。默认只保留 kaniko 的阶段行（`INFO[0004] …`）+ 每步输出的头几行与末行，中间折叠成一行统计；失败时自动回放原始日志尾部。设 `full` 原样输出全部字节 |
 | `DOCKER_RT_BUILD_CONTEXT_WARN_MB` | `256` | context 超过这个大小就打一条 `.dockerignore` 提示；`0` 关闭 |
 | `DOCKER_RT_BUILD_SANDBOX_KEEP` | `false` | `true` 时不删构建沙箱，**仅供排障**（注意：Running 状态删不掉，要先 `pause`）。同时会让 `kill -9` 后的沙箱清扫也跳过，否则这个旗子等于没设 |
-| `DOCKER_RT_BUILD_SANDBOX_SWEEP` | `true` | 守护进程被 `kill -9` 时沙箱的 `finally` 不会跑，构建沙箱会以 `sleep infinity` **一直跑着**占配额（比 staged context 更贵）。watcher 恢复完 Docker context 后，把名字以 `sandbox-docker-build-` 开头的沙箱**全部删掉**；设 `false` 关闭 |
+| `DOCKER_RT_BUILD_SANDBOX_SWEEP` | `false` | 守护进程被 `kill -9` 时沙箱的 `finally` 不会跑，构建沙箱会以 `sleep infinity` **一直跑着**占配额。**默认不清理**（opt-in，2026-10-10 用户要求）：它的规则是"名字以 `sandbox-docker-build-` 开头就删" + 账号级的 `list()`，**分不出"崩溃漏下的"和"另一台机器上正在跑的构建"的沙箱**，清错会把别人正在跑的构建删掉。设 `true` 才恢复自动清扫；默认状态下漏下的沙箱由用户自己 `docker ps \| grep sandbox-docker-build` + `docker rm -f` 清掉（watcher 会打一条提示） |
 | `DOCKER_RT_BUILD_CONTEXT_DIR` | `/kaniko/docker-rt-build` | 构建沙箱内的暂存目录。**必须在 `/kaniko` 下**：kaniko 多阶段构建切换 stage 时会删掉容器根文件系统（日志里的 `Deleting filesystem...`），只保留 `/kaniko`（它自己的二进制、`.docker/config.json` 和 `buildcontext`）。放到 `/tmp` 会在第一阶段结束时被删掉，poller 随后误报 "the launcher did not reach the fork" |
 | `DOCKER_RT_BUILD_CONTEXT_MODE` | `auto` | context 进沙箱的路由：`auto`（先走 storage 挂载，失败自动回退直传）/ `storage`（只走 storage，失败即构建失败，不静默降级）/ `upload`（完全不碰 storage，回到旧的 HTTP 直传）。**默认走 storage**：直传是「每 2 MiB 一个 exec websocket」串行推，实测 61 MiB 要 631 s（≈110 KB/s），多 GB 的 ML context 基本不可用；storage 走工作区对象存储的并发分片上传 + 集群侧本地读挂载，同样 60 MiB 只要 ~59 s 上传 + 集群内 2.7 s 拷贝。详见下方「context 怎么送进沙箱」 |
 | `DOCKER_RT_BUILD_STAGING_MOUNT` | `/kaniko/docker-rt-stage` | storage 路由的挂载目标（Pod 内路径）。**必须在 `/kaniko` 下**，理由同 `DOCKER_RT_BUILD_CONTEXT_DIR`（多阶段切 stage 会删掉 `/` 只留 `/kaniko`）；挂到别处会在 mid-build 被抹掉 |
@@ -647,25 +647,48 @@ mid-build 抹掉——而如果挂的是 `/workspace`，那意味着把用户的
 万一 pid 被回收了，watcher 知道自己盯的是哪个 pid，照样删得掉。解析不出 pid 的目录则要求
 年龄超过 `DOCKER_RT_BUILD_STAGING_SWEEP_MAX_AGE_S`（默认 1 天）才动——宁可留着也不猜。
 
-**构建沙箱同样要兜这一层**，而且它比 staged context 更贵：`kill -9` 跳过沙箱的 `finally` 之后，
-那个容器会带着 `sleep infinity` **一直跑着**。所以构建沙箱不再匿名创建，名字带一个一眼能认出的前缀：
+**构建沙箱本来是同一层兜底**（它比 staged context 更贵：`kill -9` 跳过沙箱的 `finally` 之后，
+那个容器会带着 `sleep infinity` **一直跑着**）—— 但这条清扫**默认关掉了**，见下面那一段。
+之所以和 staged context 区别对待：staged context 的判定是"**目录还属不属于某个活着的 pid**"
+（精确、只动自己的），而构建沙箱只能靠"名字前缀 + 账号级 list()"，分不出别人的构建。
+构建沙箱的名字带一个一眼能认出的前缀：
 
 ```
 sandbox-docker-build-<随机>
 # 例：sandbox-docker-build-a1b2c3
 ```
 
-watcher 恢复完 context 后调 `sweep_stale_build_sandboxes()`，规则就一条：**名字以
+watcher 恢复完 context 后会调 `sweep_stale_build_sandboxes()`，规则只有一条：**名字以
 `sandbox-docker-build-` 开头就删**。用户自己的沙箱、以及平台给无名沙箱兜的默认标签
-`SANDBOX-<uuid>`，都不带这个前缀，所以不会被误碰。`DOCKER_RT_BUILD_SANDBOX_KEEP=true`
-时整个清扫跳过——那个旗子本来就是「故意留着」；`DOCKER_RT_BUILD_SANDBOX_SWEEP=false` 关闭。
-两步清扫互相独立，一步失败不影响另一步。
+`SANDBOX-<uuid>`，都不带这个前缀，所以不会被误碰。两步清扫互相独立，一步失败不影响另一步。
 
-⚠️ **纯前缀规则的代价是明知故犯的**：`client.list()` 按**账号**过滤、不区分机器，所以它分不出
-「遗留的沙箱」和「**正在跑的**构建沙箱」——同机另一个 daemon（一个 socket 一个 daemon）、
-或**另一台机器用同一账号**正在构建时，会被一起删掉，那个构建会半路报「沙箱没了」。
-取舍：遗留沙箱会一直烧配额，被误删的构建**立刻失败**、重跑一次就好。
-不该动别人构建的机器上，设 `DOCKER_RT_BUILD_SANDBOX_KEEP=true` 让整个清扫跳过。
+> ⚠️ **这条清扫默认是关的**（`DOCKER_RT_BUILD_SANDBOX_SWEEP` 默认 `false`，2026-10-10 用户要求
+> 「不要清理了，用户自己停，或者自己删除吧」）。理由是下面那条"纯前缀规则"的代价：
+> 它**分不出"崩溃漏下的"和"另一台机器上正在跑的"**，清错就是删别人的构建。
+> 默认状态下 `kill -9` 漏下的沙箱留在那里，**由用户自己清**：
+>
+> ```bash
+> docker ps | grep sandbox-docker-build     # 看有哪些漏下的
+> docker rm -f <id>                         # 删掉（rm 内部就是 pause→delete）
+> ```
+>
+> watcher 会打一条 INFO 提醒这件事。想恢复自动清扫就设 `DOCKER_RT_BUILD_SANDBOX_SWEEP=true`。
+> **注意：正常构建结束时的清理不受这个开关影响** —— 那是 `build_in_sandbox` 的 `finally`
+> 里 `sandbox.cleanup()` 干的，每次构建都该做，关掉它才真的会每次构建都漏一个沙箱。
+
+**（开着的时候）删的顺序是「先 pause 再 delete」**（`pyromind_sdk_env.stop_then_delete_sandbox`）：
+平台**只允许删非 Running 的实例**（否则回
+`InstanceService.delete_instance-instance\`s status is Running, can not delete!`），
+构建沙箱的常态恰好就是 Running（里面跑着 `sleep infinity`）。这和 `docker rm` /
+`docker rm -f` 是同一套行为（两者 `intentionally share the same behavior`，都走
+`PyromindSDK.cleanup()`）。pause 之后的状态迁移要一会儿，所以 delete 会退避重试几次
+（清扫用 10×1s，比正常清理路径的 60×1s 短——watcher 是短命进程）。
+`DOCKER_RT_BUILD_SANDBOX_KEEP=true` 时同样跳过——那个旗子本来就是「故意留着」。
+
+⚠️ **纯前缀规则的代价是明知故犯的（也正是默认关掉它的原因）**：`client.list()` 按**账号**过滤、
+不区分机器，所以它分不出「遗留的沙箱」和「**正在跑的**构建沙箱」——同机另一个 daemon
+（一个 socket 一个 daemon）、或**另一台机器用同一账号**正在构建时，会被一起删掉，
+那个构建会半路报「沙箱没了」。打开它的人要接受这个取舍。
 
 ⚠️ **`sandbox-docker-build-*` 是这个沙箱在平台 API 里的 `name`（存在 `t_instance.name`，
 `list` 会回传），不是 k8s 里 Pod/Deployment 的名字**：k8s 对象名由服务端生成的 sandbox id 拼成
@@ -704,6 +727,22 @@ pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/sweb.eval.x86_64.astr
   跳过并告警（假定仓库已人工建好）。
 - 凭据进沙箱的方式：渲染成 kaniko 读的 `/kaniko/.docker/config.json`
   （**权限必须 0600，否则 kaniko 拒绝读取**），base64 一个参数送进去，原文不进命令行。
+
+#### 仓库名会被规范化（上海 ACR 的命名限制）
+
+上海 ACR 对**仓库名**的限制比 Docker 通用规则严：**长度 2–120**、只允许小写英文字母/数字与
+`_` `-` `.` `/`、分隔符不能在首尾、**也不能连续出现两个**。而 benchmark 生成的
+`wasmi-trap-coredumps__3xyt67d-pier-egress-proxy` 里那个 `__` 正好非法 —— 不处理的话建仓会失败、
+推送更拉不到。
+
+`buildkit.normalize_for_registry()` 负责这件事，规则是 **幂等**的：
+
+- **构建时**拼出来的推送 ref 先规范化（`__`→`_`、大写→小写、非法字符→`-`、首尾分隔符去掉；
+  超过 120 截断并贴 8 位指纹保唯一），**建仓用的仓库名和推上去的名字都取自它**；
+- **`docker create` / `run` / `inspect`** 时用户给的名字也过**同一个函数**，所以拿原来的名字
+  （compose / benchmark 用的那个）照样解析得到 —— 不然就是"推上去一个名字、拉的时候找另一个名字"；
+- 只对**本集群那台 ACR** 的名字生效：Docker Hub / 通用 registry 的规则更宽（`a__b` 完全合法），
+  在那里一字不改；集群是 ACR 但 ref 全限定写着 `docker.io/...` 时同样不动。
 
 ### 构建失败怎么查
 
@@ -791,6 +830,26 @@ pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/sweb.eval.x86_64.astr
      也说明不了它一定覆盖你要推的仓库。ACR 用的是企业版实例自己的用户名 + 临时 token；
      Docker Hub 的账号在这里没用。
    失败时 daemon 会把这几条原因一起打出来（kaniko 自己只有一句状态码，连是哪个仓库都不说）。
+11. **`docker exec <cid> <cmd>` 一点输出都没有（不是 `-it`）** —— 先看 daemon 那行汇总：
+    `pyromind exec stream id=… out=0 err=0 code=-1` 就是"**零输出 + 零退出码**"。
+    平台把 `-1` 当"我解析不出退出码"的哨兵值（`async_exec._parse_returncode` 只认
+    `Success` 和 `causes[reason=ExitCode]`，其余一律 `-1`），然后**照常**发 exit 事件 ——
+    所以这条路上没有异常、没有报错，客户端看着就是"什么都没发生"。
+
+    最常见的成因是**引号**：`docker exec cid "echo hello"` 里的 `"echo hello"` 是**一个**
+    argv 元素（CLI 不拆分引号里的空格，Docker 亦然），沙箱里没有这个名字的可执行文件。
+    实测三种写法的对照（`-it` 走 PTY、里面有登录 shell，与这条通道无关）：
+
+    | 命令 | 真 Docker | docker-rt |
+    |---|---|---|
+    | `exec cid echo hello` | 输出 `hello`，退 0 | ✅ 一样 |
+    | `exec cid sh -c 'echo hello'` | 输出 `hello`，退 0 | ✅ 一样 |
+    | `exec cid "echo hello"` | ✗ 报错 + **退 127** | ✗ 现在也报错 + 退 **127** |
+
+    按 Docker 的规矩修好了：daemon 会往流里写
+    `docker-rt: exec: "echo hello": executable file not found in $PATH`
+    （保留这句可被 grep 的原文）+ 一条"要 shell 语法就写 `sh -c`"的提示，并退 **127**
+    （`EXEC_CANNOT_START_CODE`，Docker 在"命令没起来"时用的码）。
 10. **kaniko 秒挂：`error resolving source context: archive/tar: invalid tar header`** ——
    上下文不是合法 tar。最可能的原因是**客户端已经把 context 压过了**，而我们又压了一层，
    kaniko 解开外层拿到一个压缩流。两个真实来源：classic builder 的 `--compress`（`docker compose build`

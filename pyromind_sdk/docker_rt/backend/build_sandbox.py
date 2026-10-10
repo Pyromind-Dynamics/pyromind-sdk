@@ -266,14 +266,34 @@ def is_build_sandbox_name(name: str) -> bool:
 
 
 def sandbox_sweep_enabled() -> bool:
-    """``DOCKER_RT_BUILD_SANDBOX_SWEEP`` (``true`` by default)."""
-    return _env("DOCKER_RT_BUILD_SANDBOX_SWEEP", "true").lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-        "disabled",
+    """``DOCKER_RT_BUILD_SANDBOX_SWEEP`` — **默认关**（opt-in）。
+
+    2026-10-10 用户要求："不要清理了，用户自己停，或者自己删除吧"。理由站得住：
+
+    * 它的规则是**纯前缀 + 账号级**的 ``list()``，分不出"上次崩溃漏下的沙箱"和
+      "**另一台机器上正在跑的构建**的沙箱"—— 清错就是把别人正在跑的构建删掉；
+    * 删除本身还踩过坑（平台拒删 Running 的实例，必须先 pause，见
+      :func:`~docker_rt.backend.pyromind_sdk_env.stop_then_delete_sandbox`）。
+
+    正常构建结束时的清理（``build_in_sandbox`` 的 ``finally`` → ``sandbox.cleanup()``）
+    **不受这个开关影响** —— 那是每次构建都该做的事。这个开关只管"守护进程死掉之后，
+    要不要有人来做这件事"，现在交回给用户：想清就自己
+    ``docker ps | grep sandbox-docker-build`` / ``docker rm -f``。
+    """
+    return _env("DOCKER_RT_BUILD_SANDBOX_SWEEP", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "enabled",
     }
+
+
+#: 清扫里"pause 之后 delete 还可能被拒"的重试预算。比正常清理路径
+#: （``_CLEANUP_RETRY_ATTEMPTS`` = 60 × 1s）小得多：watcher 是个短命进程，
+#: 而 pause→delete 通常第一两次就成了，不该为了一个删不掉的沙箱卡一分钟。
+SWEEP_DELETE_ATTEMPTS = 3
+SWEEP_DELETE_RETRY_DELAY_S = 1.0
 
 
 async def sweep_stale_build_sandboxes(*, client: Any | None = None) -> list[str]:
@@ -293,9 +313,9 @@ async def sweep_stale_build_sandboxes(*, client: Any | None = None) -> list[str]
     Everything else is left alone: the user's own sandboxes, and the platform's
     default ``SANDBOX-<uuid>`` label, do not carry the prefix.
 
-    ``DOCKER_RT_BUILD_SANDBOX_KEEP=true`` skips the sweep entirely, since that
-    flag exists to leave sandboxes behind on purpose; ``..._SWEEP=false`` turns
-    it off.
+    ``DOCKER_RT_BUILD_SANDBOX_SWEEP=true`` 才开（**默认关**，见
+    :func:`sandbox_sweep_enabled`）；``DOCKER_RT_BUILD_SANDBOX_KEEP=true`` 同样跳过
+    （那个旗子本来就是"故意留着"）。
 
     Two things this deliberately does *not* try to do:
 
@@ -314,7 +334,14 @@ async def sweep_stale_build_sandboxes(*, client: Any | None = None) -> list[str]
     the names removed.
     """
     if not sandbox_sweep_enabled():
-        logger.debug("build sandbox sweep disabled by DOCKER_RT_BUILD_SANDBOX_SWEEP")
+        # 默认就走这里。说清楚"没人会自动清"，并给出用户自己清的入口 ——
+        # 否则 `kill -9` 漏下的沙箱会一直跑 `sleep infinity` 吃配额而无人知晓。
+        logger.info(
+            "build sandbox sweep is off (DOCKER_RT_BUILD_SANDBOX_SWEEP) — leftover "
+            "build sandboxes are left alone; remove them yourself with "
+            "`docker ps | grep %s` + `docker rm -f <id>`",
+            BUILD_SANDBOX_NAME_STEM,
+        )
         return []
     if keep_sandbox():
         logger.warning(
@@ -329,6 +356,10 @@ async def sweep_stale_build_sandboxes(*, client: Any | None = None) -> list[str]
             from .pyromind_sdk_env import get_sandbox_client
 
             client = get_sandbox_client()
+        # 删沙箱**必须**先 pause（平台拒删 Running 的实例），这套语义和
+        # `docker rm` / `docker rm -f` 共用 —— 别再自己写 client.delete()。
+        from .pyromind_sdk_env import stop_then_delete_sandbox
+
         sandboxes = await client.list()
     except Exception as exc:  # noqa: BLE001
         logger.warning("cannot list sandboxes to sweep build sandboxes: %s", exc)
@@ -355,7 +386,12 @@ async def sweep_stale_build_sandboxes(*, client: Any | None = None) -> list[str]
                 logger.warning("leftover build sandbox %s has no id; skipping", name)
                 continue
             try:
-                await client.delete(sandbox_id)
+                await stop_then_delete_sandbox(
+                    client,
+                    sandbox_id,
+                    attempts=SWEEP_DELETE_ATTEMPTS,
+                    delay_s=SWEEP_DELETE_RETRY_DELAY_S,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "failed to delete leftover build sandbox %s (%s): %s",
