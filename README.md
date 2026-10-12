@@ -18,11 +18,12 @@ from pyromind_sdk.client.models import TrainingTaskCreateRequest
 
 client = PyroMindAPIClient(api_key="your-api-key")
 
-# Create and run a studio task
+# Create and run a studio task (out_id is required)
 task = client.studio.create(
     TrainingTaskCreateRequest(
         name="my-workflow",
-        workflow={"nodes": [...]}
+        workflow={"nodes": [...]},
+        out_id="ext-task-001",
     )
 )
 print(f"Created task: {task.task_id}")
@@ -800,12 +801,19 @@ changes.
 
 ### Client parameters
 
+Sync `PyroMindAPIClient`:
+
 | Param | Required | Type | Default | Description |
 |-------|----------|------|---------|-------------|
 | `api_key` | Yes* | `str` | `PYROMIND_API_KEY` env | Bearer token for API auth |
+| `base_url` | No | `str` | `PYROMIND_BASE_URL` env | API base URL; the SDK default is used when omitted |
 | `cluster` | No | `str` | `PYROMIND_CLUSTER` env or `"us-west-2"` | Target cluster (`X-Cluster` header) |
 | `timeout` | No | `int` | `30` | Request timeout in seconds |
 | `max_retries` | No | `int` | `3` | Max retries for failed requests |
+
+Async `PyroMindAsyncAPIClient`: the same parameters, except `timeout` defaults to **60**, plus
+`create_timeout` (a separate timeout for create-style requests) and `create_concurrency_limit`
+(cap on concurrent creates).
 
 \* `api_key` can be provided as a parameter or via `PYROMIND_API_KEY` environment variable.
 
@@ -814,10 +822,13 @@ changes.
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `PYROMIND_API_KEY` | Yes | — | API bearer token |
+| `PYROMIND_BASE_URL` | No | SDK default | API base URL (or pass `base_url=`) |
 | `PYROMIND_CLUSTER` | No | `us-west-2` | Target cluster identifier |
 | `PYROMIND_STORAGE_ENDPOINT` | No | `https://storage.pyromind.ai` | Storage endpoint URL |
 | `PYROMIND_STORAGE_SECRET_KEY` | No | — | Storage secret key |
 | `PYROMIND_STORAGE_BUCKET` | No | — | Default storage bucket name |
+| `PYROMIND_LOG_LEVEL` | No | unset | Client SDK log level (e.g. `DEBUG`) |
+| `PYROMIND_LOG_FORMAT` | No | unset | Client log format (e.g. `json`) |
 
 ### Streaming sandbox exec
 
@@ -894,6 +905,107 @@ pyromind_sdk/
 
 ## Services
 
+Service entry points on the top-level client (`PyroMindAPIClient`):
+
+| Attribute | Client | Covers |
+|-----------|--------|--------|
+| `client.sandboxes` | `SandboxClient` | Sandbox lifecycle, command exec, file I/O, desktop actions |
+| `client.studio` | `StudioClient` | Training workflows and custom nodes |
+| `client.jupyter` | `JupyterLabClient` | JupyterLab instances |
+| `client.inference` | `InferenceClient` | Inference jobs |
+| `client.echomind` | `EchoMindClient` | EchoMind instances |
+| `client.profile` | `ProfileClient` | User info, storage credentials, SSH keys |
+
+> On the async client (`PyroMindAsyncAPIClient`) Jupyter is **`client.instances`** (not
+> `jupyter`) and there is **no** `profile`; `StorageClient` is **constructed directly**
+> (there is no `client.storage`) on both. See "Async Support".
+
+### Sandbox (`client.sandboxes`)
+
+Lifecycle, command execution, file I/O and desktop actions for sandboxes
+(long-lived containers on Kubernetes).
+
+| Method | Input | Output | Description |
+|--------|-------|--------|-------------|
+| `list(query=None)` | `ListQuery` | `List[SandboxResponse]` | List sandboxes, optionally filtered by name/status |
+| `list_page(query=None)` | `ListQuery` | `SandboxPage` | Paged list (`total` / `page_size` / `page_num`) |
+| `create(request, timeout=None)` | `SandboxRequest` | `SandboxResponse` | Create a sandbox |
+| `create_and_wait(request, target_status, timeout=300, check_interval=3, ...)` | `SandboxRequest` + opts | `SandboxResponse` | Create, then poll to the target status |
+| `get_sandbox(sandbox_id, timeout=None, retry=True)` | `str` | `SandboxResponse` | Get sandbox details |
+| `get_internal_ip(sandbox_id)` | `str` | `InternalIPResponse` | In-cluster IP of one sandbox |
+| `get_internal_ips(sandbox_ids)` | `Sequence[str]` | `Dict[str, str]` | Batch in-cluster IPs (one request) |
+| `wait_for_sandbox_status(sandbox_id, target_status, timeout=300, check_interval=3, ...)` | `str` + opts | `bool` | Poll until the target status |
+| `update(sandbox_id, request)` | `str`, `SandboxRequest` | `SandboxResponse` | Update sandbox config |
+| `pause(sandbox_id, timeout=None, retry=True)` / `resume(sandbox_id)` | `str` | `SandboxResponse` | Pause / resume |
+| `delete(sandbox_id, timeout=None, retry=True)` | `str` | `None` | Delete a sandbox |
+| `exec_command(sandbox_id, command, cwd='', timeout=None)` | `str \| List[str]` | `SandboxExecResponse` | Run a command, get stdout/stderr/returncode |
+| `exec_command_stream(sandbox_id, command, cwd='', timeout=None, tty=False)` | same | `AsyncIterator[SandboxExecStreamChunk]` | Streaming execution |
+| `read_file(sandbox_id, path)` | `str` | `bytes` | Read a file |
+| `write_file(sandbox_id, path, source)` | `str \| PathLike \| bytes \| BinaryIO` | `Dict[str, Any]` | Write a file |
+| `delete_file(sandbox_id, path, recursive=False)` | `str` | `Dict[str, Any]` | Delete a file/directory |
+| `execute_action(sandbox_id, request)` _(async only)_ | `ActionRequest` | `ActionResponse` | Run one desktop action (OSWorld style) |
+| `execute_batch_actions(sandbox_id, request)` _(async only)_ | `BatchActionRequest` | `List[ActionResponse]` | Batch actions |
+| `get_vnc(sandbox_id)` _(async only)_ | `str` | `Dict[str, Any]` | VNC connection info |
+
+> _(async only)_ = present on `AsyncSandboxClient` only (`PyroMindAsyncAPIClient.sandboxes`);
+> the sync `SandboxClient` does not have these three yet. Every other method exists on both.
+
+**`SandboxRequest` parameters:**
+
+| Param | Required | Type | Description |
+|-------|----------|------|-------------|
+| `sandbox_type` | Yes | `SandboxType` | `osworld` (desktop) or `custom` (plain container) |
+| `resources` | No | `ResourceConfig` | CPU/memory/GPU/card |
+| `configuration` | No | `SandboxConfiguration` | Screen resolution, `auto_destroy`, VNC password |
+| `name` | No | `str` | Display name |
+| `system_image_path` | No | `str` | Platform-provided system image |
+| `image` | No | `str` | Custom container image (instead of `system_image_path`) |
+| `volume_mounts` | No | `List[VolumeMount]` | Mounts |
+| `port_mappings` | No | `List[PortMapping]` | Port mappings (`container_port` + optional `host_port`/`name`/`protocol`) |
+| `mount_public_dir` | No | `bool` | Mount the shared public directory |
+
+**`SandboxExecResponse` fields:** `output` (stdout), `stderr`, `returncode` (0 = success,
+`-1` = the platform could not report one), `exception_info` (infrastructure-level error,
+empty on a normal exec), `extra` (server-side metadata).
+
+**`SandboxExecStreamChunk` fields:** `type` (`stdout` / `stderr` / `exit`), `data`,
+`returncode` (meaningful on the `exit` chunk only).
+
+**`ActionRequest` parameters:**
+
+| Param | Required | Type | Description |
+|-------|----------|------|-------------|
+| `action` | Yes | `str` | Action name (e.g. `click`, `type`, `run`) |
+| `parameters` | No | `ActionParameters` | `command` / `working_directory` / `environment_variables` / `timeout` / `coordinates` / `text` / `time` / `options` |
+
+**Shared query model `ListQuery`:** `page_size`, `page_num`, `name`, `instance_id`, `status`
+(used by `list` / `list_page`; the paged models name their list differently per service —
+`sandboxes` for Sandbox, `instances` for Jupyter, `jobs` for Inference and EchoMind).
+
+**Example:**
+
+```python
+from pyromind_sdk.client.models import SandboxRequest, SandboxType, ResourceConfig
+
+sandbox = client.sandboxes.create(
+    SandboxRequest(
+        sandbox_type=SandboxType.CUSTOM,
+        name="my-box",
+        resources=ResourceConfig(cpu="2", memory="4Gi"),
+    )
+)
+
+# One-shot command
+result = client.sandboxes.exec_command(sandbox.id, ["echo", "hello"])
+print(result.output, result.returncode)
+
+# Batch in-cluster IPs
+ips = client.sandboxes.get_internal_ips([sandbox.id, "sb-other"])
+
+# Cleanup
+client.sandboxes.delete(sandbox.id)
+```
+
 ### Studio (`client.studio`)
 
 Training workflow management — create, monitor, and manage workflow tasks.
@@ -922,6 +1034,7 @@ Training workflow management — create, monitor, and manage workflow tasks.
 |-------|----------|------|-------------|
 | `name` | Yes | `str` | Task name |
 | `workflow` | Yes | `Dict[str, Any]` | Workflow JSON structure with node definitions |
+| `out_id` | Yes | `str` | Task ID used to map this job onto an external system's task |
 
 **`WorkflowRunRequest` parameters:**
 
@@ -929,17 +1042,19 @@ Training workflow management — create, monitor, and manage workflow tasks.
 |-------|----------|------|-------------|
 | `workflow_name` | Yes | `str` | Name of the stored workflow |
 | `primitive_node_map` | No | `Dict[str, Any]` | Injected primitive node values (default: `{}`) |
+| `execution_argos` | No | `Optional[list]` | Extra run-time arguments for this execution |
 
 **Example:**
 
 ```python
 from pyromind_sdk.client.models import TrainingTaskCreateRequest, WorkflowRunRequest
 
-# Create a training task
+# Create a training task (out_id is required: external system task ID)
 task = client.studio.create(
     TrainingTaskCreateRequest(
         name="my-workflow",
-        workflow={"nodes": [...]}
+        workflow={"nodes": [...]},
+        out_id="ext-task-001",
     )
 )
 print(f"Task ID: {task.task_id}")
@@ -965,9 +1080,11 @@ Jupyter instance management.
 
 | Method | Input | Output | Description |
 |--------|-------|--------|-------------|
-| `list()` | — | `List[JupyterResponse]` | List all Jupyter instances |
+| `list(query=None)` | `ListQuery` | `List[JupyterResponse]` | List all Jupyter instances |
+| `list_page(query=None)` | `ListQuery` | `JupyterPage` | Paged list (`instances` + `total` / `page_size` / `page_num`) |
 | `create(request)` | `JupyterRequest` | `JupyterResponse` | Create new instance |
 | `get_instance(jupyter_id)` | `str` | `JupyterResponse` | Get instance details |
+| `get_internal_ip(jupyter_id)` | `str` | `InternalIPResponse` | In-cluster IP |
 | `update(jupyter_id, request)` | `str`, `JupyterRequest` | `JupyterResponse` | Update instance config |
 | `delete(jupyter_id)` | `str` | `None` | Delete an instance |
 | `pause(jupyter_id)` / `resume(jupyter_id)` | `str` | `JupyterResponse` | Pause/resume |
@@ -978,6 +1095,10 @@ Jupyter instance management.
 |-------|----------|------|-------------|
 | `name` | No | `str` | Instance display name |
 | `resources` | No | `ResourceConfig` | CPU/memory/gpu config |
+
+**`JupyterResponse` fields:** `id`, `name`, `status`, `password` (access password),
+`url` (access address), `resources`, `ssh_user` / `ssh_port` / `ssh_ip` (SSH access),
+`namespace`, `uid`, `created_at`, `updated_at`.
 
 **Example:**
 
@@ -1000,9 +1121,11 @@ Inference job management.
 
 | Method | Input | Output | Description |
 |--------|-------|--------|-------------|
-| `list()` | — | `List[InferenceJobResponse]` | List all inference jobs |
+| `list(query=None)` | `ListQuery` | `List[InferenceJobResponse]` | List all inference jobs |
+| `list_page(query=None)` | `ListQuery` | `InferencePage` | Paged list (`jobs` + `total` / `page_size` / `page_num`) |
 | `create(request)` | `InferenceJobRequest` | `str` (job_id) | Create inference job |
 | `get_job(job_id)` | `str` | `InferenceJobResponse` | Get job details |
+| `get_internal_ip(job_id)` | `str` | `InternalIPResponse` | In-cluster IP |
 | `update(job_id, request)` | `str`, `InferenceJobRequest` | `InferenceJobResponse` | Update job config |
 | `delete(job_id)` | `str` | `None` | Delete a job |
 | `pause(job_id)` / `resume(job_id)` | `str` | `InferenceJobResponse` | Pause/resume job |
@@ -1021,6 +1144,11 @@ Inference job management.
 | `model_name` | No | `str` | Model name override |
 | `model_length` | No | `int` | Model context length |
 | `startup_args` | No | `List[dict]` or `List[str]` | Custom inference server startup args. Prefer `[{"--arg": value}]`; include the leading `-` or `--` yourself. Duplicate default options are overridden by user args |
+
+**`InferenceJobResponse` fields:** `id`, `name`, `model_path`, `status`, `inference_framework`,
+`image`, `inf_image`, `model_name`, `model_length`, `startup_args`, `resources`,
+`endpoint_url` (inference endpoint), `inf_sk` (key for calling the endpoint), `uid`,
+`created_at`, `updated_at`.
 
 **Example:**
 
@@ -1054,9 +1182,11 @@ EchoMind instance lifecycle management.
 
 | Method | Input | Output | Description |
 |--------|-------|--------|-------------|
-| `list()` | — | `List[EchoMindJobResponse]` | List all EchoMind instances |
+| `list(query=None)` | `ListQuery` | `List[EchoMindJobResponse]` | List all EchoMind instances |
+| `list_page(query=None)` | `ListQuery` | `EchoMindPage` | Paged list (`jobs` + `total` / `page_size` / `page_num`) |
 | `create(request)` | `EchoMindJobRequest` | `str` (job_id) | Create EchoMind instance |
 | `get_job(job_id)` | `str` | `EchoMindJobResponse` | Get instance details |
+| `get_internal_ip(job_id)` | `str` | `InternalIPResponse` | In-cluster IP |
 | `update(job_id, request)` | `str`, `EchoMindJobRequest` | `EchoMindJobResponse` | Update instance config |
 | `delete(job_id)` | `str` | `None` | Delete an instance |
 | `pause(job_id)` / `resume(job_id)` | `str` | `EchoMindJobResponse` | Pause/resume |
@@ -1065,33 +1195,67 @@ EchoMind instance lifecycle management.
 
 | Param | Required | Type | Description |
 |-------|----------|------|-------------|
-| `name` | No | `str` | Instance display name |
+| `name` | Yes | `str` | Instance display name |
+| `api_url` | Yes | `str` | API address of the sampling/inference service |
+| `origin_model` | Yes | `str` | The original (to-be-aligned) model |
+| `access_key` | Yes | `str` | Key used to call `api_url` |
+| `training_model` | Yes | `str` | Model on the training side |
+| `training_batch_size` | Yes | `int` | Training batch size |
+| `trajectory_buffer_size` | Yes | `int` | Trajectory buffer size |
+| `time_per_round` | Yes | `float` | Seconds per round |
+| `training_round` | Yes | `int` | Number of training rounds |
+| `training_save_path` | Yes | `str` | Where training artifacts are saved |
+| `api_mode` | No | `str` | API dialect: `openai` (default) / `gemini` / `anthropic` |
+| `execution_mode` | No | `str` | `manual` (default, you drive the rounds) / `automatic` |
+| `custom_runtime_script_path` | No | `str` | Path to a custom runtime script |
 | `resources` | No | `ResourceConfig` | CPU/memory/gpu config |
+
+**`EchoMindJobResponse` fields:** `job_id` (**not `id`**), `name`, `status`, `api_url`,
+`api_mode`, `origin_model`, `access_key`, `secret_key`, `training_model`,
+`training_batch_size`, `trajectory_buffer_size`, `time_per_round`, `training_round`,
+`training_save_path`, `execution_mode`, `custom_runtime_script_path`, `resources`,
+`created_at`.
 
 **Example:**
 
 ```python
 from pyromind_sdk.client.models import EchoMindJobRequest, ResourceConfig
 
-# Create EchoMind instance
+# Create an EchoMind instance
 job_id = client.echomind.create(
     EchoMindJobRequest(
         name="my-echomind",
-        resources=ResourceConfig(cpu="4", memory="16Gi")
+        api_url="https://api.example.com/v1",
+        origin_model="Qwen/Qwen3-8B",
+        access_key="sk-xxx",
+        training_model="Qwen/Qwen3-8B",
+        training_batch_size=4,
+        trajectory_buffer_size=64,
+        time_per_round=60.0,
+        training_round=10,
+        training_save_path="/workspace/echomind-out",
+        api_mode="openai",
+        execution_mode="manual",
+        resources=ResourceConfig(cpu="4", memory="16Gi", gpu="1"),
     )
 )
 print(f"EchoMind ID: {job_id}")
 
-# List instances
-instances = client.echomind.list()
+# List instances (the response field is job_id, not id)
+for job in client.echomind.list():
+    print(job.job_id, job.name, job.status)
 
 # Cleanup
 client.echomind.delete(job_id)
 ```
 
-### Storage (`client.storage`)
+### Storage (`StorageClient`, constructed directly)
 
 MinIO/S3-compatible file storage. Requires `minio` package (`pip install minio`).
+
+> The storage client is **not** `client.storage` — `PyroMindAPIClient` has no such attribute;
+> construct `StorageClient(...)` yourself (credentials may be omitted, the env vars below are
+> picked up). The same class is used from sync and async code.
 
 | Method | Input | Output | Description |
 |--------|-------|--------|-------------|
@@ -1103,6 +1267,7 @@ MinIO/S3-compatible file storage. Requires `minio` package (`pip install minio`)
 | `download_folder(folder_path, local_path)` | `str`, `str/Path` + opts | `List[Dict]` | Download folder |
 | `delete_file(object_name)` | `str` | `None` | Delete a file |
 | `delete_folder(folder_path)` | `str` + opts | `Dict` | Delete a folder |
+| `close()` | — | `None` | Close the underlying client |
 
 **Storage init parameters:**
 
@@ -1180,11 +1345,22 @@ async with PyroMindAsyncAPIClient(api_key="your-api-key") as client:
     task = await client.studio.create(request)
 ```
 
-Async clients (same method set as sync):
-- `client.studio` → `AsyncStudioClient`
-- `client.instances` → `AsyncJupyterLabClient`
-- `client.inference` → `AsyncInferenceClient`
-- `client.echomind` → `AsyncEchoMindClient`
+Async clients use **different attribute names in a few places** — mixing them up is an
+immediate `AttributeError`, so copy from this table:
+
+| Sync `PyroMindAPIClient` | Async `PyroMindAsyncAPIClient` | Client classes |
+|---|---|---|
+| `client.sandboxes` | `client.sandboxes` | `SandboxClient` / `AsyncSandboxClient` |
+| `client.studio` | `client.studio` | `StudioClient` / `AsyncStudioClient` |
+| `client.jupyter` | **`client.instances`** | `JupyterLabClient` / `AsyncJupyterLabClient` |
+| `client.inference` | `client.inference` | `InferenceClient` / `AsyncInferenceClient` |
+| `client.echomind` | `client.echomind` | `EchoMindClient` / `AsyncEchoMindClient` |
+| `client.profile` | **none** (not provided on the async client yet) | `ProfileClient` |
+| `StorageClient(...)` constructed directly | same class, shared by sync and async | `StorageClient` |
+
+Method-set differences: the sandbox **`execute_action` / `execute_batch_actions` / `get_vnc`
+exist only on the async client**; `AsyncInferenceClient` has no `resume` yet. Everything else
+matches on both sides.
 
 ## Error Handling
 
@@ -1209,7 +1385,35 @@ except PyroMindAPIError as e:
 
 ## Key Response Models
 
-Each service returns structured Pydantic model objects. Key fields:
+Each service returns structured Pydantic model objects. The fields below match
+`pyromind_sdk.client.models` (only the common ones are listed — the source/type hints
+are authoritative for the rest).
+
+### `ResourceConfig` (used by every `resources` parameter)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `cpu` | `Optional[str]` | CPU cores, e.g. `"4"` |
+| `memory` | `Optional[str]` | Memory, e.g. `"16Gi"` |
+| `gpu` | `Optional[str]` | GPU count, e.g. `"1"` |
+| `gpu_card` | `Optional[str]` | GPU card type, e.g. `"L40S"`, `"H100"` |
+
+### `SandboxResponse` (Sandbox)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `str` | Sandbox ID |
+| `name` | `str` | Name |
+| `type` | `SandboxType` | `osworld` / `custom` |
+| `status` | `str` | `creating` / `starting` / `pending` / `running` / `stopped` / `error` |
+| `endpoint_url` / `endpoint` | `Optional[str]` | Access endpoint |
+| `web_vnc_url` | `Optional[str]` | Web VNC address |
+| `resources` | `Optional[ResourceConfig]` | Allocated resources |
+| `usage` | `Optional[SandboxUsage]` | `cpu_percent` / `memory_used` / `storage_used` / `cpu_usage` / `memory_usage` / `gpu_usage` |
+| `configuration` | `Optional[SandboxConfiguration]` | Screen resolution, `auto_destroy`, VNC password |
+| `image` / `system_image_path` | `Optional[str]` | Image in use |
+| `volume_mounts` / `port_mappings` | `Optional[List[...]]` | Mounts and port mappings |
+| `uid`, `last_activity`, `created_at`, `updated_at` | | Ownership and timestamps |
 
 ### `TrainingTaskResponse` (Studio)
 
@@ -1217,11 +1421,18 @@ Each service returns structured Pydantic model objects. Key fields:
 |-------|------|-------------|
 | `task_id` | `str` | Task unique ID |
 | `name` | `str` | Task name |
-| `status` | `str` | Current status (`running`, `completed`, `failed`, etc.) |
-| `workflow` | `Dict` | Workflow configuration |
-| `nodes` | `List[TrainingTaskNodeInfo]` | Node execution details |
+| `status` | `str` | Current status (`Pending` / `Running` / `Succeeded` / `Failed` / `Error` / `Terminated` …) |
+| `metrics` | `Optional[Dict]` | Metrics |
+| `nodes` | `Optional[List[TrainingTaskNodeInfo]]` | Node execution details |
+| `created_at` / `started_at` / `completed_at` / `expires_at` | | Stage timestamps |
 | `error_message` | `Optional[str]` | Error info if failed |
-| `created_at` | `datetime` | Creation timestamp |
+
+`TrainingTaskNodeInfo`: `node_id`, `task_id`, `node_name`, `start_at`, `end_at`, `duration`,
+`resources`, `amount`, `url`, `wand_flag`.
+
+> ⚠️ This model has **no `workflow` field** (earlier docs claimed one; it is not returned).
+> The `TrainingTaskCreateResponse` returned by `create()` carries the same fields (plus
+> `metrics` / `nodes`).
 
 ### `JupyterResponse` (Jupyter)
 
@@ -1232,6 +1443,10 @@ Each service returns structured Pydantic model objects. Key fields:
 | `status` | `str` | Current status |
 | `url` | `Optional[str]` | Jupyter URL |
 | `password` | `Optional[str]` | Access password |
+| `resources` | `Optional[ResourceConfig]` | Allocated resources |
+| `ssh_user` / `ssh_port` / `ssh_ip` | | SSH access |
+| `namespace` / `uid` | | Ownership |
+| `created_at` / `updated_at` | | Timestamps |
 
 ### `InferenceJobResponse` (Inference)
 
@@ -1242,15 +1457,23 @@ Each service returns structured Pydantic model objects. Key fields:
 | `model_path` | `str` | Model path |
 | `status` | `str` | Current status |
 | `endpoint_url` | `Optional[str]` | Inference endpoint |
+| `inf_sk` | `Optional[str]` | Key for calling the endpoint |
+| `inference_framework` / `image` / `inf_image` | | Framework and images |
+| `model_name` / `model_length` / `startup_args` | | Model and startup args |
 | `resources` | `Optional[ResourceConfig]` | Allocated resources |
+| `uid` / `created_at` / `updated_at` | | Ownership and timestamps |
 
 ### `EchoMindJobResponse` (EchoMind)
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | `str` | Instance ID |
-| `name` | `str` | Instance name |
+| `job_id` | `str` | Instance ID (**not `id`**) |
+| `name` | `Optional[str]` | Instance name |
 | `status` | `str` | Current status |
+| `api_url` / `api_mode` / `origin_model` / `access_key` / `secret_key` | | Sampling-side config |
+| `training_model` / `training_batch_size` / `trajectory_buffer_size` / `time_per_round` / `training_round` / `training_save_path` | | Training-side config (strings in the response) |
+| `execution_mode` / `custom_runtime_script_path` | | Execution mode |
+| `resources` / `created_at` | | Resources and creation time |
 
 ## Workflow Validation & Conversion
 

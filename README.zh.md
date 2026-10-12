@@ -18,11 +18,12 @@ from pyromind_sdk.client.models import TrainingTaskCreateRequest
 
 client = PyroMindAPIClient(api_key="your-api-key")
 
-# 创建并运行一个 Studio 任务
+# 创建并运行一个 Studio 任务（out_id 必填）
 task = client.studio.create(
     TrainingTaskCreateRequest(
         name="my-workflow",
-        workflow={"nodes": [...]}
+        workflow={"nodes": [...]},
+        out_id="ext-task-001",
     )
 )
 print(f"Created task: {task.task_id}")
@@ -78,6 +79,104 @@ pyromind_sdk/
 
 ## 服务
 
+顶层客户端（`PyroMindAPIClient`）上的服务入口：
+
+| 属性 | 客户端 | 覆盖内容 |
+|------|--------|----------|
+| `client.sandboxes` | `SandboxClient` | 沙箱生命周期、命令执行、文件读写、桌面动作 |
+| `client.studio` | `StudioClient` | 训练工作流任务与自定义节点 |
+| `client.jupyter` | `JupyterLabClient` | JupyterLab 实例 |
+| `client.inference` | `InferenceClient` | 推理服务任务 |
+| `client.echomind` | `EchoMindClient` | EchoMind 实例 |
+| `client.profile` | `ProfileClient` | 用户信息、存储凭证、SSH 公钥 |
+
+> 异步客户端 `PyroMindAsyncAPIClient` 上 Jupyter 的名字是 **`client.instances`**（不是 `jupyter`），
+> 且**没有** `profile`；`StorageClient` 两边都是**单独构造**的（不是 `client.storage`）。
+> 详见「异步支持」。
+
+### Sandbox（`client.sandboxes`）
+
+沙箱（k8s 上的长驻容器）的生命周期、命令执行、文件读写与桌面动作。
+
+| 方法 | 输入 | 输出 | 描述 |
+|--------|------|------|------|
+| `list(query=None)` | `ListQuery` | `List[SandboxResponse]` | 列出沙箱，可按名字/状态过滤 |
+| `list_page(query=None)` | `ListQuery` | `SandboxPage` | 分页列出（带 `total` / `page_size` / `page_num`） |
+| `create(request, timeout=None)` | `SandboxRequest` | `SandboxResponse` | 创建沙箱 |
+| `create_and_wait(request, target_status, timeout=300, check_interval=3, ...)` | `SandboxRequest` + 选项 | `SandboxResponse` | 创建 + 轮询到目标状态 |
+| `get_sandbox(sandbox_id, timeout=None, retry=True)` | `str` | `SandboxResponse` | 获取沙箱详情 |
+| `get_internal_ip(sandbox_id)` | `str` | `InternalIPResponse` | 单个沙箱的集群内网 IP |
+| `get_internal_ips(sandbox_ids)` | `Sequence[str]` | `Dict[str, str]` | 批量查内网 IP（一次请求） |
+| `wait_for_sandbox_status(sandbox_id, target_status, timeout=300, check_interval=3, ...)` | `str` + 选项 | `bool` | 轮询直到到达目标状态 |
+| `update(sandbox_id, request)` | `str`, `SandboxRequest` | `SandboxResponse` | 更新沙箱配置 |
+| `pause(sandbox_id, timeout=None, retry=True)` / `resume(sandbox_id)` | `str` | `SandboxResponse` | 暂停 / 恢复 |
+| `delete(sandbox_id, timeout=None, retry=True)` | `str` | `None` | 删除沙箱 |
+| `exec_command(sandbox_id, command, cwd='', timeout=None)` | `str \| List[str]` | `SandboxExecResponse` | 执行命令，一次性拿到 stdout/stderr/returncode |
+| `exec_command_stream(sandbox_id, command, cwd='', timeout=None, tty=False)` | 同上 | `AsyncIterator[SandboxExecStreamChunk]` | 流式执行，边跑边产出 |
+| `read_file(sandbox_id, path)` | `str` | `bytes` | 读文件内容 |
+| `write_file(sandbox_id, path, source)` | `str \| PathLike \| bytes \| BinaryIO` | `Dict[str, Any]` | 写文件（本地路径或字节流） |
+| `delete_file(sandbox_id, path, recursive=False)` | `str` | `Dict[str, Any]` | 删除文件/目录 |
+| `execute_action(sandbox_id, request)` 〔异步〕 | `ActionRequest` | `ActionResponse` | 执行一个桌面动作（OSWorld 风格） |
+| `execute_batch_actions(sandbox_id, request)` 〔异步〕 | `BatchActionRequest` | `List[ActionResponse]` | 批量动作 |
+| `get_vnc(sandbox_id)` 〔异步〕 | `str` | `Dict[str, Any]` | VNC 连接信息 |
+
+> 〔异步〕= 只有 `AsyncSandboxClient`（`PyroMindAsyncAPIClient.sandboxes`）上有，同步的
+> `SandboxClient` 暂时没有这三方法；其余方法两边一致。
+
+**`SandboxRequest` 参数说明：**
+
+| 参数 | 必填 | 类型 | 说明 |
+|------|------|------|------|
+| `sandbox_type` | 是 | `SandboxType` | `osworld`（桌面）或 `custom`（普通容器） |
+| `resources` | 否 | `ResourceConfig` | CPU/内存/GPU/卡型 |
+| `configuration` | 否 | `SandboxConfiguration` | 桌面分辨率、`auto_destroy`、VNC 密码 |
+| `name` | 否 | `str` | 沙箱显示名称 |
+| `system_image_path` | 否 | `str` | 平台内置系统镜像路径 |
+| `image` | 否 | `str` | 自定义容器镜像（与 `system_image_path` 二选一） |
+| `volume_mounts` | 否 | `List[VolumeMount]` | 挂载列表 |
+| `port_mappings` | 否 | `List[PortMapping]` | 端口映射（`container_port` + 可选 `host_port`/`name`/`protocol`） |
+| `mount_public_dir` | 否 | `bool` | 是否挂载公共目录 |
+
+**`SandboxExecResponse` 字段：** `output`（stdout）、`stderr`、`returncode`（0 成功，`-1` 表示拿不到退出码）、
+`exception_info`（基础设施层错误，正常为空）、`extra`（服务端附加信息）。
+
+**`SandboxExecStreamChunk` 字段：** `type`（`stdout` / `stderr` / `exit`）、`data`、`returncode`（仅 `exit` 块有意义）。
+
+**`ActionRequest` 参数说明：**
+
+| 参数 | 必填 | 类型 | 说明 |
+|------|------|------|------|
+| `action` | 是 | `str` | 动作名（如 `click` / `type` / `run`） |
+| `parameters` | 否 | `ActionParameters` | `command` / `working_directory` / `environment_variables` / `timeout` / `coordinates` / `text` / `time` / `options` |
+
+**公共查询参数 `ListQuery`：** `page_size`、`page_num`、`name`、`instance_id`、`status`
+（`list` / `list_page` 共用；分页模型的字段名各服务略有不同：沙箱是 `sandboxes`，
+Jupyter 是 `instances`，推理是 `jobs`，EchoMind 是 `jobs`）。
+
+**示例：**
+
+```python
+from pyromind_sdk.client.models import SandboxRequest, SandboxType, ResourceConfig
+
+sandbox = client.sandboxes.create(
+    SandboxRequest(
+        sandbox_type=SandboxType.CUSTOM,
+        name="my-box",
+        resources=ResourceConfig(cpu="2", memory="4Gi"),
+    )
+)
+
+# 一次性执行
+result = client.sandboxes.exec_command(sandbox.id, ["echo", "hello"])
+print(result.output, result.returncode)
+
+# 批量查内网 IP
+ips = client.sandboxes.get_internal_ips([sandbox.id, "sb-other"])
+
+# 清理
+client.sandboxes.delete(sandbox.id)
+```
+
 ### Studio（`client.studio`）
 
 训练工作流管理 — 创建、监控和管理工作流任务。
@@ -106,6 +205,7 @@ pyromind_sdk/
 |------|------|------|------|
 | `name` | 是 | `str` | 任务名称 |
 | `workflow` | 是 | `Dict[str, Any]` | 工作流 JSON 结构，包含节点定义 |
+| `out_id` | 是 | `str` | 对接外部系统用的任务 ID（把外部系统的任务 ID 映射到本次训练任务） |
 
 **`WorkflowRunRequest` 参数说明：**
 
@@ -113,17 +213,19 @@ pyromind_sdk/
 |------|------|------|------|
 | `workflow_name` | 是 | `str` | 已存储工作流的名称 |
 | `primitive_node_map` | 否 | `Dict[str, Any]` | 注入的原始节点值（默认 `{}`） |
+| `execution_argos` | 否 | `Optional[list]` | 本次执行的额外运行参数 |
 
 **示例：**
 
 ```python
 from pyromind_sdk.client.models import TrainingTaskCreateRequest, WorkflowRunRequest
 
-# 创建训练任务
+# 创建训练任务（out_id 必填：对接外部系统的任务 ID）
 task = client.studio.create(
     TrainingTaskCreateRequest(
         name="my-workflow",
-        workflow={"nodes": [...]}
+        workflow={"nodes": [...]},
+        out_id="ext-task-001",
     )
 )
 print(f"Task ID: {task.task_id}")
@@ -149,9 +251,11 @@ Jupyter 实例管理。
 
 | 方法 | 输入 | 输出 | 描述 |
 |--------|------|------|------|
-| `list()` | — | `List[JupyterResponse]` | 列出所有 Jupyter 实例 |
+| `list(query=None)` | `ListQuery` | `List[JupyterResponse]` | 列出所有 Jupyter 实例 |
+| `list_page(query=None)` | `ListQuery` | `JupyterPage` | 分页列出（`instances` + `total` / `page_size` / `page_num`） |
 | `create(request)` | `JupyterRequest` | `JupyterResponse` | 创建实例 |
 | `get_instance(jupyter_id)` | `str` | `JupyterResponse` | 获取实例详情 |
+| `get_internal_ip(jupyter_id)` | `str` | `InternalIPResponse` | 集群内网 IP |
 | `update(jupyter_id, request)` | `str`, `JupyterRequest` | `JupyterResponse` | 更新实例配置 |
 | `delete(jupyter_id)` | `str` | `None` | 删除实例 |
 | `pause(jupyter_id)` / `resume(jupyter_id)` | `str` | `JupyterResponse` | 暂停/恢复 |
@@ -162,6 +266,10 @@ Jupyter 实例管理。
 |------|------|------|------|
 | `name` | 否 | `str` | 实例显示名称 |
 | `resources` | 否 | `ResourceConfig` | CPU/内存/GPU 配置 |
+
+**`JupyterResponse` 字段：** `id`、`name`、`status`、`password`（访问密码）、`url`（访问地址）、
+`resources`、`ssh_user` / `ssh_port` / `ssh_ip`（SSH 接入）、`namespace`、`uid`、
+`created_at`、`updated_at`。
 
 **示例：**
 
@@ -184,9 +292,11 @@ print(f"Jupyter ID: {jupyter.id}, URL: {jupyter.url}")
 
 | 方法 | 输入 | 输出 | 描述 |
 |--------|------|------|------|
-| `list()` | — | `List[InferenceJobResponse]` | 列出所有推理任务 |
+| `list(query=None)` | `ListQuery` | `List[InferenceJobResponse]` | 列出所有推理任务 |
+| `list_page(query=None)` | `ListQuery` | `InferencePage` | 分页列出（`jobs` + `total` / `page_size` / `page_num`） |
 | `create(request)` | `InferenceJobRequest` | `str` (job_id) | 创建推理任务 |
 | `get_job(job_id)` | `str` | `InferenceJobResponse` | 获取任务详情 |
+| `get_internal_ip(job_id)` | `str` | `InternalIPResponse` | 集群内网 IP |
 | `update(job_id, request)` | `str`, `InferenceJobRequest` | `InferenceJobResponse` | 更新任务配置 |
 | `delete(job_id)` | `str` | `None` | 删除任务 |
 | `pause(job_id)` / `resume(job_id)` | `str` | `InferenceJobResponse` | 暂停/恢复 |
@@ -205,6 +315,10 @@ print(f"Jupyter ID: {jupyter.id}, URL: {jupyter.url}")
 | `model_name` | 否 | `str` | 模型名称覆盖 |
 | `model_length` | 否 | `int` | 模型上下文长度 |
 | `startup_args` | 否 | `List[dict]` 或 `List[str]` | 自定义推理服务启动参数。推荐 `[{"--arg": value}]`；key 需要自己带 `-` 或 `--` 前缀；与系统默认参数重复时以用户参数为准 |
+
+**`InferenceJobResponse` 字段：** `id`、`name`、`model_path`、`status`、`inference_framework`、
+`image`、`inf_image`、`model_name`、`model_length`、`startup_args`、`resources`、
+`endpoint_url`（推理端点）、`inf_sk`（调用密钥）、`uid`、`created_at`、`updated_at`。
 
 **示例：**
 
@@ -238,9 +352,11 @@ EchoMind 实例生命周期管理。
 
 | 方法 | 输入 | 输出 | 描述 |
 |--------|------|------|------|
-| `list()` | — | `List[EchoMindJobResponse]` | 列出所有 EchoMind 实例 |
+| `list(query=None)` | `ListQuery` | `List[EchoMindJobResponse]` | 列出所有 EchoMind 实例 |
+| `list_page(query=None)` | `ListQuery` | `EchoMindPage` | 分页列出（`jobs` + `total` / `page_size` / `page_num`） |
 | `create(request)` | `EchoMindJobRequest` | `str` (job_id) | 创建实例 |
 | `get_job(job_id)` | `str` | `EchoMindJobResponse` | 获取实例详情 |
+| `get_internal_ip(job_id)` | `str` | `InternalIPResponse` | 集群内网 IP |
 | `update(job_id, request)` | `str`, `EchoMindJobRequest` | `EchoMindJobResponse` | 更新实例配置 |
 | `delete(job_id)` | `str` | `None` | 删除实例 |
 | `pause(job_id)` / `resume(job_id)` | `str` | `EchoMindJobResponse` | 暂停/恢复 |
@@ -249,8 +365,25 @@ EchoMind 实例生命周期管理。
 
 | 参数 | 必填 | 类型 | 说明 |
 |------|------|------|------|
-| `name` | 否 | `str` | 实例显示名称 |
+| `name` | 是 | `str` | 实例显示名称 |
+| `api_url` | 是 | `str` | 采样/推理服务的 API 地址 |
+| `origin_model` | 是 | `str` | 原始（被对齐的）模型 |
+| `access_key` | 是 | `str` | 调用 `api_url` 用的密钥 |
+| `training_model` | 是 | `str` | 训练侧模型 |
+| `training_batch_size` | 是 | `int` | 训练批大小 |
+| `trajectory_buffer_size` | 是 | `int` | 轨迹缓冲区大小 |
+| `time_per_round` | 是 | `float` | 每轮时长（秒） |
+| `training_round` | 是 | `int` | 训练轮数 |
+| `training_save_path` | 是 | `str` | 训练产物保存路径 |
+| `api_mode` | 否 | `str` | API 方言：`openai`（默认）/ `gemini` / `anthropic` |
+| `execution_mode` | 否 | `str` | `manual`（默认，自己控制轮次）/ `automatic` |
+| `custom_runtime_script_path` | 否 | `str` | 自定义运行时脚本路径 |
 | `resources` | 否 | `ResourceConfig` | CPU/内存/GPU 配置 |
+
+**`EchoMindJobResponse` 字段：** `job_id`（**注意不是 `id`**）、`name`、`status`、`api_url`、
+`api_mode`、`origin_model`、`access_key`、`secret_key`、`training_model`、
+`training_batch_size`、`trajectory_buffer_size`、`time_per_round`、`training_round`、
+`training_save_path`、`execution_mode`、`custom_runtime_script_path`、`resources`、`created_at`。
 
 **示例：**
 
@@ -261,21 +394,36 @@ from pyromind_sdk.client.models import EchoMindJobRequest, ResourceConfig
 job_id = client.echomind.create(
     EchoMindJobRequest(
         name="my-echomind",
-        resources=ResourceConfig(cpu="4", memory="16Gi")
+        api_url="https://api.example.com/v1",
+        origin_model="Qwen/Qwen3-8B",
+        access_key="sk-xxx",
+        training_model="Qwen/Qwen3-8B",
+        training_batch_size=4,
+        trajectory_buffer_size=64,
+        time_per_round=60.0,
+        training_round=10,
+        training_save_path="/workspace/echomind-out",
+        api_mode="openai",
+        execution_mode="manual",
+        resources=ResourceConfig(cpu="4", memory="16Gi", gpu="1"),
     )
 )
 print(f"EchoMind ID: {job_id}")
 
-# 列出实例
-instances = client.echomind.list()
+# 列出实例（响应里是 job_id，不是 id）
+for job in client.echomind.list():
+    print(job.job_id, job.name, job.status)
 
 # 清理
 client.echomind.delete(job_id)
 ```
 
-### 存储（`client.storage`）
+### 存储（`StorageClient`，**单独构造**）
 
 MinIO/S3 兼容文件存储。需要安装 `minio` 包（`pip install minio`）。
+
+> 存储客户端**不是** `client.storage` —— `PyroMindAPIClient` 上没有这个属性，要自己
+> `StorageClient(...)`（凭据可留空，自动读下面的环境变量）。它同时是同步/异步共用的。
 
 | 方法 | 输入 | 输出 | 描述 |
 |--------|------|------|------|
@@ -287,6 +435,7 @@ MinIO/S3 兼容文件存储。需要安装 `minio` 包（`pip install minio`）�
 | `download_folder(folder_path, local_path)` | `str`, `str/Path` + 选项 | `List[Dict]` | 下载文件夹 |
 | `delete_file(object_name)` | `str` | `None` | 删除文件 |
 | `delete_folder(folder_path)` | `str` + 选项 | `Dict` | 删除文件夹 |
+| `close()` | — | `None` | 关闭底层客户端 |
 
 **Storage 初始化参数说明：**
 
@@ -364,11 +513,20 @@ async with PyroMindAsyncAPIClient(api_key="your-api-key") as client:
     task = await client.studio.create(request)
 ```
 
-异步客户端（方法集与同步版一致）：
-- `client.studio` → `AsyncStudioClient`
-- `client.instances` → `AsyncJupyterLabClient`
-- `client.inference` → `AsyncInferenceClient`
-- `client.echomind` → `AsyncEchoMindClient`
+异步客户端的属性名与同步版**有几处不一样**，混用会直接 `AttributeError`，对着这张表抄：
+
+| 同步 `PyroMindAPIClient` | 异步 `PyroMindAsyncAPIClient` | 客户端类 |
+|---|---|---|
+| `client.sandboxes` | `client.sandboxes` | `SandboxClient` / `AsyncSandboxClient` |
+| `client.studio` | `client.studio` | `StudioClient` / `AsyncStudioClient` |
+| `client.jupyter` | **`client.instances`** | `JupyterLabClient` / `AsyncJupyterLabClient` |
+| `client.inference` | `client.inference` | `InferenceClient` / `AsyncInferenceClient` |
+| `client.echomind` | `client.echomind` | `EchoMindClient` / `AsyncEchoMindClient` |
+| `client.profile` | **无**（异步客户端暂未提供） | `ProfileClient` |
+| `StorageClient(...)` 单独构造 | 同一个类，同步/异步共用 | `StorageClient` |
+
+方法集的差异：沙箱的 **`execute_action` / `execute_batch_actions` / `get_vnc` 只有异步版**有；
+`AsyncInferenceClient` 暂缺 `resume`。其余方法两边一致。
 
 ## 异常处理
 
@@ -393,7 +551,34 @@ except PyroMindAPIError as e:
 
 ## 关键响应模型
 
-每个服务返回结构化的 Pydantic 模型对象。主要字段如下：
+每个服务返回结构化的 Pydantic 模型对象。字段与 `pyromind_sdk.client.models` 一致
+（下表只列常用字段，完整定义以源码/类型提示为准）。
+
+### `ResourceConfig`（所有 `resources` 参数都用它）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `cpu` | `Optional[str]` | CPU 核数，如 `"4"` |
+| `memory` | `Optional[str]` | 内存，如 `"16Gi"` |
+| `gpu` | `Optional[str]` | GPU 数量，如 `"1"` |
+| `gpu_card` | `Optional[str]` | GPU 卡型，如 `"L40S"`、`"H100"` |
+
+### `SandboxResponse`（Sandbox）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | `str` | 沙箱 ID |
+| `name` | `str` | 名称 |
+| `type` | `SandboxType` | `osworld` / `custom` |
+| `status` | `str` | `creating` / `starting` / `pending` / `running` / `stopped` / `error` |
+| `endpoint_url` / `endpoint` | `Optional[str]` | 访问端点 |
+| `web_vnc_url` | `Optional[str]` | 网页 VNC 地址 |
+| `resources` | `Optional[ResourceConfig]` | 分配的资源 |
+| `usage` | `Optional[SandboxUsage]` | `cpu_percent` / `memory_used` / `storage_used` / `cpu_usage` / `memory_usage` / `gpu_usage` |
+| `configuration` | `Optional[SandboxConfiguration]` | 桌面分辨率、`auto_destroy`、VNC 密码 |
+| `image` / `system_image_path` | `Optional[str]` | 使用的镜像 |
+| `volume_mounts` / `port_mappings` | `Optional[List[...]]` | 挂载与端口映射 |
+| `uid`、`last_activity`、`created_at`、`updated_at` | | 归属与时间戳 |
 
 ### `TrainingTaskResponse`（Studio）
 
@@ -401,11 +586,17 @@ except PyroMindAPIError as e:
 |------|------|------|
 | `task_id` | `str` | 任务唯一 ID |
 | `name` | `str` | 任务名称 |
-| `status` | `str` | 当前状态（`running`、`completed`、`failed` 等） |
-| `workflow` | `Dict` | 工作流配置 |
-| `nodes` | `List[TrainingTaskNodeInfo]` | 节点执行详情 |
+| `status` | `str` | 当前状态（`Pending` / `Running` / `Succeeded` / `Failed` / `Error` / `Terminated` …） |
+| `metrics` | `Optional[Dict]` | 指标 |
+| `nodes` | `Optional[List[TrainingTaskNodeInfo]]` | 节点执行详情 |
+| `created_at` / `started_at` / `completed_at` / `expires_at` | | 各阶段时间戳 |
 | `error_message` | `Optional[str]` | 失败时的错误信息 |
-| `created_at` | `datetime` | 创建时间戳 |
+
+`TrainingTaskNodeInfo`：`node_id`、`task_id`、`node_name`、`start_at`、`end_at`、`duration`、
+`resources`、`amount`、`url`、`wand_flag`。
+
+> ⚠️ 这个模型里**没有 `workflow` 字段**（早期文档写过，实际不返回）。
+> 创建时的 `TrainingTaskCreateResponse` 与它字段基本相同（另有 `metrics` / `nodes`）。
 
 ### `JupyterResponse`（Jupyter）
 
@@ -416,6 +607,10 @@ except PyroMindAPIError as e:
 | `status` | `str` | 当前状态 |
 | `url` | `Optional[str]` | Jupyter URL |
 | `password` | `Optional[str]` | 访问密码 |
+| `resources` | `Optional[ResourceConfig]` | 分配的资源 |
+| `ssh_user` / `ssh_port` / `ssh_ip` | | SSH 接入信息 |
+| `namespace` / `uid` | | 归属 |
+| `created_at` / `updated_at` | | 时间戳 |
 
 ### `InferenceJobResponse`（推理）
 
@@ -426,15 +621,23 @@ except PyroMindAPIError as e:
 | `model_path` | `str` | 模型路径 |
 | `status` | `str` | 当前状态 |
 | `endpoint_url` | `Optional[str]` | 推理端点 |
+| `inf_sk` | `Optional[str]` | 调用推理服务用的密钥 |
+| `inference_framework` / `image` / `inf_image` | | 框架与镜像 |
+| `model_name` / `model_length` / `startup_args` | | 模型与启动参数 |
 | `resources` | `Optional[ResourceConfig]` | 分配的资源 |
+| `uid` / `created_at` / `updated_at` | | 归属与时间戳 |
 
 ### `EchoMindJobResponse`（EchoMind）
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `id` | `str` | 实例 ID |
-| `name` | `str` | 实例名称 |
+| `job_id` | `str` | 实例 ID（**不是 `id`**） |
+| `name` | `Optional[str]` | 实例名称 |
 | `status` | `str` | 当前状态 |
+| `api_url` / `api_mode` / `origin_model` / `access_key` / `secret_key` | | 采样侧配置 |
+| `training_model` / `training_batch_size` / `trajectory_buffer_size` / `time_per_round` / `training_round` / `training_save_path` | | 训练侧配置（响应里多为字符串） |
+| `execution_mode` / `custom_runtime_script_path` | | 执行方式 |
+| `resources` / `created_at` | | 资源与创建时间 |
 
 
 ## 通过 Docker CLI 管理 Kubernetes Sandbox（docker-rt）
@@ -1154,12 +1357,18 @@ PyromindSDK 后端本地端口转发暂不支持，
 
 ### 客户端参数
 
+同步 `PyroMindAPIClient`：
+
 | 参数 | 必填 | 类型 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `api_key` | 是* | `str` | `PYROMIND_API_KEY` 环境变量 | API 认证 Bearer Token |
+| `base_url` | 否 | `str` | `PYROMIND_BASE_URL` 环境变量 | API 基址；不传就用 SDK 内置的默认地址 |
 | `cluster` | 否 | `str` | `PYROMIND_CLUSTER` 环境变量或 `"us-west-2"` | 目标集群（`X-Cluster` 请求头） |
 | `timeout` | 否 | `int` | `30` | 请求超时时间（秒） |
 | `max_retries` | 否 | `int` | `3` | 失败请求最大重试次数 |
+
+异步 `PyroMindAsyncAPIClient`：同样的参数，另外 `timeout` 默认 **60**，还有
+`create_timeout`（创建类请求单独的超时）和 `create_concurrency_limit`（并发创建上限）。
 
 \* `api_key` 可通过参数传入或设置 `PYROMIND_API_KEY` 环境变量。
 
@@ -1168,10 +1377,13 @@ PyromindSDK 后端本地端口转发暂不支持，
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
 | `PYROMIND_API_KEY` | 是 | — | API Bearer Token |
+| `PYROMIND_BASE_URL` | 否 | SDK 内置默认 | API 基址（也可用 `base_url=` 传入） |
 | `PYROMIND_CLUSTER` | 否 | `us-west-2` | 目标集群标识 |
 | `PYROMIND_STORAGE_ENDPOINT` | 否 | `https://storage.pyromind.ai` | 存储端点 URL |
 | `PYROMIND_STORAGE_SECRET_KEY` | 否 | — | 存储密钥 |
 | `PYROMIND_STORAGE_BUCKET` | 否 | — | 默认存储桶名 |
+| `PYROMIND_LOG_LEVEL` | 否 | 未设置 | 客户端 SDK 日志级别（如 `DEBUG`） |
+| `PYROMIND_LOG_FORMAT` | 否 | 未设置 | 客户端日志格式（如 `json`） |
 
 ### Sandbox 流式命令
 
