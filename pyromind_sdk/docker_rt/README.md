@@ -13,13 +13,78 @@
 | `docker volume` / `network` | 命名卷 + 网络 stub（够 Compose 用） |
 | `docker run` / `create` / `start` | `run`=创建并启动；`create` 只建本地记录；`start` 才真正创建/启动 Pod |
 | `docker run -p` / `docker port` | kube 后端本机 TCP 转发；PyromindSDK 后端仅显示端口映射 |
-| `docker exec`（含 `-it`） | 非交互（`docker exec CID CMD`）走 **exec-stream 命令通道**；`-i` / `-t` 走 **platform terminal PTY**（真正的交互终端，支持 Ctrl-C / 方向键 / TUI） |
+| `docker exec`（含 `-it`） | `-i` / `-t` 走 **platform terminal PTY**（真正的交互终端，支持 Ctrl-C / 方向键 / TUI）；**不带 `-i`** 的 `docker exec CID CMD` 走 **exec-stream 命令通道** |
 | `docker stop` / `kill` / `rm` / `restart` / `rename` | 生命周期 |
 | `docker cp` | 下载（容器 → 宿主）走 pod exec 流式 tar；上传（宿主 → 容器）走 `write_file` 分片落盘 |
 | `docker compose up`（受限） | 见下方「Compose（OSM-style）」 |
 
-**交互式 exec 为什么必须走 terminal 通道：** exec-stream WebSocket 是
-「一条命令 → 一段 stdout/stderr」的命令通道，**没有 PTY、也不转发 stdin**
+**exec 的三种形态（和真 Docker 对齐的三件事）：**
+
+| 客户端写的 | 走哪条通道 | 输出形态 |
+|---|---|---|
+| `docker exec CID CMD` | exec-stream 命令通道 | Docker **stdio 帧** |
+| `docker exec -i CID CMD`（要 stdin、不要 PTY） | terminal PTY（只有它带 stdin） | **也要 stdio 帧** —— PTY 出来的字节在写回客户端前必须 `_pty_output_for_client(..., tty=False)` 加帧头并把 CRLF 折成 LF |
+| `docker exec -it CID CMD` | terminal PTY | 原始终端字节，**不加帧** |
+
+⚠️ 第二种形态踩过坑（2026-10-13）：PTY 的原始字节直接写回、没加帧头，客户端按帧解析时
+长度字段是垃圾 ⇒ **整段输出被丢掉**，表现为 `docker exec -i CID bash -c 'echo hi'` 一个字都不打印
+（命令其实跑了）。eval harness 恰好常用 `-i`，所以特别容易中招。
+
+**`-e`、argv 与 cwd 的语义**（都和真 Docker 对齐）：
+
+* **`-e`**：沙箱侧没有"进程级环境变量"这个选项，所以是把 **`env KEY=VAL …` 前缀加到 argv 上**
+  （`backend/exec_utils.argv_with_exec_env`）。
+* **argv 原样透传**：不做任何"换成 sh/dash"的替换，`docker exec CID bash -c 'echo $0'`
+  里的 `$0` 就是 `bash`、`BASH_VERSION` 有值。
+* **cwd 由 docker-rt 自己包**（`argv_with_exec_cwd`）：`sh -c 'cd <cwd> …; exec "$@"'`
+  —— 这样 exec 语义不再依赖后端那层包装，而且"目录不存在"不再静默吞掉整条命令：
+
+  | cwd 来自 | 目录不存在时 |
+  |---|---|
+  | 容器的 WorkingDir（`docker run -w /testbed`） | 像 Docker runtime 一样 `mkdir -p` 建出来，命令照跑 |
+  | exec 自己的 `-w /x` | **报错**：`docker-rt: chdir to cwd ("/x") failed: no such file or directory`，退出码 **126** |
+
+  两条都有测试钉住：`test_argv_with_exec_cwd_unit`、
+  `test_the_cwd_wrapper_really_chdirs_and_reports_a_missing_dir`（真跑一遍那段 shell）。
+
+#### `docker exec` 参数支持矩阵
+
+标准 `docker exec` 的每个参数 + API 字段，现状如下（✅ 完全支持 / ⚠️ 接收但有限制 / ❌ 不支持）：
+
+| 参数 / 字段 | 状态 | 说明 |
+|---|---|---|
+| `-e` / `--env`（API `Env`） | ✅ | 以 `env K=V …` 前缀进沙箱（沙箱侧没有进程级 env 选项）；重复键、空值语义同 Docker |
+| `--env-file` | ✅ | **客户端**本地解析后并入 `Env`，服务端无需额外支持 |
+| `-i` / `--interactive`（API `AttachStdin`） | ✅ | 走 PTY 通道（只有它转发 stdin）；**非 TTY 时输出按 stdio 帧**回给客户端 |
+| `-t` / `--tty`（API `Tty`） | ✅ | 走 PTY；尺寸来自 create 的 `ConsoleSize` 或 `POST /exec/{id}/resize` |
+| `-d` / `--detach`（API `Detach`） | ✅ | 起后台 exec、不 attach；`inspect` 的 `ExitCode` 落在 0（真 Docker 要自己轮询到真实码，这里拿不到） |
+| `-u` / `--user`（API `User`） | ✅ | `setpriv` → 退 `runuser` → 退 `su`；`<name\|uid>[:<group\|gid>]` 都解析 |
+| `-w` / `--workdir`（API `WorkingDir`） | ✅ | docker-rt 自己包 `cd`（见上）；容器 WorkingDir 缺目录 `mkdir -p`，exec `-w` 缺目录报错退 126 |
+| API `ConsoleSize`（create 体） | ✅ | `[rows, cols]`；CLI 另外还会发 `resize`，两者都收，后到的 resize 为准 |
+| API `resize?h=&w=` | ✅ | 会话存活时转发给平台 PTY；未 start 时记在 exec 记录上 |
+| `POST /exec/{id}/json`（inspect） | ✅ | Docker 标准字段齐全：`ID` / `Running` / `ExitCode` / `ProcessConfig{entrypoint,arguments,user,tty,privileged}` / `OpenStdin|Stdout|Stderr` / `DetachKeys` / `CanRemove` / `ContainerID` |
+| stdout / stderr 分离 | ✅ | 非 TTY 分帧（`\x01` / `\x02`）；TTY 下合并成一条 —— 真 Docker 也一样 |
+| Ctrl-C / 信号 / 全屏 TUI | ✅ | 走 PTY（`kubectl exec` 语义：信号给前台进程组，没有独立的 kill API） |
+| 退出码 | ⚠️ | **非交互**（`docker exec CID CMD`）精确回传；**PTY 通道（`-i` / `-t`）恒为 0** —— 平台的 terminal WS 不上报退出码。要退出码就别带 `-i`/`-t`（或在命令里自己 `echo $?`） |
+| `--privileged`（API `Privileged`） | ⚠️ | 解析、存下、`inspect` 里能读，但**不会真的加能力**：k8s 里无法给单个 exec 进程提权（容器 securityContext 在 Pod 创建时定死） |
+| `--detach-keys`（API `DetachKeys`） | ⚠️ | 解析并回显在 `inspect`，但**按键序列不会真的分离会话** —— PTY 通道把按键原样送进容器（`Ctrl-P Ctrl-Q` 只会被 shell 收到） |
+| `inspect` 的 `Pid` | ⚠️ | 恒 0：k8s exec 不暴露被 exec 进程的 PID |
+| ❌ 真 Docker 有、这里根本没有的 | ❌ | 目前没有 —— 标准参数与 API 字段都不再是"未知字段被忽略" |
+
+> 这张表就是"不像真 Docker"的全部清单：**只有 4 处受限**（PTY 退出码、`--privileged`、
+> `--detach-keys`、`inspect.Pid`），都由 k8s/平台通道的边界决定，不是漏实现。
+> 其余参数（含 `--env-file` 这种客户端解析的）行为都对齐。
+
+**一键自检**（怀疑 `-e` / `bash` / `-i` 不对时，先在**出问题的那台机器**上跑这个，
+它会把每一项的原始值打出来，并给 PASS/FAIL）：
+
+```bash
+DOCKER_HOST=unix:///tmp/docker-rt.sock script/verify_docker_exec.sh
+# 用工单里的镜像（会额外验证 -e 注入 conda PATH 后 which python 是否进 testbed）
+DOCKER_HOST=unix:///tmp/docker-rt.sock script/verify_docker_exec.sh <SWE-bench 镜像>
+```
+
+**交互式 exec 为什么必须走 terminal 通道：** exec-stream WebSocket 是「一条命令 → 一段 stdout/stderr」的命令通道，**没有 PTY、也不转发 stdin**
 （服务端与 SDK 里那条链路上的 stdin 支持已删除，别再往回加），所以 Ctrl-C、方向键、
 `sudo`/`ssh` 的密码提示、vim/top 这类全屏程序都不会工作 —— 过去的
 `docker exec -it` 就是走它，表现是「敲键盘毫无反应，Ctrl-D 也退不出来」。
@@ -73,6 +138,8 @@ sandbox ID。
 | `docker cp` 无成功文案 | 旧 wrapper 重定向输出导致 Docker 不打印 | 升级 SDK/wrapper 并重启 docker-rt |
 | `docker cp FILE CID:/` 报 `panic: comparing uncomparable type tar.headerError`，服务端只看到 `ConnectionResetError` + 500 | `HEAD /archive` 的 `X-Docker-Container-Path-Stat` 里 `mode` 用了 Unix 模式位（`S_IFDIR`=bit14）。CLI 只认 Go `os.FileMode`（`ModeDir`=**bit31**），于是把目录当普通文件，走进 `PrepareArchiveCopy` 的「目标是已存在的文件」分支去改写 tar，而把文件名重写成 `/` 会让 `tar.WriteHeader` 返回 `headerError`（`headerError` 是 `[]string`，`net/http` 拿它和自己比较就 panic） | 升级到含 `_wire_path_stat`（`_to_go_filemode`：`S_IFDIR → 1<<31`）的版本；`GET`/`HEAD /archive` 两处都要经过它 |
 | `docker exec -it` 里敲键盘没反应、Ctrl-D 退不出 | 交互式 exec 走了 exec-stream 命令通道（无 PTY） | 升级到把 `-i`/`-t` 路由到 terminal PTY 的版本 |
+| `docker exec -i CID CMD` **一个字都不输出**（命令其实跑了） | PTY 通道把原始字节写回客户端，而带 stdin、不带 `-t` 时客户端按 **stdio 帧**解析 ⇒ 全丢 | 已修（`_pty_output_for_client`：非 TTY 时加帧头 + CRLF→LF）；升级即可 |
+| exec 报 `sh: 1: cd: can't cd to <dir>`，命令根本没跑 | 平台的 cwd 包装（有 cwd 时它会 `sh -c 'cd <cwd> && exec "$@"'`）撞上了**不存在的目录**：容器 WorkingDir 不存在，或 `-w` 指了没建的目录 | 已修（2026-10-13）：cd 改由 docker-rt 自己包 —— 容器 WorkingDir 会像 Docker runtime 一样 `mkdir -p` 出来；exec 自己的 `-w` 指错则明确报 `chdir to cwd (…) failed` 并退 126 |
 | `docker exec -it` 退出后打印 `What's next: Try Docker Debug … → docker debug <cid>` | docker ≥27 在 stdout 是 TTY 时会执行已安装 CLI 插件（docker-debug）的 hook，内容输出到 **stderr**，看着像命令失败了 | 升级 wrapper（**v17** 起在 docker-rt 分支导出 `DOCKER_CLI_HINTS=false` / `DOCKER_CLI_HOOKS=false`，真 Docker context 不受影响） |
 | `docker rm <本地ID>` 提示不存在 | daemon 已不认识该本地 ID | 使用 `sb-...` ID 或重启 daemon |
 | 创建报 `SANDBOX_CREATION_FAILED: Invalid CPU format: 100m` | cpu 被按 K8s 毫核写法提交，而 create 接口只收不带单位的核数 | 升级 SDK（`--cpus=0.1` 现提交为 `"0.1"`） |
