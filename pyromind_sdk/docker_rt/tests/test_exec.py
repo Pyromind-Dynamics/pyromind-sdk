@@ -209,7 +209,7 @@ async def test_exec_interactive_adds_bash_i(aiohttp_client, fake_kube: FakeKubeE
 async def test_exec_env_is_applied_to_oneshot(aiohttp_client, fake_kube: FakeKubeEnv):
     from ..aio_server import create_aio_app
     from .. import aio_server as mod
-    from ..backend.kube.environment import argv_with_cwd
+    from ..backend.exec_utils import argv_with_exec_cwd
 
     app = create_aio_app(run_reconcile=False)
     mod.start_kube_environment = lambda **kw: fake_kube  # type: ignore
@@ -243,8 +243,12 @@ async def test_exec_env_is_applied_to_oneshot(aiohttp_client, fake_kube: FakeKub
             break
         await asyncio.sleep(0.02)
 
-    assert fake_kube.last_attach_cmd == argv_with_cwd(["env", *env, *command], "/testbed")
-    assert fake_kube.last_attach_kwargs.get("cwd") == "/testbed"
+    # `-e` 的 env 前缀 + cd 包装都是 docker-rt 自己加的；cwd 不再交给后端
+    # （后端自己包一层的话"目录不存在"会静默吃掉整条命令）。
+    assert fake_kube.last_attach_cmd == argv_with_exec_cwd(
+        ["env", *env, *command], "/testbed"
+    )
+    assert fake_kube.last_attach_kwargs.get("cwd") == ""
     _ = await start.read()
 
 
@@ -254,8 +258,11 @@ async def test_exec_all_create_options_are_applied_and_inspected(
 ):
     from ..aio_server import create_aio_app
     from .. import aio_server as mod
-    from ..backend.exec_utils import argv_with_exec_env, argv_with_exec_user
-    from ..backend.kube.environment import argv_with_cwd
+    from ..backend.exec_utils import (
+        argv_with_exec_cwd,
+        argv_with_exec_env,
+        argv_with_exec_user,
+    )
 
     app = create_aio_app(run_reconcile=False)
     mod.start_kube_environment = lambda **kw: fake_kube  # type: ignore
@@ -303,7 +310,7 @@ async def test_exec_all_create_options_are_applied_and_inspected(
         await asyncio.sleep(0.02)
 
     expected = argv_with_exec_env(argv_with_exec_user(command, user), env)
-    assert fake_kube.last_attach_cmd == argv_with_cwd(expected, "/testbed")
+    assert fake_kube.last_attach_cmd == argv_with_exec_cwd(expected, "/testbed")
     _ = await start.read()
 
 
@@ -328,6 +335,7 @@ async def test_pyromind_exec_transport_routing(
     using the command channel, which is what automation drives.
     """
     from .. import aio_server as mod
+    from ..backend.exec_utils import argv_with_exec_cwd
     from ..backend.pyromind_sdk_env import PyromindSDK
 
     class FakeRequest:
@@ -388,10 +396,18 @@ async def test_pyromind_exec_transport_routing(
     if expected == "terminal":
         # The requested argv has to reach the PTY, otherwise the terminal would
         # quietly open a login shell instead of the command the user asked for.
-        assert calls["terminal"]["cmd"] == ["cat"]
-        assert calls["terminal"]["cwd"] == "/workspace"
+        # cd 也由 docker-rt 自己包、cwd 传空（三种 exec 形态统一，见 _exec_argv_with_cwd）。
+        assert calls["terminal"]["cmd"] == argv_with_exec_cwd(
+            ["cat"], "/workspace", create_missing=True
+        )
+        assert calls["terminal"]["cwd"] == ""
     else:
-        assert calls["oneshot"]["cmd"] == ["cat"]
+        # cd 由 docker-rt 自己包进 argv、cwd 传空（后端不再包第二层）。
+        # 这个 session 没有 exec 级 WorkingDir ⇒ 目录来自容器 ⇒ 允许 mkdir -p。
+        assert calls["oneshot"]["cmd"] == argv_with_exec_cwd(
+            ["cat"], "/workspace", create_missing=True
+        )
+        assert calls["oneshot"]["cwd"] == ""
 
 
 @pytest.mark.asyncio
@@ -637,7 +653,7 @@ async def test_exec_working_dir_wraps_argv(aiohttp_client, fake_kube: FakeKubeEn
     """SWE-bench style: create without -w, exec with WorkingDir=/testbed."""
     from ..aio_server import create_aio_app
     from .. import aio_server as mod
-    from ..backend.kube.environment import argv_with_cwd
+    from ..backend.exec_utils import argv_with_exec_cwd
 
     app = create_aio_app(run_reconcile=False)
     mod.start_kube_environment = lambda **kw: fake_kube  # type: ignore
@@ -665,9 +681,10 @@ async def test_exec_working_dir_wraps_argv(aiohttp_client, fake_kube: FakeKubeEn
         if fake_kube.last_attach_cmd is not None:
             break
         await asyncio.sleep(0.02)
-    expected = argv_with_cwd(["git", "apply", "--verbose", "-"], "/testbed")
+    expected = argv_with_exec_cwd(["git", "apply", "--verbose", "-"], "/testbed")
     assert fake_kube.last_attach_cmd == expected
-    assert fake_kube.last_attach_kwargs.get("cwd") == "/testbed"
+    # cd 由 docker-rt 包在 argv 里，就不再让后端也包一层
+    assert fake_kube.last_attach_kwargs.get("cwd") == ""
     _ = await start.read()
 
 
@@ -677,7 +694,7 @@ async def test_exec_falls_back_to_container_workdir(
 ):
     from ..aio_server import create_aio_app
     from .. import aio_server as mod
-    from ..backend.kube.environment import argv_with_cwd
+    from ..backend.exec_utils import argv_with_exec_cwd
 
     app = create_aio_app(run_reconcile=False)
     mod.start_kube_environment = lambda **kw: fake_kube  # type: ignore
@@ -700,7 +717,12 @@ async def test_exec_falls_back_to_container_workdir(
         if fake_kube.last_attach_cmd is not None:
             break
         await asyncio.sleep(0.02)
-    assert fake_kube.last_attach_cmd == argv_with_cwd(["pwd"], "/testbed")
+    # 目录来自**容器**的 WorkingDir（`docker run -w /testbed`）⇒ 按 Docker runtime
+    # 的做法先 mkdir -p，所以目录不存在也不该把命令整条吃掉。
+    assert fake_kube.last_attach_cmd == argv_with_exec_cwd(
+        ["pwd"], "/testbed", create_missing=True
+    )
+    assert fake_kube.last_attach_kwargs.get("cwd") == ""
 
 
 def test_argv_with_cwd_unit():
@@ -961,3 +983,300 @@ async def test_a_pyromind_exec_that_produced_output_but_lost_its_exit_code(monke
     assert "partial\n" in text
     assert "cannot start" not in text, "有输出就不该说'命令没起来'"
     assert code == 127
+
+
+def test_pty_output_is_framed_only_when_the_client_expects_frames():
+    """`-t` 决定客户端怎么解析输出：有 TTY 原样、无 TTY 必须带 Docker 的 stdio 帧头。
+
+    2026-10-13：`docker exec -i cid bash -c 'echo hi'`（带 stdin、不带 `-t`）走 PTY 通道，
+    而通道把 PTY 原始字节直接写给了客户端 —— 客户端按"帧"解析，长度字段是垃圾，
+    整段输出被丢掉，表现为"命令跑了但一个字都没有"。eval harness 常用这个形态。
+    """
+    from .. import aio_server as mod
+    from ..backend.stream_framing import frame_stdout
+
+    raw = b"hello\r\nworld\r\n"
+    assert mod._pty_output_for_client(raw, tty=True) == raw, "TTY 下必须原样（不折 CR、不加帧）"
+    framed = mod._pty_output_for_client(raw, tty=False)
+    assert framed == frame_stdout(b"hello\nworld\n"), "非 TTY 下要加帧头并把 CRLF 折成 LF"
+
+
+@pytest.mark.asyncio
+async def test_exec_with_stdin_and_no_tty_frames_the_terminal_output(monkeypatch):
+    """同上，但走真实的 `pump_out`：断言落到客户端那条流上的字节确实带了帧头。"""
+    import aiohttp
+    from types import SimpleNamespace
+
+    from .. import aio_server as mod
+
+    class _FakeTerminalWS:
+        def __init__(self, frames):
+            self._frames = list(frames)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._frames:
+                raise StopAsyncIteration
+            return self._frames.pop(0)
+
+        async def send_str(self, _data):
+            return None
+
+        async def close(self):
+            return None
+
+    class _FakeSession:
+        def __init__(self, ws, **_kwargs):
+            self._ws = ws
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def ws_connect(self, _url, **_kwargs):
+            return self._ws
+
+    async def _drive(*, tty: bool) -> list[bytes]:
+        ws = _FakeTerminalWS(
+            [SimpleNamespace(type=aiohttp.WSMsgType.BINARY, data=b"hello\r\n")]
+        )
+        monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: _FakeSession(ws, **k))
+        monkeypatch.setattr(mod, "_pyromind_terminal_url", lambda *a, **k: "ws://fake")
+
+        written: list[bytes] = []
+
+        class _Resp:
+            async def write(self, chunk):
+                written.append(chunk)
+
+            async def drain(self):
+                return None
+
+            def force_close(self):
+                return None
+
+        class _Content:
+            async def readany(self):
+                raise asyncio.TimeoutError
+
+        session = SimpleNamespace(
+            id="exec-pty-1",
+            running=False,
+            exit_code=None,
+            resize_hook=None,
+            tty_cols=0,
+            tty_rows=0,
+        )
+        kube_env = SimpleNamespace(sandbox_id="sb-1")
+        request = SimpleNamespace(
+            protocol=None, transport=None, content=_Content()
+        )
+
+        handled = await mod._hijack_pyromind_terminal(
+            request, _Resp(), None, session, kube_env, tty, cmd=["bash"]
+        )
+        assert handled is True
+        return written
+
+    framed = b"".join(await _drive(tty=False))
+    assert framed == mod.frame_stdout(b"hello\n")
+    assert framed[:8] == b"\x01\x00\x00\x00\x00\x00\x00\x06", "8 字节 stdio 帧头"
+
+    raw_bytes = b"".join(await _drive(tty=True))
+    assert raw_bytes == b"hello\r\n", "TTY 下原样透传，不许加帧头"
+
+
+@pytest.mark.asyncio
+async def test_exec_sends_the_clients_argv_and_env_untouched(monkeypatch):
+    """工单#1+#2 的契约：`-e` 必须进环境、`bash` 必须还是 bash。
+
+    真 Docker 是 ``execve(argv, envp)``：``bash -c 'echo $0'`` 里 ``$0`` 就是 ``bash``，
+    ``-e`` 的值进被 exec 进程的环境。谁要是把 argv 拼成字符串再交给 ``/bin/sh -c``，
+    就会出现 "$0=sh、BASH_VERSION 空、-e 不生效"，所以这里把**发给沙箱的 argv 原样钉住**。
+    """
+    from .. import aio_server as mod
+    from ..backend.pyromind_sdk_env import PyromindSDK
+
+    command = ["bash", "-c", "echo $0"]
+    env = ["PATH=/opt/miniconda3/envs/testbed/bin:/usr/bin:/bin", "CONDA_PREFIX=/opt/x"]
+
+    seen: list[list[str]] = []
+
+    async def fake_stream(cmd, **_kwargs):
+        seen.append(list(cmd))
+        yield SimpleNamespace(type="stdout", data="bash\n")
+        yield SimpleNamespace(type="exit", returncode=0)
+
+    class _Resp:
+        def __init__(self):
+            self.out = []
+
+        async def write(self, chunk):
+            self.out.append(chunk)
+
+        async def drain(self):
+            return None
+
+    kube_env = PyromindSDK.__new__(PyromindSDK)
+    monkeypatch.setattr(kube_env, "iter_exec_stream", fake_stream)
+
+    await mod._stream_ws_oneshot(
+        resp=_Resp(),
+        kube_env=kube_env,
+        cmd=mod.argv_with_exec_env(command, env),
+        session_id="exec-contract",
+    )
+
+    assert seen == [["env", *env, "bash", "-c", "echo $0"]], (
+        "发给沙箱的 argv 必须是 `env <赋值…> bash -c …`："
+        "env 前缀负责 -e，bash 保持原样不被换成 sh"
+    )
+
+
+@pytest.mark.asyncio
+async def test_exec_oneshot_keeps_env_and_bash_for_a_plain_kube_env(
+    aiohttp_client, fake_kube
+):
+    """同一条契约在非 PyromindSDK 的 kube_env（attach_exec）上也要成立。"""
+    from ..aio_server import create_aio_app
+    from .. import aio_server as mod
+
+    app = create_aio_app(run_reconcile=False)
+    mod.start_kube_environment = lambda **kw: fake_kube  # type: ignore
+    client = await aiohttp_client(app)
+    cid = await create_started_container(client, name="exec-argv")
+
+    resp = await client.post(
+        f"/containers/{cid}/exec",
+        json={
+            "Cmd": ["bash", "-c", "echo $0"],
+            "Env": ["CONDA_PREFIX=/opt/x"],
+            "AttachStdin": False,
+            "AttachStdout": True,
+            "AttachStderr": True,
+            "Tty": False,
+        },
+    )
+    eid = (await resp.json())["Id"]
+    start = asyncio.create_task(client.post(f"/exec/{eid}/start", json={}))
+    for _ in range(100):
+        if fake_kube.last_attach_cmd is not None:
+            break
+        await asyncio.sleep(0.02)
+
+    assert fake_kube.last_attach_cmd == [
+        "env",
+        "CONDA_PREFIX=/opt/x",
+        "bash",
+        "-c",
+        "echo $0",
+    ]
+    await start
+
+
+def test_argv_with_exec_cwd_unit():
+    """docker-rt 自己负责 cd：Docker 的措辞 + 退出码 126 + argv/$0 不变形。
+
+    2026-10-13 工单③：容器 WorkingDir（或 exec `-w`）指向一个**不存在**的目录时，
+    后端那层 `sh -c 'cd … && exec "$@"'` 只会吐 `sh: 1: cd: can't cd to <dir>`，
+    **命令根本不执行** —— 与"命令什么都没做"无法区分。真 Docker 这时会明确报
+    `chdir to cwd (…) failed: no such file or directory`。
+    """
+    from ..backend.exec_utils import EXEC_CHDIR_FAILED_CODE, argv_with_exec_cwd
+
+    # "" / "/" 无事可做：argv 原样
+    assert argv_with_exec_cwd(["pwd"], "") == ["pwd"]
+    assert argv_with_exec_cwd(["pwd"], "/") == ["pwd"]
+    assert argv_with_exec_cwd(["pwd"], "  ") == ["pwd"]
+    assert argv_with_exec_cwd([], "/testbed") == []
+
+    # exec 自己的 -w：目录必须已经存在，不做 mkdir
+    wrapped = argv_with_exec_cwd(["bash", "-c", "echo $0"], "/testbed")
+    assert wrapped[:2] == ["sh", "-c"]
+    assert "mkdir" not in wrapped[2]
+    assert wrapped[2].startswith("cd /testbed 2>/dev/null || {")
+    assert "chdir to cwd (\"/testbed\") failed: no such file or directory" in wrapped[2]
+    assert f"exit {EXEC_CHDIR_FAILED_CODE}" in wrapped[2]
+    assert wrapped[2].endswith('exec "$@"')
+    assert wrapped[3:] == ["sh", "bash", "-c", "echo $0"], "argv/$0 不许变形"
+
+    # 容器的 WorkingDir：像 Docker runtime 一样先建出来
+    container_wrapped = argv_with_exec_cwd(["pwd"], "/testbed", create_missing=True)
+    assert container_wrapped[2].startswith("mkdir -p /testbed 2>/dev/null; cd /testbed")
+
+    # 带空格/元字符的目录要 shell 引号
+    odd = argv_with_exec_cwd(["true"], "/tmp/my dir")
+    assert "cd '/tmp/my dir'" in odd[2]
+
+
+def test_the_cwd_wrapper_really_chdirs_and_reports_a_missing_dir(tmp_path):
+    """把那段 shell 真跑一遍：能进去、失败时报 Docker 的话并退 126。"""
+    import shutil
+    import subprocess
+
+    from ..backend.exec_utils import EXEC_CHDIR_FAILED_CODE, argv_with_exec_cwd
+
+    if shutil.which("sh") is None:  # pragma: no cover - 环境没有 sh 就没法验
+        pytest.skip("no /bin/sh")
+
+    # argv 本身就是完整 argv（第一段就是 sh），直接执行。
+    argv = argv_with_exec_cwd(["/bin/pwd"], str(tmp_path))
+    ok = subprocess.run(argv, capture_output=True, text=True)
+    assert ok.returncode == 0, ok.stderr
+    assert ok.stdout.strip() == str(tmp_path)
+
+    missing = str(tmp_path / "nope")
+    argv = argv_with_exec_cwd(["/bin/pwd"], missing)
+    bad = subprocess.run(argv, capture_output=True, text=True)
+    assert bad.returncode == EXEC_CHDIR_FAILED_CODE
+    assert f'chdir to cwd ("{missing}") failed: no such file or directory' in bad.stderr
+    assert "can't cd to" not in bad.stderr, "cd 自己的报错要压掉，别和 Docker 那句重复"
+
+
+@pytest.mark.asyncio
+async def test_exec_create_accepts_the_api_console_size(
+    aiohttp_client, fake_kube: FakeKubeEnv
+):
+    """Docker API 的 `ConsoleSize`（`[rows, cols]`）也要收 —— CLI 之外还有别的客户端。
+
+    CLI 会额外发 `POST /exec/{id}/resize`，但 SDK / compose 这类客户端**只**在 create
+    体里给 `ConsoleSize`；以前这个字段被完全忽略 ⇒ PTY 只能退化成 80x24。
+    """
+    from ..aio_server import create_aio_app
+    from .. import aio_server as mod
+
+    app = create_aio_app(run_reconcile=False)
+    mod.start_kube_environment = lambda **kw: fake_kube  # type: ignore
+    client = await aiohttp_client(app)
+    cid = await create_started_container(client, name="exec-console-size")
+
+    resp = await client.post(
+        f"/containers/{cid}/exec",
+        json={
+            "Cmd": ["bash"],
+            "AttachStdin": True,
+            "AttachStdout": True,
+            "Tty": True,
+            # Docker API：先 rows 后 cols（和 resize?h=&w= 的顺序相反）
+            "ConsoleSize": [43, 132],
+        },
+    )
+    eid = (await resp.json())["Id"]
+    rec = app["store"].get_exec(eid)
+    assert (rec.tty_rows, rec.tty_cols) == (43, 132)
+
+    # 之后真的 resize 了，仍然以 resize 为准
+    await client.post(f"/exec/{eid}/resize?h=21&w=272")
+    assert (rec.tty_rows, rec.tty_cols) == (21, 272)
+
+    # 没给 ConsoleSize 时不写脏数据（0 表示"还没定过"）
+    resp = await client.post(
+        f"/containers/{cid}/exec",
+        json={"Cmd": ["true"], "AttachStdout": True, "Tty": False},
+    )
+    rec = app["store"].get_exec((await resp.json())["Id"])
+    assert (rec.tty_rows, rec.tty_cols) == (0, 0)

@@ -12,7 +12,11 @@ from fastapi.responses import StreamingResponse
 from starlette.responses import Response as StarletteResponse
 from starlette.types import Receive, Scope, Send
 
-from ..backend.exec_utils import argv_with_exec_env, argv_with_exec_user
+from ..backend.exec_utils import (
+    argv_with_exec_cwd,
+    argv_with_exec_env,
+    argv_with_exec_user,
+)
 from ..backend.pyromind_sdk_env import PyromindSDK
 from ..backend.store import ContainerState, ContainerStore
 from ..backend.stream_framing import frame_stderr, frame_stdout
@@ -316,6 +320,11 @@ async def start_exec(request: Request, id: str) -> Response:
         cmd = [cmd[0], "-i"]
     cmd = argv_with_exec_user(cmd, exec_rec.user)
     cmd = argv_with_exec_env(cmd, exec_rec.env)
+    # cd 由 docker-rt 自己包进 argv（后端那层 `sh -c 'cd … && exec "$@"'` 在目录不存在时
+    # 会静默吃掉整条命令）；目录来自容器 WorkingDir 时按 Docker runtime 的做法 mkdir -p。
+    create_missing = not (exec_rec.working_dir or "").strip()
+    cmd = argv_with_exec_cwd(cmd, cwd, create_missing=create_missing)
+    cwd = ""
 
     if detach:
         # Fire-and-forget non-attached exec
