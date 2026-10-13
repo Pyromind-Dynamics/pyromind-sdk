@@ -27,6 +27,7 @@ from .backend.archive import (  # noqa: E402
 )
 from .backend.events import EventBus  # noqa: E402
 from .backend.exec_utils import (  # noqa: E402
+    argv_with_exec_cwd,
     argv_with_exec_env,
     argv_with_exec_user,
 )
@@ -2876,6 +2877,18 @@ async def create_exec(request: web.Request) -> web.Response:
     if not cmd:
         return _err(400, "Cmd is required")
 
+    # Docker API：``ConsoleSize`` 是 ``[rows, cols]``（和 CLI 的 ``resize`` 参数顺序不同）。
+    # CLI 会另外发 ``POST /exec/{id}/resize``；只发 ConsoleSize 的客户端（SDK / compose）
+    # 以前会退化成 80x24，现在两边都收，resize 之后到的话仍然以 resize 为准。
+    console_rows, console_cols = 0, 0
+    console = body.get("ConsoleSize")
+    if isinstance(console, (list, tuple)) and len(console) == 2:
+        try:
+            console_rows = max(int(console[0] or 0), 0)
+            console_cols = max(int(console[1] or 0), 0)
+        except (TypeError, ValueError):
+            console_rows = console_cols = 0
+
     exec_rec = store.create_exec(
         container_id=record.id,
         cmd=list(cmd),
@@ -2888,6 +2901,8 @@ async def create_exec(request: web.Request) -> web.Response:
         user=body.get("User") or "",
         working_dir=body.get("WorkingDir") or "",
         env=body.get("Env") or [],
+        tty_rows=console_rows,
+        tty_cols=console_cols,
     )
     return _json({"Id": exec_rec.id})
 
@@ -3341,6 +3356,28 @@ async def attach_container(request: web.Request) -> web.StreamResponse | web.Res
         logger.info("attach hijack end id=%s", record.short_id if record else cid[:12])
 
 
+def _exec_argv_with_cwd(cmd: list[str], cwd: str, session: Any) -> tuple[list[str], str]:
+    """输出型通道用的 ``(argv, 要传给后端的 cwd)``。
+
+    **cd 由 docker-rt 自己做**，不留给后端（见
+    :func:`~docker_rt.backend.exec_utils.argv_with_exec_cwd`）：
+
+    * 后端把 argv 拼成 ``sh -c 'cd … && exec "$@"'`` 时，**目录不存在**会让 ``cd`` 失败、
+      命令**根本不执行**，只吐一句 ``sh: 1: cd: can't cd to <dir>`` ——
+      与"命令什么都没做"无法区分（真 Docker 会明确报 ``chdir to cwd … failed``）；
+    * 顺手让 exec 的语义不再依赖任何后端的包装习惯。
+
+    目录是**容器的 WorkingDir**（``docker run -w /testbed``）时按 Docker runtime 的做法
+    ``mkdir -p`` 出来；是 exec 自己的 ``-w`` 时**不建** —— 打错一个字母应该报错，
+    而不是悄悄换到另一个目录去跑。
+    """
+    spec = (cwd or "").strip()
+    if not spec or spec == "/":
+        return list(cmd), spec
+    create_missing = not str(getattr(session, "working_dir", "") or "").strip()
+    return argv_with_exec_cwd(cmd, spec, create_missing=create_missing), ""
+
+
 async def _hijack_session(
     request: web.Request,
     resp: web.StreamResponse,
@@ -3358,6 +3395,12 @@ async def _hijack_session(
     ``cmd is None`` → attach to the Pod main process (``docker attach`` /
     ``docker run -it``). Otherwise exec ``cmd`` (``docker exec``).
     """
+    # cd 由 docker-rt 自己包，**所有 exec 形态（oneshot / PTY / attach 带 cmd）统一**：
+    # 一来它不该依赖后端/平台那层包装（目录不存在时那层会静默吞掉整条命令），
+    # 二来三种形态的 cwd 语义才一致。
+    if cmd is not None:
+        cmd, cwd = _exec_argv_with_cwd(cmd, cwd, session)
+
     # Non-interactive oneshot: stream output (no full-buffer).
     if not stdin and not tty and cmd is not None:
         try:
@@ -3631,6 +3674,26 @@ def _pyromind_terminal_url(
     )
 
 
+def _pty_output_for_client(data: bytes, *, tty: bool) -> bytes:
+    """PTY 输出 → Docker 客户端真正期望的字节形态。
+
+    ``docker exec`` 的客户端**按有没有 `-t` 决定怎么解析**输出：
+
+    * ``tty=True`` —— 按"终端"读，字节要**原样**（加帧头反而会显示一堆转义乱码）；
+    * ``tty=False`` —— 按 Docker 的 stdio **帧**读（8 字节头 + 载荷）。这时必须加帧头：
+      不加的话客户端会把原始字节当成帧头去解析，长度字段是垃圾，整段输出**被丢掉**。
+
+    2026-10-13 复现：``docker exec -i <ctr> bash -c 'echo hi'``（带 stdin、不带 ``-t``）
+    完全静默 —— 走的是 PTY 通道，而这里原样写了 PTY 字节。eval harness 恰好常用这个形态
+    （``docker exec -i`` 跑命令），于是表现为"命令跑了，但什么都没输出"。
+
+    PTY 的 ``\\r\\n`` 顺手折成 ``\\n``：非 TTY 的 Docker exec 不会有 CR。
+    """
+    if tty:
+        return data
+    return frame_stdout(data.replace(b"\r\n", b"\n"))
+
+
 async def _hijack_pyromind_terminal(
     request: web.Request,
     resp: web.StreamResponse,
@@ -3710,7 +3773,11 @@ async def _hijack_pyromind_terminal(
                         break
                     if msg.type == aiohttp.WSMsgType.BINARY:
                         try:
-                            await resp.write(msg.data)
+                            # 有没有 -t 决定客户端怎么解析：帧头的有无必须跟着它走
+                            # （见 _pty_output_for_client）。
+                            await resp.write(
+                                _pty_output_for_client(msg.data, tty=tty)
+                            )
                             await resp.drain()
                         except (ConnectionResetError, RuntimeError, ConnectionError):
                             session_over.set()
@@ -3723,8 +3790,11 @@ async def _hijack_pyromind_terminal(
                         except (json.JSONDecodeError, TypeError):
                             pass
                         try:
+                            payload = msg.data.encode("utf-8", errors="replace")
                             await resp.write(
-                                msg.data.encode("utf-8", errors="replace")
+                                payload
+                                if tty
+                                else _pty_output_for_client(payload, tty=False)
                             )
                             await resp.drain()
                         except (ConnectionResetError, RuntimeError, ConnectionError):
