@@ -502,6 +502,8 @@ class ContainerStore:
         user: str = "",
         working_dir: str = "",
         env: list[str] | None = None,
+        tty_cols: int = 0,
+        tty_rows: int = 0,
     ) -> ExecRecord:
         eid = _docker_id()
         rec = ExecRecord(
@@ -517,6 +519,10 @@ class ContainerStore:
             user=user,
             working_dir=working_dir,
             env=env or [],
+            # Docker API 的 ``ConsoleSize``（``[rows, cols]``）—— CLI 走
+            # ``POST /exec/{id}/resize``，但其他客户端只给这个字段，所以两边都收。
+            tty_cols=tty_cols,
+            tty_rows=tty_rows,
         )
         self._execs[eid] = rec
         return rec
