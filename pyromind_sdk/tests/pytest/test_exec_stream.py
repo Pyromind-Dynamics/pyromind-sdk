@@ -215,3 +215,69 @@ def test_stop_event_keeps_the_graceful_break(
     _install_fake_ws(monkeypatch, ws)
 
     assert _collect(command="ls /", stop_event=stop) == []
+
+
+class _LossyCancelWS(_FakeWS):
+    """``receive()`` 被取消时丢掉已出队的那条消息（对齐 aiohttp WS 的真实行为）。
+
+    每帧有 ``delay`` 的"已读出、未返回"窗口 —— 旧实现用 0.5s 轮询 + wait_for，
+    超时取消正好落在这个窗口里，消息就丢了。
+    """
+
+    def __init__(self, messages, delay: float = 0.55):
+        super().__init__(messages)
+        self._delay = delay
+
+    async def receive(self):
+        import asyncio as _asyncio
+
+        if not self._messages:
+            raise AssertionError("FakeWS: no more messages")
+        message = self._messages.pop(0)  # 已从 socket 读出
+        await _asyncio.sleep(self._delay)  # ← 取消窗口
+        return message
+
+
+def test_polling_timeout_never_drops_ws_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """0.5s 轮询超时**不许取消** receive —— 否则大输出会随机缺帧。
+
+    2026-10-14 实测（docker exec 输出 base64 大文件）：256KB 输出 0/4 出问题、
+    1MB 1/4、4MB 2/4 —— 与传输量正相关，正是"每次轮询取消一次 receive、丢帧概率
+    随帧数累积"的特征。修复后这里必须一条都不丢。
+    """
+    import asyncio
+    import json
+
+    from pyromind_sdk.exec_stream import iter_exec_stream_async
+
+    payloads = [f"chunk-{i}" for i in range(4)]
+    messages = [
+        types.SimpleNamespace(
+            type=aiohttp.WSMsgType.TEXT,
+            data=json.dumps({"type": "stdout", "data": p}),
+        )
+        for p in payloads
+    ]
+    messages.append(
+        types.SimpleNamespace(
+            type=aiohttp.WSMsgType.TEXT,
+            data=json.dumps({"type": "exit", "returncode": 0}),
+        )
+    )
+    ws = _LossyCancelWS(messages)
+    _install_fake_ws(monkeypatch, ws)
+
+    async def collect():
+        out = []
+        async for chunk in iter_exec_stream_async(
+            url="ws://fake/exec", command=["echo", "hi"]
+        ):
+            out.append(chunk)
+        return out
+
+    chunks = asyncio.run(collect())
+    got = "".join(c.data for c in chunks if c.type == "stdout")
+    assert got == "".join(payloads), "轮询超时丢了帧 ⇒ 大输出会随机缺数据"
+    assert chunks[-1].type == "exit"
