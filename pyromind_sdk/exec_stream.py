@@ -115,18 +115,28 @@ async def _iter_exec_stream_events(
             await ws.send_str(json.dumps(request, ensure_ascii=False))
             loop = asyncio.get_running_loop()
             last_ping = loop.time()
+            # ⚠️ 不能用 asyncio.wait_for(ws.receive(), 0.5) 轮询：超时会**取消**这次
+            # receive，而 aiohttp 的 WS 读取被取消时可能丢掉正在拼装的帧 ——
+            # 表现就是大输出随机缺一块（2026-10-14 实测：256KB 输出 0/4 出问题、
+            # 1MB 1/4、4MB 2/4，与传输量正相关）。改成**常驻 receive 任务**：
+            # 超时只是"这一轮先不取"，任务继续在后台收帧，永不取消。
+            # （middleware 的 AsyncExecStream 有同类问题，已同步修复。）
+            recv_task: Optional[asyncio.Task] = None
             while True:
                 if stop_event is not None and stop_event.is_set():
+                    if recv_task is not None:
+                        recv_task.cancel()
                     break
-                try:
-                    message = await asyncio.wait_for(
-                        ws.receive(), timeout=0.5
-                    )
-                except asyncio.TimeoutError:
+                if recv_task is None:
+                    recv_task = asyncio.ensure_future(ws.receive())
+                done, _pending = await asyncio.wait({recv_task}, timeout=0.5)
+                if not done:
                     if loop.time() - last_ping >= ping_interval_s:
                         await ws.send_str('{"type":"ping"}')
                         last_ping = loop.time()
                     continue
+                message = recv_task.result()
+                recv_task = None
 
                 if message.type == aiohttp.WSMsgType.TEXT:
                     try:
