@@ -52,6 +52,26 @@ def _decode_exec_stream_data(data: Union[str, bytes]) -> str:
         return data.decode("utf-8", errors="replace")
     return str(data)
 
+def _sandbox_is_gone(exc: BaseException) -> bool:
+    """上传失败时判断"是不是沙箱/ Pod 已经不在了"。
+
+    沙箱没了的时候**不要**再去调 abort —— 残片随沙箱一起消失，abort 只会再打一次
+    404/500 到服务端日志（2026-10-14 线上就是这种噪音）。
+    """
+    text = str(exc).lower()
+    return any(
+        s in text
+        for s in (
+            "no running pod",
+            "sandbox is gone",
+            "sandbox not found",
+            "gone away",
+            "invalid response status",
+            "404",
+        )
+    )
+
+
 
 class AsyncSandboxClient(PyroMindAsyncClient):
     """
@@ -808,14 +828,17 @@ class AsyncSandboxClient(PyroMindAsyncClient):
                 return self._extract_data(await complete_resp.json())
 
         except Exception:
-            # Best-effort abort on failure
-            try:
-                async with session.request(
-                    "DELETE", f"{base_url}/{upload_id}"
-                ):
+            # Best-effort abort on failure（清掉残片）。
+            # 沙箱已经没了就**跳过** —— 残片随沙箱消失，再去 abort 只会又打一个
+            # 404/500 到服务端日志。
+            if not _sandbox_is_gone(exc):
+                try:
+                    async with session.request(
+                        "DELETE", f"{base_url}/{upload_id}"
+                    ):
+                        pass
+                except Exception:
                     pass
-            except Exception:
-                pass
             raise
 
 

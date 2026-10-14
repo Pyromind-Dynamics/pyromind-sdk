@@ -16,6 +16,7 @@ import os
 import posixpath
 import queue
 import shlex
+import uuid
 import tarfile
 import threading
 import weakref
@@ -821,6 +822,7 @@ class PyromindSDK:
         tty: bool = False,
         cwd: str = "",
         timeout: int | None = None,
+        stdin_close: Any | None = None,
     ) -> AsyncIterator[SandboxExecStreamChunk]:
         """Stream one exec command without leaving the running event loop.
 
@@ -841,6 +843,7 @@ class PyromindSDK:
             cwd=cwd or self.working_dir,
             timeout=timeout,
             tty=tty,
+            stdin_close=stdin_close,
         ):
             yield chunk
 
@@ -1129,6 +1132,30 @@ class PyromindSDK:
             "linkTarget": "",
         }
 
+    async def write_ack(self, path: str) -> None:
+        """给「结束标记 + 等回执」的 exec 落一个回执文件。
+
+        走**文件 API**（write_file）而不是再开一个 exec：回执只是一次小 HTTP，
+        比开 exec 会话便宜，也不会把 exec 会话数顶上去。失败只记日志 ——
+        调用方（生产者）有 60s 超时兜底，不会因为回执没落上而挂死。
+        """
+        # 先用**一次 exec**（touch）落回执：比走分片上传（init/chunk/complete/merge/
+        # cleanup/stat 六七个来回）便宜得多 —— 回执是每个 exec 都要付的成本。
+        try:
+            result = await self.execute(
+                {"command": f"touch {shlex.quote(path)}"}, cwd="/"
+            )
+            if int(result.get("returncode", 0) or 0) == 0:
+                return
+            logger.debug("exec ack via touch returned %s", result.get("returncode"))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("exec ack via touch failed for %s: %s", path, exc)
+        # 兜底：文件 API（Pod 一时不可 exec 时仍能落回执）
+        try:
+            await self._client.write_file(self.sandbox_id, path, b"1")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("exec ack write failed for %s: %s", path, exc)
+
     async def iter_archive_chunks(self, path: str):
         """Yield tar bytes for ``docker cp`` from a k8s-middleware sandbox."""
         target = path if path.startswith("/") else f"/{path}"
@@ -1139,20 +1166,44 @@ class PyromindSDK:
             raise FileNotFoundError(target)
 
         if stat["mode"] & 0o040000:
-            script = (
-                f"tar -C {shlex.quote(parent)} -cf - {shlex.quote(base)} "
-                "| base64 -w0"
-            )
-            result = await self.execute({"command": script}, cwd="/")
-            code = int(result.get("returncode", 0) or 0)
-            if code != 0:
-                raise RuntimeError(
-                    result.get("exception_info")
-                    or result.get("output")
-                    or f"tar failed for {target}"
+            # 目录分支**不**直接 ``tar … | base64`` 走一次性 exec —— 实测（2026-10-14）：
+            # 命令退出瞬间会把管道里没送出的尾部丢掉（立刻退出 4/6 截断、末尾多活 1 秒
+            # 6/6 完好）。而固定等待不是修复。
+            # 改成：先把 tar 落到容器内临时文件，再用**带回执机制**的文件读取
+            # （read_file → middleware 读完 payload 才关 stdin，生产者不会在数据在途时退出）
+            # 把整包取回来，最后删掉临时文件。
+            tmp_name = f"/tmp/.docker-rt-cp-{uuid.uuid4().hex}.tar"
+            quoted_tmp = shlex.quote(tmp_name)
+            try:
+                result = await self.execute(
+                    {
+                        "command": (
+                            f"tar -C {shlex.quote(parent)} -cf {quoted_tmp} "
+                            f"-- {shlex.quote(base)}; rc=$?; "
+                            f"wc -c < {quoted_tmp} > /tmp/.docker-rt-cp-size; exit $rc"
+                        )
+                    },
+                    cwd="/",
                 )
-            raw = base64.b64decode(str(result.get("output") or ""))
-            yield raw
+                code = int(result.get("returncode", 0) or 0)
+                if code != 0:
+                    raise RuntimeError(
+                        result.get("exception_info")
+                        or result.get("output")
+                        or f"tar failed for {target}"
+                    )
+                raw = await self._client.read_file(self.sandbox_id, tmp_name)
+                if not raw:
+                    raise RuntimeError(f"tar produced no data for {target}")
+                yield raw
+            finally:
+                try:
+                    await self.execute(
+                        {"command": f"rm -f {quoted_tmp} /tmp/.docker-rt-cp-size"},
+                        cwd="/",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("temp tar cleanup failed for %s: %s", tmp_name, exc)
             return
 
         data = await self._client.read_file(self.sandbox_id, target)
