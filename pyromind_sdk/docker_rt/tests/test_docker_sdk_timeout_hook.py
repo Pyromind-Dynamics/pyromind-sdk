@@ -95,7 +95,12 @@ def test_installed_pth_patches_fake_docker_sdk_at_startup(tmp_path) -> None:
 import site
 import sys
 
+# 守护进程装过 venv 级 .pth 时，boot 模块会在解释器启动时被预导入 ⇒ 这里 tmp 的
+# .pth 会变成 no-op。先把它踢出 sys.modules，强制随本测试的 .pth 重新执行。
+sys.modules.pop("pyromind_docker_sdk_timeout_boot", None)
+
 site.addsitedir(sys.argv[1])
+sys.path.insert(0, sys.argv[1])
 
 import docker.api.client
 import docker.client
