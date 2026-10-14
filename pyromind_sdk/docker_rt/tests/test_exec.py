@@ -396,18 +396,34 @@ async def test_pyromind_exec_transport_routing(
     if expected == "terminal":
         # The requested argv has to reach the PTY, otherwise the terminal would
         # quietly open a login shell instead of the command the user asked for.
-        # cd 也由 docker-rt 自己包、cwd 传空（三种 exec 形态统一，见 _exec_argv_with_cwd）。
-        assert calls["terminal"]["cmd"] == argv_with_exec_cwd(
+        # 现在有两层包装：外层「结束标记 + 等回执」（防退出瞬间丢尾部），
+        # 内层 cd 包装（cwd 传空）。内层从第 4 个元素开始。
+        outer = calls["terminal"]["cmd"]
+        assert outer[:2] == ["sh", "-c"], outer
+        assert "__DRT_END_" in outer[2] and '"$@"' in outer[2]
+        assert outer[4:] == argv_with_exec_cwd(
             ["cat"], "/workspace", create_missing=True
         )
         assert calls["terminal"]["cwd"] == ""
+        assert calls["terminal"]["marker"].startswith("__DRT_END_")
+        assert calls["terminal"]["ack_path"].startswith("/tmp/.drt-ack-")
     else:
-        # cd 由 docker-rt 自己包进 argv、cwd 传空（后端不再包第二层）。
-        # 这个 session 没有 exec 级 WorkingDir ⇒ 目录来自容器 ⇒ 允许 mkdir -p。
-        assert calls["oneshot"]["cmd"] == argv_with_exec_cwd(
+        # 非交互 exec 现在有两层包装：外层是「结束标记 + 等回执」（防"进程退出瞬间
+        # k8s exec 代理丢尾部"），内层是 cd 包装（cwd 传空，后端不再包第二层）。
+        outer = calls["oneshot"]["cmd"]
+        assert outer[:2] == ["sh", "-c"], outer
+        assert "__DRT_END_" in outer[2] and '"$@"' in outer[2]
+        # 外层 ["sh","-c",script,"sh", *内层] ⇒ 内层从第 4 个元素开始
+        assert calls["oneshot"]["cmd"][4:] == argv_with_exec_cwd(
             ["cat"], "/workspace", create_missing=True
         )
         assert calls["oneshot"]["cwd"] == ""
+        assert calls["oneshot"]["marker"].startswith("__DRT_END_")
+        # exec-stream 这条路有 stdin 通道 ⇒ 回执 = 半关闭 stdin（不是文件），
+        # 所以这里不该有 ack_path，而是拿到一个可 set 的事件。
+        assert calls["oneshot"]["ack_path"] == ""
+        assert calls["oneshot"]["stdin_close"] is not None
+        assert "__DRT_END_" in outer[2] and "cat > /dev/null" in outer[2]
 
 
 @pytest.mark.asyncio
@@ -1280,3 +1296,97 @@ async def test_exec_create_accepts_the_api_console_size(
     )
     rec = app["store"].get_exec((await resp.json())["Id"])
     assert (rec.tty_rows, rec.tty_cols) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_stdin_eof_does_not_teardown_the_session(monkeypatch):
+    """``-i`` 的 stdin EOF ≠ 会话结束：发 Ctrl-D 近似 EOF，**输出继续泵到命令结束**。
+
+    2026-10-14：``docker exec -i c 'echo hi' </dev/null``（瞬时 EOF）会把整个会话
+    连同还没传的输出一起拆掉 ⇒ 输出为空。Docker 的 ``-i`` 语义是"stdin 关了，命令
+    继续跑到自然结束"。PTY 传不了真 EOF ⇒ 发 Ctrl-D(0x04) 近似，等 WS 关闭。
+    """
+    import asyncio
+    import aiohttp
+    from types import SimpleNamespace
+
+    from .. import aio_server as mod
+
+    class _FakeTerminalWS:
+        def __init__(self, frames):
+            self._frames = list(frames)
+            self.sent: list[bytes] = []
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._frames:
+                raise StopAsyncIteration
+            return self._frames.pop(0)
+
+        async def send_str(self, data):
+            self.sent.append(data.encode())
+
+        async def send_bytes(self, data):
+            self.sent.append(data)
+
+        async def close(self):
+            return None
+
+    class _FakeSession:
+        def __init__(self, ws, **_kwargs):
+            self._ws = ws
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def ws_connect(self, _url, **_kwargs):
+            return self._ws
+
+    class _EofContent:
+        """第一次 readany 直接 EOF（等价于 ``</dev/null``）。"""
+
+        async def readany(self):
+            return b""
+
+    ws = _FakeTerminalWS(
+        [SimpleNamespace(type=aiohttp.WSMsgType.BINARY, data=b"hello\r\n")]
+    )
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: _FakeSession(ws, **k))
+    monkeypatch.setattr(mod, "_pyromind_terminal_url", lambda *a, **k: "ws://fake")
+
+    written: list[bytes] = []
+
+    class _Resp:
+        async def write(self, chunk):
+            written.append(chunk)
+
+        async def drain(self):
+            return None
+
+        def force_close(self):
+            return None
+
+    session = SimpleNamespace(
+        id="exec-eof-1",
+        running=False,
+        exit_code=None,
+        resize_hook=None,
+        tty_cols=0,
+        tty_rows=0,
+    )
+    kube_env = SimpleNamespace(sandbox_id="sb-1")
+    request = SimpleNamespace(protocol=None, transport=None, content=_EofContent())
+
+    handled = await mod._hijack_pyromind_terminal(
+        request, _Resp(), None, session, kube_env, False, cmd=["bash"]
+    )
+    assert handled is True
+    # 输出没有跟着 EOF 一起被拆掉
+    assert b"hello\n" in b"".join(written)
+    # EOF 时向 PTY 发了 Ctrl-D 近似
+    assert b"\x04" in ws.sent

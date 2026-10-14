@@ -87,6 +87,7 @@ async def _iter_exec_stream_events(
     tty: bool = False,
     stop_event: Optional[threading.Event] = None,
     ping_interval_s: float = 60.0,
+    stdin_close: Optional[threading.Event] = None,
 ) -> AsyncIterator[Dict[str, Any]]:
     # Output-only channel: the server refused stdin support here (see the
     # docker_rt README). Interactive sessions use the terminal WebSocket.
@@ -129,8 +130,17 @@ async def _iter_exec_stream_events(
                     break
                 if recv_task is None:
                     recv_task = asyncio.ensure_future(ws.receive())
-                done, _pending = await asyncio.wait({recv_task}, timeout=0.5)
+                # ⚠️ 这个 timeout 不只是"轮询间隔"：``stdin_close``（读完回执）也是
+                # 在这一轮超时空档里检查并发送的 ⇒ 0.5s 意味着**每条命令最多白等
+                # 0.5s**（实测把 docker exec 从 650ms 拖到 999ms）。0.05s 足够小，
+                # 又不会把 CPU 拉起来（20 次/秒的空转，没有新对象）。
+                done, _pending = await asyncio.wait({recv_task}, timeout=0.05)
                 if not done:
+                    if stdin_close is not None and stdin_close.is_set():
+                        # 读端已确认把输出收完 ⇒ 半关闭容器 stdin（生产者据此退出，
+                        # 退出时管道已空 ⇒ 不会丢尾部）。这就是"读完回执"。
+                        stdin_close.clear()
+                        await ws.send_str('{"type":"stdin_close"}')
                     if loop.time() - last_ping >= ping_interval_s:
                         await ws.send_str('{"type":"ping"}')
                         last_ping = loop.time()
@@ -294,6 +304,7 @@ async def iter_exec_stream_async(
     timeout: Optional[int] = None,
     tty: bool = False,
     stop_event: Optional[threading.Event] = None,
+    stdin_close: Optional[threading.Event] = None,
 ) -> AsyncIterator[SandboxExecStreamChunk]:
     """Yield streaming exec events asynchronously."""
     async for event in _iter_exec_stream_events(
@@ -303,5 +314,6 @@ async def iter_exec_stream_async(
         timeout=timeout,
         tty=tty,
         stop_event=stop_event,
+        stdin_close=stdin_close,
     ):
         yield SandboxExecStreamChunk(**event)
