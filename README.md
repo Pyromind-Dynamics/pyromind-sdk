@@ -1,6 +1,69 @@
 # PyroMind SDK
 
-Lightweight Python SDK for the [PyroMind AI](https://pyromind.ai/) Platform API — manage training workflows, Jupyter instances, inference jobs, EchoMind and more.
+Python SDK for the [PyroMind AI](https://pyromind.ai/) platform. It includes synchronous and asynchronous API clients, custom workflow-node tools, and **docker-rt**, a Docker-compatible interface for running containers on Kubernetes.
+
+[简体中文](README.zh.md)
+
+## Features
+
+- Manage sandboxes, Studio workflows, JupyterLab instances, inference jobs, and EchoMind services through one API client.
+- Use synchronous or asynchronous clients with typed Pydantic request and response models.
+- Define, validate, and convert custom workflow nodes using Python or YAML.
+- Run common Docker CLI workflows against Kubernetes through `docker-rt`.
+
+## Project structure
+
+```text
+pyromind_sdk/
+├── __init__.py                       # Public package exports
+├── client/                           # Sync and async PyroMind API clients
+│   ├── base.py / async_base.py       # HTTP clients, authentication, and errors
+│   ├── client.py / async_client.py   # Unified client entry points
+│   ├── sandbox.py / async_sandbox.py # Sandbox lifecycle, files, and execution
+│   ├── studio.py / async_studio.py   # Studio workflows and custom nodes
+│   ├── jupyterLab.py / async_jupyterlab.py # JupyterLab instances
+│   ├── inference.py / async_inference.py   # Inference jobs
+│   ├── echomind.py / async_echomind.py     # EchoMind jobs
+│   ├── storage.py                    # Object storage client
+│   ├── profile.py                    # User profile and SSH keys
+│   ├── models.py                     # Pydantic request and response models
+│   └── workflow/                     # Workflow validation and conversion
+├── nodes/                            # Python and YAML custom-node tools
+│   ├── yaml_loader.py / node_validator.py # YAML loading and validation
+│   ├── python_to_yaml.py             # Static Python function to YAML conversion
+│   ├── function_call_wrapper.py       # Python function node wrapper
+│   ├── python_function_executor.py    # Python node execution helper
+│   └── command_executor.py            # Command template rendering and execution
+├── common/                           # Shared constants and helpers
+├── docker_rt/                        # Docker Engine API facade for Kubernetes
+│   ├── aio_server.py                 # Supported Docker Engine API daemon
+│   ├── api/                          # FastAPI compatibility endpoints
+│   ├── backend/                      # Sandbox, build, storage, and networking adapters
+│   ├── builder-image/                # Kaniko builder image assets
+│   ├── server.py / daemon.py         # CLI entry point and daemon management
+│   ├── register_context.py            # Docker context switching and restoration
+│   ├── install_wrapper.py             # User-local Docker wrapper installation
+│   ├── watcher.py                    # Context restoration and stale staging cleanup
+│   ├── tests/                        # docker-rt unit and API tests
+│   └── README.md                     # Setup, configuration, and limitations
+├── examples/
+│   ├── nodes/                        # YAML nodes and helper scripts
+│   └── openapi/                      # Sync, async, storage, and workflow examples
+├── tests/
+│   ├── pytest/                       # SDK unit and integration tests
+│   └── test_yaml_nodes.py            # YAML-node validation helper
+├── cli.py                            # Unified `pyromind` CLI
+├── python_function_to_yaml_cli.py    # Python-to-YAML CLI
+├── test_run_workflow_cli.py          # Workflow submission CLI
+├── exec_stream.py                    # Streaming sandbox exec helpers
+└── terminal.py                       # Interactive sandbox terminal
+```
+
+## Requirements
+
+- Python 3.8 or later
+- A PyroMind API key for platform API access
+- Docker CLI and access to a PyroMind cluster when using `docker-rt`
 
 ## Installation
 
@@ -8,1585 +71,245 @@ Lightweight Python SDK for the [PyroMind AI](https://pyromind.ai/) Platform API 
 pip install pyromind-sdk
 ```
 
-Requires Python >= 3.8.
-
-## Quick Start
-
-```python
-from pyromind_sdk import PyroMindAPIClient
-from pyromind_sdk.client.models import TrainingTaskCreateRequest
-
-client = PyroMindAPIClient(api_key="your-api-key")
-
-# Create and run a studio task (out_id is required)
-task = client.studio.create(
-    TrainingTaskCreateRequest(
-        name="my-workflow",
-        workflow={"nodes": [...]},
-        out_id="ext-task-001",
-    )
-)
-print(f"Created task: {task.task_id}")
-```
-
-## Docker CLI over Kubernetes (docker-rt)
-
-`pyromind_sdk.docker_rt` is an embedded Docker Engine API facade: it listens on a
-Unix socket (or TCP), translates `docker` commands into Kubernetes Pod
-operations, and exposes `KubeEnvironment` as the SDK-side adapter.
-
-```bash
-pip install -e .
-
-# start the daemon (Docker Desktop / any reachable cluster)
-docker-rt
-# underscore alias also works
-# docker_rt
-# same daemon, via the unified SDK CLI
-# pyromind docker-rt
-
-# SDK defaults: kube-context=docker-desktop, namespace=default,
-# node-selector=disabled. Override any of them with DOCKER_RT_* env vars.
-
-# background daemon
-pyromind docker-rt --daemon
-# pyromind docker-rt --daemon --log-file /tmp/docker-rt.log --pid-file /tmp/docker-rt.pid
-
-# point the Docker CLI at it
-docker-rt-context
-# docker-rt backs up the current Docker context, switches to docker-rt, and
-# on exit (including kill -9) a watcher restores the backup, then exits
-# manual fallback if needed:
-docker-rt-context --restore
-
-docker version
-docker run -d --name demo busybox:1.36 sleep 300
-docker ps
-docker exec demo echo hello
-```
-
-Docker CLI is required before starting `docker-rt`; if it is missing the
-daemon refuses to start. On Linux you can install the static binary:
-
-```bash
-curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz \
-  | tar -xz -C /tmp
-sudo mv /tmp/docker/docker /usr/local/bin/docker
-chmod +x /usr/local/bin/docker
-```
-
-For other systems, see: <https://docs.docker.com/desktop/>
-
-`docker-rt` checks the local `~/.pyromind/bin/docker` wrapper at startup. If it
-is missing it asks to install it (or installs automatically in non-interactive
-shells), and it refreshes the wrapper when the SDK version changes. Declining
-the install stops docker-rt from starting. Run `pyromind-docker-uninstall` to
-remove the wrapper and its PATH entry.
-
-### `pyromind docker-rt` parameters
-
-| Argument | Meaning | Default |
-|----------|---------|---------|
-| `--sock SOCK` | Unix socket path exposed to the Docker CLI | `$DOCKER_RT_SOCK` or `/tmp/docker-rt.sock` |
-| `--daemon` | Start docker-rt in the background and return immediately | disabled |
-| `--stop` | Stop a background docker-rt daemon and restore the previous Docker context | disabled |
-| `--log-file FILE` | Log file used by `--daemon` | `$DOCKER_RT_LOG_FILE` or `/tmp/docker-rt.log` |
-| `--pid-file FILE` | Write/read the daemon PID file | `$DOCKER_RT_PID_FILE` or `/tmp/docker-rt-<sock>.pid` |
-| `--apikey KEY` (`--api-key KEY`) | PyroMind API key | `$PYROMIND_API_KEY` |
-| `--cluster CLUSTER` | Target cluster, e.g. `us-west-1#pre` | `$PYROMIND_CLUSTER` |
-| `--ready-timeout SECONDS` | Wait for a newly created sandbox to become running | `$DOCKER_RT_READY_TIMEOUT` or `600` |
-| `-h`, `--help` | Show help and exit | - |
-
-```bash
-pyromind docker-rt \
-  --daemon \
-  --sock /tmp/docker-rt.sock \
-  --log-file /tmp/docker-rt.log \
-  --pid-file /tmp/docker-rt.pid
-```
-
-Use environment variables, or pass credentials directly:
-
-```bash
-export PYROMIND_API_KEY=XXXXXXXXX
-export PYROMIND_BASE_URL=https://pre-api.pyromind.ai/api/v1
-export PYROMIND_CLUSTER='us-west-1#pre'
-pyromind docker-rt --daemon
-
-# or
-pyromind docker-rt --daemon --apikey XXXXXXXXX --cluster 'us-west-1#pre'
-```
-
-#### docker-rt environment variables
-
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `DOCKER_RT_SOCK` | `/tmp/docker-rt.sock` | Unix socket path |
-| `DOCKER_RT_HOST` / `DOCKER_RT_PORT` | empty / `2375` | Listen on TCP instead of Unix socket |
-| `DOCKER_RT_LOG_FILE` | `/tmp/docker-rt.log` | Daemon log file |
-| `DOCKER_RT_KUBECONFIG` / `KUBECONFIG` | `~/.kube/config` or package `.kube.yaml` | kubeconfig path |
-| `DOCKER_RT_KUBE_CONTEXT` | `docker-desktop` | Kubernetes context name |
-| `DOCKER_RT_NAMESPACE` | `default` | Target Kubernetes namespace |
-| `DOCKER_RT_NODE_SELECTOR` | `none` | Pod `nodeSelector` (`key=val,...`; `none` disables) |
-| `DOCKER_RT_READY_TIMEOUT` | `600` | Seconds to wait for a newly created sandbox to become running |
-| `DOCKER_RT_GPU_CARD` | empty | GPU card name when using `docker run --gpus` with the k8s-middleware backend |
-| `DOCKER_RT_INSPECT_MODE` | `standard` | `docker inspect` structure: `standard` or `sandbox` |
-| `DOCKER_RT_CLEANUP_CONCURRENCY` | `4` | Maximum concurrent sandbox pause/delete cleanups |
-| `DOCKER_RT_DEFAULT_IMAGE` | SWE-bench default image | `docker images` default entry |
-| `DOCKER_RT_PORT_FORWARD_MODE` | `auto` | `-p` backend: `auto` / `direct` / `api` |
-| `DOCKER_RT_BUILD_IMAGE` | per cluster (see below) | **Hard prerequisite** for builds: a cluster-pullable kaniko executor image (must be the `-debug` variant). The **default is chosen by the current cluster**: `cn-east-1` (including `#pre` / `#pre2`) → `pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/kaniko-executor-pyromind:0.0.4`; every other cluster → `docker.io/pyrominddynamics/kaniko-executor-pyromind:0.0.4`. The two mirrors cannot reach each other (the Shanghai one is a VPC-internal address), so **you only set this to pick another version or your own mirror** |
-| `DOCKER_RT_BUILD_REGISTRY` | empty | Push prefix for short image tags; derived from the cluster profile when empty |
-| `DOCKER_RT_BUILD_PUSH` | `true` | Whether the build pushes to the registry. **With it off the build still runs and the archive still lands in the workspace at `/workspace/docker_images/<tag>.tar`** (a mounted directory, so it outlives the sandbox) |
-| `DOCKER_RT_BUILD_PUSH_CHECK` | `fail` | Probe the push target's reachability **from inside the build sandbox** before building (`busybox nc -z` + `nslookup` — reachability is a property of the *cluster's* network, which the daemon host cannot measure). `fail` (default): stop before the build and **print the env vars to change**; `warn`: log a warning and build anyway; `off`: skip. This is the `docker.io`-on-the-Shanghai-cluster symptom: poisoned DNS, TCP never connects, and kaniko only says `i/o timeout` in its very last line — which looks like a hung build |
-| `DOCKER_RT_BUILD_EXECUTOR` | `kaniko` | Build executor; only kaniko is implemented |
-| `DOCKER_RT_BUILD_TIMEOUT` | `3600` | Timeout (seconds) for one build |
-| `DOCKER_RT_BUILD_SANDBOX_CPU` / `_MEMORY` | `2` / `4Gi` | Build sandbox resources |
-| `DOCKER_RT_BUILD_SANDBOX_KEEP` | `false` | Keep the build sandbox (troubleshooting only). It also skips the `kill -9` sweep below, otherwise the flag would defeat itself |
-| `DOCKER_RT_BUILD_SANDBOX_SWEEP` | `false` | On `kill -9` the sandbox teardown is skipped, leaving a `sleep infinity` sandbox **running** against the user's quota. **Nothing is cleaned up automatically by default** (opt-in): the rule is "name starts with `sandbox-docker-build-`" over an **account-scoped** `list()`, so it cannot tell a leaked sandbox from one a *live* build on another machine is using — deleting the wrong one kills that build. Set `true` to re-enable; otherwise remove leftovers yourself (`docker ps \| grep sandbox-docker-build`, `docker rm -f`) — the watcher prints a reminder |
-| `DOCKER_RT_BUILD_CONTEXT_MODE` | `auto` | How the build context reaches the sandbox: `auto` (storage first, fall back to a direct upload) / `storage` (storage or fail) / `upload` (never touch storage — the old HTTP route). Storage is the default because the direct route pushes one exec websocket per 2 MiB **serially**: 631 s for 61 MiB (~110 KB/s), unusable for multi-GB ML contexts. Storage uploads the tar.gz to the user's workspace object store with parallel parts and the cluster reads it **locally** through a mount (60 MiB: ~59 s upload + 2.7 s in-cluster copy) |
-| `DOCKER_RT_BUILD_STAGING_MOUNT` | `/kaniko/docker-rt-stage` | Mount target (in-Pod path) for the storage route. It sits under `/kaniko` for consistency with the workdir; **mounts are not affected by kaniko's wipe** — kaniko adds every mount point from `/proc/self/mountinfo` to its ignore list, so `DeleteFilesystem` skips those trees wholesale |
-| `DOCKER_RT_BUILD_STAGING_PREFIX` | `.docker-rt-build` | Workspace-relative directory holding staged contexts; each build gets a unique `<build-id>/` subdirectory, removed afterwards (success or failure) |
-| `DOCKER_RT_BUILD_STAGING_WORKSPACE` | `/workspace` | Mount source root (the workspace as the platform sees it = JuiceFS subPath `<uid>`). Verified: storage key `<rel>` == `/workspace/<rel>` inside the Pod |
-| `DOCKER_RT_BUILD_STAGING_PARALLEL` | `8` | Concurrent multipart uploads (clamped to 1–32). Measured knee is 8 (60 MiB incompressible: 4 conns → 2.3 MiB/s, 8 → 5.9, 16 → 6.4) |
-| `DOCKER_RT_BUILD_STAGING_SWEEP` | `true` | On `kill -9` the daemon's `finally` never runs, so a staged context would sit in the user's quota forever. The watcher — which already restores the Docker context after such a death — sweeps those leftovers. Set `false` to disable |
-| `DOCKER_RT_BUILD_STAGING_SWEEP_MAX_AGE_S` | `86400` | Only applies to directories that cannot be attributed to a process: they must be older than this to be removed. Directories whose build id names a pid are judged by whether that pid is still alive |
-| `DOCKER_RT_STORAGE_CLUSTER` / `DOCKER_RT_CLUSTER` / `PYROMIND_CLUSTER` | empty | Cluster key for the storage profile lookup, first non-empty wins; falls back to the current profile |
-| `DOCKER_RT_REGISTRY_CLUSTER` | empty | Push profile: `us-west-1` / `us-west-2` / `cn-east-1` |
-| `DOCKER_RT_REGISTRY_NAMESPACE` | empty | Registry namespace; required on Docker Hub clusters |
-| `DOCKER_RT_REGISTRY_USERNAME` / `DOCKER_RT_REGISTRY_PASSWORD` | empty | Registry username and password/token with push permission; both nonempty take precedence over dockerconfig; unrelated to `PYROMIND_API_KEY` |
-| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | `/etc/docker-image/.dockerconfigjson` (used only if it exists) | **Either/or with the pair above, and neither is required**: credential file path readable by the daemon; contents may be JSON or base64-encoded JSON; see "Configure registry authentication before building" |
-| `DOCKER_RT_ACR_ACCESS_KEY_ID` | empty | AccessKey ID used to **pre-create** ACR repositories |
-| `DOCKER_RT_ACR_ACCESS_KEY_SECRET` | empty | AccessKey Secret used to **pre-create** ACR repositories. ⚠️ That is the whole name — **not** `DOCKER_RT_ACR_SECRET` |
-| `DOCKER_RT_ACR_INSTANCE_ID` | empty | ACR Enterprise instance ID (`cri-xxxx`), required for pre-creation |
-| `DOCKER_RT_SERVICE_DNS` | `true` | Create ClusterIP Service for Compose service DNS |
-| `DOCKER_RT_ORPHAN_POLICY` | `adopt` | `adopt` restores managed Pods; `reap` deletes them on startup |
-| `DOCKER_RT_CLEANUP_ON_EXIT` | `false` | Delete managed Pods on SIGINT/SIGTERM when `true` |
-| `DOCKER_RT_CONTEXT_KEEP` | `true` | Keep Docker context switched to `docker-rt` while the daemon runs |
-| `DOCKER_RT_CONTEXT_KEEP_INTERVAL` | `5` | Seconds between context keeper checks |
-| `DOCKER_RT_SHOW_API_KEY` | `false` | Print the full API key in the connection banner when `true` |
-| `DOCKER_RT_JUICEFS_UID` | derived from namespace | JuiceFS subPath user id |
-| `DOCKER_RT_JUICEFS_PVC` | auto-discovered | JuiceFS PVC name |
-| `DOCKER_RT_JUICEFS_HOST_PREFIXES` | empty | Extra host path to JuiceFS subPath mappings |
-| `DOCKER_RT_CONTEXT` | `docker-rt` | Docker context name used by `docker-rt-context` |
-| `LOG_LEVEL` | `INFO` | Log level |
-
-**Env vars needed to push from the Shanghai cluster (`cn-east-1`)**
-
-Nodes there cannot reach `index.docker.io` (DNS is poisoned to unrelated company
-IPs and TCP 443 never connects — measured inside the sandbox:
-`index.docker.io:443 dns=80.87.199.46 tcp=fail`, while the cluster's own ACR
-does connect). So the push target has to be that ACR. Set these on the daemon —
-**one per line** — and restart docker-rt afterwards (they are read at startup):
-
-```
-DOCKER_RT_BUILD_REGISTRY=pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind
-DOCKER_RT_REGISTRY_USERNAME=<ACR username>
-DOCKER_RT_REGISTRY_PASSWORD=<ACR password / temporary token>
-```
-
-> ⚠️ **The prefix must carry a namespace** (the trailing `/pyromind` above — **any
-> namespace you have rights on will do**). An ACR path is `<host>/<namespace>/<repo>`;
-> with the host alone ACR reads the repo name as a namespace, finds nothing, and
-> answers the push with a bare `401 Unauthorized` (after the whole build has run).
-> The daemon refuses a host-only prefix **before** building.
->
-> **The namespace always comes from the parameter — nothing is appended for you.**
-> The prefix in `DOCKER_RT_BUILD_REGISTRY` is used verbatim; if you leave it unset
-> and let the cluster profile derive it, use `DOCKER_RT_REGISTRY_NAMESPACE` to pick
-> the namespace instead.
-
-(Credentials are **either/or** and neither is mandatory: the last two lines above
-give an account; or leave those out and point at a dockerconfig.json you are
-already logged in with —
-
-```
-DOCKER_RT_REGISTRY_DOCKERCONFIG=<path to that file>
-```
-
-— and if even that is unset, the default `/etc/docker-image/.dockerconfigjson` is
-used when it exists. Precedence: `DOCKER_RT_REGISTRY_USERNAME` + `_PASSWORD`
-(both nonempty) > explicit dockerconfig > the default file.)
-
-Archive only, do not push:
-
-```
-DOCKER_RT_BUILD_PUSH=false
-```
-
-Skip this reachability check and build anyway:
-
-```
-DOCKER_RT_BUILD_PUSH_CHECK=warn
-```
-
-Without these the build is stopped **before it starts** (`DOCKER_RT_BUILD_PUSH_CHECK`
-defaults to `fail`), and the error prints exactly the lines above.
-
-There is also a **separate** group: when the ACR repository does not exist yet, these let
-the daemon pre-create it before the build. The names are spelled out in full — **do not
-abbreviate them**:
-
-```
-DOCKER_RT_ACR_ACCESS_KEY_ID=<AccessKey ID>
-DOCKER_RT_ACR_ACCESS_KEY_SECRET=<AccessKey Secret>
-DOCKER_RT_ACR_INSTANCE_ID=cri-xxxxxxxxxxxx
-```
-
-> ⚠️ `DOCKER_RT_ACR_SECRET` **does not exist** (the real name is
-> `DOCKER_RT_ACR_ACCESS_KEY_SECRET`). A misspelled variable is silently ignored — the
-> pre-creation step is skipped, and ACR answers a push to a **nonexistent** repository
-> with `401 UNAUTHORIZED: authentication required` too, which is easy to misread as a
-> credential problem. Skip this group if the repository was created by hand.
-
-**Repository names are normalized automatically.** ACR's rules are stricter than the
-general Docker ones (length 2–120, only lowercase letters/digits and `_ - . /`, no
-separator at either end and no two in a row), so the name is normalized when the build
-composes the push ref (`__`→`_`, …) and the same function runs on `docker create`/`run`,
-so the original name still resolves. Only applies to *this* cluster's ACR — Docker Hub and
-generic registries are left untouched.
-
-`DOCKER_RT_READY_TIMEOUT` / `--ready-timeout` controls the docker-rt server's
-sandbox readiness wait. It does not change the Docker client's HTTP timeout.
-Python clients must create the Docker client with a suitable timeout, for
-example `docker.from_env(timeout=600)`.
-
-For the default `k8s-middleware` backend, `docker-rt` checks
-`PYROMIND_API_KEY` and `PYROMIND_CLUSTER`; missing values are prompted one by
-one. After a successful connection it prints the active parameters in color
-and syncs the sandbox list once during startup.
-
-### Supported Docker commands
-
-| Command | Description | Supported parameters |
-|---------|-------------|----------------------|
-| `docker version` / `docker info` | Version and daemon info | none |
-| `docker ps` / `docker ps -a` | Container list; CUSTOM only by default | `-a`, `--filter name/id/status/ancestor/label`, `--no-trunc`, `--format` |
-| `docker inspect` | Container details | `--format`, `DOCKER_RT_INSPECT_MODE` |
-| `docker images` / `docker pull` | Image list; pull is a stub | image reference |
-| `docker build` | **Builds with kaniko inside a throwaway sandbox in the cluster** (see "Image builds"); pushes the image *and* archives a tarball to `/workspace/docker_images/` | `-t` / `--tag` (repeatable), `-f` / `--file`, `--target`, `--build-arg`, `--label`, `--platform`, `--quiet`. **BuildKit-only flags are rejected** (`--secret` / `--ssh` / `--cache-from` / `--cache-to` / `--load` / `--push`…); caching is controlled by `DOCKER_RT_BUILD_CACHE`, **`--no-cache` is not read** |
-| `docker run` | Create and start a sandbox | `-d`, `-it`, `--name`, `--cpus`, `--memory`, `--gpus`, `--gpu-card` / `--gpu_card`, `--label docker-rt.gpu-card=`, `-p` / `--publish`, `-v` / `--volume`, `-e` / `--env`, `-w` / `--workdir`, `--tmpfs` |
-| `docker create` | Create a local record | `--name`, `--cpus`, `--memory`, `--gpus`, `--gpu-card` / `--gpu_card`, `--label docker-rt.gpu-card=`, `-p`, `-v`, `-e`, `-w`, `--tmpfs` |
-| `docker start` | Create/start the Pod | none |
-| `docker exec` | Run a command or open a terminal | `-it`, `-w` / `--workdir` |
-| `docker cp` | Copy files | `CONTAINER:PATH <-> LOCAL_PATH` |
-| `docker stop` / `docker kill` | Stop or kill a container | none |
-| `docker restart` | Restart a container | none |
-| `docker rename` | Rename a container | none |
-| `docker rm` | Remove a container | `-f` / `--force`; same behavior with or without `-f` |
-| `docker port` | Show port mappings | none |
-| `docker volume` / `docker network` | Volume and network stubs | basic `create` / `inspect` / `ls` / `rm` |
-| `docker compose up` | Limited Compose support | basic `up` / `down` |
-
-#### `docker inspect` output
-
-Default `DOCKER_RT_INSPECT_MODE=standard`, which keeps the standard Docker
-inspect fields used by the Python Docker SDK:
-
-```json
-{
-  "Id": "sb-94d290262ee8",
-  "Name": "/test-for-doc",
-  "State": {"Status": "Stopped"}
-}
-```
-
-Set `DOCKER_RT_INSPECT_MODE=sandbox` to return only the compact sandbox fields:
-
-```json
-{
-  "id": "sb-94d290262ee8",
-  "name": "test-for-doc",
-  "type": "custom",
-  "status": "Stopped",
-  "configuration": {},
-  "resources": {},
-  "created_at": "",
-  "updated_at": "",
-  "image": "",
-  "volume_mounts": [],
-  "port_mappings": []
-}
-```
-
-#### GPU card via Docker flags
-
-`docker run --gpus` passes the GPU count. To specify the GPU card model without
-setting `DOCKER_RT_GPU_CARD`, use the `docker-rt.gpu-card` label:
-
-```bash
-docker create \
-  --name gpu-demo \
-  --cpus 4 \
-  --memory 8g \
-  --gpus 1 \
-  --label docker-rt.gpu-card=L40S \
-  swebench/swesmith.x86_64.oauthlib_1776_oauthlib.1fd52536
-```
-
-To use the shorter `--gpu-card L40S` syntax, run `pyromind docker-rt` once.
-Every `pyromind docker-rt` run asks for confirmation, installs
-`~/.pyromind/bin/docker`, and adds it to your shell PATH. Declining the prompt
-still starts docker-rt, but `--gpu-card` shorthand is unavailable; use
-`--label docker-rt.gpu-card=L40S` or `DOCKER_RT_GPU_CARD` instead.
-You can also install it manually:
-
-```bash
-pyromind docker-install
-```
-
-Before `pip uninstall pyromind-sdk`, remove the wrapper manually:
-
-```bash
-pyromind docker-uninstall
-# or
-pyromind-docker-uninstall
-```
-
-`pip uninstall` has no uninstall hook, so this explicit command deletes
-`~/.pyromind/bin/docker` and removes the PATH line from your shell rc file.
-
-After installation, open a new terminal and use:
-
-```bash
-docker create \
-  --name gpu-demo \
-  --gpus 1 \
-  --gpu-card L40S \
-  busybox:1.36 sleep 300
-```
-
-`docker ps` only shows Running sandboxes by default; use `docker ps -a` to see
-Stopped sandboxes too.
-`docker ps` shows CUSTOM sandboxes only. To include OSWorld instances, use:
-`docker ps` shows CUSTOM sandboxes only. Filter by type using `label.type`
-(default CUSTOM, `osworld` for OSWorld, `all` for both):
-
-```bash
-docker ps --filter label.type=osworld
-docker ps --filter label.type=custom
-docker ps --filter label.type=all
-```
-
-Standard Docker filters are passed to the docker-rt server and applied there:
-
-```bash
-docker ps --filter name=test-sdk-1
-docker ps --filter id=sb-94d290
-docker ps --filter status=running
-docker ps --filter ancestor=swebench
-docker ps --filter label.type=custom
-```
-
-The legacy `--filter label=docker-rt.type=<type>` syntax is still supported.
-
-This is the correct way to search on the server side. `docker ps | grep XXXX`
-is client-side filtering: `grep` runs after the daemon has returned output, so
-the docker-rt server never receives `XXXX`. Standard Docker protocol does not
-provide a cross-field substring filter; use the explicit filter that matches
-the field you know (`name`, `id`, `status`, `ancestor`, or `label`).
-
-When the docker wrapper is active, `docker ps` uses the custom header:
-`CONTAINER ID / IMAGE / COMMAND / CREATED / STATUS / PORTS / NAMES`, matching standard Docker. Column widths are adaptive to the terminal and long values are truncated; `CREATED` is computed in standard Docker style (e.g. `About a minute ago`, `3 days ago`).
-The STATUS column shows only the state keyword (running shows `Up`, stopped shows `Exited`, pending shows `Created`, failed shows `Dead`, without a duration), while `--filter status=` still matches the internal state (`running` / `stopped` / `pending` / `failed`).
-
-### Docker command reference
-
-#### `docker run` / `docker create`
-
-`docker run` creates and starts a sandbox; `docker create` only creates a local
-record; `docker start` actually creates/starts the sandbox
-(Pending -> Running).
-
-| Parameter | Description | Example |
-|-----------|-------------|---------|
-| `--name` | sandbox name | `--name gpu-demo` |
-| image | container image | `busybox:1.36` |
-| `--cpus` | CPU count (default `1`) | `--cpus 4` |
-| `--memory` | memory size (default `2Gi`) | `--memory 8g` |
-| `--gpus` | GPU count | `--gpus 1` |
-| `--gpu-card` / `--gpu_card` | GPU card model, requires wrapper | `--gpu-card L40S` |
-| `--label docker-rt.gpu-card=L40S` | GPU card model, no wrapper needed | `--label docker-rt.gpu-card=L40S` |
-| `-p` / `--publish` | port mapping | `-p 8080:80` |
-| `-v` / `--volume` | volume mount | `-v /workspace:/data` |
-| `-v ...:ro` | read-only mount | `-v /workspace:/data:ro` |
-| `-e` / `--env` | environment variable (not supported by k8s-middleware yet) | `-e FOO=bar` |
-| `-w` / `--workdir` | working directory (not supported by k8s-middleware yet) | `-w /workspace` |
-| `--tmpfs` | temporary memory disk (not supported by k8s-middleware yet) | `--tmpfs /tmp:rw` |
-
-Example:
-
-```bash
-docker create \
-  --name gpu-demo \
-  --cpus 4 \
-  --memory 8g \
-  --gpus 1 \
-  --label docker-rt.gpu-card=L40S \
-  -p 8080:80 \
-  -v /workspace:/data:ro \
-  busybox:1.36 sleep 300
-
-docker start gpu-demo
-```
-
-Minimal create / run / remove example:
-
-```bash
-docker create --name test-sdk-1 swebench/swesmith.x86_64.oauthlib_1776_oauthlib.1fd52536
-docker start test-sdk-1
-docker ps
-docker exec -it test-sdk-1 bash
-docker rm -f test-sdk-1
-```
-
-`--name` is required when you want to use a custom name. Without it,
-`docker create test-sdk-1 IMAGE` treats `test-sdk-1` as the image name.
-After creating with `--name`, `docker start test-sdk-1` and
-`docker rm -f test-sdk-1` work by name.
-`docker rm NAME` and `docker rm -f NAME` have the same behavior; running
-containers are paused before deletion. If you see
-`No such container: NAME`, run `docker ps -a` to check the actual container
-name — it is only registered when create used `--name`.
-With the k8s-middleware backend, `docker run IMAGE` without `-d` or `-it`
-returns after the sandbox is Running with a hint, because foreground attach is
-not supported yet. `docker run -d` and `docker start` also wait until the
-sandbox is Running before returning, so a following `docker exec` cannot race
-Pod creation. The command itself keeps running in the background. Use
-`docker run -it IMAGE bash` for an interactive terminal.
-
-For the k8s-middleware backend, omitting `--cpus`, `--memory` and `--gpus`
-uses `1 CPU / 2Gi memory` and no GPU.
-
-#### `docker ps` / `docker ps -a`
-
-```bash
-docker ps      # Running only
-docker ps -a   # Running + Stopped
-```
-
-With the wrapper active, the header is:
-
-```text
-CONTAINER ID  IMAGE  COMMAND  CREATED  STATUS  PORTS  NAMES
-```
-
-Long values are truncated with `...`; use `docker inspect` for full details.
-
-#### `docker inspect`
-
-```bash
-docker inspect gpu-demo
-docker inspect gpu-demo --format '{{json .resources}}'
-```
-
-The default response contains standard Docker inspect fields. Set
-`DOCKER_RT_INSPECT_MODE=sandbox` to return only compact sandbox fields.
-
-#### `docker exec`
-
-```bash
-docker exec gpu-demo echo hello
-docker exec -w /workspace gpu-demo ls -la
-```
-
-Non-interactive exec is supported; `docker exec -it <name>` reuses the
-k8s_middleware `/sandboxes/{id}/terminal` WebSocket and opens an interactive
-shell. The original `pyromind terminal <sandbox-id>` subcommand keeps its
-existing parameters and logic.
-`--cluster` and `--api-key` can be supplied as flags or environment variables,
-but at least one source for each is required; `--base-url` is optional.
-
-#### `docker logs`
-
-```bash
-docker logs gpu-demo
-docker logs -f gpu-demo
-```
-
-The k8s_middleware backend does not expose `/logs` yet.
-
-#### `docker cp`
-
-```bash
-docker cp gpu-demo:/etc/os-release /tmp/os-release
-docker cp /tmp/file.txt gpu-demo:/workspace/file.txt
-```
-
-#### `docker stop` / `docker start`
-
-```bash
-docker stop gpu-demo
-docker start gpu-demo
-```
-
-With the k8s_middleware backend, stop maps to pause and start maps to resume.
-
-#### `docker restart`
-
-```bash
-docker restart gpu-demo
-```
-
-Maps to pause then resume.
-
-#### `docker rename`
-
-```bash
-docker rename gpu-demo gpu-demo-2
-```
-
-With the k8s_middleware backend, name-only changes skip the StatefulSet rollout.
-
-#### `docker rm`
-
-```bash
-docker rm -f gpu-demo
-```
-
-With the k8s_middleware backend, it pauses before deleting.
-
-#### `docker port`
-
-```bash
-docker port gpu-demo
-```
-
-Ports come from k8s_middleware `port_mappings`.
-With the PyromindSDK backend, docker-rt only shows port mappings; local access
-is not supported yet and would require an adapter to k8s_middleware
-port-forward / NodePort.
-
-#### `docker events`
-
-`docker events` is not supported by the `k8s-middleware` backend. Use
-`docker ps` and `docker inspect` to check container state.
-
-#### Unsupported Docker commands
-
-After starting docker-rt, these commands are not supported:
-
-```text
-docker buildx build
-docker compose build
-docker compose up --build
-docker logs
-docker events
-```
-
-`docker build` **is** supported (see "Image builds" below): it builds with kaniko
-inside a throwaway sandbox in the cluster, pushes the image to a registry and
-archives a tarball to `/workspace/docker_images/`, so it needs
-neither a local Docker daemon nor any privilege. `buildx build` / `compose build`
-are not wired up yet — use `docker build` or plain Docker for now.
-`docker logs` is not supported by the `k8s-middleware` backend; use
-`docker exec -it <container> bash` to view logs inside the container.
-
-Chain: `Docker CLI -> docker-rt daemon -> KubeEnvironment -> Kubernetes API`.
-The current implementation uses the official Kubernetes Python SDK directly; a
-future adapter can replace that hop with the `k8s_middleware` HTTP API.
-
-### Image builds
-
-`docker build` **is supported**: it builds with kaniko inside a **throwaway sandbox** in
-the cluster. It needs neither a local Docker daemon nor any privilege (`buildx build` /
-`compose build` are not wired up yet). Every build has **two outputs**:
-
-1. a **push** to a registry (the default, `DOCKER_RT_BUILD_PUSH=true`);
-2. an image tarball in your workspace: `/workspace/docker_images/<tag>.tar`
-   (see "Artifact archive" below).
-
-#### Before you start: these must be set
-
-Set them **before** starting the daemon — a running daemon does not pick up new
-variables; stop it (`pyromind docker-rt --stop`) and start it again. When something from
-the second group is missing, docker-rt **rejects the build before creating a sandbox**
-and names the variable, instead of burning a build.
-
-**① Platform connection** — needed by every docker-rt command, builds included:
-
-| Variable | Description |
-|----------|-------------|
-| `PYROMIND_API_KEY` | Platform API key (also available as `--apikey`) |
-| `PYROMIND_BASE_URL` | Platform API URL, e.g. `https://pre-api.pyromind.ai/api/v1` |
-| `PYROMIND_CLUSTER` | Target cluster, e.g. `us-west-1#pre` (also `--cluster`) |
-
-**② Build-specific**:
-
-| Variable | Required? | Description |
-|----------|-----------|-------------|
-| `DOCKER_RT_BUILD_IMAGE` | per cluster (usually no) | **Builder image.** Must be the kaniko executor's **`-debug` variant**: the default executor is `FROM scratch` — no `sleep`, no shell — while the sandbox template pins `command: ["sleep","infinity"]`. When unset the image is **chosen by the current cluster** (`cn-east-1` and its `#pre`/`#pre2 variants → the Shanghai ACR mirror; every other cluster → `docker.io/pyrominddynamics/…`); only set it to change the version or use a private mirror |
-| `DOCKER_RT_BUILD_REGISTRY` | short tags | The **push prefix** for a short tag (`-t myapp`), e.g. `docker.io/your-namespace`. Without it (and without a resolvable cluster profile) the build is **rejected rather than guessed**. A fully-qualified tag (`docker.io/you/app:1`) does not need it |
-| `DOCKER_RT_REGISTRY_USERNAME`<br>`DOCKER_RT_REGISTRY_PASSWORD` | pushing | Registry account plus a password / token with **push** permission. Both nonempty take precedence over the dockerconfig file |
-| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | either/or | Reuse an existing dockerconfig: the value is a **file path on the daemon's machine** |
-
-**③ Platform side**: the directory **`/workspace/docker_images` must already exist** in the
-user's workspace — it is the mount source for the artifact archive. Without it the build
-sandbox cannot be created.
-
-**④ What you do *not* need** (common misconception): `docker login` credentials,
-`~/.docker/config.json` and system credential helpers are **never read**, and no local
-Docker daemon takes part in the build.
-
-#### Minimal working example
-
-```bash
-# ① platform connection
-export PYROMIND_API_KEY=XXXXXXXXX
-export PYROMIND_BASE_URL=https://pre-api.pyromind.ai/api/v1
-export PYROMIND_CLUSTER='us-west-1#pre'
-
-# ② build-specific (the prompt keeps the password out of shell history)
-export DOCKER_RT_BUILD_IMAGE="your-registry.example.com/builders/kaniko:v1.24.0-debug"
-export DOCKER_RT_BUILD_REGISTRY="docker.io/your-namespace"
-export DOCKER_RT_REGISTRY_USERNAME="your-dockerhub-user"
-export DOCKER_RT_REGISTRY_PASSWORD="$(python3 -c 'import getpass; print(getpass.getpass("Registry password/token: "))')"
-
-pyromind docker-rt --daemon
-docker-rt-context                      # point the Docker CLI at docker-rt
-
-docker build -t myapp:latest .          # build
-ls /workspace/docker_images             # → myapp_latest.tar and friends (see "Artifact archive")
-```
-
-This pushes to `docker.io/your-namespace/myapp:latest`. For another registry, set
-`DOCKER_RT_BUILD_REGISTRY` to its `registry-host/namespace` and supply that registry's
-username and password/token.
-
-#### Registry authentication: two options
-
-**Option 1: registry username + password/token** (this is what the minimal example above
-does). Docker Hub, ACR and similar registries require the target registry's account and
-password, or a token with push permission; **anonymous pulls do not imply anonymous
-pushes**. `PYROMIND_API_KEY` authenticates the Sandbox platform API and **cannot** replace
-registry credentials. When both credential variables are nonempty, they take precedence
-over the dockerconfig file.
-
-**Option 2: an existing dockerconfig file.** Choose this instead of the username/password
-variables before starting the daemon:
-
-```bash
-unset DOCKER_RT_REGISTRY_USERNAME DOCKER_RT_REGISTRY_PASSWORD
-export DOCKER_RT_REGISTRY_DOCKERCONFIG="/absolute/path/to/dockerconfig.json"
-```
-
-- The variable must contain a **file path on the daemon's machine**, not JSON or a
-  base64 string. File contents may be JSON or base64-encoded JSON; `auths` must
-  contain the registry's `auth` or `username`/`password` credentials.
-- The default mounted file is `/etc/docker-image/.dockerconfigjson`. Even when using
-  this file, explicitly set `DOCKER_RT_REGISTRY_DOCKERCONFIG` to pass the current
-  credential precheck for short-tag builds.
-- Builds do not automatically consume `docker login` authentication headers,
-  `~/.docker/config.json`, or system credential helpers. A config containing only
-  `credsStore` / `credHelpers` or `identitytoken` is insufficient; the explicitly
-  selected file must include the `auths` credentials described above.
-- The **docker-rt daemon** reads these variables, so configure them before startup.
-  If it is already running, stop it with `pyromind docker-rt --stop` and restart it
-  from the configured shell. Setting variables only on the `docker build` command
-  does not update an existing daemon's environment.
-- ACR repository creation uses separate `DOCKER_RT_ACR_ACCESS_KEY_ID`,
-  `DOCKER_RT_ACR_ACCESS_KEY_SECRET`, and `DOCKER_RT_ACR_INSTANCE_ID` settings;
-  these do not replace registry push credentials.
-
-Do not commit real passwords, tokens, or dockerconfig files, or copy them into a
-Dockerfile or build context. Base64 is not encryption; restrict access to credential files.
-
-#### Build flow and limitations
-
-How `docker build -t myapp .` works:
-
-```text
-wrapper exports DOCKER_BUILDKIT=0
-  → the classic builder POSTs the context tar to docker-rt's /build
-  → a throwaway CUSTOM sandbox is created from DOCKER_RT_BUILD_IMAGE,
-    with your /workspace/docker_images mounted (for the artifact archive)
-  → the context is uploaded as a single gzipped file
-  → exec kaniko --context=tar://… --destination=… --tar-path=/workspace/docker_images/<tag>.tar --digest-file=…
-  → read the digest, register the short-tag alias, delete the sandbox
-docker run myapp   → a normal sandbox pulls the image that was just pushed
-```
-
-Four things worth knowing:
-
-1. **The build sandbox must be disposable** and cannot be the container the user
-   already has: kaniko unpacks the `FROM` image's rootfs into **its own container
-   root** ("may overwrite anything already there"), so it can only ever run in a
-   throwaway container.
-2. **The builder image must be kaniko's `-debug` variant** (e.g.
-   `gcr.io/kaniko-project/executor:v1.24.0-debug`): the default executor image is
-   `FROM scratch` — no `sleep`, no shell — while the sandbox template pins
-   `command: ["sleep", "infinity"]`. Also, `gcr.io` is unreachable from some
-   clusters, so mirror it into a registry the cluster can pull and point
-   `DOCKER_RT_BUILD_IMAGE` at the mirror. See
-   `pyromind_sdk/docker_rt/builder-image/kaniko/README.md`.
-3. **The push target differs per cluster**: west pushes to Docker Hub, Shanghai
-   pushes to Aliyun ACR Enterprise Edition and **requires the repository to exist
-   first** (docker-rt creates it before spending a sandbox; missing AccessKey /
-   instance id is a skip-with-warning). Short tags need
-   `DOCKER_RT_BUILD_REGISTRY` (or a cluster profile plus
-   `DOCKER_RT_REGISTRY_NAMESPACE`); when it cannot be resolved the build is
-   **rejected rather than guessed**.
-4. **The legacy-builder deprecation banner is stripped by the wrapper.** Forcing
-   `DOCKER_BUILDKIT=0` (which is what routes the build to `POST /build`) makes the
-   real `docker` CLI print `DEPRECATED: The legacy builder is deprecated …` on
-   stderr. That notice is about docker's own builder — not a docker-rt problem —
-   and docker ships no switch to silence it, so the wrapper pipes the CLI's
-   stderr through a filter that drops exactly that banner. stdout, every other
-   stderr line and the CLI's exit code pass through untouched.
-
-kaniko does not implement BuildKit-only features: `RUN --mount=type=cache/secret/ssh`,
-heredocs, `--cache-to/from`, true multi-platform builds. BuildKit-only flags such
-as `--platform` / `--secret` / `--ssh` are rejected by the wrapper instead of
-being silently ignored.
-
-#### Artifact archive: `/workspace/docker_images/<tag>.tar`
-
-**Besides pushing, every build leaves a tarball of the image in your workspace**, so you
-can use it without a registry or hand it around:
-
-```bash
-# load it wherever the workspace is visible (Jupyter, or a machine with it mounted);
-# the tag comes back with it
-docker load -i /workspace/docker_images/myapp_latest.tar
-```
-
-- `/workspace/docker_images` inside the sandbox **is** that workspace directory — the
-  mount's source and target are the same string, so there is only one path to reason about.
-- The file name comes from the first `-t`: `pyromind-console:dev` →
-  `pyromind-console_dev.tar` (anything outside `[A-Za-z0-9._-]` becomes `_`). The image name
-  inside the tarball is that tag. **Rebuilding the same tag replaces that tag's archive**;
-  other tags keep theirs.
-- **Prerequisite**: the directory must already exist (it is the mount source — see "③
-  Platform side" above).
-- **A failed push does not lose the artifact**: the build runs first, the tarball is written,
-  and only then is the image pushed (every build carries `--skip-push-permission-check` —
-  without it kaniko's push-permission probe runs *before* the build and produces nothing at all).
-  On a push failure the log gains a `The image was archived to …` line. An unwritable directory
-  still wastes the whole build before it fails.
-- The build log prints `==> This image is also archived to …`; `docker build --quiet` hides it.
-
-To run through `k8s_middleware` OpenAPI instead:
-
-```bash
-PYROMIND_API_KEY=your-key \
-PYROMIND_BASE_URL=https://api.pyromind.ai/api/v1 \
-PYROMIND_CLUSTER=us-west-2 \
-pyromind docker-rt
-```
-
-In this mode `docker-rt` uses the `PyromindSDK` adapter, which reads the
-current sandbox, merges changed fields, and submits the full sandbox update.
-The backend is fixed to `k8s-middleware`.
-Local port forwarding is not supported for the PyromindSDK backend yet.
-`k8s_middleware` skips the StatefulSet rollout when only the sandbox `name`
-changes.
-
-### Common issues
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| `docker ps` still shows the standard `CONTAINER ID ...` header | The wrapper is installed but the current shell has an old `PATH` | Run `source ~/.bashrc` or open a new terminal |
-| `docker` commands connect to `~/.docker/run/docker.sock` | Docker context is `desktop-linux` / `default` instead of `docker-rt` | Run `docker-rt-context`, or use `DOCKER_HOST=unix:///tmp/docker-rt.sock` |
-| `docker logs` / `docker events` wait forever or return unsupported | These commands are not supported by the `k8s-middleware` backend | Use `docker exec -it <container> bash`, `docker ps`, and `docker inspect` |
-| `docker cp` finishes but no `Successfully copied` message | An old wrapper redirected Docker output, and Docker CLI suppressed the message when stdout/stderr was not a TTY | Update the SDK/wrapper and restart docker-rt |
-| `docker rm <local-id>` returns no such container | The current daemon does not know that local ID | Use the `sb-...` sandbox ID, or restart docker-rt to refresh local records |
-| The build sandbox is stuck pulling the builder image (`ImagePullBackOff`) | The default builder image is **per cluster** (`cn-east-1` and its `#pre`/`#pre2` → the Shanghai ACR VPC address, every other cluster → Docker Hub); a wrong cluster identity makes docker-rt pull an unreachable address | Check that `PYROMIND_CLUSTER` / `--cluster` matches the target cluster; to change the version or use your own mirror, set `DOCKER_RT_BUILD_IMAGE` and **restart the daemon** |
-| `docker build` says `DOCKER_RT_BUILD_REGISTRY is required to push short tags` | A short tag (`-t myapp`) was used but no prefix could be resolved | Set `DOCKER_RT_BUILD_REGISTRY` (or configure `DOCKER_RT_REGISTRY_NAMESPACE` in the cluster profile), or use a fully-qualified tag such as `docker.io/you/myapp:1` |
-| The build runs to the end and the last line is `401 Unauthorized` (`error pushing image`) | Wrong **repo path** or wrong credentials for that host. On ACR the path must be `<host>/<namespace>/<repo>`: a host-only `DOCKER_RT_BUILD_REGISTRY` makes ACR read the repo name as a namespace. Note `docker login <host>` succeeding says nothing about the repo path | Add a namespace to the prefix (any namespace — it comes from the parameter, nothing is appended for you); the daemon refuses a host-only prefix **before** building. For credentials, ACR wants its own instance username + temporary token — a Docker Hub account will not do |
-| kaniko dies instantly with `error resolving source context: archive/tar: invalid tar header` | The context is not a valid tar — usually because the **client already compressed it** (`docker compose build` goes through the classic builder's `--compress`, or the context is a `.tar.gz` URL) and we compressed it a second time | Fixed: the daemon now sniffs and decompresses like moby does (gzip/bzip2/xz/zstd). Look for the `the client sent it …-compressed; unwrapping it…` line in the log |
-| `docker build` says `cannot create build sandbox (...)` and mentions a mount/subPath | `/workspace/docker_images` does not exist in the workspace (it is the archive's mount source) | Create it first (in Jupyter / the workspace: `mkdir -p docker_images`) and retry |
-| The build succeeded but there is no tarball | Archiving is the build's **last** step, or the directory is not writable | Check the log for `==> This image is also archived to …`; if it is missing, that step failed |
-| An API error has no `trace_id` | The operation did not reach k8s-middleware (local validation only) | Only backend responses carrying `x-trace-id` will include `trace_id=` |
-
-## Configuration
-
-### Client parameters
-
-Sync `PyroMindAPIClient`:
-
-| Param | Required | Type | Default | Description |
-|-------|----------|------|---------|-------------|
-| `api_key` | Yes* | `str` | `PYROMIND_API_KEY` env | Bearer token for API auth |
-| `base_url` | No | `str` | `PYROMIND_BASE_URL` env | API base URL; the SDK default is used when omitted |
-| `cluster` | No | `str` | `PYROMIND_CLUSTER` env or `"us-west-2"` | Target cluster (`X-Cluster` header) |
-| `timeout` | No | `int` | `30` | Request timeout in seconds |
-| `max_retries` | No | `int` | `3` | Max retries for failed requests |
-
-Async `PyroMindAsyncAPIClient`: the same parameters, except `timeout` defaults to **60**, plus
-`create_timeout` (a separate timeout for create-style requests) and `create_concurrency_limit`
-(cap on concurrent creates).
-
-\* `api_key` can be provided as a parameter or via `PYROMIND_API_KEY` environment variable.
-
-### Environment variables
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `PYROMIND_API_KEY` | Yes | — | API bearer token |
-| `PYROMIND_BASE_URL` | No | SDK default | API base URL (or pass `base_url=`) |
-| `PYROMIND_CLUSTER` | No | `us-west-2` | Target cluster identifier |
-| `PYROMIND_STORAGE_ENDPOINT` | No | `https://storage.pyromind.ai` | Storage endpoint URL |
-| `PYROMIND_STORAGE_SECRET_KEY` | No | — | Storage secret key |
-| `PYROMIND_STORAGE_BUCKET` | No | — | Default storage bucket name |
-| `PYROMIND_LOG_LEVEL` | No | unset | Client SDK log level (e.g. `DEBUG`) |
-| `PYROMIND_LOG_FORMAT` | No | unset | Client log format (e.g. `json`) |
-
-### Streaming sandbox exec
-
-Use `exec_command_stream` for long-running commands. Output arrives as
-raw stdout/stderr byte chunks without the one-shot HTTP timeout:
-
-```python
-import sys
-
-with PyroMindAPIClient() as client:
-    for chunk in client.sandboxes.exec_command_stream(
-        "sb-xxxx",
-        "python train.py",
-        cwd="/workspace",
-    ):
-        if chunk.type == "stdout":
-            sys.stdout.buffer.write(chunk.data)
-        elif chunk.type == "stderr":
-            sys.stderr.buffer.write(chunk.data)
-        elif chunk.type == "exit":
-            print(f"exit={chunk.returncode}")
-```
-
-The async client supports `async for chunk in client.sandboxes.exec_command_stream(...)`.
-Pass `tty=True` when the command needs a pseudo-terminal for its output.
-
-## Project Structure
-
-```
-pyromind_sdk/
-├── __init__.py                      # Package exports
-├── client/                          # Sync and async API clients
-│   ├── base.py / async_base.py      # Base HTTP clients
-│   ├── client.py / async_client.py  # Unified sync/async entries
-│   ├── sandbox.py / async_sandbox.py # Sandbox instances
-│   ├── studio.py / async_studio.py  # Studio / training tasks
-│   ├── jupyterLab.py / async_jupyterlab.py # Jupyter instances
-│   ├── inference.py / async_inference.py   # Inference jobs
-│   ├── echomind.py / async_echomind.py     # EchoMind instances
-│   ├── storage.py                   # File storage
-│   ├── profile.py                   # User profile & SSH keys
-│   ├── models.py                    # Pydantic models
-│   └── workflow/                    # Workflow validation & conversion
-├── nodes/                           # Custom node SDK
-│   ├── function_call_wrapper.py     # Python function → node
-│   ├── python_function_executor.py  # Python node executor
-│   ├── python_to_yaml.py            # Convert Python to YAML
-│   ├── yaml_loader.py               # YAML node loader
-│   ├── node_validator.py            # Node validation
-│   ├── command_executor.py          # Command template execution
-│   └── type_converter.py            # Node type conversion
-├── common/                          # Shared utilities
-│   ├── constants.py
-│   └── node_sdk.py
-├── docker_rt/                       # Docker-compatible Kubernetes runtime
-│   ├── api/                         # Docker Engine API endpoints
-│   ├── backend/                     # Runtime, build, storage & K8s adapters
-│   ├── scripts/                     # Context registration helpers
-│   ├── builder-image/               # Kaniko builder assets
-│   ├── server.py / aio_server.py    # Sync/async daemon entry points
-│   └── tests/                       # docker-rt test suite
-├── cli.py                           # Unified CLI entry
-├── python_function_to_yaml_cli.py   # Python → YAML CLI tool
-├── test_run_workflow_cli.py         # Workflow submission CLI
-├── exec_stream.py                   # Sandbox exec streaming helpers
-├── terminal.py                      # Interactive sandbox terminal
-├── examples/                        # Usage examples
-│   ├── nodes/                       # YAML node examples
-│   └── openapi/                     # API usage examples
-└── tests/                           # SDK test suite
-    ├── pytest/                      # Unit and integration tests
-    └── test_yaml_nodes.py           # YAML node validation helper
-```
-
-## Services
-
-Service entry points on the top-level client (`PyroMindAPIClient`):
-
-| Attribute | Client | Covers |
-|-----------|--------|--------|
-| `client.sandboxes` | `SandboxClient` | Sandbox lifecycle, command exec, file I/O, desktop actions |
-| `client.studio` | `StudioClient` | Training workflows and custom nodes |
-| `client.jupyter` | `JupyterLabClient` | JupyterLab instances |
-| `client.inference` | `InferenceClient` | Inference jobs |
-| `client.echomind` | `EchoMindClient` | EchoMind instances |
-| `client.profile` | `ProfileClient` | User info, storage credentials, SSH keys |
-
-> On the async client (`PyroMindAsyncAPIClient`) Jupyter is **`client.instances`** (not
-> `jupyter`) and there is **no** `profile`; `StorageClient` is **constructed directly**
-> (there is no `client.storage`) on both. See "Async Support".
-
-### Sandbox (`client.sandboxes`)
-
-Lifecycle, command execution, file I/O and desktop actions for sandboxes
-(long-lived containers on Kubernetes).
-
-| Method | Input | Output | Description |
-|--------|-------|--------|-------------|
-| `list(query=None)` | `ListQuery` | `List[SandboxResponse]` | List sandboxes, optionally filtered by name/status |
-| `list_page(query=None)` | `ListQuery` | `SandboxPage` | Paged list (`total` / `page_size` / `page_num`) |
-| `create(request, timeout=None)` | `SandboxRequest` | `SandboxResponse` | Create a sandbox |
-| `create_and_wait(request, target_status, timeout=300, check_interval=3, ...)` | `SandboxRequest` + opts | `SandboxResponse` | Create, then poll to the target status |
-| `get_sandbox(sandbox_id, timeout=None, retry=True)` | `str` | `SandboxResponse` | Get sandbox details |
-| `get_internal_ip(sandbox_id)` | `str` | `InternalIPResponse` | In-cluster IP of one sandbox |
-| `get_internal_ips(sandbox_ids)` | `Sequence[str]` | `Dict[str, str]` | Batch in-cluster IPs (one request) |
-| `wait_for_sandbox_status(sandbox_id, target_status, timeout=300, check_interval=3, ...)` | `str` + opts | `bool` | Poll until the target status |
-| `update(sandbox_id, request)` | `str`, `SandboxRequest` | `SandboxResponse` | Update sandbox config |
-| `pause(sandbox_id, timeout=None, retry=True)` / `resume(sandbox_id)` | `str` | `SandboxResponse` | Pause / resume |
-| `delete(sandbox_id, timeout=None, retry=True)` | `str` | `None` | Delete a sandbox |
-| `exec_command(sandbox_id, command, cwd='', timeout=None)` | `str \| List[str]` | `SandboxExecResponse` | Run a command, get stdout/stderr/returncode |
-| `exec_command_stream(sandbox_id, command, cwd='', timeout=None, tty=False)` | same | `AsyncIterator[SandboxExecStreamChunk]` | Streaming execution |
-| `read_file(sandbox_id, path)` | `str` | `bytes` | Read a file |
-| `write_file(sandbox_id, path, source)` | `str \| PathLike \| bytes \| BinaryIO` | `Dict[str, Any]` | Write a file |
-| `delete_file(sandbox_id, path, recursive=False)` | `str` | `Dict[str, Any]` | Delete a file/directory |
-| `execute_action(sandbox_id, request)` _(async only)_ | `ActionRequest` | `ActionResponse` | Run one desktop action (OSWorld style) |
-| `execute_batch_actions(sandbox_id, request)` _(async only)_ | `BatchActionRequest` | `List[ActionResponse]` | Batch actions |
-| `get_vnc(sandbox_id)` _(async only)_ | `str` | `Dict[str, Any]` | VNC connection info |
-
-> _(async only)_ = present on `AsyncSandboxClient` only (`PyroMindAsyncAPIClient.sandboxes`);
-> the sync `SandboxClient` does not have these three yet. Every other method exists on both.
-
-**`SandboxRequest` parameters:**
-
-| Param | Required | Type | Description |
-|-------|----------|------|-------------|
-| `sandbox_type` | Yes | `SandboxType` | `osworld` (desktop) or `custom` (plain container) |
-| `resources` | No | `ResourceConfig` | CPU/memory/GPU/card |
-| `configuration` | No | `SandboxConfiguration` | Screen resolution, `auto_destroy`, VNC password |
-| `name` | No | `str` | Display name |
-| `system_image_path` | No | `str` | Platform-provided system image |
-| `image` | No | `str` | Custom container image (instead of `system_image_path`) |
-| `volume_mounts` | No | `List[VolumeMount]` | Mounts |
-| `port_mappings` | No | `List[PortMapping]` | Port mappings (`container_port` + optional `host_port`/`name`/`protocol`) |
-| `mount_public_dir` | No | `bool` | Mount the shared public directory |
-
-**`SandboxExecResponse` fields:** `output` (stdout), `stderr`, `returncode` (0 = success,
-`-1` = the platform could not report one), `exception_info` (infrastructure-level error,
-empty on a normal exec), `extra` (server-side metadata).
-
-**`SandboxExecStreamChunk` fields:** `type` (`stdout` / `stderr` / `exit`), `data`,
-`returncode` (meaningful on the `exit` chunk only).
-
-**`ActionRequest` parameters:**
-
-| Param | Required | Type | Description |
-|-------|----------|------|-------------|
-| `action` | Yes | `str` | Action name (e.g. `click`, `type`, `run`) |
-| `parameters` | No | `ActionParameters` | `command` / `working_directory` / `environment_variables` / `timeout` / `coordinates` / `text` / `time` / `options` |
-
-**Shared query model `ListQuery`:** `page_size`, `page_num`, `name`, `instance_id`, `status`
-(used by `list` / `list_page`; the paged models name their list differently per service —
-`sandboxes` for Sandbox, `instances` for Jupyter, `jobs` for Inference and EchoMind).
-
-**Example:**
-
-```python
-from pyromind_sdk.client.models import SandboxRequest, SandboxType, ResourceConfig
-
-sandbox = client.sandboxes.create(
-    SandboxRequest(
-        sandbox_type=SandboxType.CUSTOM,
-        name="my-box",
-        resources=ResourceConfig(cpu="2", memory="4Gi"),
-    )
-)
-
-# One-shot command
-result = client.sandboxes.exec_command(sandbox.id, ["echo", "hello"])
-print(result.output, result.returncode)
-
-# Batch in-cluster IPs
-ips = client.sandboxes.get_internal_ips([sandbox.id, "sb-other"])
-
-# Cleanup
-client.sandboxes.delete(sandbox.id)
-```
-
-### Studio (`client.studio`)
-
-Training workflow management — create, monitor, and manage workflow tasks.
-
-| Method | Input | Output | Description |
-|--------|-------|--------|-------------|
-| `list()` | — | `List[TrainingTaskResponse]` | List all studio tasks |
-| `create(request)` | `TrainingTaskCreateRequest` | `TrainingTaskCreateResponse` | Create a new training task |
-| `get_job(task_id)` / `get_task(task_id)` | `str` | `TrainingTaskResponse` | Get task details |
-| `delete(task_id, force=False)` | `str`, `bool` | `None` | Delete a task |
-| `stop(task_id)` | `str` | `TrainingTaskResponse` | Stop a running task |
-| `get_node_output(task_id, node_id)` | `str`, `str` | `Optional[Dict]` | Get node-level output |
-| `get_node_info(names=None)` | `Optional[str]` | `Dict[str, Any]` | Get node definition info |
-| `reload_nodes(node_name=None)` | `Optional[str]` | `Dict[str, Any]` | Reload node YAML definitions |
-| `create_node(...)` | `yaml_path/yaml_content` + opts | `Dict[str, Any]` | Register a custom node |
-| `delete_node_by_name(node_name)` | `str` | `Dict[str, Any]` | Delete a custom node |
-| `move_node(node_name, source_file_path)` | `str`, `str` | `Dict[str, Any]` | Move node source |
-| `run_with_params(request)` | `WorkflowRunRequest` | `TrainingTaskCreateResponse` | Run stored workflow with params |
-| `export_node_outputs(task_id, nodes_info, ...)` | `str`, `List`, `Optional[List]` | `List[Dict]` | Export all node outputs |
-| `wait_for_task_completion(task_id, ...)` | `str` + opts | `str` (status) | Poll until terminal status |
-| `create_and_wait(request, ...)` | `TrainingTaskCreateRequest` + opts | `Dict[str, Any]` | Create + poll + optionally export outputs |
-
-**`TrainingTaskCreateRequest` parameters:**
-
-| Param | Required | Type | Description |
-|-------|----------|------|-------------|
-| `name` | Yes | `str` | Task name |
-| `workflow` | Yes | `Dict[str, Any]` | Workflow JSON structure with node definitions |
-| `out_id` | Yes | `str` | Task ID used to map this job onto an external system's task |
-
-**`WorkflowRunRequest` parameters:**
-
-| Param | Required | Type | Description |
-|-------|----------|------|-------------|
-| `workflow_name` | Yes | `str` | Name of the stored workflow |
-| `primitive_node_map` | No | `Dict[str, Any]` | Injected primitive node values (default: `{}`) |
-| `execution_argos` | No | `Optional[list]` | Extra run-time arguments for this execution |
-
-**Example:**
-
-```python
-from pyromind_sdk.client.models import TrainingTaskCreateRequest, WorkflowRunRequest
-
-# Create a training task (out_id is required: external system task ID)
-task = client.studio.create(
-    TrainingTaskCreateRequest(
-        name="my-workflow",
-        workflow={"nodes": [...]},
-        out_id="ext-task-001",
-    )
-)
-print(f"Task ID: {task.task_id}")
-
-# List tasks
-tasks = client.studio.list()
-
-# Run workflow with params
-result = client.studio.run_with_params(
-    WorkflowRunRequest(workflow_name="my-workflow", primitive_node_map={"key": "value"})
-)
-
-# Wait for completion
-status = client.studio.wait_for_task_completion(task.task_id, timeout=600)
-print(f"Final status: {status}")
-```
-
-
-
-### Jupyter (`client.jupyter`)
-
-Jupyter instance management.
-
-| Method | Input | Output | Description |
-|--------|-------|--------|-------------|
-| `list(query=None)` | `ListQuery` | `List[JupyterResponse]` | List all Jupyter instances |
-| `list_page(query=None)` | `ListQuery` | `JupyterPage` | Paged list (`instances` + `total` / `page_size` / `page_num`) |
-| `create(request)` | `JupyterRequest` | `JupyterResponse` | Create new instance |
-| `get_instance(jupyter_id)` | `str` | `JupyterResponse` | Get instance details |
-| `get_internal_ip(jupyter_id)` | `str` | `InternalIPResponse` | In-cluster IP |
-| `update(jupyter_id, request)` | `str`, `JupyterRequest` | `JupyterResponse` | Update instance config |
-| `delete(jupyter_id)` | `str` | `None` | Delete an instance |
-| `pause(jupyter_id)` / `resume(jupyter_id)` | `str` | `JupyterResponse` | Pause/resume |
-
-**`JupyterRequest` parameters:**
-
-| Param | Required | Type | Description |
-|-------|----------|------|-------------|
-| `name` | No | `str` | Instance display name |
-| `resources` | No | `ResourceConfig` | CPU/memory/gpu config |
-
-**`JupyterResponse` fields:** `id`, `name`, `status`, `password` (access password),
-`url` (access address), `resources`, `ssh_user` / `ssh_port` / `ssh_ip` (SSH access),
-`namespace`, `uid`, `created_at`, `updated_at`.
-
-**Example:**
-
-```python
-from pyromind_sdk.client.models import JupyterRequest, ResourceConfig
-
-# Create Jupyter instance
-jupyter = client.jupyter.create(
-    JupyterRequest(
-        name="my-notebook",
-        resources=ResourceConfig(cpu="4", memory="16Gi", gpu="1")
-    )
-)
-print(f"Jupyter ID: {jupyter.id}, URL: {jupyter.url}")
-```
-
-### Inference (`client.inference`)
-
-Inference job management.
-
-| Method | Input | Output | Description |
-|--------|-------|--------|-------------|
-| `list(query=None)` | `ListQuery` | `List[InferenceJobResponse]` | List all inference jobs |
-| `list_page(query=None)` | `ListQuery` | `InferencePage` | Paged list (`jobs` + `total` / `page_size` / `page_num`) |
-| `create(request)` | `InferenceJobRequest` | `str` (job_id) | Create inference job |
-| `get_job(job_id)` | `str` | `InferenceJobResponse` | Get job details |
-| `get_internal_ip(job_id)` | `str` | `InternalIPResponse` | In-cluster IP |
-| `update(job_id, request)` | `str`, `InferenceJobRequest` | `InferenceJobResponse` | Update job config |
-| `delete(job_id)` | `str` | `None` | Delete a job |
-| `pause(job_id)` / `resume(job_id)` | `str` | `InferenceJobResponse` | Pause/resume job |
-| `get_framework()` | — | `List[str]` | List available frameworks |
-| `get_inf_image(framework)` | `str` | `List[str]` | List inference images |
-
-**`InferenceJobRequest` parameters:**
-
-| Param | Required | Type | Description |
-|-------|----------|------|-------------|
-| `model_path` | Yes | `str` | Path to the model |
-| `inference_framework` | No | `str` | Framework name (get via `get_framework()`) |
-| `resources` | No | `ResourceConfig` | CPU/memory/gpu config |
-| `name` | No | `str` | Job display name |
-| `inf_image` | No | `str` | Inference image (get via `get_inf_image()`) |
-| `model_name` | No | `str` | Model name override |
-| `model_length` | No | `int` | Model context length |
-| `startup_args` | No | `List[dict]` or `List[str]` | Custom inference server startup args. Prefer `[{"--arg": value}]`; include the leading `-` or `--` yourself. Duplicate default options are overridden by user args |
-
-**`InferenceJobResponse` fields:** `id`, `name`, `model_path`, `status`, `inference_framework`,
-`image`, `inf_image`, `model_name`, `model_length`, `startup_args`, `resources`,
-`endpoint_url` (inference endpoint), `inf_sk` (key for calling the endpoint), `uid`,
-`created_at`, `updated_at`.
-
-**Example:**
-
-```python
-from pyromind_sdk.client.models import InferenceJobRequest, ResourceConfig
-
-# List available frameworks and images
-frameworks = client.inference.get_framework()
-images = client.inference.get_inf_image(frameworks[0])
-
-# Create inference job
-job_id = client.inference.create(
-    InferenceJobRequest(
-        model_path="/path/to/model",
-        inference_framework=frameworks[0],
-        resources=ResourceConfig(cpu="8", memory="32Gi", gpu="1", gpu_card="H100"),
-        startup_args=[{"--trust-remote-code": None}],
-        name="my-inference"
-    )
-)
-print(f"Job ID: {job_id}")
-
-# Get job details
-job = client.inference.get_job(job_id)
-print(f"Status: {job.status}")
-```
-
-### EchoMind (`client.echomind`)
-
-EchoMind instance lifecycle management.
-
-| Method | Input | Output | Description |
-|--------|-------|--------|-------------|
-| `list(query=None)` | `ListQuery` | `List[EchoMindJobResponse]` | List all EchoMind instances |
-| `list_page(query=None)` | `ListQuery` | `EchoMindPage` | Paged list (`jobs` + `total` / `page_size` / `page_num`) |
-| `create(request)` | `EchoMindJobRequest` | `str` (job_id) | Create EchoMind instance |
-| `get_job(job_id)` | `str` | `EchoMindJobResponse` | Get instance details |
-| `get_internal_ip(job_id)` | `str` | `InternalIPResponse` | In-cluster IP |
-| `update(job_id, request)` | `str`, `EchoMindJobRequest` | `EchoMindJobResponse` | Update instance config |
-| `delete(job_id)` | `str` | `None` | Delete an instance |
-| `pause(job_id)` / `resume(job_id)` | `str` | `EchoMindJobResponse` | Pause/resume |
-
-**`EchoMindJobRequest` parameters:**
-
-| Param | Required | Type | Description |
-|-------|----------|------|-------------|
-| `name` | Yes | `str` | Instance display name |
-| `api_url` | Yes | `str` | API address of the sampling/inference service |
-| `origin_model` | Yes | `str` | The original (to-be-aligned) model |
-| `access_key` | Yes | `str` | Key used to call `api_url` |
-| `training_model` | Yes | `str` | Model on the training side |
-| `training_batch_size` | Yes | `int` | Training batch size |
-| `trajectory_buffer_size` | Yes | `int` | Trajectory buffer size |
-| `time_per_round` | Yes | `float` | Seconds per round |
-| `training_round` | Yes | `int` | Number of training rounds |
-| `training_save_path` | Yes | `str` | Where training artifacts are saved |
-| `api_mode` | No | `str` | API dialect: `openai` (default) / `gemini` / `anthropic` |
-| `execution_mode` | No | `str` | `manual` (default, you drive the rounds) / `automatic` |
-| `custom_runtime_script_path` | No | `str` | Path to a custom runtime script |
-| `resources` | No | `ResourceConfig` | CPU/memory/gpu config |
-
-**`EchoMindJobResponse` fields:** `job_id` (**not `id`**), `name`, `status`, `api_url`,
-`api_mode`, `origin_model`, `access_key`, `secret_key`, `training_model`,
-`training_batch_size`, `trajectory_buffer_size`, `time_per_round`, `training_round`,
-`training_save_path`, `execution_mode`, `custom_runtime_script_path`, `resources`,
-`created_at`.
-
-**Example:**
-
-```python
-from pyromind_sdk.client.models import EchoMindJobRequest, ResourceConfig
-
-# Create an EchoMind instance
-job_id = client.echomind.create(
-    EchoMindJobRequest(
-        name="my-echomind",
-        api_url="https://api.example.com/v1",
-        origin_model="Qwen/Qwen3-8B",
-        access_key="sk-xxx",
-        training_model="Qwen/Qwen3-8B",
-        training_batch_size=4,
-        trajectory_buffer_size=64,
-        time_per_round=60.0,
-        training_round=10,
-        training_save_path="/workspace/echomind-out",
-        api_mode="openai",
-        execution_mode="manual",
-        resources=ResourceConfig(cpu="4", memory="16Gi", gpu="1"),
-    )
-)
-print(f"EchoMind ID: {job_id}")
-
-# List instances (the response field is job_id, not id)
-for job in client.echomind.list():
-    print(job.job_id, job.name, job.status)
-
-# Cleanup
-client.echomind.delete(job_id)
-```
-
-### Storage (`StorageClient`, constructed directly)
-
-MinIO/S3-compatible file storage. Requires `minio` package (`pip install minio`).
-
-> The storage client is **not** `client.storage` — `PyroMindAPIClient` has no such attribute;
-> construct `StorageClient(...)` yourself (credentials may be omitted, the env vars below are
-> picked up). The same class is used from sync and async code.
-
-| Method | Input | Output | Description |
-|--------|-------|--------|-------------|
-| `list_files(folder_path, ...)` | `str` + opts | `List[Dict]` | List files in a directory |
-| `file_exists(file_path)` | `str` | `bool` | Check file existence |
-| `upload_file(file_path, object_name, ...)` | `str/Path/BinaryIO` + opts | `Dict[str, Any]` | Upload file (multipart support) |
-| `upload_folder(folder_path, ...)` | `str/Path` + opts | `List[Dict]` | Upload entire folder |
-| `download_file(object_name, ...)` | `str` + opts | `Union[bytes, Path]` | Download file |
-| `download_folder(folder_path, local_path)` | `str`, `str/Path` + opts | `List[Dict]` | Download folder |
-| `delete_file(object_name)` | `str` | `None` | Delete a file |
-| `delete_folder(folder_path)` | `str` + opts | `Dict` | Delete a folder |
-| `close()` | — | `None` | Close the underlying client |
-
-**Storage init parameters:**
-
-| Param | Required | Type | Description |
-|-------|----------|------|-------------|
-| `endpoint` | No | `str` | Storage endpoint (env: `PYROMIND_STORAGE_ENDPOINT`, default: `https://storage.pyromind.ai`) |
-| `access_key` | No | `str` | Access key (env: `PYROMIND_API_KEY`) |
-| `secret_key` | No | `str` | Secret key (env: `PYROMIND_STORAGE_SECRET_KEY`) |
-| `bucket_name` | No | `str` | Default bucket (env: `PYROMIND_STORAGE_BUCKET`) |
-| `secure` | No | `bool` | Use HTTPS (auto-detected from endpoint URL) |
-| `region` | No | `str` | Storage region (default: `us-east-1`) |
-
-**Example:**
-
-```python
-from pyromind_sdk.client.storage import StorageClient
-
-storage = StorageClient()
-
-# List files
-files = storage.list_files(folder_path="documents/")
-for f in files:
-    print(f"{f['object_name']} ({f['size']} bytes)")
-
-# Upload file
-storage.upload_file("local/file.txt", "remote/file.txt")
-
-# Download file
-storage.download_file("remote/file.txt", "downloaded/file.txt")
-
-# Check existence
-if storage.file_exists("remote/file.txt"):
-    print("File exists")
-```
-
-### Profile (`client.profile`)
-
-User profile and SSH keys.
-
-| Method | Input | Output | Description |
-|--------|-------|--------|-------------|
-| `get_user_info(credit_info=False)` | `bool` | `ProfileUserInfoResponse` | Get user info |
-| `get_access_key()` | — | `str` | Get access key |
-| `get_storage_info()` | — | `ProfileStorageInfoResponse` | Get storage credentials |
-| `add_key(request)` | `UserPubKeyRequest` | `bool` | Add SSH public key |
-| `list_keys()` | — | `List[UserPubKey]` | List SSH public keys |
-
-**Example:**
-
-```python
-# Get user info
-user = client.profile.get_user_info()
-print(f"User: {user.username}")
-
-# Get storage info
-storage_info = client.profile.get_storage_info()
-print(f"Used: {storage_info.human_used_size} / Total: {storage_info.human_total_size}")
-
-# SSH key management
-from pyromind_sdk.client.models import UserPubKeyRequest
-
-client.profile.add_key(UserPubKeyRequest(key="ssh-ed25519 AAAA..."))
-keys = client.profile.list_keys()
-```
-
-## Async Support
-
-All services have async counterparts via `PyroMindAsyncAPIClient`:
-
-```python
-from pyromind_sdk import PyroMindAsyncAPIClient
-
-async with PyroMindAsyncAPIClient(api_key="your-api-key") as client:
-    tasks = await client.studio.list()
-    task = await client.studio.create(request)
-```
-
-Async clients use **different attribute names in a few places** — mixing them up is an
-immediate `AttributeError`, so copy from this table:
-
-| Sync `PyroMindAPIClient` | Async `PyroMindAsyncAPIClient` | Client classes |
-|---|---|---|
-| `client.sandboxes` | `client.sandboxes` | `SandboxClient` / `AsyncSandboxClient` |
-| `client.studio` | `client.studio` | `StudioClient` / `AsyncStudioClient` |
-| `client.jupyter` | **`client.instances`** | `JupyterLabClient` / `AsyncJupyterLabClient` |
-| `client.inference` | `client.inference` | `InferenceClient` / `AsyncInferenceClient` |
-| `client.echomind` | `client.echomind` | `EchoMindClient` / `AsyncEchoMindClient` |
-| `client.profile` | **none** (not provided on the async client yet) | `ProfileClient` |
-| `StorageClient(...)` constructed directly | same class, shared by sync and async | `StorageClient` |
-
-Method-set differences: the sandbox **`execute_action` / `execute_batch_actions` / `get_vnc`
-exist only on the async client**; `AsyncInferenceClient` has no `resume` yet. Everything else
-matches on both sides.
-
-## Error Handling
-
-All API calls raise `PyroMindAPIError` (sync) or `PyroMindAsyncAPIError` (async) on failure:
-
-```python
-from pyromind_sdk.client.base import PyroMindAPIError
-
-try:
-    task = client.studio.get_task("invalid-id")
-except PyroMindAPIError as e:
-    print(f"Error {e.status_code}: {e.message}")
-    if e.response:
-        print(f"Response: {e.response}")
-```
-
-| Attribute | Type | Description |
-|-----------|------|-------------|
-| `message` | `str` | Error description |
-| `status_code` | `Optional[int]` | HTTP status code |
-| `response` | `Optional[Dict]` | API error response body |
-
-## Key Response Models
-
-Each service returns structured Pydantic model objects. The fields below match
-`pyromind_sdk.client.models` (only the common ones are listed — the source/type hints
-are authoritative for the rest).
-
-### `ResourceConfig` (used by every `resources` parameter)
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `cpu` | `Optional[str]` | CPU cores, e.g. `"4"` |
-| `memory` | `Optional[str]` | Memory, e.g. `"16Gi"` |
-| `gpu` | `Optional[str]` | GPU count, e.g. `"1"` |
-| `gpu_card` | `Optional[str]` | GPU card type, e.g. `"L40S"`, `"H100"` |
-
-### `SandboxResponse` (Sandbox)
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | `str` | Sandbox ID |
-| `name` | `str` | Name |
-| `type` | `SandboxType` | `osworld` / `custom` |
-| `status` | `str` | `creating` / `starting` / `pending` / `running` / `stopped` / `error` |
-| `endpoint_url` / `endpoint` | `Optional[str]` | Access endpoint |
-| `web_vnc_url` | `Optional[str]` | Web VNC address |
-| `resources` | `Optional[ResourceConfig]` | Allocated resources |
-| `usage` | `Optional[SandboxUsage]` | `cpu_percent` / `memory_used` / `storage_used` / `cpu_usage` / `memory_usage` / `gpu_usage` |
-| `configuration` | `Optional[SandboxConfiguration]` | Screen resolution, `auto_destroy`, VNC password |
-| `image` / `system_image_path` | `Optional[str]` | Image in use |
-| `volume_mounts` / `port_mappings` | `Optional[List[...]]` | Mounts and port mappings |
-| `uid`, `last_activity`, `created_at`, `updated_at` | | Ownership and timestamps |
-
-### `TrainingTaskResponse` (Studio)
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `task_id` | `str` | Task unique ID |
-| `name` | `str` | Task name |
-| `status` | `str` | Current status (`Pending` / `Running` / `Succeeded` / `Failed` / `Error` / `Terminated` …) |
-| `metrics` | `Optional[Dict]` | Metrics |
-| `nodes` | `Optional[List[TrainingTaskNodeInfo]]` | Node execution details |
-| `created_at` / `started_at` / `completed_at` / `expires_at` | | Stage timestamps |
-| `error_message` | `Optional[str]` | Error info if failed |
-
-`TrainingTaskNodeInfo`: `node_id`, `task_id`, `node_name`, `start_at`, `end_at`, `duration`,
-`resources`, `amount`, `url`, `wand_flag`.
-
-> ⚠️ This model has **no `workflow` field** (earlier docs claimed one; it is not returned).
-> The `TrainingTaskCreateResponse` returned by `create()` carries the same fields (plus
-> `metrics` / `nodes`).
-
-### `JupyterResponse` (Jupyter)
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | `str` | Instance ID |
-| `name` | `str` | Instance name |
-| `status` | `str` | Current status |
-| `url` | `Optional[str]` | Jupyter URL |
-| `password` | `Optional[str]` | Access password |
-| `resources` | `Optional[ResourceConfig]` | Allocated resources |
-| `ssh_user` / `ssh_port` / `ssh_ip` | | SSH access |
-| `namespace` / `uid` | | Ownership |
-| `created_at` / `updated_at` | | Timestamps |
-
-### `InferenceJobResponse` (Inference)
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | `str` | Job ID |
-| `name` | `str` | Job name |
-| `model_path` | `str` | Model path |
-| `status` | `str` | Current status |
-| `endpoint_url` | `Optional[str]` | Inference endpoint |
-| `inf_sk` | `Optional[str]` | Key for calling the endpoint |
-| `inference_framework` / `image` / `inf_image` | | Framework and images |
-| `model_name` / `model_length` / `startup_args` | | Model and startup args |
-| `resources` | `Optional[ResourceConfig]` | Allocated resources |
-| `uid` / `created_at` / `updated_at` | | Ownership and timestamps |
-
-### `EchoMindJobResponse` (EchoMind)
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `job_id` | `str` | Instance ID (**not `id`**) |
-| `name` | `Optional[str]` | Instance name |
-| `status` | `str` | Current status |
-| `api_url` / `api_mode` / `origin_model` / `access_key` / `secret_key` | | Sampling-side config |
-| `training_model` / `training_batch_size` / `trajectory_buffer_size` / `time_per_round` / `training_round` / `training_save_path` | | Training-side config (strings in the response) |
-| `execution_mode` / `custom_runtime_script_path` | | Execution mode |
-| `resources` / `created_at` | | Resources and creation time |
-
-## Workflow Validation & Conversion
-
-The `client/workflow/` module provides workflow validation and format conversion:
-
-```python
-from pyromind_sdk.client import validate_workflow, ValidationError
-
-# Validate a workflow structure
-try:
-    validate_workflow(workflow_dict)
-    print("Workflow is valid")
-except ValidationError as e:
-    print(f"Invalid workflow: {e}")
-```
-
-| Tool | Description |
-|------|-------------|
-| `validate_workflow(workflow)` | Validate workflow JSON structure |
-| `ValidationError` | Raised on invalid workflow |
-| `converter.py` | Convert between workflow formats |
-
-## CLI Tools
-
-| Command | Description |
-|---------|-------------|
-| `python -m pyromind_sdk.cli` | SDK CLI (various utilities) |
-| `python -m pyromind_sdk.python_function_to_yaml_cli` | Convert Python function → YAML node definition |
-
-## Custom Node SDK
-
-Beyond YAML definitions, the SDK provides programmatic node creation tools:
-
-**Wrap a Python function as a custom node:**
-
-```python
-from pyromind_sdk.nodes.function_call_wrapper import create_node_from_function
-
-# Decorate any function to become a node definition
-@create_node_from_function(
-    name="my_custom_node",
-    description="Processes input data",
-    category="data-processing"
-)
-def process_data(input_text: str, threshold: float = 0.5) -> dict:
-    # Your logic here
-    return {"result": "processed", "value": len(input_text)}
-```
-
-**Execute Python functions as nodes at runtime:**
-
-```python
-from pyromind_sdk.nodes.python_function_executor import execute_python_node
-
-result = execute_python_node(
-    source_code="print('hello')",
-    node_type="python"
-)
-```
-
-**Convert Python functions to YAML config:**
-
-```python
-from pyromind_sdk.nodes.python_to_yaml import python_function_to_yaml_config
-
-def my_func(input: str) -> str:
-    return input.upper()
-
-yaml_config = python_function_to_yaml_config(my_func)
-# yaml_config can be saved to a .yaml file and registered via studio.create_node()
-```
-
-**Validate and load YAML node definitions:**
-
-```python
-from pyromind_sdk.nodes.yaml_loader import load_yaml_node
-from pyromind_sdk.nodes.node_validator import validate_node_config
-
-node_config = load_yaml_node("path/to/node.yaml")
-validate_node_config(node_config)
-```
-
-## Testing
-
-```bash
-pytest
-```
-
-## Examples
-
-| Example | Description |
-|---------|-------------|
-| `api_client_basic.py` | Basic client setup |
-| `studio_example.py` | Studio task CRUD + node output |
-| `studio_monitor.py` | Monitor task status in a loop |
-| `workflow_cli.py` | CLI tool for workflow management |
-| `complete_workflow_example.py` | End-to-end workflow demo |
-| `jupyter_instance_example.py` | Jupyter instance CRUD |
-| `inference_example.py` | Inference job management |
-| `echomind_example.py` | EchoMind lifecycle |
-| `storage_example.py` | File upload/download |
-| `release_all_instance.py` | Bulk release resources |
-| `async_training_example.py` | Async studio training |
-| `async_inference_example.py` | Async inference |
-| `async_echomind_example.py` | Async EchoMind |
-| `async_jupyter_instance_example.py` | Async Jupyter |
-
-## Development
-
-### Install from source
+To install the current source checkout for development:
 
 ```bash
 git clone https://github.com/pyromind/pyromind-sdk.git
 cd pyromind-sdk
 pip install -e .
 ```
+
+## Quick start
+
+Set your API key in the environment:
+
+```bash
+export PYROMIND_API_KEY="your-api-key"
+```
+
+Create a client and submit a Studio workflow:
+
+```python
+from pyromind_sdk import PyroMindAPIClient
+from pyromind_sdk.client.models import TrainingTaskCreateRequest
+
+with PyroMindAPIClient() as client:
+    task = client.studio.create(
+        TrainingTaskCreateRequest(
+            name="my-workflow",
+            workflow={"nodes": [...]},
+            out_id="external-task-001",
+        )
+    )
+    print(task.task_id)
+```
+
+`PYROMIND_BASE_URL` optionally overrides the API endpoint. The default is `https://api-portal.pyromind.ai/api/v1`. The API key can also be passed as `PyroMindAPIClient(api_key="...")`.
+
+## API clients
+
+The synchronous client exposes these service clients:
+
+| Attribute | Service |
+| --- | --- |
+| `client.sandboxes` | Sandbox lifecycle, commands, and file operations |
+| `client.studio` | Training workflows and custom nodes |
+| `client.jupyter` | JupyterLab instances |
+| `client.inference` | Inference jobs |
+| `client.echomind` | EchoMind instances |
+| `client.profile` | User profile and SSH keys |
+
+For asynchronous applications, use `PyroMindAsyncAPIClient`:
+
+```python
+import asyncio
+from pyromind_sdk import PyroMindAsyncAPIClient
+
+async def main():
+    async with PyroMindAsyncAPIClient() as client:
+        tasks = await client.studio.list()
+        print(f"Found {len(tasks)} tasks")
+
+asyncio.run(main())
+```
+
+On the async client, Jupyter is exposed as `client.instances`. Storage is provided by the separately constructed `StorageClient` in both sync and async applications. See the [API client guide](pyromind_sdk/client/README.md) for service methods, models, errors, and async API details.
+
+### Client configuration
+
+The client reads its API key from `PYROMIND_API_KEY`. You can set a non-default API endpoint with `PYROMIND_BASE_URL` and select a cluster with `PYROMIND_CLUSTER`. These values can also be passed to the client constructor. The synchronous client supports context manager usage so its resources are closed when the block exits.
+
+```python
+from pyromind_sdk import PyroMindAPIClient
+
+with PyroMindAPIClient(
+    api_key="your-api-key",
+    base_url="https://api-portal.pyromind.ai/api/v1",
+    cluster="us-west-1#pre",
+) as client:
+    sandboxes = client.sandboxes.list()
+```
+
+### Storage client
+
+`StorageClient` is constructed separately from `PyroMindAPIClient` and provides file and object-storage operations such as listing, uploading, downloading, and checking files. See the [API client guide](pyromind_sdk/client/README.md#storage-operations) for configuration and examples.
+
+### Service API index
+
+The following tables are a complete index of the public service methods. Request and response types are defined in `pyromind_sdk.client.models`; use the [API client guide](pyromind_sdk/client/README.md) for parameter-level examples.
+
+### Sandbox (`client.sandboxes`)
+
+| Method | Purpose |
+| --- | --- |
+| `list()` / `list_page()` | List sandboxes, optionally with pagination and filters. |
+| `create()` / `create_and_wait()` | Create a sandbox, optionally waiting for a target state. |
+| `get_sandbox()` | Get a sandbox by ID. |
+| `get_internal_ip()` / `get_internal_ips()` | Get one or more cluster-internal IP addresses. |
+| `wait_for_sandbox_status()` | Wait until a sandbox reaches a target status. |
+| `update()` / `pause()` / `resume()` / `delete()` | Change configuration or manage lifecycle. |
+| `exec_command()` / `exec_command_stream()` | Run a command once or consume streamed stdout, stderr, and exit chunks. |
+| `read_file()` / `write_file()` / `delete_file()` | Read, upload, or remove files in a sandbox. |
+| `execute_action()` / `execute_batch_actions()` / `get_vnc()` | Async client only: desktop actions and VNC connection information. |
+
+### Studio (`client.studio`)
+
+| Method | Purpose |
+| --- | --- |
+| `list()` / `create()` / `get_job()` / `get_task()` | List, create, and inspect training tasks. |
+| `stop()` / `delete()` | Stop or remove a task. |
+| `get_node_output()` / `get_node_info()` / `reload_nodes()` | Inspect task outputs and available node definitions. |
+| `create_node()` / `delete_node_by_name()` / `move_node()` | Manage custom node definitions. |
+| `run_with_params()` | Run a stored workflow with supplied primitive-node values. |
+| `export_node_outputs()` | Export outputs for selected workflow nodes. |
+| `wait_for_task_completion()` / `create_and_wait()` | Wait for completion, optionally from task creation onward. |
+
+### JupyterLab (`client.jupyter`)
+
+| Method | Purpose |
+| --- | --- |
+| `list()` / `list_page()` | List JupyterLab instances. |
+| `create()` / `get_instance()` / `update()` / `delete()` | Create and manage an instance. |
+| `get_internal_ip()` | Get the instance's cluster-internal IP address. |
+| `pause()` / `resume()` | Suspend or resume an instance. |
+
+The async client exposes this service as `client.instances`.
+
+### Inference (`client.inference`)
+
+| Method | Purpose |
+| --- | --- |
+| `list()` / `list_page()` | List inference jobs. |
+| `create()` / `get_job()` / `update()` / `delete()` | Create and manage jobs. |
+| `get_internal_ip()` | Get a job's cluster-internal IP address. |
+| `pause()` / `resume()` | Suspend or resume a job; `resume()` is currently sync-client only. |
+| `get_framework()` / `get_inf_image()` | Discover supported frameworks and their available images. |
+
+### EchoMind (`client.echomind`)
+
+| Method | Purpose |
+| --- | --- |
+| `list()` / `list_page()` | List EchoMind jobs. |
+| `create()` / `get_job()` / `update()` / `delete()` | Create and manage jobs. |
+| `get_internal_ip()` | Get a job's cluster-internal IP address. |
+| `pause()` / `resume()` | Suspend or resume a job. |
+
+### Profile (`client.profile`)
+
+| Method | Purpose |
+| --- | --- |
+| `get_user_info()` | Get account information, optionally including credit information. |
+| `get_access_key()` / `get_storage_info()` | Get an access key or storage credentials. |
+| `add_key()` / `list_keys()` | Add and list SSH public keys. |
+
+`ProfileClient` is available only on the synchronous top-level client.
+
+### Storage (`StorageClient`)
+
+| Method | Purpose |
+| --- | --- |
+| `list_files()` / `file_exists()` | List objects and check whether one exists. |
+| `upload_file()` / `upload_folder()` | Upload one file or a directory tree. |
+| `download_file()` / `download_folder()` | Download one file or a directory tree. |
+| `delete_file()` / `delete_folder()` | Remove one object or a directory prefix. |
+| `close()` | Release the underlying storage client. |
+
+## Docker CLI on Kubernetes (`docker-rt`)
+
+The SDK also packages `docker-rt`, a Docker Engine API-compatible service that translates supported Docker CLI requests into Kubernetes-backed PyroMind sandbox operations. This is useful when existing tools expect to call `docker` but the workloads should run on a Kubernetes cluster.
+
+After installing `pyromind-sdk`, configure the platform credentials and target cluster, then start the daemon:
+
+```bash
+export PYROMIND_API_KEY="your-api-key"
+export PYROMIND_CLUSTER="us-west-1#pre"
+
+docker-rt
+```
+
+In another terminal, register the local Docker context and use the Docker CLI as usual:
+
+```bash
+docker-rt-context
+docker version
+docker run -d --name demo busybox:1.36 sleep 300
+docker ps
+docker exec demo echo hello
+docker rm -f demo
+```
+
+`docker-rt-context` switches the Docker CLI to the `docker-rt` endpoint. The daemon requires the Docker CLI and access to the configured cluster. Common lifecycle and exec commands are supported; image builds and port forwarding have additional behavior and constraints. Docker Compose commands are not supported. For setup options, supported-command details, environment variables, image builds, and troubleshooting, see the dedicated [`docker-rt` documentation](pyromind_sdk/docker_rt/README.md).
+
+## Custom workflow nodes
+
+The SDK can load node definitions from YAML and convert Python functions to node configuration. For example:
+
+```python
+from pyromind_sdk.nodes.python_to_yaml import python_function_to_yaml_config
+
+def uppercase(text: str) -> str:
+    return text.upper()
+
+node_config = python_function_to_yaml_config(uppercase)
+```
+
+See [node SDK documentation](pyromind_sdk/README_CN.md) and the [examples](pyromind_sdk/examples/README.md) for YAML schemas, validation, and additional patterns.
+
+## Workflow tools and CLI
+
+The client workflow package validates and converts workflow payloads between standard and lightweight representations. Its public helpers include `validate_workflow`, `validate_standard_format`, `to_workflow_lite`, `to_workflow_standard`, `WorkflowLiteConverter`, and `LayoutGenerator`.
+
+The `pyromind` command provides three user-facing tools:
+
+| Command | Purpose |
+| --- | --- |
+| `pyromind python-to-yaml <file> <function> --node-name <name>` | Statically analyze a Python function and print or write a YAML node definition. |
+| `pyromind terminal <sandbox-id>` | Open an interactive terminal in a running custom sandbox. Requires API key and cluster settings. |
+| `pyromind docker-rt` | Start the Docker-compatible runtime described below. |
+
+For example, write a node definition to a file:
+
+```bash
+pyromind python-to-yaml examples.py uppercase \
+  --node-name UppercaseNode \
+  --output uppercase_node.yaml
+```
+
+## Examples
+
+- [API client examples](pyromind_sdk/examples/openapi/API_CLIENT_EXAMPLES.md)
+- [Example directory guide](pyromind_sdk/examples/README.md)
+- [Docker runtime guide](pyromind_sdk/docker_rt/README.md)
+
+## Development
+
+Install the package and development tools, then run the test suite:
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
