@@ -836,7 +836,10 @@ async def info(request: web.Request) -> web.Response:
             "ContainersRunning": len(running),
             "ContainersPaused": 0,
             "ContainersStopped": len(containers) - len(running),
-            "Images": len({request.app["default_image"]} | store.known_images()),
+            # 只数"真实存在"的镜像：默认镜像（未指定 Image 时才用的那个）
+            # 不该出现在 docker images / 计数里（2026-10-15 用户报：没拉过镜像
+            # 却能看到一条 SWE-bench 默认镜像）。
+            "Images": len(store.known_images()),
             "Driver": "kube-sandbox",
             "DriverStatus": [["Backend", "Kubernetes Pod"]],
             "Plugins": {
@@ -1626,22 +1629,12 @@ async def create_container(request: web.Request) -> web.Response:
         return _err(400, "Image is required")
     image = store.resolve_image(image)
 
-    # Foreground attach (`docker run img` without -d / -i / -t) cannot be served
-    # by the k8s-middleware backend: there is no main-process stream to attach
-    # to. Reject HERE — before anything is created — instead of letting the CLI
-    # create+start a sandbox and only failing at the attach hijack (that used to
-    # leave a running instance the user never asked to keep).
-    # Interactive runs (-i / -t) ride the terminal PTY and stay allowed; -d does
-    # not attach at all.
-    if (
-        (body.get("AttachStdout") or body.get("AttachStderr"))
-        and not body.get("AttachStdin")
-        and not body.get("Tty")
-    ):
-        return _err(
-            400,
-            "foreground attach is not supported by k8s-middleware; use -d or -it",
-        )
+    # `docker create` / `docker run`（不带 -d/-i/-t）**不再拒绝**。
+    # 之前这里对"要 attach stdout/stderr 但没有 stdin/tty"直接 400，可 docker CLI
+    # 的 `create` 默认就带 AttachStdout/AttachStderr ⇒ 连纯 create 都被挡掉
+    # （2026-10-15 用户报：docker create 直接失败）。
+    # 现在前台 run 由 attach 阶段用 **exec 跑这条 Cmd** 来服务（容器常驻 + exec 干活，
+    # 业界常见做法）：输出、退出码都拿得到，`--rm` 跑完自动删。
 
     env = parse_env_list(body.get("Env"))
     cmd = body.get("Cmd") or []
@@ -1698,6 +1691,12 @@ async def create_container(request: web.Request) -> web.Response:
             env=env,
             cmd=list(cmd),
             working_dir=working_dir,
+            # `docker run --rm`：CLI 可能把 AutoRemove 放在 HostConfig 里，
+            # 也可能放在 create body 顶层 —— **两处都看**（2026-10-15 实测只查
+            # HostConfig 时 --rm 不生效，容器残留）。
+            auto_remove=bool(
+                (host_config or {}).get("AutoRemove") or body.get("AutoRemove")
+            ),
             namespace=namespace,
             kubeconfig=request.app.get("kubeconfig"),
             kube_context=request.app.get("kube_context"),
@@ -1757,6 +1756,9 @@ async def create_container(request: web.Request) -> web.Response:
         )
 
     await _emit(request, action="create", record=record)
+    # 注意：create 保持**标准 Docker 语义**——只登记容器、立刻返回（不启动）。
+    # 真正的启动发生在 start / run；前台 run 会在 attach 阶段
+    # ``_wait_container_running`` 等 sandbox 变成 Running/Up 之后才执行命令。
     return _json({"Id": record.id, "Warnings": []}, status=201)
 
 
@@ -1766,7 +1768,27 @@ async def start_container(request: web.Request) -> web.Response:
     record = store.get(cid)
     if record is None:
         return _err(404, f"No such container: {cid}")
+    return await _start_record(request, store, record)
 
+
+async def _auto_remove_container(app: Any, record: Any) -> None:
+    """前台 run 的 `--rm` 收尾 —— **直接复用 `docker rm` 的同一段逻辑**。
+
+    为什么服务端做：docker CLI 的 `--rm` **不发** `DELETE /containers/{id}`，
+    它依赖 daemon 的 AutoRemove（实测）。
+    为什么后台任务：`/wait` 一写回响应客户端就走人，同步删会被取消。
+    """
+    try:
+        await _remove_container(app, app["store"], record)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("foreground --rm failed for %s: %s", record.id[:12], exc)
+
+async def _start_record(
+    request: web.Request,
+    store: ContainerStore,
+    record: Any,
+) -> web.Response:
+    """启动 sandbox 并等它 Running（create 与 start 共用）。"""
     await _refresh_record_state(record, store)
     async with record.lock:
         if record.state == ContainerState.RUNNING:
@@ -2399,9 +2421,25 @@ async def wait_container(request: web.Request) -> web.StreamResponse:
     except (ClientConnectionResetError, ConnectionResetError):
         return resp
 
+
     snapshot = store.state_snapshot(container_id)
     watchdog = _wait_watchdog_interval()
     while True:
+        # 前台 run：exec 跑完就记下退出码（容器本身还 Running，当"工作台"用），
+        # **每轮都要先看它** —— 它可能在 /wait 挂起之后才产生。
+        fg = getattr(record, "foreground_exit_code", None)
+        if fg is not None:
+            await _write_wait_result(
+                request,
+                resp,
+                json.dumps({"StatusCode": int(fg)}).encode() + b"\n",
+            )
+            # `docker run --rm`：**服务端负责删**（实测 docker CLI 的 --rm 不发 DELETE，
+            # 它依赖 daemon 的 AutoRemove）。用**后台任务**做，避免客户端读完就走
+            # 导致删除被取消；删除前先 pause（cleanup 会暂停 sandbox，running 状态删不掉）。
+            if bool(getattr(record, "auto_remove", False)):
+                asyncio.create_task(_auto_remove_container(request.app, record))
+            return resp
         if snapshot.exists and container_wait_condition_met(snapshot, condition):
             await _write_wait_result(
                 request,
@@ -2438,25 +2476,34 @@ async def wait_container(request: web.Request) -> web.StreamResponse:
         )
 
 
-async def delete_container(request: web.Request) -> web.Response:
-    store: ContainerStore = request.app["store"]
-    cid = request.match_info["id"]
-    record = store.get(cid)
-    if record is None:
-        return _err(404, f"No such container: {cid}")
+async def _remove_container(
+    app: Any,
+    store: "ContainerStore",
+    record: Any,
+    *,
+    request: web.Request | None = None,
+    emit_action: str = "destroy",
+) -> None:
+    """**删除一个容器** —— `docker rm` 与前台 run 的 `--rm` 共用这一段。
 
-    # docker rm and docker rm -f intentionally share the same behavior.
-    # Cleanup pauses a running sandbox before deleting it.
+    语义（与 docker 一致）：
+    * sandbox 还在 **Running/Up** ⇒ 先 **pause**（`cleanup()` 内部会 pause 再删）；
+    * 其它状态（Created / Exited / 已暂停 / 不存在）⇒ **直接删**；
+    * 删的是**真 sandbox**（`client.delete`），不是只暂停 —— 见
+      `pyromind_sdk_env._prepare_for_cleanup()` 与 `_cleanup_once()`。
+
+    失败会抛异常，由调用方决定怎么报（路由 ⇒ 500；`--rm` 后台任务 ⇒ 记日志）。
+    """
     await _refresh_record_state(record, store)
     async with record.lock:
         if record.kube_env is not None:
             await _stop_port_forward(record)
             try:
                 await call_environment_method(record.kube_env, "cleanup")
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 record.error = format_exception_message(exc)
                 logger.exception("container cleanup failed")
-                return _err(500, format_exception_message(exc))
+                raise
             record.kube_env = None
             record.sandbox_id = None
             record.sandbox_status = None
@@ -2467,14 +2514,29 @@ async def delete_container(request: web.Request) -> web.Response:
         else:
             await _stop_port_forward(record)
 
-    await _release_service(record, request.app)
-    networks: NetworkStore = request.app["networks"]
+    await _release_service(record, app)
+    networks: NetworkStore = app["networks"]
     networks.disconnect_container(record.id)
     remove_mapping(record.id, record.sandbox_id)
     await store.remove(record)
-    await _emit(request, action="destroy", record=record)
-    return _empty(204)
+    if request is not None:
+        await _emit(request, action=emit_action, record=record)
 
+
+async def delete_container(request: web.Request) -> web.Response:
+    store: ContainerStore = request.app["store"]
+    cid = request.match_info["id"]
+    record = store.get(cid)
+    if record is None:
+        return _err(404, f"No such container: {cid}")
+
+    # `docker rm` / `docker rm -f` 行为一致；**与前台 run 的 `--rm` 共用同一个删除实现**
+    # （Running 先 pause 再真删，其它状态直接删 —— 见 _remove_container）。
+    try:
+        await _remove_container(request.app, store, record, request=request)
+    except Exception as exc:  # noqa: BLE001
+        return _err(500, format_exception_message(exc))
+    return _empty(204)
 
 async def inspect_container(request: web.Request) -> web.Response:
     store: ContainerStore = request.app["store"]
@@ -2576,9 +2638,14 @@ async def container_logs(request: web.Request) -> web.StreamResponse:
 
 
 async def list_images(request: web.Request) -> web.Response:
+    """`docker images` —— **只列真实存在的镜像**。
+
+    隐式默认镜像（create/run 未给 Image 时才兜底用）**不算**"本地已有"：
+    用户没显式拉/用过它，就不该凭空出现在列表里（2026-10-15 用户报）。
+    """
     store: ContainerStore = request.app["store"]
     default = request.app["default_image"]
-    names = {default} | store.known_images()
+    names = store.known_images() - {default}
     return _json([images_mod.to_image_summary(n) for n in sorted(names)])
 
 
@@ -3399,16 +3466,25 @@ async def attach_container(request: web.Request) -> web.StreamResponse | web.Res
             return resp
 
         # Attach to the main process (Cmd is now the Pod entrypoint).
+        # 前台 `docker run`（无 -d/-i/-t）：把容器的 Cmd 传进去，由 exec 跑；
+        # 返回后把退出码记到 record（供 /wait 回给 CLI），`--rm` 则删容器。
+        foreground_cmd = None
+        if not stdin and not tty and list(getattr(record, "cmd", None) or []):
+            foreground_cmd = list(getattr(record, "cmd", None) or [])
         try:
-            return await _hijack_session(
+            resp_out = await _hijack_session(
                 request,
                 resp,
                 protocol,
                 session,
                 kube_env,
-                None,
+                # 前台 run（无 -d/-i/-t）：把容器的 Cmd 作为 cmd 传下去，
+                # 走**已验证的 oneshot/exec 路径**（输出、退出码都拿得到）。
+                # 传 None 会落到"挂主进程"的死路（runtime 后端会永久阻塞）。
+                foreground_cmd if foreground_cmd else None,
                 tty,
                 stdin=stdin,
+                foreground_cmd=foreground_cmd,
             )
         finally:
             # Keep the Pod for ``docker logs`` after the process exits.
@@ -3447,6 +3523,35 @@ async def attach_container(request: web.Request) -> web.StreamResponse | web.Res
     finally:
         logger.info("attach hijack end id=%s", record.short_id if record else cid[:12])
 
+    # 前台 run 的收尾：exec 的退出码写回 record（/wait 直接回它，CLI 拿到 rc）；
+    # `--rm`（AutoRemove）⇒ 清理并删除容器（与 docker rm 同一清理路径）。
+    if foreground_cmd is not None:
+        code = int(getattr(session, "exit_code", -1) or -1)
+        record.foreground_exit_code = code
+        record.exit_code = code
+        record.finished_at = time.time()
+        await store.set_state(record, ContainerState.EXITED)
+        if bool(getattr(record, "auto_remove", False)):
+            try:
+                async with record.lock:
+                    if record.kube_env is not None:
+                        await _stop_port_forward(record)
+                        await call_environment_method(record.kube_env, "cleanup")
+                    record.kube_env = None
+                    record.sandbox_id = None
+                    await store.set_state(record, ContainerState.EXITED)
+                await _release_service(record, request.app)
+                request.app["networks"].disconnect_container(record.id)
+                await store.remove(record)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("foreground --rm cleanup failed: %s", exc)
+    return resp_out
+
+    # 兜底：**任何路径都不许落空返回 None** —— aiohttp 会打
+    # 'Missing return statement on request handler' 并回 500
+    # （2026-10-15 线上 docker run --rm 的 attach 就栽在这）。
+    return resp
+
 
 def _exec_argv_with_cwd(cmd: list[str], cwd: str, session: Any) -> tuple[list[str], str]:
     """输出型通道用的 ``(argv, 要传给后端的 cwd)``。
@@ -3481,6 +3586,7 @@ async def _hijack_session(
     *,
     stdin: bool = True,
     cwd: str = "",
+    foreground_cmd: list[str] | None = None,
 ) -> web.StreamResponse:
     """Drive an upgraded Docker stream against kube exec/attach WS.
 
@@ -3591,20 +3697,71 @@ async def _hijack_session(
                 tty=tty,
                 session_id=getattr(session, "id", "") or "",
                 cwd=cwd,
+                foreground_cmd=foreground_cmd,
             )
         finally:
             session.running = False
             _force_close_hijack(request, resp)
-        return resp
+
+        # 前台 run 的收尾：退出码记入 record（唤醒 /wait）；--rm 则删容器
+        if foreground_cmd is not None:
+            code = int(getattr(session, "exit_code", -1) or -1)
+            record.foreground_exit_code = code
+            record.exit_code = code
+            record.finished_at = time.time()
+            await store.set_state(record, ContainerState.EXITED)
+            host_cfg = getattr(record, "host_config", None) or {}
+            if bool(host_cfg.get("AutoRemove")):
+                try:
+                    async with record.lock:
+                        if record.kube_env is not None:
+                            await _stop_port_forward(record)
+                            await call_environment_method(record.kube_env, "cleanup")
+                        record.kube_env = None
+                        record.sandbox_id = None
+                        await store.set_state(record, ContainerState.EXITED)
+                    await _release_service(record, request.app)
+                    networks.disconnect_container(record.id)
+                    await store.remove(record)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("foreground --rm cleanup failed: %s", exc)
+        return resp_out
 
     if isinstance(kube_env, PyromindSDK) and cmd is None:
+        if not stdin and not tty and foreground_cmd:
+            # 前台 `docker run`（无 -d/-i/-t）：k8s-middleware 没有"主进程输出流"，
+            # 所以这里**用 exec 跑容器的 Cmd**（Cmd 由调用方从容器记录里取好传进来
+            # —— 这一层拿不到 record）。输出与退出码都能拿回来；`--rm`（AutoRemove）
+            # 由调用方在 attach 返回后删除。容器本身保持 Running（当"工作台"用）。
+            token = uuid.uuid4().hex
+            marker = f"__DRT_END_{token}__"
+            session.running = True
+            code = -1
+            try:
+                code = await _stream_pyromind_exec(
+                    resp=resp,
+                    kube_env=kube_env,
+                    cmd=argv_with_exec_handshake(foreground_cmd, marker=marker),
+                    tty=False,
+                    session_id=getattr(session, "id", "") or "",
+                    cwd=cwd,
+                    marker=marker,
+                    stdin_close=asyncio.Event(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("foreground run exec failed: %s", exc)
+                code = 255
+            finally:
+                session.running = False
+            session.exit_code = code
+            _force_close_hijack(request, resp)
+            return resp
+
         if not stdin and not tty:
-            # k8s-middleware has no main-process log stream yet. Close the
-            # non-interactive foreground attach after the sandbox is Running
-            # instead of hanging like a terminal websocket.
+            # 真的没有命令（例如 attach 一个已存在的容器）：如实告知，而不是静默返回 0
             message = (
-                b"docker-rt: foreground attach is not supported by "
-                b"k8s-middleware; use -d or -it.\r\n"
+                b"docker-rt: this container has no command to run; "
+                b"use -d or -it.\r\n"
             )
             try:
                 await resp.write(frame_stdout(message))

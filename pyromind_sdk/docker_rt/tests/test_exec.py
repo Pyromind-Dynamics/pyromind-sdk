@@ -1390,3 +1390,102 @@ async def test_stdin_eof_does_not_teardown_the_session(monkeypatch):
     assert b"hello\n" in b"".join(written)
     # EOF 时向 PTY 发了 Ctrl-D 近似
     assert b"\x04" in ws.sent
+
+
+@pytest.mark.asyncio
+async def test_hijack_foreground_run_returns_a_response(monkeypatch: Any) -> None:
+    """前台 run（`cmd=None` + `foreground_cmd`）**必须返回响应**。
+
+    2026-10-15 线上：`docker run --rm …` 的 attach 请求拿到 500 ——
+    aiohttp 报 `Missing return statement on request handler`，
+    根因是 `_hijack_session` 有路径落空、返回 None
+    （`AttributeError: 'NoneType' object has no attribute 'prepare'`）。
+    这个测试就是钉住"任何路径都要有返回值"。
+    """
+    from .. import aio_server as mod
+    from ..backend.pyromind_sdk_env import PyromindSDK
+
+    class _Protocol:
+        _upgraded = False
+
+        def force_close(self) -> None:
+            return None
+
+        def pause_reading(self) -> None:
+            return None
+
+        def is_closing(self) -> bool:
+            return False
+
+        def close(self) -> None:
+            return None
+
+    class _Resp:
+        def __init__(self) -> None:
+            self.written: list[bytes] = []
+
+        async def write(self, data: bytes) -> None:
+            self.written.append(bytes(data))
+
+        async def drain(self) -> None:
+            return None
+
+        async def prepare(self, _request: Any) -> Any:
+            return self
+
+    class _Request:
+        def __init__(self, protocol: Any) -> None:
+            self._protocol = protocol
+            self.protocol = protocol
+            self.app = {}
+
+        @property
+        def transport(self) -> Any:
+            return self._protocol
+
+        @property
+        def content(self) -> Any:
+            class _C:
+                async def readany(self) -> bytes:
+                    return b""
+
+            return _C()
+
+    kube_env = PyromindSDK.__new__(PyromindSDK)
+    kube_env.sandbox_id = "sb-test"
+    kube_env.working_dir = "/"
+    calls: dict[str, dict] = {}
+
+    async def foreground(*args, **kwargs):
+        calls["foreground"] = kwargs
+        return 7
+
+    monkeypatch.setattr(mod, "_stream_pyromind_exec", foreground)
+
+    protocol = _Protocol()
+    resp = _Resp()
+    session = SimpleNamespace(
+        id="exec-fg", running=False, exit_code=None, tty_cols=100, tty_rows=30
+    )
+
+    result = await asyncio.wait_for(
+        mod._hijack_session(
+            _Request(protocol),
+            resp,
+            protocol,
+            session,
+            kube_env,
+            None,  # attach 不带 cmd
+            False,  # tty=False
+            stdin=False,
+            cwd="",
+            foreground_cmd=["sh", "-c", "echo HELLO_RUN; exit 7"],
+        ),
+        timeout=2,
+    )
+
+    assert result is not None, (
+        "_hijack_session 落空返回 None —— attach 会 500（Missing return statement）"
+    )
+    assert "foreground" in calls, f"前台 run 必须走 exec，实际调用={calls}"
+    assert session.exit_code == 7
