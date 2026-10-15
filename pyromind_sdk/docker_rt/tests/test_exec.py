@@ -567,6 +567,254 @@ async def test_pyromind_terminal_bridge_pumps_stdin_and_resize(monkeypatch):
     assert session.resize_hook is None
 
 
+_MARKER = "__DRT_END_deadbeef__"
+
+
+def test_unclearable_stdin_tail_is_dropped_not_replayed():
+    """``_message_tail`` 清不掉时必须**丢字节**，绝不能把同一份反复交出去。
+
+    调用方 ``pump_in`` 是"取到就转发"的循环（20ms 一轮，没有退避）：如果这里在
+    清空失败时仍然返回 tail，PTY 会被**无限重放**同一串按键 —— 终端刷屏、Ctrl-C
+    都停不下来。而 ``_message_tail`` 是 aiohttp ``RequestHandler`` 的 slot，
+    ``data_received`` 能往里追加就说明它可写；真的不可写时 ``getattr`` 也拿不到
+    东西。所以这个分支只是保险，但保险的**方向**必须是"丢"而不是"重放"。
+    """
+    from ..aio_server import _take_client_stdin
+
+    class StickyTail:
+        """读得到、写不进去（property 没有 setter）。"""
+
+        def __init__(self, data: bytes):
+            self._tail = data
+
+        @property
+        def _message_tail(self) -> bytes:
+            return self._tail
+
+    proto = StickyTail(b"rm -rf /\n")
+    assert _take_client_stdin(proto) == b""
+    assert _take_client_stdin(proto) == b""
+
+
+@pytest.mark.parametrize(
+    "buf,expected",
+    [
+        (b"", 0),
+        # 提示符只有 2 字节：**必须**原样出去，否则交互式 shell 全黑屏。
+        (b"# ", 0),
+        (b"total 0\r\n", 0),
+        (b"$ ", 0),
+        # 结尾真的可能是标记前缀 ⇒ 留着等下一帧。
+        (b"_", 1),
+        (b"__", 2),
+        (b"boom__DRT_END_de", len("__DRT_END_de")),
+        # 完整的标记由 find 那一路消费掉；这里算的是"最长后缀同时也是标记前缀"，
+        # 标记自己以 ``__`` 结尾 ⇒ 只留 2 字节（本来就该这样，留多了才会卡屏）。
+        (_MARKER.encode(), 2),
+        # 长得像但不是前缀 ⇒ 一个字节都不用留。
+        (b"boom_x", 0),
+        (b"__X", 0),
+    ],
+)
+def test_marker_holdback_only_withholds_a_real_marker_prefix(buf, expected):
+    """尾部只留"真的可能是结束标记前缀"的字节。
+
+    原来是无条件 ``len(marker)+1``（= 47），于是**任何不足 47 字节的读取都发不
+    出去**。PTY 通道 stdout/stderr 合并，交互式提示符正好只有 2 字节 ⇒ 用户
+    ``docker exec -it c sh`` 看到全黑屏、之后每一步都落后 47 字节
+    （2026-07-15 用户报的"卡住 + ctrl+c 也停止不了"就是这个）。
+    """
+    from ..aio_server import _marker_holdback
+
+    assert _marker_holdback(bytearray(buf), _MARKER.encode()) == expected
+
+
+async def _drive_terminal_bridge(
+    monkeypatch,
+    frames,
+    *,
+    marker: str = "",
+    ack_path: str = "",
+    tail: bytes = b"",
+    probe: list | None = None,
+):
+    """跑一遍 ``_hijack_pyromind_terminal``，返回 (resp, ws, session, acked)。
+
+    ``probe`` 给了就会在**每一帧被 pump_out 处理完之后**追加一次
+    ``len(resp.written)`` —— 这样能验证"某个字节是在下一帧到达之前就发出去了"，
+    而不是等到流结束才被兜底刷出来（旧实现正是靠兜底刷，所以只看最终内容分不出）。
+    """
+    import aiohttp
+
+    from .. import aio_server as mod
+    from ..backend.pyromind_sdk_env import PyromindSDK
+
+    class FakeRequest:
+        def __init__(self, protocol):
+            self.content = None
+            self.transport = None
+            self.protocol = protocol
+
+    class FakeProtocol:
+        def __init__(self):
+            self._message_tail = tail
+
+        def force_close(self):
+            return None
+
+    class FakeWs:
+        def __init__(self):
+            self.sent_bytes: list[bytes] = []
+            self.sent_text: list[str] = []
+            self.closed = False
+
+        def __aiter__(self):
+            async def gen():
+                for frame_type, data in frames:
+                    yield SimpleNamespace(type=frame_type, data=data)
+                    # 消费者再次取下一帧时，上一帧已经被 pump_out 处理完了。
+                    if probe is not None:
+                        probe.append(len(resp.written))
+
+            return gen()
+
+        async def send_bytes(self, data):
+            self.sent_bytes.append(data)
+
+        async def send_str(self, text):
+            self.sent_text.append(text)
+
+        async def close(self):
+            self.closed = True
+
+    class FakeResp:
+        def __init__(self):
+            self.written: list[bytes] = []
+
+        async def write(self, data):
+            self.written.append(data)
+            await asyncio.sleep(0.02)
+
+        async def drain(self):
+            return None
+
+        def force_close(self):
+            return None
+
+    captured: dict = {}
+    acked: list[str] = []
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def ws_connect(self, url, heartbeat=None):
+            captured["url"] = url
+            captured["ws"] = FakeWs()
+            return captured["ws"]
+
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: FakeSession())
+    monkeypatch.setattr(mod, "_pyromind_terminal_url", lambda *a, **k: "ws://fake")
+
+    kube_env = PyromindSDK.__new__(PyromindSDK)
+    kube_env.sandbox_id = "sb-terminal"
+
+    async def write_ack(path):
+        acked.append(path)
+
+    kube_env.write_ack = write_ack  # type: ignore[method-assign]
+
+    resp = FakeResp()
+    session = SimpleNamespace(
+        id="exec-it", running=False, exit_code=None, tty_cols=100, tty_rows=30
+    )
+    protocol = FakeProtocol()
+
+    handled = await asyncio.wait_for(
+        mod._hijack_pyromind_terminal(
+            FakeRequest(protocol),
+            resp,
+            protocol,
+            session,
+            kube_env,
+            True,
+            cmd=["sh", "-i"],
+            cwd="/workspace",
+            marker=marker,
+            ack_path=ack_path,
+        ),
+        timeout=5,
+    )
+    assert handled is True
+    # ``create_task(write_ack(...))`` 需要一次调度才跑完。
+    await asyncio.sleep(0.05)
+    return resp, captured["ws"], session, acked
+
+
+@pytest.mark.asyncio
+async def test_terminal_prompt_reaches_the_client_without_waiting(monkeypatch):
+    """带结束标记时，**提示符必须在下一帧到达之前就送到客户端**。
+
+    这是用户 2026-10-15 报的"``docker exec -it`` 卡住、像一直连不上"的回归测试：
+    PTY 第一条输出就是提示符（2 字节），被那个**无条件**的 47 字节 holdback 扣在
+    缓冲里 ⇒ 只要没有别的输出，客户端一个字节也收不到。旧实现只在流结束时靠兜底
+    刷新把它放出来，所以"最终内容"分不出区别 —— ``probe`` 看的是**时机**。
+    """
+    import aiohttp
+
+    probe: list[int] = []
+    resp, _ws, session, acked = await _drive_terminal_bridge(
+        monkeypatch,
+        [
+            (aiohttp.WSMsgType.BINARY, b"# "),
+            (aiohttp.WSMsgType.BINARY, b"$ "),
+            (aiohttp.WSMsgType.CLOSE, None),
+        ],
+        marker=_MARKER,
+        ack_path="/tmp/.drt-ack-test",
+        probe=probe,
+    )
+
+    assert probe[0] == 1, (
+        "提示符被结束标记的 holdback 扣住了 —— 交互式 exec 会表现为全黑屏/卡在建连"
+    )
+    assert resp.written == [b"# ", b"$ "], (
+        "每一小段输出都必须立刻发出去，不能被合并/延迟（旧实现留 47 字节才发）"
+    )
+    # 没出现标记，就不能落回执（否则生产者会提前退出，尾部丢掉）。
+    assert acked == []
+    assert session.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_still_strips_a_marker_split_across_frames(monkeypatch):
+    """收紧 holdback 之后，"标记被拆帧"的保护必须还在。
+
+    标记的前半截留在尾部（不能发出去），下一帧补齐后整体摘掉，并在那一刻落回执。
+    """
+    import aiohttp
+
+    head, tail = _MARKER[:8], _MARKER[8:]
+    resp, _ws, _session, acked = await _drive_terminal_bridge(
+        monkeypatch,
+        [
+            (aiohttp.WSMsgType.BINARY, b"done\r\n" + head.encode()),
+            (aiohttp.WSMsgType.BINARY, tail.encode() + b"\r\n"),
+            (aiohttp.WSMsgType.CLOSE, None),
+        ],
+        marker=_MARKER,
+        ack_path="/tmp/.drt-ack-split",
+    )
+
+    joined = b"".join(resp.written)
+    assert joined == b"done\r\n"
+    assert _MARKER.encode() not in joined, "标记绝不能漏给用户"
+    assert acked == ["/tmp/.drt-ack-split"]
+
+
 @pytest.mark.asyncio
 async def test_exec_resize_is_stored_and_forwarded(aiohttp_client, fake_kube: FakeKubeEnv):
     """`POST /exec/{id}/resize` must be kept, not dropped.
@@ -1303,8 +1551,13 @@ async def test_stdin_eof_does_not_teardown_the_session(monkeypatch):
     """``-i`` 的 stdin EOF ≠ 会话结束：发 Ctrl-D 近似 EOF，**输出继续泵到命令结束**。
 
     2026-10-14：``docker exec -i c 'echo hi' </dev/null``（瞬时 EOF）会把整个会话
-    连同还没传的输出一起拆掉 ⇒ 输出为空。Docker 的 ``-i`` 语义是"stdin 关了，命令
-    继续跑到自然结束"。PTY 传不了真 EOF ⇒ 发 Ctrl-D(0x04) 近似，等 WS 关闭。
+    连同还没传的输出一起拆掉 ⇒ 输出为空。Docker 的 ``-i`` 语义是"stdin 关了，
+    命令继续跑到自然结束"。PTY 传不了真 EOF ⇒ 发 Ctrl-D(0x04) 近似，等 WS 关闭。
+
+    ⚠️ 2026-10-15 修正：这里的"EOF"必须是**客户端半关闭**（``eof_received``），
+    **不能**是 ``request.content.readany()`` 的 ``b""`` —— upgrade 之后 payload
+    早就 EOF，``readany()`` 每次调用都立刻返回 ``b""``。拿它当 EOF 信号会让每条
+    ``docker exec -it`` 一进 shell 就收到 Ctrl-D 并立刻退出（用户报的"进去就退"）。
     """
     import asyncio
     import aiohttp
@@ -1313,8 +1566,9 @@ async def test_stdin_eof_does_not_teardown_the_session(monkeypatch):
     from .. import aio_server as mod
 
     class _FakeTerminalWS:
-        def __init__(self, frames):
+        def __init__(self, frames, tail_wait: float = 0.0):
             self._frames = list(frames)
+            self._tail_wait = tail_wait
             self.sent: list[bytes] = []
 
         def __aiter__(self):
@@ -1322,6 +1576,10 @@ async def test_stdin_eof_does_not_teardown_the_session(monkeypatch):
 
         async def __anext__(self):
             if not self._frames:
+                if self._tail_wait:
+                    # 模拟"WS 还开着"：给 stdin 泵留出可观察的时间窗
+                    await asyncio.sleep(self._tail_wait)
+                    self._tail_wait = 0.0
                 raise StopAsyncIteration
             return self._frames.pop(0)
 
@@ -1347,14 +1605,17 @@ async def test_stdin_eof_does_not_teardown_the_session(monkeypatch):
         async def ws_connect(self, _url, **_kwargs):
             return self._ws
 
-    class _EofContent:
-        """第一次 readany 直接 EOF（等价于 ``</dev/null``）。"""
+    class _Proto:
+        """最小替身：upgrade 之后客户端字节落在 ``_message_tail``。"""
 
-        async def readany(self):
-            return b""
+        _message_tail = b""
+
+        def eof_received(self):  # 会被 docker-rt 的钩子换掉
+            return None
 
     ws = _FakeTerminalWS(
-        [SimpleNamespace(type=aiohttp.WSMsgType.BINARY, data=b"hello\r\n")]
+        [SimpleNamespace(type=aiohttp.WSMsgType.BINARY, data=b"hello\r\n")],
+        tail_wait=0.4,
     )
     monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: _FakeSession(ws, **k))
     monkeypatch.setattr(mod, "_pyromind_terminal_url", lambda *a, **k: "ws://fake")
@@ -1380,16 +1641,79 @@ async def test_stdin_eof_does_not_teardown_the_session(monkeypatch):
         tty_rows=0,
     )
     kube_env = SimpleNamespace(sandbox_id="sb-1")
-    request = SimpleNamespace(protocol=None, transport=None, content=_EofContent())
+    protocol = _Proto()
+    # 真实路径里这两步由 _begin_tcp_upgrade 完成
+    mod._keep_transport_after_client_eof(protocol)
+    request = SimpleNamespace(protocol=protocol, transport=None, content=None)
 
-    handled = await mod._hijack_pyromind_terminal(
-        request, _Resp(), None, session, kube_env, False, cmd=["bash"]
+    task = asyncio.create_task(
+        mod._hijack_pyromind_terminal(
+            request, _Resp(), protocol, session, kube_env, False, cmd=["bash"]
+        )
     )
+
+    async def drive_client() -> None:
+        await asyncio.sleep(0.1)
+        # 用户敲下的字：101 之后的数据只可能出现在 _message_tail
+        protocol._message_tail += b"echo hi\n"
+        await asyncio.sleep(0.15)
+        # 客户端半关闭 stdin（``</dev/null`` 或用户按 Ctrl-D）
+        assert protocol.eof_received() is True
+
+    try:
+        await drive_client()
+        handled = await task
+    finally:
+        mod._client_eof_events.pop(id(protocol), None)
+
     assert handled is True
     # 输出没有跟着 EOF 一起被拆掉
     assert b"hello\n" in b"".join(written)
+    # keystrokes 必须真的被搬到 PTY —— "进去就退/敲不了字" 的回归点
+    assert b"echo hi\n" in ws.sent, f"stdin 没被搬走，实际 sent={ws.sent}"
     # EOF 时向 PTY 发了 Ctrl-D 近似
     assert b"\x04" in ws.sent
+
+
+def test_upgraded_stdin_is_taken_from_the_message_tail() -> None:
+    """101 之后 stdin **只**在 ``_message_tail``；取走必须清空（否则重复发给 PTY）。"""
+    from .. import aio_server as mod
+
+    class _Proto:
+        _message_tail = b""
+
+    protocol = _Proto()
+    assert mod._take_client_stdin(protocol) == b""
+    protocol._message_tail = b"ls -l\n"
+    assert mod._take_client_stdin(protocol) == b"ls -l\n"
+    assert protocol._message_tail == b""
+
+
+def test_half_close_hook_is_scoped_to_hijacked_connections() -> None:
+    """半关闭钩子：只保留 hijack 连接的 transport，别的连接交回 aiohttp 原生行为。
+
+    钩子必须打在**类**上 —— ``RequestHandler`` 是 ``__slots__`` 类，实例赋值
+    ``eof_received`` 会 ``AttributeError: … is read-only``（aiohttp 3.14 实测），
+    旧写法因此静默失效：``docker exec -i … </dev/null`` 的输出仍会丢。
+    """
+    from .. import aio_server as mod
+
+    class _Proto:
+        def eof_received(self):  # 未登记时保持原生行为
+            return None
+
+    plain = _Proto()
+    assert plain.eof_received() is None
+
+    hijacked = _Proto()
+    mod._keep_transport_after_client_eof(hijacked)
+    try:
+        assert hijacked.eof_received() is True, "FIN 不能在命令还没结束时拆掉连接"
+        assert mod._client_stdin_eof(hijacked) is True
+        # 同一个类上的钩子，对**没登记**的连接仍然返回 None
+        assert plain.eof_received() is None
+    finally:
+        mod._client_eof_events.pop(id(hijacked), None)
 
 
 @pytest.mark.asyncio
@@ -1489,3 +1813,149 @@ async def test_hijack_foreground_run_returns_a_response(monkeypatch: Any) -> Non
     )
     assert "foreground" in calls, f"前台 run 必须走 exec，实际调用={calls}"
     assert session.exit_code == 7
+
+
+@pytest.mark.asyncio
+async def test_interactive_fallback_matches_the_exec_stream_signature(monkeypatch):
+    """terminal 打不开时回落到 exec stream —— 调用必须与真实签名逐字相符。
+
+    2026-08-15 之后的这条路上，调用点曾经多传了一个 ``foreground_cmd=``
+    （``_stream_pyromind_exec`` 根本不接这个参数）。它只在"terminal 打不开、
+    回落到 exec stream"时才走到，于是 ``docker exec -i/-t`` 一旦回落就得到
+    ``TypeError``，用户连"已回落、stdin 不透传"的提示都看不到。
+
+    替身照抄真实签名 ⇒ 多传或漏传一个关键字都会让这条测试失败。
+    """
+    from .. import aio_server as mod
+    from ..backend.pyromind_sdk_env import PyromindSDK
+
+    class _Protocol:
+        def force_close(self):
+            return None
+
+    class _Resp:
+        def __init__(self):
+            self.written: list[bytes] = []
+
+        async def write(self, chunk):
+            self.written.append(chunk)
+
+        async def drain(self):
+            return None
+
+        def force_close(self):
+            return None
+
+    class _Request:
+        def __init__(self, protocol):
+            self.protocol = protocol
+            self.transport = None
+            self.content = None
+
+    kube_env = PyromindSDK.__new__(PyromindSDK)
+    kube_env.sandbox_id = "sb-test"
+    kube_env.working_dir = "/"
+
+    async def terminal(*args, **kwargs):
+        return False  # 打不开 ⇒ 必须回落
+
+    calls: dict[str, object] = {}
+
+    async def stream(
+        *,
+        resp,
+        kube_env,
+        cmd,
+        tty=False,
+        session_id="",
+        cwd="",
+        marker="",
+        ack_path="",
+        stdin_close=None,
+    ):
+        calls["cmd"] = cmd
+        calls["stdin_close"] = stdin_close
+        return 3
+
+    monkeypatch.setattr(mod, "_hijack_pyromind_terminal", terminal)
+    monkeypatch.setattr(mod, "_stream_pyromind_exec", stream)
+
+    protocol = _Protocol()
+    resp = _Resp()
+    session = SimpleNamespace(
+        id="exec-fallback", running=False, exit_code=None, tty_cols=80, tty_rows=24
+    )
+
+    await asyncio.wait_for(
+        mod._hijack_session(
+            _Request(protocol),
+            resp,
+            protocol,
+            session,
+            kube_env,
+            ["cat"],
+            False,
+            stdin=True,
+            cwd="",
+        ),
+        timeout=2,
+    )
+
+    assert "cmd" in calls, "terminal 打不开必须回落到 exec stream"
+    assert session.exit_code == 3
+    assert any(
+        b"interactive terminal unavailable" in chunk for chunk in resp.written
+    ), "回落必须说出来（那条通道没有 PTY，stdin 不会被透传）"
+
+
+@pytest.mark.asyncio
+async def test_platform_error_code_reaches_the_exec_stream():
+    """平台报的错**带错误码**时必须一路传到客户端。
+
+    k8s-middleware 现在会在"上游 exec 流断了、命令没给出退出码"时回
+    ``{"type":"error","code":"EXEC_STREAM_LOST"}``（而不是以前那个假装结束的
+    ``{"type":"exit","returncode":-1}``）。这个码对调用方的含义和
+    ``EXEC_STREAM_RELAY_FAILED`` 完全不同 —— 前者是"命令可能已经跑过，**不要盲目
+    重试**"。只把人话文本打出去的话，这个区分就丢了。
+    """
+    from .. import aio_server as mod
+    from ...exec_stream import SandboxExecStreamError
+
+    message = (
+        "the container command did not report an exit status: the kube exec "
+        "stream was lost; 4096 stdout / 0 stderr bytes had already been delivered"
+    )
+
+    class _ExplodingEnv:
+        def iter_exec_stream(self, _cmd, **_kwargs):
+            async def _gen():
+                raise SandboxExecStreamError(message, "EXEC_STREAM_LOST")
+                yield  # pragma: no cover - 只为了让它是个 async generator
+
+            return _gen()
+
+    class _Resp:
+        def __init__(self):
+            self.written: list[bytes] = []
+
+        async def write(self, data):
+            self.written.append(data)
+
+        async def drain(self):
+            return None
+
+    resp = _Resp()
+    code = await mod._stream_pyromind_exec(
+        resp=resp,
+        kube_env=_ExplodingEnv(),
+        cmd=["sh", "-c", "true"],
+        tty=False,
+        session_id="exec-lost",
+        cwd="",
+    )
+
+    text = b"".join(resp.written)
+    assert code == 1
+    assert b"EXEC_STREAM_LOST" in text, "错误码必须打出来（agent 靠它决定要不要重试）"
+    assert b"did not report an exit status" in text, "平台给的原因不能被吞掉"
+    assert b"4096 stdout" in text, "已发字节数也要带出来"
