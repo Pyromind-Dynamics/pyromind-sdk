@@ -141,16 +141,19 @@ def resolve_image_name(ref: str, names: Iterable[str]) -> str | None:
 @router.get("/images/json")
 async def list_images(request: Request) -> list[dict[str, Any]]:
     store = request.app.state.store
-    default = getattr(request.app.state, "default_image", None) or DEFAULT_IMAGE
-    names = {default} | store.known_images()
-    return [to_image_summary(n) for n in sorted(names)]
+    # **只列真实存在的镜像**：默认镜像（仅在 create/run 未给 Image 时才使用）
+    # 不算"本地已有镜像"，否则用户没拉过镜像也会在 docker images 里看到它
+    # （2026-10-15 用户报：SWE-bench 默认镜像凭空出现）。
+    return [to_image_summary(n) for n in sorted(store.known_images())]
 
 
 @router.get("/images/{name:path}/json")
 async def inspect_image_route(request: Request, name: str) -> dict[str, Any]:
     store = request.app.state.store
     default = getattr(request.app.state, "default_image", None) or DEFAULT_IMAGE
-    names = {default} | store.known_images()
+    names = store.known_images() - {
+        getattr(request.app.state, "default_image", None) or DEFAULT_IMAGE
+    }  # 隐式默认镜像不算"本地已有"（用户没显式拉/用过就不该看到）
     resolved = resolve_image_name(name, names)
     if resolved is None:
         from fastapi import HTTPException
