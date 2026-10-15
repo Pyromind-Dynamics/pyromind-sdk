@@ -417,6 +417,31 @@ async def _write_exec_error(
         pass
 
 
+def _marker_holdback(buf: "bytearray", marker: bytes) -> int:
+    """为了防"标记被拆帧"，``buf`` 尾部**必须**留多少字节不发。
+
+    结束标记会出现在流的任意位置，而它完全可能被切成两帧（第一帧末尾是标记的
+    前半截）。所以最后一截必须先攒着，等下一帧到了再判断。
+
+    ⚠️ 但**只能留"真的可能是标记前缀"的那几字节**。这里原来是**无条件**留
+    ``len(marker)+1`` 字节（实测标记长 46 ⇒ 留 47），于是任何一次读取只要不足
+    47 字节就**一个字节都发不出去**。对 PTY 通道（stdout/stderr 合并成一条流）
+    这是致命的：交互式 shell 的提示符只有 ``# ``（2 字节）—— 用户 ``docker exec
+    -it c sh`` 之后屏幕上**永远是一片空白**，看着就像"卡在连接"；此后每个字符的
+    回显都落后 47 字节，用户狂敲 Enter / Ctrl-C 才看到一串迟到的 ``#`` 涌出来
+    （2026-10-15 用户报的"卡住 + ctrl+c 也停止不了"）。这是**数据延迟**，不是
+    丢数据 —— 所以症状才会是"显示得很怪"而不是"输出不全"。
+    """
+    if not marker:
+        return 0
+    # 只可能是"标记的前缀"，所以最多 len(marker)-1 字节；完整的标记由调用方的
+    # ``find`` 处理掉（那一路会连它一起消费）。
+    for size in range(min(len(marker) - 1, len(buf)), 0, -1):
+        if bytes(buf[-size:]) == marker[:size]:
+            return size
+    return 0
+
+
 async def _stream_pyromind_exec(
     *,
     resp: web.StreamResponse,
@@ -439,9 +464,10 @@ async def _stream_pyromind_exec(
     returncode = -1
     out_n = 0
     err_n = 0
-    # 结束标记的滚动缓冲：标记可能被拆在两帧里，所以尾巴留 len(marker)+1 字节不急着发。
+    # 结束标记的滚动缓冲：标记可能被拆在两帧里，所以尾巴要留一截不急着发。
+    # 留多少由 :func:`_marker_holdback` 按"真的可能是标记前缀"算 —— **不是**
+    # 无条件 len(marker)+1（那会把不足 47 字节的输出整体扣住）。
     marker_bytes = marker.encode() if marker else b""
-    tail_keep = len(marker_bytes) + 1 if marker_bytes else 0
     err_buf = bytearray()
     ack_fired = False
 
@@ -467,10 +493,14 @@ async def _stream_pyromind_exec(
             payload += bytes(err_buf).lstrip(b"\r\n")
             err_buf.clear()
             return payload
-        if len(err_buf) <= tail_keep:
+        # ⚠️ 只留"可能是标记前缀"的那几字节，**不能**无条件留 len(marker)+1：
+        # 那会让任何一次不足 47 字节的 stderr 读取都发不出去（stderr 输出会整体
+        # 延迟到攒够 47 字节才可见）。见 :func:`_marker_holdback`。
+        hold = _marker_holdback(err_buf, marker_bytes)
+        if len(err_buf) <= hold:
             return b""
-        payload = bytes(err_buf[: len(err_buf) - tail_keep])
-        del err_buf[: len(err_buf) - tail_keep]
+        payload = bytes(err_buf[: len(err_buf) - hold])
+        del err_buf[: len(err_buf) - hold]
         return payload
 
     try:
@@ -518,12 +548,19 @@ async def _stream_pyromind_exec(
         # binary, a bad cwd, a sandbox that is not started. Historically it
         # was logged at DEBUG and dropped, so ``docker exec`` looked like it
         # simply did nothing. Report it on the stream instead.
+        #
+        # 平台自己给的错误码要**一起打出来**：``EXEC_STREAM_LOST``（上游流断了、
+        # 命令没给出退出码）和 ``EXEC_STREAM_RELAY_FAILED``（中继炸了）对调用方的
+        # 含义完全不同 —— 前者"命令可能已经跑过"，脚本/agent 该据此决定**不要盲目
+        # 重试**；只留一句人话文本的话，这个区分就丢了。
+        code = getattr(exc, "code", None)
+        reason = f"docker-rt: {exc}" + (f" [{code}]" if code else "")
         logger.warning(
             "pyromind exec stream failed id=%s: %s",
             session_id[:12] or "?",
             exc,
         )
-        await _write_exec_error(resp, f"docker-rt: {exc}", tty=tty)
+        await _write_exec_error(resp, reason, tty=tty)
         returncode = 1
     if returncode < 0:
         # 平台把退出码丢了（它自己的哨兵值 -1）。**零输出 + 零退出码**是"命令根本
@@ -3199,7 +3236,9 @@ def _force_close_hijack(request: web.Request, resp: web.StreamResponse) -> None:
     """Drop upgraded connection so aiohttp won't parse leftover raw bytes as HTTP."""
     protocol = request.protocol
     _mark_protocol_upgraded(protocol)
-    _keep_transport_after_client_eof(protocol)
+    # 会话结束了：把它从"半关闭也要保留 transport"的表里摘掉（那张表是给活跃会话
+    # 用的），免得 id 被复用后误伤后来的连接。
+    _client_eof_events.pop(id(protocol), None)
     try:
         protocol.force_close()
     except Exception:
@@ -3216,24 +3255,90 @@ def _force_close_hijack(request: web.Request, resp: web.StreamResponse) -> None:
             pass
 
 
+#: 每条 hijack（101 upgrade）连接的"客户端 stdin 已半关闭"事件。
+#: 用 ``id(protocol)`` 做键、而不是给 protocol 挂属性 —— ``RequestHandler`` 是
+#: ``__slots__`` 类（无 ``__dict__``），实例上既加不了新属性，也覆盖不了
+#: ``eof_received``，所以钩子只能打在类上，靠这张表区分"这是不是我们的连接"。
+#: 会话收尾时在 :func:`_force_close_hijack` 里摘掉，避免 id 复用误伤后来者。
+_client_eof_events: dict[int, asyncio.Event] = {}
+
+
 def _keep_transport_after_client_eof(protocol: Any) -> None:
     """客户端**半关闭**（stdin EOF，如 ``</dev/null``）时不让 asyncio 关掉连接。
 
-    asyncio 的默认行为：协议没实现 ``eof_received`` ⇒ 收到客户端 FIN 就关闭整个
-    transport ⇒ 之后我们写出去的输出**全部消失**。表现正好是 stderr 工单的形态：
-    ``docker exec -i c cmd </dev/null`` 一个字都不回（F 组实验：stdin 保持打开就有输出，
-    半关闭就没有 —— 2026-10-14）。
+    asyncio 的默认行为：协议没实现 ``eof_received``（aiohttp 的实现就是 ``pass``
+    ⇒ 返回 ``None``）就关闭整个 transport ⇒ 之后我们写出去的输出**全部消失**。
+    表现正好是 stderr 工单的形态：``docker exec -i c cmd </dev/null`` 一个字都不回
+    （F 组实验：stdin 保持打开就有输出，半关闭就没有 —— 2026-10-14）。
 
-    ``docker exec -i`` 的语义要求连接在 stdin 关闭后**仍然可写**，直到命令结束、
-    我们把输出发完。实现 ``eof_received -> True`` 就是告诉 asyncio「FIN 我收下了，
-    transport 保留」。只对 hijack 的连接设置，影响面限于 exec/attach 这条流。
+    钩子必须打在**类**上 —— ``RequestHandler`` 是 ``__slots__`` 类（实例没有
+    ``__dict__``），给实例赋值 ``protocol.eof_received = …`` 直接
+    ``AttributeError: 'RequestHandler' object attribute 'eof_received' is read-only``
+    （2026-10-15 本地实测，aiohttp 3.14）。旧写法正是给实例赋值，异常又被
+    ``except Exception: pass`` 吃掉 ⇒ 那个"修复"一直是**静默失效**的。
+
+    钩子只对登记过的 hijack 连接返回 ``True``（见 ``_client_eof_events``），
+    其它连接原样交回 aiohttp 的行为，影响面限于 exec/attach 这条流。
     """
     if protocol is None:
         return
+    _client_eof_events.setdefault(id(protocol), asyncio.Event())
+    cls = type(protocol)
+    if getattr(cls, "_drt_client_eof_hooked", False):
+        return
+
+    def eof_received(self: Any) -> Any:
+        event = _client_eof_events.get(id(self))
+        if event is None:
+            # 不是 hijack 连接：保持 aiohttp 的原生行为（None ⇒ 关连接）
+            return None
+        event.set()
+        # True ⇒ "FIN 我收下了，transport 保留"：命令可能还要继续吐输出。
+        return True
+
     try:
-        protocol.eof_received = lambda: True
+        cls.eof_received = eof_received  # type: ignore[method-assign]
+        cls._drt_client_eof_hooked = True
     except Exception:
-        pass
+        logger.debug("cannot hook eof_received on %s", cls, exc_info=True)
+
+
+def _client_stdin_eof(protocol: Any) -> bool:
+    """这个 hijack 连接上，客户端是否已经半关闭了 stdin。"""
+    if protocol is None:
+        return False
+    event = _client_eof_events.get(id(protocol))
+    return bool(event is not None and event.is_set())
+
+
+def _take_client_stdin(protocol: Any) -> bytes:
+    """取走 101 之后客户端发来的 stdin 字节（非阻塞；没有就是 ``b""``）。
+
+    ⚠️ **只能**看 ``protocol._message_tail``：upgrade 之后 aiohttp 不再往 payload
+    里喂数据（``web_protocol.data_received`` 的 upgraded 分支就是
+    ``self._message_tail += data``），``request.content.readany()`` 读到的只有
+    **请求体残留**，之后每次调用都**立刻返回 ``b""``**（2026-10-15 本地实测）。
+
+    把那个 ``b""`` 当成"客户端 stdin 关了"，正是"``docker exec -it`` 进去就退"
+    的根因：pump_in 第一轮就判定 EOF、给 PTY 发 Ctrl-D，shell 打印完提示符立刻退出。
+    """
+    tail = getattr(protocol, "_message_tail", None)
+    if not tail:
+        return b""
+    try:
+        protocol._message_tail = b""
+    except (AttributeError, TypeError):
+        # ⚠️ 清不掉就**绝不能**把 tail 返回去：调用方是"取到就转发"的循环（没有
+        # 退避），返回同一份字节等于每 20ms 往 PTY 重放一次 ⇒ 终端刷屏、Ctrl-C
+        # 都停不下来（比"丢这几个按键"严重得多）。宁可丢掉这一次输入。
+        logger.warning(
+            "cannot clear protocol._message_tail on %s; dropping %d bytes of "
+            "client stdin instead of replaying them in a loop",
+            type(protocol).__name__,
+            len(tail),
+        )
+        return b""
+    return bytes(tail)
 
 
 def _mark_protocol_upgraded(protocol: Any) -> None:
@@ -3690,6 +3795,10 @@ async def _hijack_session(
                     tty=tty,
                 )
         try:
+            # ⚠️ ``_stream_pyromind_exec`` 不接 ``foreground_cmd``（前台 run 的退出码
+            # 收尾在本函数下面自己做）。这里曾经把它当关键字传了进去 —— 那条路径
+            # 只在"terminal 打不开、回落到 exec stream"时才会走到，于是 ``docker
+            # exec -i/-t`` 一旦回落就得到 ``TypeError``，用户连回落的提示都看不到。
             session.exit_code = await _stream_pyromind_exec(
                 resp=resp,
                 kube_env=kube_env,
@@ -3697,35 +3806,18 @@ async def _hijack_session(
                 tty=tty,
                 session_id=getattr(session, "id", "") or "",
                 cwd=cwd,
-                foreground_cmd=foreground_cmd,
             )
         finally:
             session.running = False
             _force_close_hijack(request, resp)
 
-        # 前台 run 的收尾：退出码记入 record（唤醒 /wait）；--rm 则删容器
-        if foreground_cmd is not None:
-            code = int(getattr(session, "exit_code", -1) or -1)
-            record.foreground_exit_code = code
-            record.exit_code = code
-            record.finished_at = time.time()
-            await store.set_state(record, ContainerState.EXITED)
-            host_cfg = getattr(record, "host_config", None) or {}
-            if bool(host_cfg.get("AutoRemove")):
-                try:
-                    async with record.lock:
-                        if record.kube_env is not None:
-                            await _stop_port_forward(record)
-                            await call_environment_method(record.kube_env, "cleanup")
-                        record.kube_env = None
-                        record.sandbox_id = None
-                        await store.set_state(record, ContainerState.EXITED)
-                    await _release_service(record, request.app)
-                    networks.disconnect_container(record.id)
-                    await store.remove(record)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("foreground --rm cleanup failed: %s", exc)
-        return resp_out
+        # 前台 run 的收尾（退出码回写 record、`--rm` 清理）**不在这里做**：这一层
+        # 拿不到 ``record`` / ``store`` / ``networks`` —— 它们属于 attach 那条路径
+        # （见 ``attach_container``）。这里原来是从那里复制过来的残留，引用了三个
+        # 未定义的名字（``record`` / ``store`` / ``resp_out``）：真跑到就 ``NameError``。
+        # 而它本来就是死代码 —— 前台 run 一定 stdin/tty 都为假，早在上面 oneshot
+        # 分支就返回了。
+        return resp
 
     if isinstance(kube_env, PyromindSDK) and cmd is None:
         if not stdin and not tty and foreground_cmd:
@@ -4048,9 +4140,15 @@ async def _hijack_pyromind_terminal(
 
             async def pump_out() -> None:
                 # 结束标记的滚动缓冲（PTY 是合并流，没有 stderr 通道可分辨）：
-                # 标记可能被拆在两次读取里，所以尾巴留 len(marker)+1 字节不急着发。
+                # 标记可能被拆在两次读取里，所以尾巴要留一截不急着发。
+                #
+                # ⚠️ 这一截必须由 :func:`_marker_holdback` 算（只留"真的可能是标记
+                # 前缀"的字节）。原来无条件留 ``len(marker)+1`` = 47 字节，于是
+                # 交互式 shell 的提示符 ``# ``（2 字节）**一个字节都发不出去** ——
+                # 用户 ``docker exec -it c sh`` 看到的是**全黑屏**，像卡在建连；
+                # 之后每个字符的回显都落后 47 字节，用户猛敲 Enter/Ctrl-C 只会
+                # 看到一串迟到的 ``#`` 涌出来（2026-10-15 用户实测症状）。
                 marker_bytes = marker.encode() if marker else b""
-                tail_keep = len(marker_bytes) + 1 if marker_bytes else 0
                 filter_buf = bytearray()
                 ack_fired = False
 
@@ -4071,10 +4169,11 @@ async def _hijack_pyromind_terminal(
                         payload += bytes(filter_buf).lstrip(b"\r\n")
                         filter_buf.clear()
                         return payload
-                    if len(filter_buf) <= tail_keep:
+                    hold = _marker_holdback(filter_buf, marker_bytes)
+                    if len(filter_buf) <= hold:
                         return b""
-                    payload = bytes(filter_buf[: len(filter_buf) - tail_keep])
-                    del filter_buf[: len(filter_buf) - tail_keep]
+                    payload = bytes(filter_buf[: len(filter_buf) - hold])
+                    del filter_buf[: len(filter_buf) - hold]
                     return payload
 
                 async for msg in ws:
@@ -4148,52 +4247,41 @@ async def _hijack_pyromind_terminal(
             async def pump_in() -> None:
                 """客户端 stdin → PTY。
 
-                **stdin 半关闭（EOF）≠ 会话结束** —— Docker 的 ``-i`` 语义是
-                「stdin 关了，命令继续跑到自然结束」。之前这里把 EOF 当成"客户端走了"，
-                ``finally`` 里直接 ``session_over.set()``：``docker exec -i c 'echo hi'
-                </dev/null``（瞬时 EOF）会把还没来得及传输的输出**连同会话一起拆掉**
-                ⇒ 输出为空（stderr 工单的同族现象，2026-10-14 复现）。
+                ⚠️ stdin **只**能从 ``protocol._message_tail`` 取（见
+                :func:`_take_client_stdin`）。旧实现在没有 tail 时读
+                ``request.content.readany()`` 并把它的 ``b""`` 当"客户端 stdin 关了"
+                —— 而 upgrade 之后 payload 早已 EOF，``readany()`` 每次都立刻返回
+                ``b""``（2026-10-15 本地实测）：于是**每条 ``docker exec -it`` 一进
+                shell 就给 PTY 发 Ctrl-D**，提示符刚打出来进程就没了 —— 用户报的
+                "进去就退/根本敲不了字"就是这个（keystrokes 全部堆在
+                ``_message_tail``，一个字节都没被搬走）。
 
-                PTY 传不了真 EOF，用 **Ctrl-D（0x04）** 近似：交互 shell 的行规程里
-                它就是 EOF；对一次性命令（``bash -c …``，不在读 stdin）是多余的无害
-                字节。EOF 之后**只停 stdin 泵、继续泵输出**，直到 terminal WS 关闭
-                （命令结束）。客户端真正断开由 ``pump_out`` 的 write 失败兜底。
+                **stdin 半关闭（EOF）≠ 会话结束** —— Docker 的 ``-i`` 语义是
+                「stdin 关了，命令继续跑到自然结束」。真的半关闭由
+                :func:`_keep_transport_after_client_eof` 记成事件；PTY 传不了真 EOF，
+                用 **Ctrl-D（0x04）** 近似（交互 shell 的行规程里它就是 EOF；对一次性
+                命令是多余的无害字节），之后**继续泵输出**，直到 terminal WS 关闭。
+                客户端真正断开由 ``pump_out`` 的 write 失败兜底。
                 """
-                eof = False
+                eof_sent = False
                 try:
-                    while not session_over.is_set() and not eof:
-                        data = b""
-                        tail = getattr(protocol, "_message_tail", b"") or b""
-                        if tail:
-                            try:
-                                protocol._message_tail = b""
-                            except (AttributeError, TypeError):
-                                pass
-                            data = tail
-                        else:
-                            try:
-                                more = await asyncio.wait_for(
-                                    request.content.readany(), timeout=0.05
-                                )
-                            except asyncio.TimeoutError:
-                                await asyncio.sleep(0.02)
-                                continue
-                            if not more:
-                                # EOF：stdin 半关闭。停泵，但**不**结束会话。
-                                eof = True
-                                break
-                            data = more
+                    while not session_over.is_set():
+                        data = _take_client_stdin(protocol)
                         if data:
                             await ws.send_bytes(data)
-                    if eof and not session_over.is_set():
-                        try:
-                            await ws.send_bytes(b"\x04")
-                            logger.debug(
-                                "pyromind terminal stdin EOF -> EOT, draining "
-                                "output until the command ends"
-                            )
-                        except Exception:
-                            pass
+                            continue
+                        if not eof_sent and _client_stdin_eof(protocol):
+                            eof_sent = True
+                            try:
+                                await ws.send_bytes(b"\x04")
+                                logger.debug(
+                                    "pyromind terminal stdin EOF -> EOT, draining "
+                                    "output until the command ends"
+                                )
+                            except Exception:
+                                pass
+                            continue
+                        await asyncio.sleep(0.02)
                 except Exception as exc:
                     logger.debug("pyromind terminal stdin end: %s", exc)
                     session_over.set()

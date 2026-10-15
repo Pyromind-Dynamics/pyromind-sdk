@@ -261,6 +261,8 @@ Kaniko 执行器镜像必须包含 shell 和 `sleep`，应使用兼容的 `-debu
 | 构建无法启动 | 检查构建器镜像是否可拉取、是否包含 shell 和 `sleep`；若 Sandbox 因 OOM 被终止，可增加内存。 |
 | 构建完成但推送失败 | 检查仓库连通性和凭据；镜像归档可能仍保存在 `/workspace/docker_images/`。 |
 | 仅归档构建后 `docker run` 失败 | 归档位于 workspace storage，不会自动注册为集群镜像；要通过 docker-rt 运行，请推送到集群可访问的仓库。 |
+| `docker exec` 报 `[EXEC_STREAM_LOST]` | **平台自己告诉你原因了**：上游（kubelet/apiserver）的 exec 流在命令给出退出码之前断了（`[EXEC_STREAM_RELAY_FAILED]` 同理，只是断在中继而不是上游）。消息里带着诊断和"已经发给你多少字节"：`0 stdout / 0 stderr` 几乎可以断定命令没跑起来；已经收到输出则是命令跑过、只是尾部/退出码丢了 —— 这种**不要盲目重试**（命令可能已产生副作用）。只对幂等命令重试。 |
+| `docker exec` 偶发报 `docker-rt: exec stream connection lost before any exit event` | **没拿到任何原因**：exec 的 WebSocket 被平台之外的东西中途切断（代理 / LB / 空闲超时 / 网络重置 / 服务端重启），连错误帧都没送到。报错里带着"活了多久、收到多少字节"，读法和上面一行相同。若频繁出现，检查服务进程所在环境是否设置了 `HTTP_PROXY` / `HTTPS_PROXY`（exec 走 WebSocket，代理对长连接的处理远不如 HTTP 稳），必要时给集群域名设 `NO_PROXY`。 |
 
 ## 测试
 

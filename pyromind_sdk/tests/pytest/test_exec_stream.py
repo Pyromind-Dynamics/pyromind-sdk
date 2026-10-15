@@ -281,3 +281,101 @@ def test_polling_timeout_never_drops_ws_frames(
     got = "".join(c.data for c in chunks if c.type == "stdout")
     assert got == "".join(payloads), "轮询超时丢了帧 ⇒ 大输出会随机缺数据"
     assert chunks[-1].type == "exit"
+
+
+# ---------------------------------------------------------------------------
+# 收帧不能跟着消费者的节奏停：aiohttp 的 autoping（回 PONG）发生在
+# ``ws.receive()`` 内部，消费者一慢（``resp.drain()`` 背压、写下游卡住），
+# 服务端的 keepalive ping 就无人应答，连接被服务端直接放掉 —— 用户看到的是
+# "exec stream connection lost before any exit event"，与"命令真的失败了"无法区分。
+# ---------------------------------------------------------------------------
+
+
+def test_slow_consumer_still_keeps_receiving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    import json
+
+    from pyromind_sdk.exec_stream import iter_exec_stream_async
+
+    payloads = [f"chunk-{i}" for i in range(3)]
+    receives: list[float] = []
+    consumer_sleeps: list[tuple[float, float]] = []
+
+    class _TimestampedWS(_FakeWS):
+        async def receive(self):
+            import asyncio as _asyncio
+
+            # 真实 socket 上 receive 会阻塞到下一帧；这里用 0.15s 模拟这段等待，
+            # 时间戳记在"这一帧收完"的时刻。
+            await _asyncio.sleep(0.15)
+            receives.append(_asyncio.get_running_loop().time())
+            return await super().receive()
+
+    messages = [
+        types.SimpleNamespace(
+            type=aiohttp.WSMsgType.TEXT,
+            data=json.dumps({"type": "stdout", "data": p}),
+        )
+        for p in payloads
+    ]
+    messages.append(
+        types.SimpleNamespace(
+            type=aiohttp.WSMsgType.TEXT,
+            data=json.dumps({"type": "exit", "returncode": 0}),
+        )
+    )
+    ws = _TimestampedWS(messages)
+    _install_fake_ws(monkeypatch, ws)
+
+    async def collect():
+        out = []
+        async for chunk in iter_exec_stream_async(
+            url="ws://fake/exec", command=["echo", "hi"]
+        ):
+            out.append(chunk)
+            if chunk.type == "stdout":
+                loop = asyncio.get_running_loop()
+                start = loop.time()
+                await asyncio.sleep(0.3)
+                consumer_sleeps.append((start, loop.time()))
+        return out
+
+    chunks = asyncio.run(collect())
+
+    assert "".join(c.data for c in chunks if c.type == "stdout") == "".join(payloads)
+    assert consumer_sleeps, "测试自身没造出慢消费者"
+    assert any(
+        start < when < end
+        for start, end in consumer_sleeps
+        for when in receives
+    ), (
+        "消费者暂停期间没有任何 receive 在跑 ⇒ PING 无人应答，"
+        "服务端 keepalive 超时就会把连接放掉"
+    )
+
+
+def test_loss_context_reports_elapsed_time_and_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """断连错误必须自带上下文：活了多久、收到多少 —— 否则根因无从分辨。"""
+    ws = _FakeWS(
+        [
+            aiohttp.WSMessage(
+                aiohttp.WSMsgType.TEXT,
+                '{"type":"stdout","data":"partial"}',
+                None,
+            ),
+            aiohttp.WSMessage(aiohttp.WSMsgType.CLOSED, None, None),
+        ]
+    )
+    _install_fake_ws(monkeypatch, ws)
+
+    with pytest.raises(SandboxExecStreamError) as excinfo:
+        _collect(command="ls /")
+
+    message = str(excinfo.value)
+    assert "connection lost" in message
+    assert "received 7 stdout / 0 stderr bytes" in message
+    assert "after " in message
