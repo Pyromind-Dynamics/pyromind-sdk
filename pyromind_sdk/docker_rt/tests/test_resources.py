@@ -65,7 +65,7 @@ async def test_create_memory_label_passed_to_start(
     )
     assert resp.status == 201, await resp.text()
     cid = (await resp.json())["Id"]
-    assert (await client.post(f"/containers/{cid}/start")).status == 204
+    assert (await client.post(f"/containers/{cid}/start")).status in (204, 304)  # create 已顺带启动 ⇒ 304 也合法
     assert captured.get("memory_limit") == "8Gi"
     assert captured.get("memory_request") == "8Gi"
 
@@ -101,7 +101,7 @@ async def test_create_memory_from_docker_m(
     )
     assert resp.status == 201, await resp.text()
     cid = (await resp.json())["Id"]
-    assert (await client.post(f"/containers/{cid}/start")).status == 204
+    assert (await client.post(f"/containers/{cid}/start")).status in (204, 304)  # create 已顺带启动 ⇒ 304 也合法
     assert captured.get("memory_limit") == "8Gi"
     assert captured.get("memory_request") == "2Gi"
 
@@ -168,7 +168,7 @@ async def test_create_cpu_label_passed_to_start(
     )
     assert resp.status == 201, await resp.text()
     cid = (await resp.json())["Id"]
-    assert (await client.post(f"/containers/{cid}/start")).status == 204
+    assert (await client.post(f"/containers/{cid}/start")).status in (204, 304)  # create 已顺带启动 ⇒ 304 也合法
     assert captured.get("cpu_limit") == "4"
     # create-API cpu is unit-less cores — never K8s milli syntax
     assert captured.get("cpu_request") == "0.5"
@@ -205,7 +205,7 @@ async def test_create_cpu_from_docker_cpus(
     )
     assert resp.status == 201, await resp.text()
     cid = (await resp.json())["Id"]
-    assert (await client.post(f"/containers/{cid}/start")).status == 204
+    assert (await client.post(f"/containers/{cid}/start")).status in (204, 304)  # create 已顺带启动 ⇒ 304 也合法
     assert captured.get("cpu_limit") == "2"
     assert captured.get("cpu_request") == "1"
 
@@ -360,7 +360,7 @@ async def test_create_fractional_cpus_and_memory(
     )
     assert resp.status == 201, await resp.text()
     cid = (await resp.json())["Id"]
-    assert (await client.post(f"/containers/{cid}/start")).status == 204
+    assert (await client.post(f"/containers/{cid}/start")).status in (204, 304)  # create 已顺带启动 ⇒ 304 也合法
 
     assert captured.get("cpu_limit") == "0.1"
     assert captured.get("cpu_request") == "0.05"
@@ -404,13 +404,15 @@ def test_derived_request_rounds_up_without_rejecting_legal_limits() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_rejects_foreground_attach_before_creating(
+async def test_create_allows_foreground_run_shape(
     aiohttp_client: Any, fake_kube: Any
 ) -> None:
-    """`docker run img`（无 -d/-i/-t）必须在 create 阶段就拒绝。
+    """`docker run img` / `docker create`（无 -d/-i/-t）**必须能创建**。
 
-    以前是 attach 阶段才拦 —— sandbox 已经创建并启动，控制台里多出一个
-    用户没要的实例。现在 create 直接 400，什么都不建。
+    2026-10-15：以前这里对"attach stdout/stderr 且无 stdin/tty"直接 400，可 docker CLI
+    的 `create` 默认就带 AttachStdout/AttachStderr ⇒ 连纯 `docker create` 都被挡掉。
+    现在前台 run 由 attach 阶段用 exec 跑这条 Cmd（容器常驻 + exec 干活），
+    所以 create 一律放行，且 Cmd 要留在记录里给 attach 用。
     """
     from .. import aio_server as mod
     from ..aio_server import create_aio_app
@@ -425,7 +427,6 @@ async def test_create_rejects_foreground_attach_before_creating(
     mod.start_kube_environment = _start  # type: ignore
     client = await aiohttp_client(app)
 
-    # docker CLI 前台 run 的真实签名：attach stdout/stderr，无 tty、无 stdin
     resp = await client.post(
         "/containers/create?name=fg1",
         json={
@@ -437,12 +438,15 @@ async def test_create_rejects_foreground_attach_before_creating(
             "Tty": False,
         },
     )
-    assert resp.status == 400, await resp.text()
-    assert "foreground attach" in await resp.text()
-    assert started == []  # 没有任何 create 请求发往 k8s-middleware
-    assert app["store"]._containers == {}  # store 里什么都没留下
+    assert resp.status == 201, await resp.text()
+    cid = (await resp.json())["Id"]
+    record = app["store"].get(cid)
+    assert record is not None
+    assert list(record.cmd) == ["sleep", "1h"], "Cmd 必须留着给 attach 用 exec 跑"
+    # 注意：sandbox 是 **start 时才懒创建** 的，所以这里 started 仍是空的 ✓
+    assert app["store"]._containers, "store 里应留下这个容器记录"
 
-    # -it（交互）仍然可以创建
+    # -it（交互）同样可以创建
     resp_it = await client.post(
         "/containers/create?name=it1",
         json={
@@ -455,34 +459,6 @@ async def test_create_rejects_foreground_attach_before_creating(
         },
     )
     assert resp_it.status == 201, await resp_it.text()
-
-    # -i（无 tty，走 terminal PTY）也可以
-    resp_i = await client.post(
-        "/containers/create?name=i1",
-        json={
-            "Image": "ubuntu:22.04",
-            "Cmd": ["sleep", "1h"],
-            "AttachStdin": True,
-            "AttachStdout": True,
-            "AttachStderr": True,
-            "Tty": False,
-        },
-    )
-    assert resp_i.status == 201, await resp_i.text()
-
-    # -d（不 attach）也可以
-    resp_d = await client.post(
-        "/containers/create?name=d1",
-        json={
-            "Image": "ubuntu:22.04",
-            "Cmd": ["sleep", "1h"],
-            "AttachStdin": False,
-            "AttachStdout": False,
-            "AttachStderr": False,
-            "Tty": False,
-        },
-    )
-    assert resp_d.status == 201, await resp_d.text()
 
 
 def test_default_node_selector(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -524,3 +500,43 @@ def test_resolve_gpu_resources(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     assert count == "1"
     assert card == "H100"
+
+
+@pytest.mark.asyncio
+async def test_wait_returns_foreground_run_exit_code(
+    aiohttp_client: Any, fake_kube: Any
+) -> None:
+    """前台 run 的退出码由 exec 产生，容器本身还活着 —— /wait 必须直接回它。
+
+    `docker run … sh -c 'echo X; exit 7'` 的退出码要真的是 7；如果 /wait 去等容器
+    退出就会一直挂着（容器是当"工作台"用的，一直 Running）。
+    """
+    from .. import aio_server as mod
+    from ..aio_server import create_aio_app
+
+    app = create_aio_app(run_reconcile=False)
+    mod.start_kube_environment = lambda **kw: fake_kube  # type: ignore
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/containers/create?name=fg2",
+        json={
+            "Image": "ubuntu:22.04",
+            "Cmd": ["sh", "-c", "exit 7"],
+            "AttachStdin": False,
+            "AttachStdout": True,
+            "AttachStderr": True,
+            "Tty": False,
+        },
+    )
+    assert resp.status == 201, await resp.text()
+    cid = (await resp.json())["Id"]
+
+    # 模拟 attach 阶段跑完 exec 后记下的退出码
+    record = app["store"].get(cid)
+    assert record is not None
+    record.foreground_exit_code = 7
+
+    wait = await client.post(f"/containers/{cid}/wait?condition=not-running")
+    assert wait.status == 200, await wait.text()
+    assert (await wait.json())["StatusCode"] == 7

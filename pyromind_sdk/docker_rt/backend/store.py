@@ -65,6 +65,11 @@ class ContainerRecord:
     env: dict[str, str] = field(default_factory=dict)
     cmd: list[str] = field(default_factory=list)
     working_dir: str = "/"
+    # `docker run --rm`（HostConfig.AutoRemove）—— 前台 run 跑完命令后据此删容器。
+    auto_remove: bool = False
+    # 前台 `docker run`（无 -d/-i/-t）：我们用 exec 跑这条 Cmd，退出码记在这里，
+    # `POST /containers/{id}/wait` 直接回它（容器本身还活着，不能等它退出）。
+    foreground_exit_code: int | None = None
     namespace: str = ""
     kubeconfig: str | None = None
     kube_context: str | None = None
@@ -253,6 +258,7 @@ class ContainerStore:
         env: dict[str, str],
         cmd: list[str],
         working_dir: str,
+        auto_remove: bool = False,
         namespace: str,
         kubeconfig: str | None = None,
         kube_context: str | None = None,
@@ -296,6 +302,7 @@ class ContainerStore:
                 env=env,
                 cmd=cmd,
                 working_dir=working_dir or "/",
+            auto_remove=auto_remove,
                 namespace=namespace,
                 kubeconfig=kubeconfig,
                 kube_context=kube_context,
