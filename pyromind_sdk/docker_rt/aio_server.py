@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from aiohttp import web
+from aiohttp import WSMsgType, web
 from aiohttp.client_exceptions import ClientConnectionResetError
 
 from .api.system import API_VERSION, MIN_API_VERSION  # noqa: E402
@@ -440,6 +440,86 @@ def _marker_holdback(buf: "bytearray", marker: bytes) -> int:
         if bytes(buf[-size:]) == marker[:size]:
             return size
     return 0
+
+
+#: 平台那条 WS 的"结束类"消息。``async for`` 会在这几个类型上直接
+#: ``StopAsyncIteration``（见 :func:`_ws_close_note`），所以必须自己 ``receive()``。
+_WS_END_TYPES = frozenset(
+    {
+        WSMsgType.CLOSE,
+        WSMsgType.CLOSING,
+        WSMsgType.CLOSED,
+        WSMsgType.ERROR,
+    }
+)
+
+
+#: 常用 close code 的人话（2026-10-16 加）。**只加注解，不改原有字段**，
+#: 这样既有 grep 友好的 ``code=NNNN``，也省得每次翻 RFC。
+#:
+#: 1012 是**线上抓到过的真凶**：uvicorn 的 ``WebSocketProtocol.shutdown()``
+#: 在收到 SIGTERM/SIGINT（pod 重启、滚动发布、被驱逐）时对**每条**已握手的
+#: WS 发 ``fail_connection(1012)``（`uvicorn/protocols/websockets/websockets_impl.py:143-149`）。
+#: ⇒ 看到 1012 就是"中间件那个进程在关闭"，不是用户退出、不是网络。
+_WS_CLOSE_HINTS: dict[int, str] = {
+    1000: "normal close by peer app",
+    1001: "peer going away",
+    1006: "no close frame from peer - hard drop or black-hole",
+    1011: "peer keepalive ping timeout",
+    1012: "peer uvicorn is shutting down - pod restart/rollout",
+}
+
+
+def _ws_close_note(ws: Any, msg: Any) -> str:
+    """把"这条 WS 为什么结束了"写成一句能进日志的话（2026-10-16 补）。
+
+    **为什么必须有它**：原先这里是 ``async for msg in ws``，而 aiohttp 的
+    ``ClientWebSocketResponse.__anext__`` 在 ``CLOSE``/``CLOSING``/``CLOSED`` 上
+    直接 ``StopAsyncIteration`` —— **循环体一次都看不到这三个类型**。于是
+    "对端发了关闭帧"和"连接无声无息地断了"在日志里长得**一模一样：什么都没有**。
+    2026-10-15 那次悬案（中间件 19:41:12 已判定客户端 WS 断了，docker-rt 19:57:53
+    才收场，中间 16 分钟零线索）就卡在这个盲区上。
+
+    ``ws.close_code`` 本身就是判据（aiohttp ``client_ws.receive`` 的赋值路径）：
+
+    * ``1006`` ABNORMAL_CLOSURE —— 连接被硬断（RST / 黑洞 / 中间设备静默丢弃）；
+    * ``1000`` OK（``EofStream``）—— 对端只是把 TCP 关了，**没发**关闭帧；
+    * 其它值（1000/1001/1011…）—— 对端**发了**关闭帧，code 就是它给的理由
+      （1001 走了、1011 keepalive ping 超时）。
+
+    ⚠️ **最该找的那一行**：本文件连平台用的是 aiohttp 客户端
+    （``client.ws_connect(url, heartbeat=30)``，见 :func:`_hijack_pyromind_terminal`；
+    ``pyromind_sdk/terminal.py`` / ``exec_stream.py`` 也是 30），它的客户端心跳是
+    **ping 每 30s、等 PONG 只等 ``heartbeat/2 = 15s``**；等不到就
+    ``_handle_ping_pong_exception`` → ``_close_code = ABNORMAL_CLOSURE(1006)``，
+    并且往 reader 里喂一条 ``WSMessage(ERROR, ServerTimeoutError(...))``
+    （aiohttp 3.14.3 ``client_ws.py:184-223``）。所以"平台那条腿半开（对端进程没了 /
+    中间设备把包吞了，TCP 却还没 RST）"在这套日志里的**指纹**是：
+
+        reason=ws-error ServerTimeoutError('No PONG received after 15.0 seconds') (code=1006)
+
+    看到它就**不用再猜网络**了 —— 是心跳自己判的死刑，且**对端连关闭帧都没给**。
+
+    注意这条消息只有"喂进去时正好有人在 ``receive()``"才拿得到
+    （``_handle_ping_pong_exception`` 里的 ``if self._waiting``）。:func:`pump_out`
+    正常情况下**一直挂着 ``receive()``**，所以能命中；万一没命中，就退化成
+    ``transport-closed-without-close-frame (code=1006)`` —— **code=1006 依然足够**
+    （1006 的含义就是"没有关闭帧的硬断"）。
+    """
+    code = getattr(ws, "close_code", None)
+    reason = (getattr(ws, "close_reason", None) or "").strip()
+    bits = [f"code={code}"]
+    hint = _WS_CLOSE_HINTS.get(code)
+    if hint:  # 见 _WS_CLOSE_HINTS：1012 = 中间件在重启
+        bits.append(hint)
+    if reason:
+        bits.append(f"reason={reason!r}")
+    suffix = "; ".join(bits)
+    if msg.type is WSMsgType.ERROR:
+        return f"ws-error {msg.data!r} ({suffix})"
+    if msg.type is WSMsgType.CLOSE:
+        return f"peer-close-frame ({suffix})"
+    return f"transport-closed-without-close-frame ({suffix})"
 
 
 async def _stream_pyromind_exec(
@@ -3311,6 +3391,32 @@ def _client_stdin_eof(protocol: Any) -> bool:
     return bool(event is not None and event.is_set())
 
 
+def _client_link_state(protocol: Any) -> str:
+    """一句话说清"收尾时客户端那条 hijack 连接还活着吗"（2026-10-16 补日志）。
+
+    和 :func:`_ws_close_note` 一起看就能把"谁先断"钉死，不用再猜：
+
+    * ``client-conn=open`` + ``reason=transport-closed-without-close-frame``
+      ⇒ 是**平台那条 WS** 先没的（网络/中间设备/对端关），客户端这边毫发无损；
+    * ``client-conn=gone|closing`` + ``reason=docker-client-write-failed``
+      ⇒ 是 **docker CLI** 先没的（终端被关、进程被杀、本机网络断）。
+
+    2026-10-15 那次"16 分钟后才收场"正是因为两格都没记，日志里只剩一条
+    事后的 ``No such exec``，根因无从下手。
+    """
+    if protocol is None:
+        return "unknown"
+    transport = getattr(protocol, "transport", None)
+    if transport is None:
+        return "gone"
+    is_closing = getattr(transport, "is_closing", None)
+    if callable(is_closing) and is_closing():
+        return "closing"
+    if _client_stdin_eof(protocol):
+        return "half-closed(client-eof)"
+    return "open"
+
+
 def _take_client_stdin(protocol: Any) -> bytes:
     """取走 101 之后客户端发来的 stdin 字节（非阻塞；没有就是 ``b""``）。
 
@@ -4098,6 +4204,14 @@ async def _hijack_pyromind_terminal(
         rows,
         cmd or "(login shell)",
     )
+    # 收尾摘要用的观测点（2026-10-16 补日志）：
+    #   * ``stop``  —— 这条会话**为什么结束**（=`_ws_close_note` 的一句话）；
+    #   * ``stats`` —— 两个方向各搬了多少字节 / 多少帧。
+    # 放在 ``try`` **外面**，这样最外层 ``finally`` 也能读到它们并打一行摘要 ——
+    # 用户要的是"谁先断"，而这件事只能靠"结束原因 + 收尾时客户端连接状态"一起看。
+    started_at = time.monotonic()
+    stop: list[str] = [""]
+    stats = {"pty_to_cli": 0, "cli_to_pty": 0, "frames_out": 0}
     try:
         async with aiohttp.ClientSession() as client:
             try:
@@ -4176,8 +4290,24 @@ async def _hijack_pyromind_terminal(
                     del filter_buf[: len(filter_buf) - hold]
                     return payload
 
-                async for msg in ws:
+                # ⚠️ 显式 ``receive()``，**不要** ``async for``：aiohttp 的
+                # ``__anext__`` 在 CLOSE/CLOSING/CLOSED 上直接 StopAsyncIteration，
+                # 循环体看不到它们 ⇒ 关帧会被静默吞掉（见 :func:`_ws_close_note`）。
+                # 这里每个出口都往 ``stop`` 里写一句"为什么结束"，收尾日志才有的看。
+                while True:
+                    try:
+                        msg = await ws.receive()
+                    except Exception as exc:  # noqa: BLE001 — 记录类型就够了
+                        stop[0] = f"receive-raised {type(exc).__name__}: {exc}"
+                        session_over.set()
+                        break
                     if session_over.is_set():
+                        # 别的任务先结束了（stdin 侧出错 / 客户端断开被发现）。
+                        stop[0] = stop[0] or "stopped-by-peer-task"
+                        break
+                    if msg.type in _WS_END_TYPES:
+                        stop[0] = _ws_close_note(ws, msg)
+                        session_over.set()
                         break
                     if msg.type == aiohttp.WSMsgType.BINARY:
                         try:
@@ -4186,11 +4316,24 @@ async def _hijack_pyromind_terminal(
                             payload = _strip_marker(msg.data)
                             if not payload:
                                 continue
+                            stats["pty_to_cli"] += len(payload)
+                            stats["frames_out"] += 1
                             await resp.write(
                                 _pty_output_for_client(payload, tty=tty)
                             )
                             await resp.drain()
-                        except (ConnectionResetError, RuntimeError, ConnectionError):
+                        except (
+                            ConnectionResetError,
+                            RuntimeError,
+                            ConnectionError,
+                        ) as exc:
+                            # 写不进去 = **docker CLI 那边先没了**（终端被关、
+                            # 进程被杀、本机网络断）。原来这里是静默 break，
+                            # 于是"CLI 先断"和"平台先断"在日志里分不出来。
+                            stop[0] = (
+                                f"docker-client-write-failed "
+                                f"{type(exc).__name__}: {exc}"
+                            )
                             session_over.set()
                             break
                     elif msg.type == aiohttp.WSMsgType.TEXT:
@@ -4202,21 +4345,25 @@ async def _hijack_pyromind_terminal(
                             pass
                         try:
                             payload = msg.data.encode("utf-8", errors="replace")
+                            stats["pty_to_cli"] += len(payload)
+                            stats["frames_out"] += 1
                             await resp.write(
                                 payload
                                 if tty
                                 else _pty_output_for_client(payload, tty=False)
                             )
                             await resp.drain()
-                        except (ConnectionResetError, RuntimeError, ConnectionError):
+                        except (
+                            ConnectionResetError,
+                            RuntimeError,
+                            ConnectionError,
+                        ) as exc:
+                            stop[0] = (
+                                f"docker-client-write-failed "
+                                f"{type(exc).__name__}: {exc}"
+                            )
                             session_over.set()
                             break
-                    elif msg.type in (
-                        aiohttp.WSMsgType.CLOSE,
-                        aiohttp.WSMsgType.ERROR,
-                    ):
-                        session_over.set()
-                        break
 
                 # 流结束了：把为"标记可能被拆帧"而暂存的尾巴**刷出去**。
                 # 不刷的话最后 ≤len(marker)+1 字节会被永远压在缓冲里丢掉 —— 短输出
@@ -4268,6 +4415,7 @@ async def _hijack_pyromind_terminal(
                     while not session_over.is_set():
                         data = _take_client_stdin(protocol)
                         if data:
+                            stats["cli_to_pty"] += len(data)
                             await ws.send_bytes(data)
                             continue
                         if not eof_sent and _client_stdin_eof(protocol):
@@ -4287,15 +4435,35 @@ async def _hijack_pyromind_terminal(
                     session_over.set()
 
             async def send_pings() -> None:
-                try:
-                    while not session_over.is_set():
+                """每 60 秒发一个应用层 ``{"type":"ping"}``（不是 WS 协议层 PING）。
+
+                ⚠️ 失败**必须记一笔**（2026-10-16 补日志）：原来是
+                ``except Exception: pass``，把"这条 WS 已经写不进去了"整个吞掉，
+                而且它**从不** ``session_over.set()`` —— keepalive 因此完全失去
+                "探活"作用，连接死了只能等内核 TCP 重传超时（Linux 默认
+                ``tcp_retries2=15`` ≈ 924s ≈ 15.4 分钟）才发现。2026-10-15 那次
+                "中间件 19:41:12 判定客户端 WS 已断、docker-rt 19:57:53 才收场"
+                正好就是这个量级。只记**第一次**，避免每分钟刷屏。
+                """
+                logged = False
+                while not session_over.is_set():
+                    try:
                         await asyncio.sleep(60)
-                        if not session_over.is_set():
-                            await ws.send_str(json.dumps({"type": "ping"}))
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    pass
+                        if session_over.is_set():
+                            break
+                        await ws.send_str(json.dumps({"type": "ping"}))
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        if not logged:
+                            logged = True
+                            logger.warning(
+                                "pyromind terminal keepalive ping failed id=%s "
+                                "(%s: %s); the platform WS is already gone",
+                                getattr(session, "id", "")[:12],
+                                type(exc).__name__,
+                                exc,
+                            )
 
             out_task = asyncio.create_task(pump_out())
             in_task = asyncio.create_task(pump_in())
@@ -4336,7 +4504,31 @@ async def _hijack_pyromind_terminal(
             # failure code — ``docker exec -it`` then exits 0, like a shell
             # that the user quit with ``exit``/Ctrl-D.
             session.exit_code = 0
+        # ⚠️ ``client-conn`` **必须在这里取样**，不能放到下面 ``_force_close_hijack``
+        # 之后：`_force_close_hijack` 会 ``protocol.force_close()`` + ``transport.close()``，
+        # 采样点一挪，这个字段就恒为 "closing"/"gone"，**永远失去判别能力** ——
+        # 2026-10-16 首版就踩了（线上两条摘要都印 gone，等于没记）。
+        client_link = _client_link_state(protocol)
         _force_close_hijack(request, resp)
+        # ⭐ 一行说清"这次会话怎么结束的"（2026-10-16 补）。
+        # ``reason`` 与 ``client-conn`` 必须**一起**看，才分得出"谁先断"：
+        #   reason=transport-closed-without-close-frame + client-conn=open
+        #       ⇒ 平台那条 WS 先没的（网络/中间设备），CLI 侧毫发无损；
+        #   reason=docker-client-write-failed + client-conn=gone
+        #       ⇒ docker CLI 先没的（终端关了/进程被杀/本机网络断）。
+        #   reason=peer-close-frame (code=1012) ⇒ **中间件在重启**（见 _ws_close_note）。
+        # 那条 16 分钟悬案就是缺了这一行：只有事后的 ``No such exec``，无因可查。
+        logger.info(
+            "pyromind terminal hijack summary id=%s reason=%s "
+            "elapsed=%.1fs pty->cli=%dB cli->pty=%dB frames=%d client-conn=%s",
+            getattr(session, "id", "")[:12],
+            stop[0] or "unknown",
+            time.monotonic() - started_at,
+            stats["pty_to_cli"],
+            stats["cli_to_pty"],
+            stats["frames_out"],
+            client_link,
+        )
     logger.info("pyromind terminal hijack end id=%s", getattr(session, "id", "")[:12])
     return True
 
