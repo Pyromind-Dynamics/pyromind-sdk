@@ -18,11 +18,13 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 
 from .api.system import API_VERSION, MIN_API_VERSION  # noqa: E402
 from .backend.archive import (  # noqa: E402
+    TarHead,
     finish_put_archive,
     iter_archive_chunks,
     open_put_archive,
     path_stat,
     put_archive,
+    scan_tar_head,
     write_put_chunk,
 )
 import uuid
@@ -3067,11 +3069,69 @@ async def head_container_archive(request: web.Request) -> web.Response:
     )
 
 
-async def put_container_archive(request: web.Request) -> web.Response:
-    """PUT /containers/{id}/archive?path=... — docker cp INTO container.
+#: 解析 tar 头时一次读多少（判一个头只要 512 字节，读大点少几次唤醒）。
+_CP_HEAD_READ = 64 * 1024
+#: ``docker cp`` 上传的**本地预检**上限（字节）。默认与 k8s_middleware 的
+#: ``_FILE_MAX_BYTES``（1 GiB）一致 —— **真正的闸门在那边**，这里只是提前、且
+#: 不把文件攒进内存地把超限请求拒掉。``0`` = 不预检。
+_CP_MAX_BYTES_DEFAULT = 1024 * 1024 * 1024
+#: 覆盖开关（按项目约定：默认值写进代码，环境变量只做覆盖）。
+_CP_MAX_ENV = "DOCKER_RT_CP_MAX_BYTES"
 
-    Small payloads (SWE-bench patches) go through ``execute`` (no stdin WS);
-    large ones stream via ``tar -xf -``.
+
+def _cp_max_bytes() -> int:
+    """``DOCKER_RT_CP_MAX_BYTES``（空/非法 → 默认；``0`` 或负数 → 不预检）。"""
+    raw = os.environ.get(_CP_MAX_ENV)
+    if raw is None or not raw.strip():
+        return _CP_MAX_BYTES_DEFAULT
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        logger.warning(
+            "%s=%r is not an integer; keeping the default %d bytes",
+            _CP_MAX_ENV,
+            raw,
+            _CP_MAX_BYTES_DEFAULT,
+        )
+        return _CP_MAX_BYTES_DEFAULT
+    return max(0, value)
+
+
+def _human_bytes(n: float) -> str:
+    """``1800754698`` → ``1.7GiB``（错误消息里给人看，别为它引依赖）。"""
+    value = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{int(value)}B" if unit == "B" else f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{value:.1f}TiB"
+
+
+async def _discard_body(content: Any) -> None:
+    """把请求体剩余部分读掉**但不保存**。
+
+    为什么必须先读掉再回错误：CLI 还在推 body 的时候如果直接甩一个响应回去，
+    Go 的 http client 往往把它报成"写失败/broken pipe"，**我们要说的那句话就丢了**。
+    读掉只是让字节过一遍（不驻留内存），CLI 收完 body 就会读到我们给的状态码与消息。
+    """
+    async for _chunk in content.iter_chunked(_CP_HEAD_READ):
+        pass
+
+
+async def put_container_archive(request: web.Request) -> web.Response:
+    """PUT /containers/{id}/archive?path=... — ``docker cp`` INTO container.
+
+    **先校验大小**（2026-10-16）：CLI 推上来的 body 是 tar，**头 512 字节里就写着
+    Size**，所以最多读几十 KiB 就能判"这个文件是不是太大"。超限就 **413** 并停手 ——
+    既不把它交给 SDK，也不在 daemon 里攒（老实现是先把整个 body 收进 ``chunks``
+    列表、``b"".join``、再 ``io.BytesIO`` + 成员 ``read()``：同一个 1.8GB 文件同时
+    活 4 份，**OOM 就出在这里**）。
+
+    ⚠️ ``docker cli`` 那句 ``Successfully copied …`` **服务端消不掉**：它在
+    ``cli/command/container/cp.go`` 的 ``copyToContainer`` 里是**无条件**先 ``Fprint``、
+    再 ``return err``（源码里自带 ``// TODO(thaJeztah): error-handling looks odd here``）。
+    只会撒谎的是它；我们能做的是让失败**早发生、且说得清**。客户端想不看那句，
+    用 ``docker cp -q``（quiet 分支直接 return，不打 summary）。
     """
     store: ContainerStore = request.app["store"]
     cid = request.match_info["id"]
@@ -3083,15 +3143,59 @@ async def put_container_archive(request: web.Request) -> web.Response:
     if record.kube_env is None or record.state != ContainerState.RUNNING:
         return _err(409, "Container is not running")
 
-    chunks: list[bytes] = []
+    # ---- 1) 先从 tar 头把大小读出来（最多几十 KiB，不进内存攒着）----
+    content = request.content
+    prefix = bytearray()
+    head: TarHead | None = None
     try:
-        async for chunk in request.content.iter_chunked(64 * 1024):
+        while True:
+            more = await content.read(_CP_HEAD_READ)
+            if more:
+                prefix.extend(more)
+            head, _consumed, need = scan_tar_head(bytes(prefix))
+            if head is not None:
+                break
+            if need == 0 or not more:
+                # 不是我们认得的 tar（或连一个头都凑不齐）⇒ 不预检，原样交给下面
+                head = None
+                break
+    except (ConnectionResetError, ConnectionError, ClientConnectionResetError):
+        logger.debug("archive put client disconnected id=%s", cid[:12])
+        return _empty(499)
+
+    # ---- 2) 超限就拒，不传、不存 ----
+    limit = _cp_max_bytes()
+    if head is not None and head.size_known and limit and head.size > limit:
+        await _discard_body(content)
+        logger.warning(
+            "docker cp rejected id=%s name=%s size=%d (> %d, %s)",
+            cid[:12],
+            head.name or "?",
+            head.size,
+            limit,
+            _CP_MAX_ENV,
+        )
+        return _err(
+            413,
+            f"File too large: {_human_bytes(head.size)} ({head.size} bytes) exceeds "
+            f"the limit {_human_bytes(limit)} ({limit} bytes). "
+            f"Raise {_CP_MAX_ENV} to allow it (the k8s_middleware side caps files "
+            f"at its own _FILE_MAX_BYTES too).",
+        )
+
+    # ---- 3) 未超限：老路径原样走（把先读掉的那段原样补回去，不丢字节）----
+    chunks: list[bytes] = [bytes(prefix)] if prefix else []
+    try:
+        async for chunk in content.iter_chunked(_CP_HEAD_READ):
             chunks.append(chunk)
         data = b"".join(chunks)
         if isinstance(record.kube_env, PyromindSDK):
             await record.kube_env.put_archive(path, data)
         else:
             await asyncio.to_thread(put_archive, record.kube_env, path, data)
+    except (ConnectionResetError, ConnectionError, ClientConnectionResetError):
+        logger.debug("archive put client disconnected id=%s", cid[:12])
+        return _empty(499)
     except Exception as exc:
         logger.exception("archive put failed id=%s", cid[:12])
         return _err(500, format_exception_message(exc))
@@ -3391,6 +3495,43 @@ def _client_stdin_eof(protocol: Any) -> bool:
     return bool(event is not None and event.is_set())
 
 
+#: 空闲关门的**兜底**判据：中间件没带 close reason 时（老镜像），只要两条腿都安静
+#: 了这么久，就认定是平台的空闲策略关的。取 1700s 而不是 1800s —— 中间件阈值是
+#: 1800s + 最多 30s 轮询，留点余量，别"刚好卡在边界"时漏报。
+_IDLE_CLOSE_FALLBACK_S = 1700.0
+
+
+def _terminal_close_notice(
+    *,
+    close_code: Any,
+    close_reason: str,
+    last_traffic: float,
+    now: float,
+) -> str:
+    """准备一句"它为什么自己关了"（空串 = 没什么可说）。
+
+    为什么要它（2026-10-16）：平台的**空闲看门狗**和 **pod 重启**都只发普通关闭帧，
+    docker CLI 那边看到的是干净的 EOF —— **屏幕上一个字都不会打**，用户就永远只会
+    觉得"莫名其妙自己断了"。这里把那两种情况翻成人话，写回 CLI 的输出流。
+
+    ⚠️ 只该给 **tty** 会话写（调用方负责判断）：非 tty 的 stdout 是要被管道消费的，
+    掺进去会污染数据。
+    """
+    reason = (close_reason or "").strip().lower()
+    idle_text = "\r\ndocker-rt: session closed after 30m idle (no keystrokes)\r\n"
+    if "idle" in reason:
+        # 精确判据：中间件在关帧里写了 reason=idle-timeout。
+        return idle_text
+    if not reason and close_code == 1000 and (now - last_traffic) >= _IDLE_CLOSE_FALLBACK_S:
+        # 兜底：**老镜像**不带 reason（"两条腿都安静了 28 分钟以上"就认这份）。
+        # 只在 reason 为空时用，免得误伤"用户自己 exit"（那时最后有按键，时间不够）。
+        return idle_text
+    if close_code == 1012:
+        # uvicorn 收到 SIGTERM 时对每条已握手 WS 发的 code = Service Restart。
+        return "\r\ndocker-rt: session closed because k8s_middleware restarted\r\n"
+    return ""
+
+
 def _client_link_state(protocol: Any) -> str:
     """一句话说清"收尾时客户端那条 hijack 连接还活着吗"（2026-10-16 补日志）。
 
@@ -3576,6 +3717,35 @@ async def _exec_hijack(
             pass
 
 
+def _should_cleanup_foreground_run(
+    *,
+    foreground_cmd: Any,
+    stdin: bool,
+    tty: bool,
+    record: Any,
+    session: Any,
+) -> bool:
+    """attach 结束后要不要做"前台 run 收尾"（退出码回写 + ``--rm`` 删除容器）。
+
+    * **非交互**前台 run（`docker run` 不带 -i/-t）⇒ 一直是；
+    * **交互**（`-it`，如 `docker run -it --rm IMG sh`）⇒ 只有
+      "PTY 侧先结束"（用户 `exit`、命令真的退出了）**并且** `--rm` 时才算。
+
+    为什么交互要加后两个条件（2026-10-18 用户实测）：以前只在
+    ``not stdin and not tty`` 时算前台 run ⇒ `docker run -it --rm` 退出后
+    **容器残留**（`docker ps -a` 还能看到）。反过来，如果无条件对交互会话做删除，
+    `docker attach` 到 `--rm` 容器后 Ctrl-C 断开也会把容器删掉 —— 所以要用
+    ``session.stop_reason`` 区分"PTY 结束了"和"客户端走了"。
+    """
+    if foreground_cmd is not None:
+        return True
+    if not (stdin or tty) or not bool(list(getattr(record, "cmd", None) or [])):
+        return False
+    if not bool(getattr(record, "auto_remove", False)):
+        return False
+    return str(getattr(session, "stop_reason", "")).startswith("peer-close-frame")
+
+
 async def attach_container(request: web.Request) -> web.StreamResponse | web.Response:
     """POST /containers/{id}/attach — TCP Upgrade for ``docker run -it`` / ``attach``.
 
@@ -3736,7 +3906,15 @@ async def attach_container(request: web.Request) -> web.StreamResponse | web.Res
 
     # 前台 run 的收尾：exec 的退出码写回 record（/wait 直接回它，CLI 拿到 rc）；
     # `--rm`（AutoRemove）⇒ 清理并删除容器（与 docker rm 同一清理路径）。
-    if foreground_cmd is not None:
+    # 交互式（`-it`）的判定见 _should_cleanup_foreground_run（2026-10-18：以前会让
+    # `docker run -it --rm` 的容器残留）。
+    if _should_cleanup_foreground_run(
+        foreground_cmd=foreground_cmd,
+        stdin=stdin,
+        tty=tty,
+        record=record,
+        session=session,
+    ):
         code = int(getattr(session, "exit_code", -1) or -1)
         record.foreground_exit_code = code
         record.exit_code = code
@@ -4211,7 +4389,17 @@ async def _hijack_pyromind_terminal(
     # 用户要的是"谁先断"，而这件事只能靠"结束原因 + 收尾时客户端连接状态"一起看。
     started_at = time.monotonic()
     stop: list[str] = [""]
-    stats = {"pty_to_cli": 0, "cli_to_pty": 0, "frames_out": 0}
+    #: 关帧的结构化信息（``_ws_close_note`` 是给别人看的字符串，这里留原始值给
+    #: "该不该给用户打一行说明"的判断用）。
+    stop_info: dict[str, Any] = {"close_code": None, "close_reason": ""}
+    #: ``last_traffic`` 用来判断"是不是闲了很久才被平台关的"（见
+    #: :func:`_terminal_close_notice`）。
+    stats = {
+        "pty_to_cli": 0,
+        "cli_to_pty": 0,
+        "frames_out": 0,
+        "last_traffic": started_at,
+    }
     try:
         async with aiohttp.ClientSession() as client:
             try:
@@ -4306,6 +4494,10 @@ async def _hijack_pyromind_terminal(
                         stop[0] = stop[0] or "stopped-by-peer-task"
                         break
                     if msg.type in _WS_END_TYPES:
+                        stop_info["close_code"] = getattr(ws, "close_code", None)
+                        stop_info["close_reason"] = (
+                            getattr(ws, "close_reason", None) or ""
+                        )
                         stop[0] = _ws_close_note(ws, msg)
                         session_over.set()
                         break
@@ -4317,6 +4509,7 @@ async def _hijack_pyromind_terminal(
                             if not payload:
                                 continue
                             stats["pty_to_cli"] += len(payload)
+                            stats["last_traffic"] = time.monotonic()
                             stats["frames_out"] += 1
                             await resp.write(
                                 _pty_output_for_client(payload, tty=tty)
@@ -4346,6 +4539,7 @@ async def _hijack_pyromind_terminal(
                         try:
                             payload = msg.data.encode("utf-8", errors="replace")
                             stats["pty_to_cli"] += len(payload)
+                            stats["last_traffic"] = time.monotonic()
                             stats["frames_out"] += 1
                             await resp.write(
                                 payload
@@ -4416,6 +4610,7 @@ async def _hijack_pyromind_terminal(
                         data = _take_client_stdin(protocol)
                         if data:
                             stats["cli_to_pty"] += len(data)
+                            stats["last_traffic"] = time.monotonic()
                             await ws.send_bytes(data)
                             continue
                         if not eof_sent and _client_stdin_eof(protocol):
@@ -4504,6 +4699,32 @@ async def _hijack_pyromind_terminal(
             # failure code — ``docker exec -it`` then exits 0, like a shell
             # that the user quit with ``exit``/Ctrl-D.
             session.exit_code = 0
+        # 供 attach 路径判断"是 PTY 结束了、还是客户端走了"（见
+        # ``_should_cleanup_foreground_run``）：只有前者才做 `--rm` 删除。
+        session.stop_reason = stop[0] or "unknown"
+        # 给 **tty** 会话留一句人话（见 :func:`_terminal_close_notice`）。平台侧
+        # 主动关门（空闲看门狗 / pod 重启）时客户端看到的是**干净的 EOF**，屏幕上
+        # 一个字都没有 —— 用户只会觉得"莫名其妙自己断了"。必须在
+        # ``_force_close_hijack`` **之前**写，之后就写不出去了。
+        # 非 tty 会话不写：那边 stdout 是要被管道消费的，掺字会污染数据。
+        if getattr(session, "tty", False):
+            notice = _terminal_close_notice(
+                close_code=stop_info.get("close_code"),
+                close_reason=str(stop_info.get("close_reason") or ""),
+                last_traffic=stats["last_traffic"],
+                now=time.monotonic(),
+            )
+            if notice:
+                try:
+                    await resp.write(notice.encode("utf-8"))
+                    await resp.drain()
+                    logger.info(
+                        "pyromind terminal hijack notice id=%s text=%r",
+                        getattr(session, "id", "")[:12],
+                        notice.strip(),
+                    )
+                except Exception as exc:  # noqa: BLE001 — 客户端可能已经走了
+                    logger.debug("terminal close notice not delivered: %s", exc)
         # ⚠️ ``client-conn`` **必须在这里取样**，不能放到下面 ``_force_close_hijack``
         # 之后：`_force_close_hijack` 会 ``protocol.force_close()`` + ``transport.close()``，
         # 采样点一挪，这个字段就恒为 "closing"/"gone"，**永远失去判别能力** ——

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -220,9 +221,9 @@ async def test_remove_wakes_waiters_with_removed_snapshot():
     assert record.id not in store._state_waiters
 
 
-def test_prune_execs_by_age_and_cap():
-    store = ContainerStore()
-    for i in range(200):
+def _aged_finished_execs(store, count: int) -> None:
+    """造 ``count`` 条"早已结束"的 exec 记录（``created`` 递增，便于验 LRU）。"""
+    for i in range(count):
         rec = store.create_exec(
             container_id="c1",
             cmd=["true"],
@@ -234,9 +235,44 @@ def test_prune_execs_by_age_and_cap():
         rec.running = False
         rec.exit_code = 0
         rec.created = float(i)
-    removed = store.prune_execs(max_finished=50, max_age_s=1e9)
+
+
+def test_prune_execs_cap_keeps_the_newest():
+    store = ContainerStore()
+    _aged_finished_execs(store, 200)
+    removed = store.prune_execs(max_finished=50)
     assert removed >= 150
     assert len(store._execs) <= 50
+    # 留下的是最新的那批（LRU 从最旧的开始丢）
+    assert any(ex.created == 199 for ex in store._execs.values())
+
+
+def test_prune_execs_does_not_age_out_by_default():
+    """**默认不按时间老化**（2026-10-16 改）。
+
+    这是那个反复出现的 ``No such exec`` 的根因：老实现 ``max_age_s=600`` 会在会话
+    结束的瞬间把"10 分钟前创建"的记录删掉，而 docker CLI 在流结束后**必定**要
+    ``ExecInspect`` 一次拿退出码 ⇒ 活过 10 分钟的 ``docker exec`` 全都 404、
+    退出码还被改成 1。真 Docker 从来没有这条时间老化。
+    """
+    store = ContainerStore()
+    _aged_finished_execs(store, 3)
+    for ex in store._execs.values():
+        ex.created = 0.0  # 看起来"几十年前创建"
+    removed = store.prune_execs(max_finished=128)
+    assert removed == 0
+    assert len(store._execs) == 3, "只有数量上限能删记录，时间不能"
+
+
+def test_prune_execs_aging_still_available_when_asked():
+    """``max_age_s`` 显式给了才老化（留的后路）。"""
+    store = ContainerStore()
+    _aged_finished_execs(store, 3)
+    for ex in store._execs.values():
+        ex.created = time.time() - 100_000
+    removed = store.prune_execs(max_age_s=600.0)
+    assert removed == 3
+    assert store._execs == {}
 
 
 @pytest.mark.asyncio

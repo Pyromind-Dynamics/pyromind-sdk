@@ -17,6 +17,7 @@ runs the test logic, and cleans up (pause + delete) at the end.
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -164,6 +165,8 @@ def _create_sandbox(
     if port_mappings is not None:
         request_kwargs["port_mappings"] = port_mappings
     try:
+        # 创建现在**必须显式给 name**（服务端缺名返回 400 INVALID_INSTANCE_NAME）。
+        request_kwargs.setdefault("name", f"sandbox-it-{uuid.uuid4().hex[:8]}")
         sandbox = client.sandboxes.create(
             SandboxRequest(**request_kwargs)
         )

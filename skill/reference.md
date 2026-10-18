@@ -64,7 +64,7 @@ from pyromind_sdk.client.models import ResourceConfig, SandboxRequest, SandboxTy
 
 client = PyroMindAPIClient(api_key="YOUR_API_KEY")
 sandbox = client.sandboxes.create(
-    SandboxRequest(sandbox_type=SandboxType.LINUX, resources=ResourceConfig(cpu=2, memory=4))
+    SandboxRequest(sandbox_type=SandboxType.LINUX, name="my-sandbox", resources=ResourceConfig(cpu=2, memory=4))
 )
 print(sandbox.id, sandbox.status)
 client.close()

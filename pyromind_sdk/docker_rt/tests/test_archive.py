@@ -10,8 +10,17 @@ from io import BytesIO
 import pytest
 
 from .helpers import FakeKubeEnv, create_started_container
-from ..backend.archive import make_single_file_tar
+from ..backend.archive import make_single_file_tar, scan_tar_head
 from ..backend.stream_framing import frame_stderr, frame_stdout
+
+
+def _tar_with(name: str, payload: bytes = b"payload", *, fmt: int = tarfile.GNU_FORMAT):
+    buf = BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=fmt) as tar:
+        info = tarfile.TarInfo(name)
+        info.size = len(payload)
+        tar.addfile(info, BytesIO(payload))
+    return buf.getvalue()
 
 
 def test_path_stat_uses_go_filemode_bits():
@@ -239,6 +248,74 @@ async def test_archive_stat_failure_is_500_and_logged(
     messages = [record.getMessage() for record in caplog.records]
     assert sum("archive stat failed" in m for m in messages) == 2, messages
     assert any("instance_type" in m for m in messages), messages
+
+
+def test_scan_tar_head_reads_the_first_real_entry():
+    """第一个 512 字节块就是真条目：名字 / 大小 / 需要转发的字节数。"""
+    raw = _tar_with("a.bin", b"z" * 1000)
+    head, consumed, need = scan_tar_head(raw)
+    assert head is not None and need == 0
+    assert head.name == "a.bin"
+    assert head.size == 1000
+    assert head.isdir is False
+    assert head.size_known is True
+    assert consumed == 512
+
+
+def test_scan_tar_head_skips_gnu_longname_pseudo_entries():
+    """超长名字的真名藏在 ``L`` 伪条目数据里，**不能**只取头里的前 100 字节。
+
+    名字要用来判"目标路径是文件还是目录"（``_archive_extract_dir``），截断就会把
+    解包目录算错、多套一层目录。
+    """
+    long_name = "p" * 150 + ".bin"
+    head, consumed, need = scan_tar_head(_tar_with(long_name, b"payload"))
+    assert head is not None and need == 0
+    assert head.name == long_name, "必须用伪条目里的真名，不是被截断的 100 字节"
+    assert head.size == 7
+    assert consumed == 1536, "512(L 头) + 512(名字数据) + 512(真头)"
+
+
+def test_scan_tar_head_skips_pax_extended_headers():
+    """PAX（``x``）同样要跳过，并且从 ``path=`` 记录里取真名。"""
+    long_name = "q" * 140 + ".bin"
+    head, _consumed, need = scan_tar_head(
+        _tar_with(long_name, b"payload", fmt=tarfile.PAX_FORMAT)
+    )
+    assert head is not None and need == 0
+    assert head.name == long_name
+    assert head.size == 7
+
+
+def test_scan_tar_head_asks_for_more_bytes_until_a_header_fits():
+    raw = _tar_with("a.bin", b"z")
+    head, consumed, need = scan_tar_head(raw[:100])
+    assert (head, consumed) == (None, 0)
+    assert need == 512 - 100, "要告诉调用方还差多少字节，而不是让它猜"
+    # 补齐之后立刻成功
+    head, _consumed, need = scan_tar_head(raw[:512])
+    assert head is not None and need == 0
+
+
+def test_scan_tar_head_gives_up_on_non_tar_bytes():
+    """不是 tar（或伪条目多到离谱）⇒ ``need == 0``，调用方走降级路径。"""
+    assert scan_tar_head(bytes(4096)) == (None, 0, 0)
+    assert scan_tar_head(b"not a tar at all" + bytes(600)) == (None, 0, 0)
+    # 但太短时只能说"还不够"（不能凭 3 个字节就断言不是 tar）
+    assert scan_tar_head(b"\x01\x02\x03")[2] == 512 - 3
+
+
+def test_scan_tar_head_marks_directories():
+    buf = BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo("mydir")
+        info.type = tarfile.DIRTYPE
+        info.mode = 0o755
+        tar.addfile(info)
+    head, _consumed, _need = scan_tar_head(buf.getvalue())
+    assert head is not None
+    assert head.isdir is True
+    assert head.size == 0
 
 
 def test_make_single_file_tar_roundtrip():
