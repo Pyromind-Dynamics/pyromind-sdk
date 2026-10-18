@@ -546,19 +546,39 @@ class ContainerStore:
         self,
         *,
         max_finished: int = 128,
-        max_age_s: float = 600.0,
+        max_age_s: float | None = None,
     ) -> int:
-        """Drop finished/abandoned exec records. Returns number removed."""
+        """Drop finished exec records. Returns number removed.
+
+        ⚠️ **默认不再按时间老化**（2026-10-16 改）。原来 ``max_age_s=600`` 会在会话
+        结束的那一瞬间把"创建于 10 分钟前"的记录删掉，而 docker CLI 在流结束后
+        **必定**要发一次 ``ExecInspect``（``GET /exec/{id}/json``）拿退出码 ——
+        于是**凡是活过 10 分钟**的 ``docker exec`` 都会：
+
+        * CLI 报 ``Error response from daemon: {"message": "No such exec: …"}``；
+        * **退出码变成 1**，而 daemon 侧记录的其实是 0。
+
+        实测（2026-10-16 12:03）：一个 1830s 的交互会话，结束瞬间记录被删，
+        1 秒后的 inspect 404 —— 中间件的 ``terminal teardown: first=idle-timeout``
+        与这条 404 是同一秒。
+
+        真 Docker 的 exec 记录在**容器生命周期内一直可 inspect**，本来就没有
+        "10 分钟"这一说，所以这里只保留**数量上限**（LRU，保留 ``created`` 最新的
+        ``max_finished`` 条）。刚结束的会话一定是最新的，因此它的 inspect 一定还在。
+
+        ``max_age_s`` 仍可显式传入（给自己留的后路 / 测试用）；``None`` = 不老化。
+        """
         now = time.time()
         removed = 0
-        for eid, ex in list(self._execs.items()):
-            if ex.running:
-                continue
-            aged = (now - float(ex.created)) > max_age_s
-            finished = ex.exit_code is not None
-            if aged and (finished or not ex.running):
-                self._execs.pop(eid, None)
-                removed += 1
+        if max_age_s is not None:
+            for eid, ex in list(self._execs.items()):
+                if ex.running:
+                    continue
+                aged = (now - float(ex.created)) > max_age_s
+                finished = ex.exit_code is not None
+                if aged and (finished or not ex.running):
+                    self._execs.pop(eid, None)
+                    removed += 1
         finished = [
             (eid, ex)
             for eid, ex in self._execs.items()

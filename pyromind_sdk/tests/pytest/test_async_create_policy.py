@@ -102,6 +102,7 @@ def test_create_uses_create_timeout_and_never_retries():
     request = SandboxRequest(
         sandbox_type=SandboxType.CUSTOM,
         image="python:3.11-slim",
+        name="sb-1",
     )
     response = asyncio.run(client.create(request))
 
@@ -138,6 +139,7 @@ def test_create_concurrency_limit_bounds_parallel_posts():
     request = SandboxRequest(
         sandbox_type=SandboxType.CUSTOM,
         image="python:3.11-slim",
+        name="sb-1",
     )
 
     async def run_all():

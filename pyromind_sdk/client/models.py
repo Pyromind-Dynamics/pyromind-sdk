@@ -188,7 +188,9 @@ class SandboxRequest(BaseModel):
         resources: CPU / memory / GPU resource limits for the sandbox pod.
         configuration: Optional GUI configuration (screen resolution, VNC password, etc.).
             Ignored for headless sandbox types (``CUSTOM``).
-        name: Human-readable name for the sandbox. Auto-generated when omitted.
+        name: **Required when creating.** Human-readable name shown in the
+            console (up to 200 chars). On update, omit it (or leave ``None``)
+            to keep the current name — the server backfills it.
         system_image_path: **OSWorld only.** JuiceFS sub-path to a custom system
             image (e.g. ``"template/Ubuntu.qcow2"``). Ignored for other sandbox types;
             the server falls back to its built-in default image when ``None``.
@@ -208,11 +210,21 @@ class SandboxRequest(BaseModel):
             mount is read-only under ``/public/<dir>``. ``None`` leaves the
             setting untouched, which is what you want on update calls that
             should not change it.
+        env: **CUSTOM only.** Container environment variables (docker ``-e``
+            style). Applied when the sandbox is created; ignored on update.
     """
     sandbox_type: SandboxType
     resources: Optional[ResourceConfig] = None
     configuration: Optional[SandboxConfiguration] = None
-    name: Optional[str] = None
+    name: Optional[str] = Field(
+        default=None,
+        description=(
+            "Human-readable name shown in the console. **Required when "
+            "creating** — the server rejects a create without it "
+            "(HTTP 400, INVALID_INSTANCE_NAME). On update, omit it to keep "
+            "the current name."
+        ),
+    )
     system_image_path: Optional[str] = Field(
         default=None,
         description=(
@@ -247,6 +259,13 @@ class SandboxRequest(BaseModel):
             "CUSTOM only: mount the platform's shared read-only directories "
             "under /public/<dir>. The list is platform-registered and always "
             "read-only. None leaves the current setting unchanged."
+        ),
+    )
+    env: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=(
+            "CUSTOM only: container environment variables (docker -e style). "
+            "Applied when the sandbox is created; ignored on update."
         ),
     )
 

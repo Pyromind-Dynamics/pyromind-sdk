@@ -18,6 +18,7 @@ import asyncio
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -159,6 +160,8 @@ async def _create_sandbox(
     if image is not None:
         request_kwargs["image"] = image
     try:
+        # 创建现在**必须显式给 name**（服务端缺名返回 400 INVALID_INSTANCE_NAME）。
+        request_kwargs.setdefault("name", f"sandbox-it-{uuid.uuid4().hex[:8]}")
         sandbox = await client.sandboxes.create(
             SandboxRequest(**request_kwargs)
         )

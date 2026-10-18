@@ -32,7 +32,9 @@ from pyromind_sdk.client.sandbox import SandboxClient
 
 def _create_payload(**kwargs) -> dict:
     """Build a create/update body exactly the way the clients do."""
-    request = SandboxRequest(sandbox_type="custom", image="img:1", **kwargs)
+    request = SandboxRequest(
+        sandbox_type="custom", image="img:1", name="mount-it", **kwargs
+    )
     return request.model_dump(exclude_none=True)
 
 

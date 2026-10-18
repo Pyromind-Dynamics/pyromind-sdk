@@ -5,10 +5,12 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import posixpath
 import shlex
 import tarfile
 import time
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from typing import Any
 
 from kubernetes.stream import stream
@@ -19,6 +21,141 @@ logger = logging.getLogger("docker_rt.archive")
 _CHUNK = 64 * 1024
 # Stay under typical ARG_MAX after base64 + shell quoting (~2MiB).
 _EMBED_MAX = 700_000
+
+# ---- tar 头解析：为了"上传之前先校验大小"（2026-10-16）------------------------
+#
+# ``docker cp`` 的 PUT body 就是 tar，**头 512 字节里就写着 Size** —— 所以"这个文件
+# 是不是太大"最多读几十 KiB 就能判，不需要把 1.8GB 收进来才失败（老实现要先把整个
+# body 读进内存，见 ``aio_server.put_container_archive``）。
+#
+# 这里只做一件事：从缓冲区开头找到**第一个真实条目**的 ustar 头，跳过 PAX / GNU
+# 长名那类伪条目。不用 ``tarfile`` 是因为它是同步的，而请求体是 async 的，喂不进去。
+
+_TAR_BLOCK = 512
+_TAR_MAGIC_OFF = 257
+_TAR_CHECKSUM_OFF = 148
+#: PAX（``x``/``g``）与 GNU 长名/长链接（``L``/``K``）都是"伪条目"，不是真文件。
+_TAR_EXTENDED_TYPES = (b"x", b"g", b"L", b"K")
+#: 连读这么多字节都还凑不出一个真实头 ⇒ 不是我们认得的 tar，调用方降级。
+_TAR_SCAN_MAX = 64 * _TAR_BLOCK
+
+
+@dataclass(frozen=True)
+class TarHead:
+    """第一个真实条目的头（``docker cp`` 单文件时就是那个文件）。"""
+
+    name: str
+    size: int
+    isdir: bool
+    #: ``False`` ⇒ 大小字段是 base64 数字之类我们没解的形态 ⇒ 放弃 ETA。
+    size_known: bool
+
+    @property
+    def basename(self) -> str:
+        return posixpath.basename(self.name.rstrip("/"))
+
+
+def _tar_pad(size: int) -> int:
+    """tar 里的数据段按 512 字节对齐。"""
+    return (size + _TAR_BLOCK - 1) // _TAR_BLOCK * _TAR_BLOCK
+
+
+def _tar_octal(field: bytes) -> int | None:
+    """解析 tar 数字字段（八进制 ASCII）。base64 变体不认识 ⇒ ``None``。"""
+    raw = field.split(b"\0")[0].strip()
+    if not raw:
+        return 0
+    if raw[0] & 0x80:
+        return None
+    try:
+        return int(raw, 8)
+    except ValueError:
+        return None
+
+
+def _tar_checksum_ok(block: bytes) -> bool:
+    """兜底判据：magic 不认时用校验和确认"这确实是个 tar 头"。"""
+    want = _tar_octal(block[_TAR_CHECKSUM_OFF : _TAR_CHECKSUM_OFF + 8])
+    if want is None:
+        return False
+    body = block[:_TAR_CHECKSUM_OFF] + b" " * 8 + block[_TAR_CHECKSUM_OFF + 8 :]
+    unsigned = sum(body)
+    signed = sum(b - 256 if b > 127 else b for b in body)
+    return want in (unsigned, signed)
+
+
+def _pseudo_long_name(block: bytes, data: bytes) -> str | None:
+    """从 ``L``（GNU 长名）/``x``（PAX）伪条目的**数据段**里取真实名字。
+
+    为什么必须取：tar 头的 ``name`` 字段只有 100 字节，超过就只留前 100 个字符，
+    真正的名字在伪条目数据里。而名字要用来判"目标路径其实是文件还是目录"
+    （见 ``_archive_extract_dir``），截断会导致解包目录算错、多套一层。
+    """
+    typeflag = block[156:157]
+    if typeflag == b"L":  # GNU: 数据就是名字 + NUL
+        return data.split(b"\0")[0].decode("utf-8", "replace") or None
+    if typeflag == b"x":  # PAX: 每行 "<长度> key=value"
+        for line in data.split(b"\n"):
+            if b" path=" in line:
+                return line.split(b" path=", 1)[1].decode("utf-8", "replace")
+    return None
+
+
+def scan_tar_head(buf: bytes) -> tuple[TarHead | None, int, int]:
+    """扫 ``buf`` 找第一个真实条目的头。
+
+    Returns:
+        ``(head, consumed, need)``
+
+        * ``head`` 非空 —— 成功。``consumed`` = **要原样转发出去的字节数**
+          （前面的伪条目 + 这个头本身）。调用方把 ``buf[:consumed]`` 转发掉，然后
+          从 ``consumed`` 开始继续转发请求体的剩余部分。
+        * ``head is None, need > 0`` —— 还差 ``need`` 字节才能判，读完再来。
+        * ``head is None, need == 0`` —— 不是我们认得的 tar（或伪条目过多），降级。
+    """
+    off = 0
+    long_name: str | None = None
+    while True:
+        if off + _TAR_BLOCK > len(buf):
+            if off >= _TAR_SCAN_MAX:
+                return None, 0, 0
+            return None, 0, off + _TAR_BLOCK - len(buf)
+        block = buf[off : off + _TAR_BLOCK]
+        magic = block[_TAR_MAGIC_OFF : _TAR_MAGIC_OFF + 5]
+        if not magic.startswith(b"ustar") and not _tar_checksum_ok(block):
+            return None, 0, 0
+        size = _tar_octal(block[124:136])
+        typeflag = block[156:157]
+        name = block[:100].split(b"\0")[0].decode("utf-8", "replace")
+        if typeflag in _TAR_EXTENDED_TYPES:
+            if size is None:
+                return None, 0, 0
+            # 伪条目的数据段也要读完才能跳过（长名就写在里面）。
+            data_end = off + _TAR_BLOCK + _tar_pad(size)
+            if data_end > len(buf):
+                if data_end > _TAR_SCAN_MAX:
+                    return None, 0, 0
+                return None, 0, data_end - len(buf)
+            found = _pseudo_long_name(
+                block, buf[off + _TAR_BLOCK : off + _TAR_BLOCK + size]
+            )
+            if found:
+                long_name = found
+            off = data_end
+            if off >= _TAR_SCAN_MAX:
+                return None, 0, 0
+            continue
+        real_name = long_name or name
+        return (
+            TarHead(
+                name=real_name,
+                size=int(size or 0),
+                isdir=typeflag == b"5" or real_name.endswith("/"),
+                size_known=size is not None,
+            ),
+            off + _TAR_BLOCK,
+            0,
+        )
 
 
 def _normalize_path(path: str) -> str:

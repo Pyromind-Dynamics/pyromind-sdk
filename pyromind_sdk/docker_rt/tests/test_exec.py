@@ -639,9 +639,11 @@ async def _drive_terminal_bridge(
     tail: bytes = b"",
     probe: list | None = None,
     close_code: int | None = None,
+    close_reason: str | None = None,
     write_error: BaseException | None = None,
     client_transport_closing: bool = False,
     force_close_marks_closing: bool = False,
+    session_tty: bool = True,
 ):
     """跑一遍 ``_hijack_pyromind_terminal``，返回 (resp, ws, session, acked)。
 
@@ -649,8 +651,10 @@ async def _drive_terminal_bridge(
     ``len(resp.written)`` —— 这样能验证"某个字节是在下一帧到达之前就发出去了"，
     而不是等到流结束才被兜底刷出来（旧实现正是靠兜底刷，所以只看最终内容分不出）。
 
-    ``close_code`` 用来模拟"关帧里的 code / 静默断线的 1006"，
-    ``write_error`` 让"写给 docker 客户端"直接抛（模拟 CLI 先断开）。
+    ``close_code`` / ``close_reason`` 用来模拟"关帧里的 code/reason
+    （或静默断线的 1006）"，``write_error`` 让"写给 docker 客户端"直接抛
+    （模拟 CLI 先断开）。``session_tty`` 默认 True —— 这条路径本来就是 tty 会话，
+    而"给用户留一句人话"只在 tty 下写。
 
     ``force_close_marks_closing`` 让收尾的 ``_force_close_hijack``（它真的会关
     客户端连接）**改变** ``is_closing()`` 的答案 —— 用来钉死摘要里 ``client-conn``
@@ -688,7 +692,7 @@ async def _drive_terminal_bridge(
             self.sent_text: list[str] = []
             self.closed = False
             self.close_code = close_code
-            self.close_reason = None
+            self.close_reason = close_reason
             self._frames = list(frames)
             self._delivered = 0
 
@@ -765,7 +769,12 @@ async def _drive_terminal_bridge(
 
     resp = FakeResp()
     session = SimpleNamespace(
-        id="exec-it", running=False, exit_code=None, tty_cols=100, tty_rows=30
+        id="exec-it",
+        running=False,
+        exit_code=None,
+        tty_cols=100,
+        tty_rows=30,
+        tty=session_tty,
     )
     protocol = FakeProtocol()
 
@@ -981,6 +990,119 @@ async def test_terminal_summary_samples_client_state_before_force_close(
     assert "client-conn=open" in text, (
         f"取样点被挪到 _force_close_hijack 之后了（那时连接已被自己关掉）：{text}"
     )
+
+
+@pytest.mark.parametrize(
+    "close_code, close_reason, idle_for, expected",
+    [
+        # 中间件带了标签（新镜像）：精确判据
+        (1000, "idle-timeout", 5.0, "30m idle"),
+        (1000, "kube-stream-ended", 9999.0, ""),
+        # 老镜像不带 reason：靠"两条腿都安静了这么久"兜底
+        (1000, "", 1800.0, "30m idle"),
+        (1000, "", 60.0, ""),
+        # pod 重启（uvicorn 的 1012），无需中间件配合
+        (1012, "", 5.0, "k8s_middleware restarted"),
+        (1012, "", 9999.0, "k8s_middleware restarted"),
+        # 无声无息断线：不猜
+        (1006, "", 9999.0, ""),
+        (None, "", 9999.0, ""),
+    ],
+)
+def test_close_notice_translates_the_platforms_silent_closes(
+    close_code, close_reason, idle_for, expected
+):
+    """平台的两种"自己断"必须能翻成人话，同时**不能**误伤用户自己退出。
+
+    看门狗和 pod 重启都只发普通关闭帧 ⇒ docker CLI 看到干净的 EOF、屏幕上一个字都
+    没有 ⇒ 用户只会觉得"莫名其妙自己断了"（2026-10-16 第三次被问）。
+    """
+    from ..aio_server import _terminal_close_notice
+
+    notice = _terminal_close_notice(
+        close_code=close_code,
+        close_reason=close_reason,
+        last_traffic=1000.0,
+        now=1000.0 + idle_for,
+    )
+    if expected:
+        assert expected in notice, (close_code, close_reason, idle_for, notice)
+        assert notice.startswith("\r\n") and notice.endswith("\r\n"), notice
+        assert "docker-rt:" in notice
+    else:
+        assert notice == "", (close_code, close_reason, idle_for, notice)
+
+
+@pytest.mark.asyncio
+async def test_idle_close_writes_a_plain_explanation_to_the_tty_client(
+    monkeypatch,
+):
+    """空闲超时收尾时，客户端要收到那行人话（而不是什么都看不到）。"""
+    import aiohttp
+
+    resp, _ws, _session, _acked = await _drive_terminal_bridge(
+        monkeypatch,
+        [
+            (aiohttp.WSMsgType.BINARY, b"# "),
+            (aiohttp.WSMsgType.CLOSE, 1000),
+        ],
+        close_code=1000,
+        close_reason="idle-timeout",
+    )
+
+    text = b"".join(resp.written)
+    assert b"# " in text
+    assert b"docker-rt: session closed after 30m idle (no keystrokes)" in text
+
+
+@pytest.mark.asyncio
+async def test_middleware_restart_close_is_explained_too(monkeypatch):
+    """pod 重启（1012）同样要说明 —— 那是另一种"自己断"。"""
+    import aiohttp
+
+    resp, _ws, _session, _acked = await _drive_terminal_bridge(
+        monkeypatch,
+        [(aiohttp.WSMsgType.CLOSE, 1012)],
+        close_code=1012,
+    )
+
+    text = b"".join(resp.written)
+    assert b"k8s_middleware restarted" in text
+
+
+@pytest.mark.asyncio
+async def test_non_tty_sessions_get_no_extra_bytes(monkeypatch):
+    """**非 tty** 会话绝不能掺字：那边的 stdout 是要被管道消费的。"""
+    import aiohttp
+
+    resp, _ws, _session, _acked = await _drive_terminal_bridge(
+        monkeypatch,
+        [
+            (aiohttp.WSMsgType.BINARY, b"payload\n"),
+            (aiohttp.WSMsgType.CLOSE, 1012),
+        ],
+        close_code=1012,
+        session_tty=False,
+    )
+
+    assert b"".join(resp.written) == b"payload\n"
+
+
+@pytest.mark.asyncio
+async def test_normal_user_exit_writes_nothing_extra(monkeypatch):
+    """用户自己退出（1000、刚有流量）不该多出一行 —— 别把正常收尾也搞得像故障。"""
+    import aiohttp
+
+    resp, _ws, _session, _acked = await _drive_terminal_bridge(
+        monkeypatch,
+        [
+            (aiohttp.WSMsgType.BINARY, b"bye\r\n"),
+            (aiohttp.WSMsgType.CLOSE, 1000),
+        ],
+        close_code=1000,
+    )
+
+    assert b"".join(resp.written) == b"bye\r\n"
 
 
 @pytest.mark.asyncio

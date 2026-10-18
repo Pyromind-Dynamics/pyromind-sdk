@@ -592,6 +592,8 @@ class PyromindSDK:
             memory_limit=kwargs.get("memory_limit"),
             cpu_limit=kwargs.get("cpu_limit"),
             gpu=kwargs.get("gpu"),
+            # `docker run -e` 的容器环境变量（create 时注入 Pod）
+            env=kwargs.get("env"),
             gpu_card=kwargs.get("gpu_card"),
         )
         if obj.command and obj.command not in (["sleep"], ["sleep", "2h"]):
@@ -637,6 +639,7 @@ class PyromindSDK:
         cpu_limit: str | None,
         gpu: str | None,
         gpu_card: str | None,
+        env: dict[str, str] | None = None,
     ) -> None:
         request = SandboxRequest(
             sandbox_type=SandboxType.CUSTOM,
@@ -654,6 +657,9 @@ class PyromindSDK:
                 exposed_ports,
                 publish_all_ports,
             ),
+            # `docker run -e`：容器环境变量。以前这里没有这个字段 ⇒ docker-rt 的
+            # `docker inspect` 里有 Config.Env、容器里却读不到（`<unset>`）。
+            env=dict(env) if env else None,
         )
         try:
             response = await self._client.create(request)
