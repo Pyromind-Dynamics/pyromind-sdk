@@ -3717,6 +3717,18 @@ async def _exec_hijack(
             pass
 
 
+def _session_exit_code(session: Any) -> int:
+    """把 ``session.exit_code`` 变成 ``/wait`` 能用的整数（``None`` ⇒ ``-1``）。
+
+    ⚠️ **不能用 ``raw or -1``**：退出码 **0 是假值**，会被翻成 ``-1`` ⇒ ``/wait`` 回
+    ``{"StatusCode": -1}`` ⇒ docker CLI 以 **255** 退出 —— 终端里就是一个红标
+    （"命令失败"），而实际上会话是正常结束的（2026-10-19 用户实测：
+    `docker run -it --rm ... sh` → `exit` → 容器删了、但退出码非 0）。
+    """
+    raw = getattr(session, "exit_code", None)
+    return -1 if raw is None else int(raw)
+
+
 def _should_cleanup_foreground_run(
     *,
     foreground_cmd: Any,
@@ -3883,10 +3895,13 @@ async def attach_container(request: web.Request) -> web.StreamResponse | web.Res
                     async with latest.lock:
                         if latest.state == ContainerState.RUNNING:
                             await _stop_port_forward(latest)
-                            latest.exit_code = int(
-                                getattr(latest.kube_env, "exit_code", 0)
-                                or session.exit_code
-                                or 0
+                            # 优先用 Pod 的真实退出码；拿不到才退回会话的。
+                            # 同样**不能**用 `x or y`：0 是假值（"成功"会被当成没值）。
+                            kube_code = getattr(latest.kube_env, "exit_code", None)
+                            latest.exit_code = (
+                                int(kube_code)
+                                if kube_code is not None
+                                else _session_exit_code(session)
                             )
                             latest.finished_at = time.time()
                             await store.set_state(latest, ContainerState.EXITED)
@@ -3915,7 +3930,7 @@ async def attach_container(request: web.Request) -> web.StreamResponse | web.Res
         record=record,
         session=session,
     ):
-        code = int(getattr(session, "exit_code", -1) or -1)
+        code = _session_exit_code(session)
         record.foreground_exit_code = code
         record.exit_code = code
         record.finished_at = time.time()

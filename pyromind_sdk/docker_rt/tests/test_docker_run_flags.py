@@ -60,6 +60,27 @@ def test_should_cleanup_foreground_run(
     )
 
 
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (0, 0),      # ⚠️ 关键：0 必须保持 0（`0 or -1` 会翻成 -1 ⇒ CLI 退出码 255）
+        (1, 1),
+        (137, 137),
+        (None, -1),  # 未知就是未知
+    ],
+)
+def test_session_exit_code_keeps_zero(raw, expected):
+    """`docker run -it --rm` 正常退出必须给 CLI 退出码 **0**（否则终端红标）。
+
+    2026-10-19 用户实测：容器删掉了，但 `docker run -it --rm ... sh` → `exit` 之后
+    终端出现红标 —— 因为 ``int(session.exit_code or -1)`` 把 **0** 当成假值翻成 -1，
+    ``/wait`` 回 ``{"StatusCode": -1}``，CLI 就以 255 退出。
+    """
+    from ..aio_server import _session_exit_code
+
+    assert _session_exit_code(SimpleNamespace(exit_code=raw)) == expected
+
+
 def test_create_sandbox_forwards_env_into_the_create_request():
     """``-e`` 的值必须进创建请求的 ``env`` 字段（否则后面三层都拿不到）。"""
     from ..backend.pyromind_sdk_env import PyromindSDK
