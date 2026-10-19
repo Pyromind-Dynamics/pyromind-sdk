@@ -1255,20 +1255,6 @@ class TransferClearResponse(BaseModel):
     deleted: int = 0
 
 
-class TransferSyncingPath(BaseModel):
-    """A local path that still has an active transfer."""
-
-    path: str
-    size: int = 0
-
-
-class TransferSyncingResponse(BaseModel):
-    """Active transfer paths returned by the syncing endpoint."""
-
-    items: List[TransferSyncingPath] = Field(default_factory=list)
-    paths: List[str] = Field(default_factory=list)
-
-
 class TrainingTaskEventType(str, Enum):
     """Training task event type enumeration"""
     TRAINING_TASK_STATUS_CHANGED = "training_task_status_changed"

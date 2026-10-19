@@ -12,7 +12,6 @@ from .models import (
     TransferListQuery,
     TransferPage,
     TransferRequest,
-    TransferSyncingResponse,
     TransferTask,
 )
 
@@ -144,11 +143,3 @@ class TransferClient(PyroMindClient):
         body = {"ids": ids} if ids is not None else None
         response = self.post(f"{self._TRANSFER_PREFIX}/clear", json_data=body)
         return TransferClearResponse(**self._extract_transfer_data(response))
-
-    def list_syncing_paths(self) -> TransferSyncingResponse:
-        """List local paths that still have queued or active transfers."""
-
-        response = self.get(f"{self._TRANSFER_PREFIX}/syncing")
-        return TransferSyncingResponse(**self._extract_transfer_data(response))
-
-    syncing_paths = list_syncing_paths

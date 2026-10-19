@@ -107,21 +107,12 @@ def test_business_failure_in_http_200_is_reported_as_sdk_error():
 
 
 @pytest.mark.asyncio
-async def test_async_client_supports_submit_and_syncing_paths():
+async def test_async_client_supports_submit():
     client = AsyncTransferClient(api_key="test-key")
     client.post = AsyncMock(
         return_value={
             "success": True,
             "data": {"transfer_task_id": "task-1", "id": 7, "status": "packing"},
-        }
-    )
-    client.get = AsyncMock(
-        return_value={
-            "success": True,
-            "data": {
-                "items": [{"path": "/workspace/src", "size": 12}],
-                "paths": ["/workspace/src"],
-            },
         }
     )
 
@@ -130,9 +121,6 @@ async def test_async_client_supports_submit_and_syncing_paths():
         target_cluster="us-west-2",
         target_path="/workspace/dst",
     )
-    syncing = await client.list_syncing_paths()
 
     assert created.transfer_task_id == "task-1"
-    assert syncing.items[0].path == "/workspace/src"
     client.post.assert_awaited_once()
-    client.get.assert_awaited_once_with("/storage/transfer/syncing")
