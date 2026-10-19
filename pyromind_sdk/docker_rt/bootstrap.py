@@ -66,6 +66,45 @@ def _prompt(
     return input(message).strip()
 
 
+def _cluster_choices() -> list[str]:
+    """Selectable cluster codes — the keys of ``CLUSTER_RESOURCE`` (single source of truth)."""
+    from ..client.base import available_clusters
+
+    return available_clusters()
+
+
+def _ask_cluster(
+    *,
+    interactive: bool,
+    stdin: Any | None,
+    stdout: Any,
+    color: bool,
+) -> str:
+    """Prompt for ``PYROMIND_CLUSTER`` until the answer is one of the configured keys.
+
+    The choices are the **cluster keys only** (``CLUSTER_RESOURCE``), so adding a
+    cluster to the table updates the prompt automatically. Blank input falls back
+    to ``DEFAULT_CLUSTER``.
+    """
+    from ..client.base import DEFAULT_CLUSTER, resolve_base_url_from_cluster
+
+    choices = ", ".join(_cluster_choices())
+    prompt = f"PYROMIND_CLUSTER ({choices}): "
+    if color:
+        prompt = f"{_BOLD}{_CYAN}PYROMIND_CLUSTER ({choices}):{_RESET} "
+    while True:
+        candidate = _prompt(prompt, stdin=stdin, stdout=stdout) or DEFAULT_CLUSTER
+        try:
+            resolve_base_url_from_cluster(candidate)
+        except ValueError as exc:
+            if not interactive:
+                raise RuntimeError(str(exc))
+            stdout.write(f"{exc}\n")
+            stdout.flush()
+            continue
+        return candidate
+
+
 def prepare_env(
     *,
     api_key: str | None = None,
@@ -135,16 +174,12 @@ def prepare_env(
                 "PYROMIND_CLUSTER is not set and no interactive terminal is "
                 "available to prompt for it"
             )
-        prompt = "PYROMIND_CLUSTER (e.g. us-west-2/us-west-1): "
-        if color:
-            prompt = f"{_BOLD}{_CYAN}PYROMIND_CLUSTER (e.g. us-west-2/us-west-1):{_RESET} "
-        cluster = _prompt(
-            prompt,
+        cluster = _ask_cluster(
+            interactive=interactive,
             stdin=stdin,
             stdout=stdout,
+            color=color,
         )
-        if not cluster:
-            cluster = "us-west-2"
         os.environ["PYROMIND_CLUSTER"] = cluster
 
     result["api_key"] = api_key

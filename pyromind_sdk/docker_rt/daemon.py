@@ -258,6 +258,11 @@ def stop_daemon(
 def prepare_server_parser() -> Any:
     import argparse
 
+    from ..client.base import available_clusters
+
+    # 可选集群来自 CLUSTER_RESOURCE 的 key（新增集群只改那张表，帮助文本自动跟上）
+    cluster_choices = ", ".join(available_clusters())
+
     def positive_int(value: str) -> int:
         try:
             parsed = int(value)
@@ -306,7 +311,7 @@ def prepare_server_parser() -> Any:
     parser.add_argument(
         "--cluster",
         default=None,
-        help="Target cluster, e.g. us-west-1, us-west-1 (defaults to $PYROMIND_CLUSTER)",
+        help=f"Target cluster ({cluster_choices}); defaults to $PYROMIND_CLUSTER",
     )
     parser.add_argument(
         "--ready-timeout",

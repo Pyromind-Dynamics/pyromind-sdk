@@ -165,7 +165,8 @@ def _create_sandbox(
     if port_mappings is not None:
         request_kwargs["port_mappings"] = port_mappings
     try:
-        # 创建现在**必须显式给 name**（服务端缺名返回 400 INVALID_INSTANCE_NAME）。
+        # 创建现在**必须显式给 name**（SDK create() 前置拦截；服务端缺名返回
+        # 422 请求校验错误）。
         request_kwargs.setdefault("name", f"sandbox-it-{uuid.uuid4().hex[:8]}")
         sandbox = client.sandboxes.create(
             SandboxRequest(**request_kwargs)

@@ -214,7 +214,13 @@ class SandboxClient(PyroMindClient):
             
         Returns:
             SandboxResponse object
+
+        Raises:
+            ValueError: When ``request.name`` is missing or blank — the server
+                requires a name on create (HTTP 422 request validation).
+                Failing here avoids a pointless round-trip.
         """
+        request.require_name_for_create()
         response = self.post("/sandboxes", json_data=request.model_dump(exclude_none=True))
         # API returns {success: True, data: {...}} format
         data = self._extract_data(response)

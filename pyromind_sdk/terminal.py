@@ -37,6 +37,7 @@ from pyromind_sdk.client.base import (
     ENV_API_KEY,
     ENV_BASE_URL,
     ENV_CLUSTER,
+    available_clusters,
     resolve_base_url_from_cluster,
 )
 
@@ -238,7 +239,8 @@ def run_terminal(
     if not base_url:
         if not cluster:
             print(
-                f"Error: --cluster is required (e.g. us-west-1, us-west-1) or set {ENV_CLUSTER}.",
+                f"Error: --cluster is required ({', '.join(available_clusters())}) "
+                f"or set {ENV_CLUSTER}.",
                 file=sys.stderr,
             )
             return 1
