@@ -108,6 +108,62 @@ def test_prepare_env_does_not_create_backend_env(monkeypatch: MonkeyPatch) -> No
     assert os.getenv("DOCKER_RT_BACKEND") is None
 
 
+def test_cluster_prompt_lists_every_configured_cluster(monkeypatch: MonkeyPatch) -> None:
+    """提示里的可选项必须来自 ``CLUSTER_RESOURCE`` 的 key，不能写死。"""
+    from ...client.base import available_clusters
+
+    monkeypatch.setenv("PYROMIND_API_KEY", "existing-key")
+    monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
+
+    stdout = io.StringIO()
+    info = prepare_env(stdin=io.StringIO("us-west-1\n"), stdout=stdout)
+
+    assert info["cluster"] == "us-west-1"
+    prompt_line = next(
+        line for line in stdout.getvalue().splitlines() if "PYROMIND_CLUSTER (" in line
+    )
+    # 只列最外层的 key，顺序跟配置一致；不出现 us-west-1 这类变体
+    assert prompt_line == f"PYROMIND_CLUSTER ({', '.join(available_clusters())}): "
+    assert "#" not in prompt_line
+
+
+def test_cluster_prompt_rejects_unknown_code_and_asks_again(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("PYROMIND_API_KEY", "existing-key")
+    monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
+
+    stdout = io.StringIO()
+    info = prepare_env(
+        stdin=io.StringIO("asia-north-9\ncn-east-1\n"),
+        stdout=stdout,
+    )
+
+    assert info["cluster"] == "cn-east-1"
+    assert "Unknown cluster 'asia-north-9'" in stdout.getvalue()
+
+
+def test_cluster_prompt_blank_falls_back_to_default(monkeypatch: MonkeyPatch) -> None:
+    from ...client.base import DEFAULT_CLUSTER
+
+    monkeypatch.setenv("PYROMIND_API_KEY", "existing-key")
+    monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
+
+    info = prepare_env(stdin=io.StringIO("\n"), stdout=io.StringIO())
+
+    assert info["cluster"] == DEFAULT_CLUSTER
+
+
+def test_cluster_prompt_rejects_unknown_env_suffix(monkeypatch: MonkeyPatch) -> None:
+    """``#env`` 也要按表校验，别拿到一个能拼 URL 却连不上的地址。"""
+    monkeypatch.setenv("PYROMIND_API_KEY", "existing-key")
+    monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
+
+    stdout = io.StringIO()
+    info = prepare_env(stdin=io.StringIO("us-west-1#staging\nus-west-1\n"), stdout=stdout)
+
+    assert info["cluster"] == "us-west-1"
+    assert "Unknown env 'staging'" in stdout.getvalue()
+
+
 def test_check_docker_cli_missing_prints_hint(monkeypatch: MonkeyPatch) -> None:
     from pyromind_sdk.docker_rt import install_wrapper as install_mod
     def missing_real_docker() -> str:

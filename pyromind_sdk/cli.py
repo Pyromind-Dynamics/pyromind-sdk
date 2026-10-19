@@ -23,6 +23,10 @@ from pyromind_sdk.nodes.python_to_yaml import python_function_to_yaml
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from pyromind_sdk.client.base import available_clusters
+
+    # 可选集群 = CLUSTER_RESOURCE 的 key（唯一来源，新增集群不用改帮助文本）
+    cluster_choices = ", ".join(available_clusters())
     parser = argparse.ArgumentParser(description="PyroMind SDK unified CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -54,11 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     terminal.add_argument("sandbox_id", type=str, help="Sandbox id, e.g. sb-xxxx")
     terminal.add_argument(
         "--cluster", type=str, required=False,
-        help=(
-            "Target cluster code, e.g. us-west-1, us-west-2. "
-            "Append #env for non-prod: us-west-1, us-west-12, us-west-1#dev. "
-            "Defaults to $PYROMIND_CLUSTER."
-        ),
+        help=f"Target cluster ({cluster_choices}); defaults to $PYROMIND_CLUSTER",
     )
     terminal.add_argument(
         "--api-key", type=str, default=None,
@@ -108,7 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     docker_rt.add_argument(
         "--cluster",
         default=None,
-        help="Target cluster, e.g. us-west-1, us-west-1 (defaults to $PYROMIND_CLUSTER)",
+        help=f"Target cluster ({cluster_choices}); defaults to $PYROMIND_CLUSTER",
     )
 
     docker_rt_context = subparsers.add_parser(

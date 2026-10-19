@@ -267,3 +267,15 @@ def test_server_main_connection_failure_returns_before_context(
 
     assert server_mod.main([]) == 1
     assert activated == []
+
+
+def test_cluster_help_lists_every_configured_cluster() -> None:
+    """``--cluster`` 的可选项来自 ``CLUSTER_RESOURCE``，不是写死的示例。"""
+    from ...client.base import CLUSTER_RESOURCE
+    from ..daemon import prepare_server_parser
+
+    help_text = prepare_server_parser().format_help()
+
+    assert "--cluster" in help_text
+    for code in CLUSTER_RESOURCE:
+        assert code in help_text, (code, help_text)
