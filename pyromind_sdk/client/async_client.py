@@ -11,6 +11,7 @@ from .async_inference import AsyncInferenceClient
 from .async_jupyterlab import AsyncJupyterLabClient
 from .async_sandbox import AsyncSandboxClient
 from .async_studio import AsyncStudioClient
+from .async_transfer import AsyncTransferClient
 
 
 class PyroMindAsyncAPIClient:
@@ -98,6 +99,14 @@ class PyroMindAsyncAPIClient:
             timeout=timeout,
             max_retries=max_retries
         )
+        self.transfers = AsyncTransferClient(
+            api_key=api_key,
+            base_url=base_url,
+            cluster=cluster,
+            timeout=timeout,
+            max_retries=max_retries
+        )
+        self.transfer = self.transfers
 
     async def close(self):
         """Close all client sessions"""
@@ -107,6 +116,7 @@ class PyroMindAsyncAPIClient:
         await self.instances.close()
         await self.sandboxes.close()
         await self.studio.close()
+        await self.transfers.close()
 
     async def __aenter__(self):
         """Async context manager entry"""

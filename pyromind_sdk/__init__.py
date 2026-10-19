@@ -60,6 +60,7 @@ from .client import (
     PyroMindAPIClient,
     EchoMindClient,
     ProfileClient,
+    TransferClient,
     # Async clients
     PyroMindAsyncClient,
     PyroMindAsyncAPIError,
@@ -68,6 +69,7 @@ from .client import (
     AsyncInferenceClient,
     AsyncStudioClient,
     AsyncEchoMindClient,
+    AsyncTransferClient,
     PyroMindAsyncAPIClient,
 )
 
@@ -81,6 +83,16 @@ from .client.models import (
     ResourceConfig,
     VolumeMount,
     PortMapping,
+    TransferRequest,
+    TransferLocation,
+    TransferTask,
+    TransferPage,
+    TransferListQuery,
+    TransferCreateResponse,
+    TransferActionResponse,
+    TransferClearResponse,
+    TransferSyncingResponse,
+    TransferSyncingPath,
 )
 
 # Export workflow functionality
@@ -145,6 +157,7 @@ __all__ = [
     "PyroMindAPIClient",
     "EchoMindClient",
     "ProfileClient",
+    "TransferClient",
     # Async clients
     "PyroMindAsyncClient",
     "PyroMindAsyncAPIError",
@@ -153,6 +166,7 @@ __all__ = [
     "AsyncInferenceClient",
     "AsyncStudioClient",
     "AsyncEchoMindClient",
+    "AsyncTransferClient",
     "PyroMindAsyncAPIClient",
     # Models
     "ApiMode",
@@ -163,6 +177,16 @@ __all__ = [
     "ResourceConfig",
     "VolumeMount",
     "PortMapping",
+    "TransferRequest",
+    "TransferLocation",
+    "TransferTask",
+    "TransferPage",
+    "TransferListQuery",
+    "TransferCreateResponse",
+    "TransferActionResponse",
+    "TransferClearResponse",
+    "TransferSyncingResponse",
+    "TransferSyncingPath",
     # Workflow functionality
     "WorkflowLiteConverter",
     "LayoutGenerator",

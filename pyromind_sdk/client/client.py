@@ -13,6 +13,7 @@ from .inference import InferenceClient
 from .studio import StudioClient
 from .echomind import EchoMindClient
 from .profile import ProfileClient
+from .transfer import TransferClient
 
 
 class PyroMindAPIClient:
@@ -147,6 +148,15 @@ class PyroMindAPIClient:
             timeout=timeout,
             max_retries=max_retries
         )
+        self.transfers = TransferClient(
+            api_key=api_key,
+            base_url=base_url,
+            cluster=cluster,
+            timeout=timeout,
+            max_retries=max_retries
+        )
+        # Singular alias for callers that prefer resource names in the API.
+        self.transfer = self.transfers
     
     def close(self):
         """Close all client sessions"""
@@ -157,6 +167,7 @@ class PyroMindAPIClient:
         self.studio.close()
         self.echomind.close()
         self.profile.close()
+        self.transfers.close()
     
     def __enter__(self):
         """Context manager entry"""
