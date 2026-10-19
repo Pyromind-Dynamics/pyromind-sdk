@@ -496,19 +496,74 @@ def test_wrapper_normalizes_unitless_memory_to_gi(
     ]
 
 
-def test_wrapper_still_gates_buildx_and_compose_build(
+def test_wrapper_blocks_buildx_compose_and_network_outright(
     monkeypatch: MonkeyPatch,
     tmp_path,
 ) -> None:
-    path = tmp_path / "docker"
-    monkeypatch.setattr(mod, "WRAPPER_PATH", path)
-    monkeypatch.setattr(mod, "find_real_docker", lambda: "/usr/local/bin/docker")
+    """2026-10-19 用户要求：这些命令直接拦截，不静默降级。
+
+    以前只拦 ``buildx build`` 和 ``compose build`` —— 结果 ``buildx ls`` 会打印**本机**
+    Docker CLI 的 builder（看着像"这里能用 BuildKit"），``compose up`` 会"成功"而服务名
+    根本解析不了、也没有共享网络。全部拦掉，报错里说清原因和替代做法。
+    """
+    wrapper = tmp_path / "docker"
+    fake_docker = tmp_path / "fake-docker"
+    log = tmp_path / "calls.log"
+    fake_docker.write_text(
+        "#!/usr/bin/env bash\n"
+        'for a in "$@"; do echo "ARG:$a"; done >> "$FAKE_LOG"\n',
+        encoding="utf-8",
+    )
+    fake_docker.chmod(fake_docker.stat().st_mode | stat.S_IXUSR)
+
+    monkeypatch.setattr(mod, "WRAPPER_PATH", wrapper)
+    monkeypatch.setattr(mod, "find_real_docker", lambda: str(fake_docker))
     monkeypatch.setattr(mod, "_shell_rc_path", lambda: tmp_path / "rc")
+    mod.install_wrapper()
 
-    text = mod.install_wrapper().read_text(encoding="utf-8")
+    def run(*argv: str) -> subprocess.CompletedProcess[str]:
+        log.unlink(missing_ok=True)
+        return subprocess.run(
+            ["bash", str(wrapper), *argv],
+            env={
+                "PATH": "/usr/bin:/bin",
+                "FAKE_LOG": str(log),
+                "DOCKER_HOST": "unix:///tmp/docker-rt.sock",
+            },
+            capture_output=True,
+            text=True,
+        )
 
-    assert "does not support docker buildx build yet" in text
-    assert "does not support docker compose build yet" in text
+    cases = (
+        (("buildx", "build", "-t", "app:dev", "."), "docker-rt does not support docker buildx"),
+        (("buildx", "ls"), "docker-rt does not support docker buildx"),
+        (("compose", "up", "-d"), "docker-rt does not support docker compose"),
+        (("compose", "build"), "docker-rt does not support docker compose"),
+        (("compose", "ps"), "docker-rt does not support docker compose"),
+        (("network", "create", "backend"), "docker-rt does not support docker network"),
+        (("network", "ls"), "docker-rt does not support docker network"),
+    )
+    for argv, needle in cases:
+        proc = run(*argv)
+        assert proc.returncode == 1, (argv, proc.stdout, proc.stderr)
+        assert needle in proc.stderr, (argv, proc.stderr)
+        # Blocked means blocked: nothing may reach the real docker CLI.
+        assert not log.exists(), (argv, log.read_text() if log.exists() else "")
+
+    # A real Docker context is none of docker-rt's business — plain passthrough.
+    log.unlink(missing_ok=True)
+    proc = subprocess.run(
+        ["bash", str(wrapper), "network", "ls"],
+        env={
+            "PATH": "/usr/bin:/bin",
+            "FAKE_LOG": str(log),
+            "DOCKER_HOST": "unix:///var/run/docker.sock",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert log.exists(), "on a real Docker context the wrapper must hand over"
 
 
 def test_wrapper_build_filters_stderr_instead_of_execing_docker(

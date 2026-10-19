@@ -12,7 +12,7 @@ from pathlib import Path
 WRAPPER_DIR = Path.home() / ".pyromind" / "bin"
 WRAPPER_PATH = WRAPPER_DIR / "docker"
 PATH_LINE = 'export PATH="$HOME/.pyromind/bin:$PATH"'
-WRAPPER_VERSION = "18"
+WRAPPER_VERSION = "19"
 
 
 def _wrapper_version() -> str | None:
@@ -411,22 +411,38 @@ if [[ "${{args[0]:-}}" == "build" ]]; then
   exit $_build_rc
 fi
 if [[ "${{args[0]:-}}" == "buildx" ]]; then
-  for arg in "${{args[@]:1}}"; do
-    if [[ "$arg" == "build" ]]; then
-      echo "docker-rt does not support docker buildx build yet." >&2
-      echo "Use plain 'docker build -t <tag> .' — it builds in the cluster sandbox." >&2
-      exit 1
-    fi
-  done
+  # ``buildx`` is BuildKit's CLI. docker-rt builds through the classic builder
+  # path (POST /build + tar, executed by kaniko) and has no /session endpoint,
+  # so no ``buildx`` subcommand can do what the user expects. Intercepting only
+  # ``buildx build`` left ``buildx ls`` printing the *local* Docker CLI's
+  # builders, which reads like "BuildKit is available here".
+  echo "docker-rt does not support docker buildx." >&2
+  echo "Builds run as plain 'docker build -t <tag> .' (classic builder, executed by kaniko)." >&2
+  echo "The BuildKit session a buildx command needs is not available." >&2
+  exit 1
 fi
 if [[ "${{args[0]:-}}" == "compose" ]]; then
-  for arg in "${{args[@]:1}}"; do
-    if [[ "$arg" == "--build" || "$arg" == "build" ]]; then
-      echo "docker-rt does not support docker compose build yet." >&2
-      echo "Use a pre-built image with docker compose up (without --build)." >&2
-      exit 1
-    fi
-  done
+  # Cut the whole command, not just ``build``/``--build``. The endpoints Compose
+  # calls mostly exist, which is worse than a hard failure: ``up`` "succeeds"
+  # while there is no shared Docker network, no service-name DNS, and no health
+  # signal, so depends_on and service discovery silently misbehave.
+  # 2026-10-19: the user asked for these to be blocked outright rather than
+  # degrade quietly.
+  echo "docker-rt does not support docker compose." >&2
+  echo "Containers do not share a Docker network, service names do not resolve, and" >&2
+  echo "'compose build' / 'up --build' need BuildKit, which the cluster does not run." >&2
+  echo "Manage containers individually with 'docker run' / 'exec' / 'cp'." >&2
+  exit 1
+fi
+if [[ "${{args[0]:-}}" == "network" ]]; then
+  # Network endpoints exist and return Docker-shaped JSON, but they are an
+  # in-process registry: no isolation (every sandbox sits in one k8s namespace)
+  # and no DNS. Letting the command pass turns "create succeeded" into a false
+  # promise of isolation.
+  echo "docker-rt does not support docker network." >&2
+  echo "Networks here are metadata only: no real isolation and no name resolution." >&2
+  echo "Connect containers with published ports (-p) or Pod IPs instead." >&2
+  exit 1
 fi
 if [[ "${{args[0]:-}}" == "cp" ]]; then
   src="${{args[1]:-}}"
