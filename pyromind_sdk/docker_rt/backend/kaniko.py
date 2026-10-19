@@ -157,7 +157,7 @@ _UNSAFE_ARTIFACT_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def image_archive_name(ref: str) -> str:
-    """``pyromind-console:dev`` → ``pyromind-console_dev.tar``.
+    """``my-console:dev`` → ``my-console_dev.tar``.
 
     The tag is the user's handle on the image and ``docker load`` restores the
     real name from inside the tarball, so the file name only has to be

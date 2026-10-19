@@ -62,9 +62,10 @@ def test_acr_profile_resolves_namespace_from_profile(monkeypatch: pytest.MonkeyP
 
     _clear(monkeypatch)
     monkeypatch.setenv("DOCKER_RT_REGISTRY_CLUSTER", "cn-east-1")
-    assert (
-        registry_push.build_registry()
-        == "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind"
+    # 期望值从 profile 配置推导，测试文件里不写死具体 namespace
+    profile = registry_push.registry_profile("cn-east-1")
+    assert registry_push.build_registry() == (
+        f"{profile.host}/{registry_push.registry_namespace(profile, 'cn-east-1')}"
     )
 
 
@@ -77,8 +78,8 @@ def test_dockerhub_profile_requires_an_explicit_namespace(monkeypatch: pytest.Mo
         registry_push.build_registry()
     assert "DOCKER_RT_REGISTRY_NAMESPACE" in str(excinfo.value)
 
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_NAMESPACE", "lvniqi")
-    assert registry_push.build_registry() == "docker.io/lvniqi"
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_NAMESPACE", "my-user")
+    assert registry_push.build_registry() == "docker.io/my-user"
 
 
 def test_unknown_cluster_falls_back_to_generic(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -126,9 +127,10 @@ def test_pyromind_cluster_stage_suffix_is_stripped(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1#prod")
     assert registry_push.current_cluster() == "cn-east-1"
     assert registry_push.registry_profile().kind == "acr"
-    assert (
-        registry_push.build_registry()
-        == "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind"
+    # 期望值从 profile 配置推导，测试文件里不写死具体 namespace
+    acr_profile = registry_push.registry_profile("cn-east-1")
+    assert registry_push.build_registry() == (
+        f"{acr_profile.host}/{registry_push.registry_namespace(acr_profile, 'cn-east-1')}"
     )
 
 
@@ -157,7 +159,7 @@ def test_dockerhub_host_spellings(monkeypatch: pytest.MonkeyPatch) -> None:
 
     _clear(monkeypatch)
     monkeypatch.setenv("DOCKER_RT_REGISTRY_CLUSTER", "us-west-2")
-    hosts = registry_push.registry_hosts_for("docker.io/lvniqi")
+    hosts = registry_push.registry_hosts_for("docker.io/my-user")
     for spelling in registry_push.DOCKER_HUB_AUTH_KEYS:
         assert spelling in hosts
 
@@ -168,7 +170,7 @@ def test_acr_host_spellings_include_vpc_and_public(monkeypatch: pytest.MonkeyPat
     _clear(monkeypatch)
     monkeypatch.setenv("DOCKER_RT_REGISTRY_CLUSTER", "cn-east-1")
     hosts = registry_push.registry_hosts_for(
-        "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind"
+        "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/my-team"
     )
     assert "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com" in hosts
     assert "pyromind-registry.cn-shanghai.cr.aliyuncs.com" in hosts
@@ -265,11 +267,11 @@ def test_username_password_beats_dockerconfig(monkeypatch: pytest.MonkeyPatch, t
     path.write_text(json.dumps({"auths": {"docker.io": {"auth": "ZnJvbS1maWxl"}}}), encoding="utf-8")
     monkeypatch.setenv("DOCKER_RT_REGISTRY_CLUSTER", "us-west-2")
     monkeypatch.setenv("DOCKER_RT_REGISTRY_DOCKERCONFIG", str(path))
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_USERNAME", "lvniqi")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_USERNAME", "my-user")
     monkeypatch.setenv("DOCKER_RT_REGISTRY_PASSWORD", "pat")
     assert registry_push.credential_source() == "username_password"
-    decoded = json.loads(base64.b64decode(registry_push.docker_config_b64("docker.io/lvniqi")))
-    assert decoded["auths"]["docker.io"]["auth"] == base64.b64encode(b"lvniqi:pat").decode()
+    decoded = json.loads(base64.b64decode(registry_push.docker_config_b64("docker.io/my-user")))
+    assert decoded["auths"]["docker.io"]["auth"] == base64.b64encode(b"my-user:pat").decode()
     assert "ZnJvbS1maWxl" not in json.dumps(decoded)
 
 
@@ -282,9 +284,9 @@ def test_docker_config_auths_are_objects_not_strings(monkeypatch: pytest.MonkeyP
     from ..backend import registry_push
 
     _clear(monkeypatch)
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_USERNAME", "lvniqi")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_USERNAME", "my-user")
     monkeypatch.setenv("DOCKER_RT_REGISTRY_PASSWORD", "pat")
-    decoded = json.loads(base64.b64decode(registry_push.docker_config_b64("docker.io/lvniqi")))
+    decoded = json.loads(base64.b64decode(registry_push.docker_config_b64("docker.io/my-user")))
 
     assert decoded["auths"], "expected at least one docker hub spelling"
     for host, entry in decoded["auths"].items():
@@ -301,7 +303,7 @@ def test_docker_config_b64_empty_when_unconfigured(monkeypatch: pytest.MonkeyPat
     assert registry_push.credential_source() == "dockerconfig"
     with pytest.raises(registry_push.RegistryConfigError):
         # Configured but unreadable is an error, not a silent anonymous push.
-        registry_push.docker_config_b64("docker.io/lvniqi")
+        registry_push.docker_config_b64("docker.io/my-user")
 
 
 # --------------------------------------------------------------------------
@@ -444,7 +446,7 @@ def test_ensure_repositories_is_a_noop_for_non_acr(monkeypatch: pytest.MonkeyPat
     def transport(url: str, data: dict[str, str]):  # pragma: no cover - must not run
         raise AssertionError("must not call ACR for a Docker Hub cluster")
 
-    result = registry_push.ensure_repositories(["docker.io/lvniqi/app:1"], transport=transport)
+    result = registry_push.ensure_repositories(["docker.io/my-user/app:1"], transport=transport)
     assert result.error == ""
     assert result.created == []
 
@@ -457,7 +459,7 @@ def test_ensure_repositories_skips_with_warning_without_credentials(
     _clear(monkeypatch)
     monkeypatch.setenv("DOCKER_RT_REGISTRY_CLUSTER", "cn-east-1")
     result = registry_push.ensure_repositories(
-        ["pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/app:1"]
+        ["pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/my-team/app:1"]
     )
     assert result.error == ""
     assert result.warnings
@@ -482,13 +484,14 @@ def test_ensure_repositories_uses_the_image_ref_not_the_prefix(
         return 200, json.dumps({"IsSuccess": True, "Code": "success"})
 
     result = registry_push.ensure_repositories(
-        ["pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/teamsvc:1"],
+        ["pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/my-team/teamsvc:1"],
         transport=transport,
     )
     assert result.error == ""
     assert result.created
     assert seen[0]["RepoName"] == ["teamsvc"]
-    assert seen[0]["RepoNamespaceName"] == ["pyromind"]
+    # namespace 取自 ref 前缀（参数里给的），不是代码补的
+    assert seen[0]["RepoNamespaceName"] == ["my-team"]
 
 
 def test_ensure_repositories_already_exists_is_success(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -506,7 +509,7 @@ def test_ensure_repositories_already_exists_is_success(monkeypatch: pytest.Monke
         )
 
     result = registry_push.ensure_repositories(
-        ["pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/app:1"],
+        ["pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/my-team/app:1"],
         transport=transport,
     )
     assert result.error == ""
@@ -564,7 +567,7 @@ def test_ensure_repositories_aborts_on_other_errors(monkeypatch: pytest.MonkeyPa
         return 200, json.dumps({"Code": "NoPrivilege", "IsSuccess": False, "Message": "denied"})
 
     result = registry_push.ensure_repositories(
-        ["pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/app:1"],
+        ["pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/my-team/app:1"],
         transport=transport,
     )
     assert "NoPrivilege" in result.error
@@ -578,7 +581,7 @@ def test_ensure_repositories_can_be_disabled(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv("DOCKER_RT_REGISTRY_CLUSTER", "cn-east-1")
     monkeypatch.setenv("DOCKER_RT_ACR_AUTO_CREATE_REPO", "false")
     result = registry_push.ensure_repositories(
-        ["pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/app:1"],
+        ["pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/my-team/app:1"],
         transport=lambda url, data: (_ for _ in ()).throw(AssertionError("must not call ACR")),
     )
     assert result.error == ""
@@ -616,7 +619,7 @@ def test_split_repository() -> None:
 def test_push_plan_does_not_warn_about_private_acr_repos(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """上海集群挂的 niqi-dev-secret 含 ACR 凭据，私有仓库能拉，不该告警。
+    """上海集群挂的 acr-pull-secret 含 ACR 凭据，私有仓库能拉，不该告警。
 
     回归点：早期版本据 us-west 那份 secret（Docker Hub 凭据）推断「ACR 私有仓库
     拉不到」，于是对 cn-east-1 每次都打一条误导性 warning（2026-09-22 用户确认后删除）。
@@ -627,7 +630,11 @@ def test_push_plan_does_not_warn_about_private_acr_repos(
     monkeypatch.setenv("DOCKER_RT_REGISTRY_CLUSTER", "cn-east-1")
     plan = registry_push.push_plan()
     assert plan.kind == "acr"
-    assert plan.registry.endswith("/pyromind")
+    # namespace 由 profile 配置给出，测试文件里不写死具体值
+    acr_profile = registry_push.registry_profile("cn-east-1")
+    assert plan.registry.endswith(
+        "/" + registry_push.registry_namespace(acr_profile, "cn-east-1")
+    )
     assert not plan.acr_repo_public
     assert not any("imagePullSecret" in w for w in plan.warnings)
     assert not any("PRIVATE" in w for w in plan.warnings)
@@ -648,7 +655,7 @@ def test_push_plan_reports_missing_credentials(monkeypatch: pytest.MonkeyPatch) 
 
     _clear(monkeypatch)
     monkeypatch.setenv("DOCKER_RT_REGISTRY_CLUSTER", "us-west-1")
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_NAMESPACE", "lvniqi")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_NAMESPACE", "my-user")
     plan = registry_push.push_plan()
     assert not plan.has_credentials
     assert plan.credential_source == ""
@@ -660,7 +667,7 @@ def test_registry_prefix_error_catches_a_host_only_acr_prefix(
     """ACR 必须 ``<host>/<namespace>/<repo>``；只给 host 会把 repo 名当成 namespace。
 
     2026-10-09 实测：用户设 ``DOCKER_RT_BUILD_REGISTRY=pyromind-registry.cn-shanghai.cr.aliyuncs.com``，
-    推 ``…/pyromind-console:dev-5``（少了 ``/pyromind``）→ kaniko 构建 91 秒全成功，
+    推 ``…/my-console:dev-5``（少了 ``/my-team``）→ kaniko 构建 91 秒全成功，
     最后一行才 ``401 Unauthorized``；而同一个 host 的 ``docker login`` 是成功的。
     这条要在**构建之前**拒绝，并告诉用户该写什么。
     """
@@ -687,7 +694,7 @@ def test_registry_prefix_error_catches_a_host_only_acr_prefix(
     # 带命名空间就没事；推**别的** registry 也不按 ACR 的规矩评判
     assert (
         registry_push.registry_prefix_error(
-            "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind"
+            "pyromind-registry.cn-shanghai.cr.aliyuncs.com/my-team"
         )
         is None
     )
@@ -723,7 +730,7 @@ def test_registry_prefix_error_is_acr_only(monkeypatch: pytest.MonkeyPatch) -> N
 
     _clear(monkeypatch)
     monkeypatch.setenv("DOCKER_RT_REGISTRY_CLUSTER", "us-west-2")
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_NAMESPACE", "lvniqi")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_NAMESPACE", "my-user")
     assert registry_push.registry_prefix_error("docker.io") is None
 
 

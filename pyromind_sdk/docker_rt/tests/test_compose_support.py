@@ -407,8 +407,8 @@ def test_normalize_repository_name_keeps_the_length_limit() -> None:
 def test_normalize_image_name_leaves_host_and_tag_alone() -> None:
     from ..backend.buildkit import normalize_image_name as norm
 
-    assert norm("pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/App__1:Dev-5") == (
-        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/app_1:Dev-5"
+    assert norm("pyromind-registry.cn-shanghai.cr.aliyuncs.com/my-team/App__1:Dev-5") == (
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/my-team/app_1:Dev-5"
     )
     # host 带端口时不能把端口当成 tag、更不能动 host
     assert norm("reg.example.com:5000/ns/My__App:1") == "reg.example.com:5000/ns/my_app:1"
@@ -425,17 +425,17 @@ def test_normalize_for_registry_only_touches_acr(monkeypatch: pytest.MonkeyPatch
     """
     from ..backend.buildkit import normalize_for_registry as norm
 
-    acr_ref = "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/My__App:1"
+    acr_ref = "pyromind-registry.cn-shanghai.cr.aliyuncs.com/my-team/My__App:1"
 
     _acr_cluster(monkeypatch)
-    assert norm(acr_ref) == "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/my_app:1"
+    assert norm(acr_ref) == "pyromind-registry.cn-shanghai.cr.aliyuncs.com/my-team/my_app:1"
     # 别人的 registry：不动
-    assert norm("docker.io/lvniqi/My__App:1") == "docker.io/lvniqi/My__App:1"
+    assert norm("docker.io/my-user/My__App:1") == "docker.io/my-user/My__App:1"
 
     # 西部集群（Docker Hub profile）：连 ACR 地址都不当成自己的
     monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2#pre")
     assert norm(acr_ref) == acr_ref
-    assert norm("docker.io/lvniqi/My__App:1") == "docker.io/lvniqi/My__App:1"
+    assert norm("docker.io/my-user/My__App:1") == "docker.io/my-user/My__App:1"
 
 
 def test_the_pushed_ref_is_normalized_on_an_acr_cluster(
@@ -447,10 +447,10 @@ def test_the_pushed_ref_is_normalized_on_an_acr_cluster(
     _acr_cluster(monkeypatch)
     _short, pullable = normalize_image_ref(
         "wasmi-trap-coredumps__3xyt67d-pier-egress-proxy:latest",
-        registry="pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind",
+        registry="pyromind-registry.cn-shanghai.cr.aliyuncs.com/my-team",
     )
     assert pullable == (
-        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/"
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/my-team/"
         "wasmi-trap-coredumps_3xyt67d-pier-egress-proxy:latest"
     )
 
@@ -468,11 +468,11 @@ def test_create_and_run_resolve_a_name_that_was_normalized(
     _acr_cluster(monkeypatch)
     store = ContainerStore()
     raw = (
-        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/"
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/my-team/"
         "wasmi-trap-coredumps__3xyt67d-pier-egress-proxy:latest"
     )
     normalized = (
-        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/"
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/my-team/"
         "wasmi-trap-coredumps_3xyt67d-pier-egress-proxy:latest"
     )
     # 别名表里存的是**规范化后**的 pullable ref（构建时写进去的）
@@ -495,7 +495,7 @@ def test_inspect_finds_an_image_under_its_normalized_name(
     from ..api.images import resolve_image_name
 
     _acr_cluster(monkeypatch)
-    host = "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind"
+    host = "pyromind-registry.cn-shanghai.cr.aliyuncs.com/my-team"
     assert resolve_image_name(f"{host}/app__x", [f"{host}/app_x"]) == f"{host}/app_x"
 
 
@@ -506,14 +506,14 @@ def test_a_fully_qualified_acr_ref_is_normalized_but_other_registries_are_not(
     from ..backend.buildkit import normalize_for_registry as norm
 
     _acr_cluster(monkeypatch)
-    assert norm("pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/App__1:1") == (
-        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/app_1:1"
+    assert norm("pyromind-registry.cn-shanghai.cr.aliyuncs.com/my-team/App__1:1") == (
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/my-team/app_1:1"
     )
     # VPC 入口也是同一台
-    assert norm("pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/App__1:1") == (
-        "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/app_1:1"
+    assert norm("pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/my-team/App__1:1") == (
+        "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/my-team/app_1:1"
     )
     # 别人的 registry：一个字都不动
-    untouched = "docker.io/lvniqi/My__App:1"
+    untouched = "docker.io/my-user/My__App:1"
     assert norm(untouched) == untouched
     assert norm("myharbor.example.com/ns/My__App:1") == "myharbor.example.com/ns/My__App:1"

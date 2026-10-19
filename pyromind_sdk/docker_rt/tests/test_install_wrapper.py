@@ -355,8 +355,8 @@ def test_generated_wrapper_forwards_build_argv_verbatim(
         "-f",
         "Dockerfile-dev",
         "-t",
-        "pyromind-console:dev",
-        "/Users/x/pyromind-console-1",
+        "my-console:dev",
+        "/Users/x/my-console-1",
     ]
     proc = run(user_args)
     assert proc.returncode == 0, proc.stderr
