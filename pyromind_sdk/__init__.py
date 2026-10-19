@@ -60,6 +60,7 @@ from .client import (
     PyroMindAPIClient,
     EchoMindClient,
     ProfileClient,
+    StorageAPIClient,
     # Async clients
     PyroMindAsyncClient,
     PyroMindAsyncAPIError,
@@ -68,6 +69,7 @@ from .client import (
     AsyncInferenceClient,
     AsyncStudioClient,
     AsyncEchoMindClient,
+    AsyncStorageAPIClient,
     PyroMindAsyncAPIClient,
 )
 
@@ -81,6 +83,14 @@ from .client.models import (
     ResourceConfig,
     VolumeMount,
     PortMapping,
+    TransferRequest,
+    TransferLocation,
+    TransferTask,
+    TransferPage,
+    TransferListQuery,
+    TransferCreateResponse,
+    TransferActionResponse,
+    TransferClearResponse,
     SandboxExecStreamChunk,
 )
 
@@ -146,6 +156,7 @@ __all__ = [
     "PyroMindAPIClient",
     "EchoMindClient",
     "ProfileClient",
+    "StorageAPIClient",
     # Async clients
     "PyroMindAsyncClient",
     "PyroMindAsyncAPIError",
@@ -154,6 +165,7 @@ __all__ = [
     "AsyncInferenceClient",
     "AsyncStudioClient",
     "AsyncEchoMindClient",
+    "AsyncStorageAPIClient",
     "PyroMindAsyncAPIClient",
     # Models
     "ApiMode",
@@ -165,6 +177,14 @@ __all__ = [
     "VolumeMount",
     "PortMapping",
     "SandboxExecStreamChunk",
+    "TransferRequest",
+    "TransferLocation",
+    "TransferTask",
+    "TransferPage",
+    "TransferListQuery",
+    "TransferCreateResponse",
+    "TransferActionResponse",
+    "TransferClearResponse",
     # Workflow functionality
     "WorkflowLiteConverter",
     "LayoutGenerator",
