@@ -261,7 +261,7 @@ def _storage(buckets: list[str] | Exception, *, current: str | None = None) -> A
 def test_bucket_prefers_the_configured_default() -> None:
     from ..backend import context_staging as cs
 
-    info = SimpleNamespace(uid="your-bucket-id")
+    info = SimpleNamespace(uid="1000000001")
     assert cs.resolve_bucket(_storage(["other", "x"], current="mine"), info) == "mine"
 
 
@@ -270,22 +270,22 @@ def test_bucket_uses_the_single_visible_bucket() -> None:
     from ..backend import context_staging as cs
 
     info = SimpleNamespace(uid=None)
-    assert cs.resolve_bucket(_storage(["your-bucket-id"]), info) == "your-bucket-id"
+    assert cs.resolve_bucket(_storage(["1000000001"]), info) == "1000000001"
 
 
 def test_bucket_falls_back_to_the_uid() -> None:
     from ..backend import context_staging as cs
 
-    info = SimpleNamespace(uid="your-bucket-id")
-    assert cs.resolve_bucket(_storage(OSError("denied")), info) == "your-bucket-id"
+    info = SimpleNamespace(uid="1000000001")
+    assert cs.resolve_bucket(_storage(OSError("denied")), info) == "1000000001"
 
 
 def test_bucket_picks_the_only_numeric_candidate() -> None:
     from ..backend import context_staging as cs
 
     info = SimpleNamespace(uid=None)
-    assert cs.resolve_bucket(_storage(["shared", "assets", "your-bucket-id"]), info) == (
-        "your-bucket-id"
+    assert cs.resolve_bucket(_storage(["shared", "assets", "1000000001"]), info) == (
+        "1000000001"
     )
 
 
@@ -328,7 +328,7 @@ def _stager(
     monkeypatch: pytest.MonkeyPatch,
     storage: _FakeStorageClient,
     *,
-    bucket: str = "your-bucket-id",
+    bucket: str = "1000000001",
 ) -> Any:
     """A stager wired to a fake storage client (no profile call, no network)."""
     from ..backend import context_staging as cs
@@ -353,7 +353,7 @@ def test_upload_sends_the_packed_bytes_under_the_planned_key(
     (call,) = storage.uploads
     assert call["object_name"] == stager.plan.object_key
     assert call["payload"] == b"packed-bytes"
-    assert call["bucket_name"] == "your-bucket-id"
+    assert call["bucket_name"] == "1000000001"
     assert call["content_type"] == "application/gzip"
     # Parallel multipart is the entire point of this route.
     assert call["num_parallel_uploads"] >= 2
@@ -378,7 +378,7 @@ def test_cleanup_deletes_the_build_directory(monkeypatch: pytest.MonkeyPatch) ->
     stager.upload(b"x")
 
     assert stager.cleanup() is True
-    assert storage.deleted == [("your-bucket-id", f"{stager.plan.object_dir}/")]
+    assert storage.deleted == [("1000000001", f"{stager.plan.object_dir}/")]
     assert stager.uploaded is False
     # Idempotent: a second call is a no-op, not a second delete.
     assert stager.cleanup() is True
@@ -498,7 +498,7 @@ def _sweep(storage: _FakeListingStorage, **kwargs: Any) -> list[str]:
     from ..backend import context_staging as cs
 
     return cs.sweep_stale_staging(
-        storage=storage, bucket="your-bucket-id", now=_NOW, **kwargs
+        storage=storage, bucket="1000000001", now=_NOW, **kwargs
     )
 
 
@@ -513,9 +513,9 @@ def test_sweep_removes_what_the_dead_daemon_left(
     monkeypatch.setattr(cs, "_pid_alive", lambda _pid: False)
 
     assert _sweep(storage, dead_pid=80566) == [stale]
-    assert storage.deleted == [("your-bucket-id", f".docker-rt-build/{stale}/")]
+    assert storage.deleted == [("1000000001", f".docker-rt-build/{stale}/")]
     # Non-recursive: only the build directories themselves are candidates.
-    assert storage.listed == (".docker-rt-build", "your-bucket-id", False)
+    assert storage.listed == (".docker-rt-build", "1000000001", False)
 
 
 def test_sweep_keeps_a_directory_whose_daemon_is_still_running(
@@ -627,7 +627,7 @@ def test_sweep_does_not_list_when_disabled(monkeypatch: pytest.MonkeyPatch) -> N
     storage = _FakeListingStorage([_dir(".docker-rt-build/whatever/")])
 
     cs.sweep_stale_staging(
-        storage=storage, bucket="your-bucket-id", now=_NOW, dead_pid=80566
+        storage=storage, bucket="1000000001", now=_NOW, dead_pid=80566
     )
 
     assert storage.listed is None

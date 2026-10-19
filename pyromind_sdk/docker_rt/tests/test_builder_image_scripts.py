@@ -33,7 +33,13 @@ BUILD_SANDBOX_PY = REPO_ROOT / "pyromind_sdk" / "docker_rt" / "backend" / "build
 IMAGE_NAME = "kaniko-executor-pyromind"
 #: 上海 ACR 那条的 VPC 内网 host —— daemon 在集群里用的地址，推送时用不了，
 #: 所以 ``--push`` 只换它后面的版本号，这个前缀必须原样留在源码里。
-ACR_VPC_HOST = "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind"
+#: namespace 从 registry profile 配置推导，测试文件里不写死。
+from ..backend import registry_push as _registry_push
+
+_acr_profile = _registry_push.registry_profile("cn-east-1")
+ACR_VPC_HOST = (
+    f"{_acr_profile.host}/{_registry_push.registry_namespace(_acr_profile, 'cn-east-1')}"
+)
 
 needs_bash = pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
 

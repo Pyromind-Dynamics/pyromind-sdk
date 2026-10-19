@@ -213,7 +213,7 @@ def registry_prefix_error(prefix: str, cluster: str | None = None) -> str | None
     ``401 Unauthorized``, **after the whole build**.
 
     实测（2026-10-09）：用户设 ``DOCKER_RT_BUILD_REGISTRY=pyromind-registry.cn-shanghai.cr.aliyuncs.com``，
-    于是推 ``…cn-shanghai.cr.aliyuncs.com/pyromind-console:dev-5``（少了 ``/pyromind``）——
+    于是推 ``…cn-shanghai.cr.aliyuncs.com/my-console:dev-5``（少了 ``/my-team``）——
     kaniko 跑了 91 秒、构建全成功，最后一行才 401；而同一个 host
     ``docker login`` 是成功的（登录成功说明不了任何关于**仓库路径**的事）。
 
@@ -828,7 +828,7 @@ def push_plan(cluster: str | None = None) -> PushPlan:
                 + ")"
             )
         # 这里**故意不**告警「ACR 私有仓库拉不到」。
-        # 2026-09-22 用户确认：上海集群 sandbox 模板挂的 `niqi-dev-secret` 是**按命名空间**
+        # 2026-09-22 用户确认：上海集群 sandbox 模板挂的 `acr-pull-secret` 是**按命名空间**
         # 的 secret，cn-east-1 下那份就含 pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com
         # 的凭据 ⇒ 私有仓库（`repo_public=False`）照常能拉。
         # 教训：**别从「secret 名字一样」推出「内容一样」** —— 早期就是据 us-west 那份
