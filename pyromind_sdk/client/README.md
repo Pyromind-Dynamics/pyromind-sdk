@@ -59,6 +59,31 @@ with PyroMindAPIClient(api_key="your-api-key") as client:
     pass
 ```
 
+## Cross-cluster file transfer
+
+The API client can submit and manage transfers between clusters. The client
+must target the source cluster, and paths are under `/workspace`.
+
+```python
+from pyromind_sdk import PyroMindAPIClient, TransferRequest
+
+client = PyroMindAPIClient(api_key="your-api-key", cluster="us-west-1")
+created = client.transfers.submit(
+    TransferRequest(
+        source_path="/workspace/models",
+        target_cluster="us-west-2",
+        target_path="/workspace/models",
+    )
+)
+
+tasks = client.transfers.list()
+client.transfers.cancel(created.id)
+```
+
+Use `client.transfers.list_page()`, `delete()`, `clear_finished()`, and
+`list_syncing_paths()` to manage and monitor tasks. The async client exposes
+the same resource as `client.transfers`.
+
 ## Sandboxes（⚠️desperate can not create）
 
 ### List all sandboxes

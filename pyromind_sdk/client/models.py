@@ -1163,6 +1163,112 @@ class UserPubKeyListResponse(BaseModel):
 
 
 
+class TransferRequest(BaseModel):
+    """Request model for a cross-cluster file transfer."""
+
+    source_path: str = Field(
+        ...,
+        description="File or directory path under /workspace on the source cluster.",
+    )
+    target_cluster: str = Field(..., description="Destination cluster code.")
+    target_path: str = Field(
+        ...,
+        description="Destination path under /workspace on the target cluster.",
+    )
+    overwrite: Literal["skip", "overwrite"] = Field(
+        default="skip",
+        description="Conflict policy for same-name files.",
+    )
+
+
+class TransferLocation(BaseModel):
+    """Source or destination location returned for a transfer task."""
+
+    cluster: Optional[str] = None
+    path: Optional[str] = None
+
+
+class TransferTask(BaseModel):
+    """Cross-cluster transfer task returned by the API."""
+
+    transfer_task_id: Optional[str] = None
+    id: Optional[int] = None
+    path: Optional[str] = None
+    size: int = 0
+    ui_status: Optional[str] = None
+    ui_status_key: Optional[str] = None
+    status: Optional[str] = None
+    stage: Optional[str] = None
+    progress: Optional[int] = None
+    source: Optional[TransferLocation] = None
+    target: Optional[TransferLocation] = None
+    error: Optional[str] = None
+    created_at: Optional[str] = None
+    finished_at: Optional[str] = None
+
+
+class TransferCreateResponse(BaseModel):
+    """Response returned after a transfer task is queued."""
+
+    transfer_task_id: str
+    id: int
+    status: str
+
+
+class TransferActionResponse(BaseModel):
+    """Response returned after cancelling or deleting a transfer task."""
+
+    transfer_task_id: str
+    status: Optional[str] = None
+    deleted: Optional[bool] = None
+
+
+class TransferPage(BaseModel):
+    """One page of cross-cluster transfer tasks."""
+
+    tasks: List[TransferTask] = Field(default_factory=list)
+    total: int = 0
+    page_number: int = 1
+    page_size: int = 20
+
+
+class TransferListQuery(BaseModel):
+    """Filters for the cross-cluster transfer list endpoint."""
+
+    page_number: int = Field(default=1, ge=1)
+    page_size: int = Field(default=20, ge=1, le=100)
+    status: Optional[str] = None
+
+    def to_params(self) -> Dict[str, Any]:
+        params: Dict[str, Any] = {
+            "page_number": self.page_number,
+            "page_size": self.page_size,
+        }
+        if self.status:
+            params["status"] = self.status
+        return params
+
+
+class TransferClearResponse(BaseModel):
+    """Response returned after clearing finished transfer tasks."""
+
+    deleted: int = 0
+
+
+class TransferSyncingPath(BaseModel):
+    """A local path that still has an active transfer."""
+
+    path: str
+    size: int = 0
+
+
+class TransferSyncingResponse(BaseModel):
+    """Active transfer paths returned by the syncing endpoint."""
+
+    items: List[TransferSyncingPath] = Field(default_factory=list)
+    paths: List[str] = Field(default_factory=list)
+
+
 class TrainingTaskEventType(str, Enum):
     """Training task event type enumeration"""
     TRAINING_TASK_STATUS_CHANGED = "training_task_status_changed"
