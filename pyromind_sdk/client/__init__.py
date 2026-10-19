@@ -13,6 +13,7 @@ from .storage import StorageClient
 from .echomind import EchoMindClient
 from .profile import ProfileClient
 from .transfer import TransferClient
+from .storage_api import StorageAPIClient
 from .client import PyroMindAPIClient
 from .workflow import (
     validate_workflow,
@@ -26,6 +27,7 @@ from .async_jupyterlab import AsyncJupyterLabClient
 from .async_inference import AsyncInferenceClient
 from .async_studio import AsyncStudioClient
 from .async_transfer import AsyncTransferClient
+from .async_storage_api import AsyncStorageAPIClient
 from .async_echomind import AsyncEchoMindClient
 from .async_client import PyroMindAsyncAPIClient, PyroMindAsyncClient
 from .models import (
@@ -49,6 +51,7 @@ __all__ = [
     "EchoMindClient",
     "ProfileClient",
     "TransferClient",
+    "StorageAPIClient",
     "PyroMindAPIClient",
     "validate_workflow",
     "ValidationError",
@@ -60,6 +63,7 @@ __all__ = [
     "AsyncInferenceClient",
     "AsyncStudioClient",
     "AsyncTransferClient",
+    "AsyncStorageAPIClient",
     "AsyncEchoMindClient",
     "PyroMindAsyncAPIClient",
     "InternalIPResponse",
