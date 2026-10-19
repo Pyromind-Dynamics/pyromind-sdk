@@ -83,8 +83,6 @@ client.storage.transfers.cancel(created.id)
 Use `client.storage.transfers.list_page()`, `delete()`, and `clear_finished()`
 to manage and monitor tasks. `client.storage.transfer` is the singular alias.
 The async client exposes the same resource as `client.storage.transfers`.
-The top-level `client.transfers` and `client.transfer` aliases remain
-available for backward compatibility.
 
 ## Sandboxes（⚠️desperate can not create）
 

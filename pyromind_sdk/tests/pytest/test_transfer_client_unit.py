@@ -3,11 +3,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from pyromind_sdk.client.async_client import PyroMindAsyncAPIClient
-from pyromind_sdk.client.async_transfer import AsyncTransferClient
+from pyromind_sdk.client.async_storage_api import AsyncStorageAPIClient
 from pyromind_sdk.client.base import PyroMindAPIError
 from pyromind_sdk.client.client import PyroMindAPIClient
 from pyromind_sdk.client.models import TransferRequest
-from pyromind_sdk.client.transfer import TransferClient
+from pyromind_sdk.client.storage_api import StorageAPIClient
 
 
 @pytest.fixture(autouse=True)
@@ -23,7 +23,7 @@ def mock_networking(monkeypatch):
 
 
 def test_submit_supports_request_model_and_uses_storage_transfer_endpoint():
-    client = TransferClient(api_key="test-key")
+    client = StorageAPIClient(api_key="test-key")
     calls = []
 
     def fake_post(endpoint, json_data=None, **kwargs):
@@ -58,7 +58,7 @@ def test_submit_supports_request_model_and_uses_storage_transfer_endpoint():
 
 
 def test_list_page_maps_backend_list_shape_and_query_params():
-    client = TransferClient(api_key="test-key")
+    client = StorageAPIClient(api_key="test-key")
     calls = []
 
     def fake_get(endpoint, params=None, **kwargs):
@@ -94,7 +94,7 @@ def test_list_page_maps_backend_list_shape_and_query_params():
 
 
 def test_business_failure_in_http_200_is_reported_as_sdk_error():
-    client = TransferClient(api_key="test-key")
+    client = StorageAPIClient(api_key="test-key")
     client.post = lambda *args, **kwargs: {
         "success": False,
         "message": "target cluster invalid",
@@ -111,16 +111,18 @@ def test_business_failure_in_http_200_is_reported_as_sdk_error():
 def test_main_client_exposes_transfer_under_storage_namespace():
     client = PyroMindAPIClient(api_key="test-key")
 
+    assert client.storage.transfers is client.storage
+    assert client.storage.transfer is client.storage
     assert client.storage.transfers is client.storage.transfer
-    assert client.transfers is client.storage.transfers
-    assert client.transfer is client.storage.transfer
+    assert not hasattr(client, "transfers")
+    assert not hasattr(client, "transfer")
 
     client.close()
 
 
 @pytest.mark.asyncio
 async def test_async_client_supports_submit():
-    client = AsyncTransferClient(api_key="test-key")
+    client = AsyncStorageAPIClient(api_key="test-key")
     client.post = AsyncMock(
         return_value={
             "success": True,
@@ -142,8 +144,10 @@ async def test_async_client_supports_submit():
 async def test_async_main_client_exposes_transfer_under_storage_namespace():
     client = PyroMindAsyncAPIClient(api_key="test-key")
 
+    assert client.storage.transfers is client.storage
+    assert client.storage.transfer is client.storage
     assert client.storage.transfers is client.storage.transfer
-    assert client.transfers is client.storage.transfers
-    assert client.transfer is client.storage.transfer
+    assert not hasattr(client, "transfers")
+    assert not hasattr(client, "transfer")
 
     await client.close()
