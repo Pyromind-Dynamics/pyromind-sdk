@@ -200,7 +200,7 @@ DOCKER_RT_REGISTRY_PASSWORD=<该 registry 的密码 / 临时 token>
 ```
 
 > 上海集群要设的完整变量清单（含只出归档、跳过检查两种退路）见
-> `docker_rt/README.md` 的「cn-east-1（上海集群）推送需要设的环境变量」。
+> `docker_rt/README.zh.md` 的「cn-east-1（上海集群）推送需要设的环境变量」。
 
 改完**重启 docker-rt**（环境变量是进程启动时读的）。
 

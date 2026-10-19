@@ -76,23 +76,90 @@ docker rm -f demo
 
 ## 支持的命令与限制
 
-| 类别 | 支持内容 |
+docker-rt 的目标是让为 Docker 写的工具不改代码就能跑，而不是在 Kubernetes 上复刻 Docker Engine。
+判断一条命令能不能用的标准只有一条：它发出的 Engine API 请求能否映射成对 Sandbox 的创建、执行或文件操作。
+
+### 支持
+
+| 类别 | 命令 | 说明 |
+| --- | --- | --- |
+| 系统信息 | `version`、`info`、`ps`、`inspect` | `inspect` 默认返回 Docker 结构；`DOCKER_RT_INSPECT_MODE=sandbox` 可改为沙箱原始结构 |
+| 生命周期 | `run`、`create`、`start`、`stop`、`kill`、`restart`、`rm`、`rename`、`wait` | `run -d` 在 Sandbox 运行后返回；前台模式连接并等待命令结束 |
+| Exec 与 attach | `exec`、`exec -i`、`exec -it`、`attach`、终端尺寸调整 | `exec` 走命令流并返回退出码；`-it` 走终端通道 |
+| 文件 | 双向 `cp` | 单次传输上限 `DOCKER_RT_CP_MAX_BYTES`（默认 1 GiB） |
+| 镜像 | `images`、`inspect`、`pull`、`rmi`、`build` | `pull` / `rmi` 只操作登记记录，见下表 |
+| 卷 | `volume create`、`ls`、`inspect`、`rm` | 命名卷数据真实持久化在 workspace 的 JuiceFS subPath |
+| 端口 | TCP `-p` / `--publish`、`port` | 仅 TCP |
+
+### 部分支持：能用，但语义和 Docker 不同
+
+这些命令**不会报错**，因此最容易误判。使用前请确认下表的实际行为。
+
+| 命令 / 参数 | 实际行为 |
 | --- | --- |
-| 系统信息 | `docker version`、`docker info`、`docker ps`、`docker inspect` |
-| 生命周期 | `run`、`create`、`start`、`stop`、`kill`、`restart`、`rm`、`rename`、`wait` |
-| Exec 与 attach | 交互式和非交互式命令、attach、终端尺寸调整 |
-| 文件 | 双向 `docker cp` |
-| 镜像 | `images`、`inspect`、登记 `pull` 引用、`rmi`、`build` |
-| 端口 | TCP `-p` / `--publish` 和 `docker port` |
+| `docker pull` | 只登记镜像引用，不下载镜像层。启动 Sandbox 时由集群拉取。 |
+| `docker rmi` | 只删除 docker-rt 的镜像登记记录，不删除集群节点或镜像仓库里的镜像。 |
+| `--memory` / `-m`（不带单位） | 视为 **Gi** 而非字节：`-m 0.5` 表示 0.5 GiB。CLI 包装器会补 `g` 后缀，否则 Docker 会把 `0.23` 解析成 0 字节（等于「不限制」）。 |
+| `--cpus` / `-m` | 映射为沙箱的 CPU / 内存。CPU request 默认是 limit 的一半（向上取到两位小数），内存 request 默认**等于** limit。 |
+| `docker volume` | 数据真实持久化，但 `inspect` 里的 `Mountpoint` 只是展示值，不是本机路径。 |
+| `-p` | 默认 `auto` 模式在可直连时使用 Pod IP，否则通过 Kubernetes API 端口转发。UDP 不转发。 |
 
-主要限制：
+### 不支持：会明确报错
 
-- `docker pull` 只登记镜像引用，不会把镜像层下载到本机。启动 Sandbox 时由集群拉取镜像。
-- 不支持 `docker events`。`docker logs` 不是完整的容器日志驱动；请通过 Sandbox 命令或文件检查工作负载输出。
-- 不支持 Docker Compose。SDK 的 Docker CLI 集成没有实现 `docker compose` 命令或多容器编排；请使用已支持的 `docker` 命令逐个创建和管理容器。
-- 不支持 UDP 端口映射、特权容器、Docker detach-key、`inspect` 中的进程 ID，也不提供隔离的 Docker 网络。
-- 状态属于单个服务进程。多个服务进程不会共享容器、卷或网络记录。
-- `-p` 转发 TCP 端口。默认 `auto` 模式会在可直连时使用 Pod IP，否则通过 Kubernetes API 端口转发。
+以下功能没有实现。docker-rt 不会静默成功，而是给出可读的错误（CLI 包装器直接退出，或 API 返回 501 / 404）。
+
+| 功能 | 表现 |
+| --- | --- |
+| `docker logs` | CLI 包装器直接拦截并提示改用 `docker exec`；API 对默认后端返回 501。 |
+| `docker events` | CLI 包装器直接拦截；API 返回 501。 |
+| `docker compose` | CLI 包装器**直接拦截全部子命令**（含 `up`、`ps`、`build`），提示改用 `docker` 基本命令逐容器管理。详见下文。 |
+| `docker network` | CLI 包装器**直接拦截全部子命令**，提示用 `-p` 或 Pod IP 互连。底层 API 仅保留给 docker-py 等直接调用方。 |
+| `docker buildx` | CLI 包装器**直接拦截全部子命令**（含 `ls` / `create`），提示改用 `docker build`。 |
+| BuildKit | `docker build` 强制 `DOCKER_BUILDKIT=0`，走经典 builder，由 Kaniko 执行。 |
+| 其他未实现子命令 | `commit`、`push`、`tag`、`save`、`load`、`pause`、`top`、`stats`、`diff`、`system df`、`login`、`swarm` 等没有对应的 Engine API 路由，返回 404。 |
+
+此外不支持：UDP 端口映射、特权容器、Docker detach-key、`inspect` 中的进程 ID。状态属于单个服务进程，多个服务进程不共享容器、卷或网络记录。
+
+### 为什么这几类功能不可用
+
+#### `docker compose`
+
+docker-rt 不再把 Compose 作为可用路径。自 2026-10-19 起，CLI 包装器**直接拦截全部 `docker compose` 子命令**（`up` / `ps` / `build` / `down` 等），在 stderr 给出替代做法，命令不会发往后端。
+
+之前只拦 `compose build` / `up --build`，其余子命令放行 —— 这反而更危险：`up` 看似成功后，容器之间**没有共享 Docker 网络**、Compose 服务名**无法解析**、`inspect` 不返回 `State.Health` 导致 `depends_on: condition: service_healthy` 一直等待。表面成功、实则编排语义全都不成立，比直接报错更误导。
+
+底层仍保留了 Compose 需要的网络、卷与 `com.docker.compose.*` 标签写入（API 层不返回 404），但那是给 docker-py 等绕过 CLI 直接调用方用的，命令行不可达。
+
+需要多容器时，用受支持的 `docker` 命令逐个创建，通过 Pod IP 或已发布端口互连。
+
+#### `docker logs` 与 `docker events`
+
+两者都在 CLI 包装器里直接拦截（仅在 `docker-rt` context 下），因为默认的 PyroMind Sandbox API 后端不聚合容器标准输出，也不提供事件流。
+
+- 看日志：`docker exec -it <container> bash`，或读取沙箱内文件。
+- 看状态：`docker ps`、`docker inspect`。
+
+服务端保留了一份直连 Kubernetes 的 `logs` 实现（支持 `--tail` / `--follow` / `--timestamps`），但只有绕过包装器直接请求 API 时才会走到；从 CLI 使用一律被拦截。
+
+#### `docker network`
+
+自 2026-10-19 起，CLI 包装器**直接拦截全部 `docker network` 子命令**（`create` / `ls` / `inspect` / `rm` / `connect` / `disconnect`），命令不会发往后端。
+
+之前这些端点存在且返回 Docker 结构，但它们只是 docker-rt 进程内的一张注册表，不产生任何集群侧网络资源：没有隔离（所有沙箱在同一个 Kubernetes namespace，Pod 之间本就互通）、没有内建 DNS（`--network` / `--network-alias` 指定的名字不会互相解析），`network inspect` 的 `IPAM.Config` 固定返回 `172.18.0.0/16`、`IPv4Address` / `MacAddress` 为空 —— 让命令"成功"只会让人误以为有了隔离网络。底层 API 仍保留，供 docker-py 等直接调用方使用。
+
+容器之间用已发布端口（`-p`）或 Pod IP 互连。
+
+#### `docker buildx` 与 BuildKit
+
+集群侧唯一的构建执行器是 Kaniko，它以经典 builder 的方式接收构建上下文（`POST /build` + tar 包）。BuildKit 客户端不走这条路：它需要先建立 `/session` 连接并通过 gRPC 与 buildkitd 通信，docker-rt 没有实现。
+
+| 用法 | 结果 |
+| --- | --- |
+| `docker buildx <任何子命令>` | 包装器直接拦截，提示改用 `docker build -t <tag> .` |
+| `docker build --mount` / `--secret` / `--ssh` / `--output` / `-o` / `--cache-to` / `--cache-from` / `--push` / `--load` / `--builder` / `--provenance` / `--sbom` / `--attest` / `--allow` | 包装器逐项拒绝，说明这些参数 Kaniko 构建沙箱无法处理 |
+| `docker build ...`（普通用法） | 强制 `DOCKER_BUILDKIT=0`，用经典 builder 提交上下文，由 Kaniko 构建并推送 |
+
+需要 BuildKit 特有语义（cache mount、secret mount、一次构建多平台、`--output type=oci` 等）时，只能在 docker-rt 之外构建，再让集群从镜像仓库拉取。
 
 ## 镜像构建与存储
 
@@ -103,6 +170,27 @@ docker rm -f demo
 ```
 
 每次成功构建都会写入归档，不论是否推送镜像。workspace 由用户的 PyroMind storage 持久化，临时构建 Sandbox 删除后归档仍然保留。文件名根据解析后的第一个镜像目标转换为安全文件名。例如，仅归档构建中的短标签 `myapp:dev` 会生成 `myapp_dev.tar`。相同目标再次构建会覆盖原归档。
+
+### 构建在集群内执行：先确认网络可达
+
+`docker build` 的每一步都在集群的临时 Sandbox 里跑，**用的是集群的出网能力，不是你本机的**。
+「在我机器上能 build」不代表在上海集群能 build —— 上海集群（`cn-east-1`）访问不到 Docker Hub、
+GitHub Releases、`pypi.org` 这类境外源，任何需要联网的步骤都会卡住或超时。
+
+Dockerfile 里的依赖必须换成中国网络可达的地址：
+
+| 位置 | 常见写法 | 在上海集群的建议 |
+| --- | --- | --- |
+| `FROM` | `ubuntu:22.04` | 用集群能拉取的基础镜像，或先在 ACR 里同步好再引用 |
+| apt | `deb.debian.org`、`archive.ubuntu.com` | 换成阿里云镜像源 |
+| pip | 默认 `pypi.org` | `-i https://mirrors.aliyun.com/pypi/simple/` |
+| npm | 默认 `registry.npmjs.org` | `--registry=https://registry.npmmirror.com` |
+| Go | `proxy.golang.org` | `GOPROXY=https://goproxy.cn` |
+| 直接下载 | `curl https://github.com/...` | 改从国内镜像或 CDN 取，或把文件预先放进构建上下文 |
+
+同理，**推送目标也必须是集群能访问的仓库**（例如阿里云 ACR；集群在同一 VPC 时可用内网地址
+`*-vpc.<region>.cr.aliyuncs.com`）。推到 Docker Hub 会在鉴权或网络这一步失败。
+只需要产出镜像、不需要立刻推送时，用 `DOCKER_RT_BUILD_PUSH=false` 只保留归档，见下一节。
 
 ### 推送镜像到仓库
 
@@ -117,6 +205,15 @@ docker build -t myapp:dev .
 ```
 
 完整限定的镜像标签会按原样使用。短标签会使用 `DOCKER_RT_BUILD_REGISTRY` 或集群仓库配置补全。也可以通过 Docker `config.json` 提供仓库凭据。
+
+上海集群（`cn-east-1`）还有两个额外要求：
+
+- **前缀必须带命名空间**，例如 `registry-host/pyromind`。只写到仓库域名时，后面的镜像路径会被当成命名空间的一部分，表现为构建全部成功、最后推送返回 401。
+- 仓库地址必须是**中国网络可达**的，即上一节说的集群出网能力。
+
+默认 `DOCKER_RT_BUILD_PUSH_CHECK=fail`：构建开始前会先探测「构建沙箱 → 仓库」的连通性，不通就直接失败，不会白跑一次构建。排查阶段可设成 `warn` 看清完整报错，或设成 `off` 跳过。
+
+完整变量见后文「仓库凭据与集群配置」。
 
 ### 只构建并保留归档，不推送
 
@@ -172,7 +269,7 @@ Kaniko 执行器镜像必须包含 shell 和 `sleep`，应使用兼容的 `-debu
 | `DOCKER_RT_GPU_CARD` | 未设置 | 支持 GPU 请求时使用的默认 GPU 卡类型。 |
 | `DOCKER_RT_INSPECT_MODE` | `standard` | Docker inspect 响应格式：`standard` 或 `sandbox`。 |
 | `DOCKER_RT_PORT_FORWARD_MODE` | `auto` | TCP 转发方式：`auto`、`direct` 或 `api`。 |
-| `DOCKER_RT_SERVICE_DNS` | `true` | 为带有服务标签的 API 请求启用 Kubernetes Service DNS 集成；这不代表支持 Docker Compose。 |
+| `DOCKER_RT_SERVICE_DNS` | `true` | 为带有服务标签的 API 请求启用 Kubernetes Service DNS 集成；只在沙箱不是由中间件 API 创建时生效（正常部署中不生效）。这不代表支持 Docker Compose。 |
 | `DOCKER_RT_KUBECONFIG` / `KUBECONFIG` | SDK 自动发现 | 可选 kubeconfig 路径，用于端口转发、服务 DNS 集成等直接访问 Kubernetes 的功能。 |
 | `DOCKER_RT_KUBE_CONTEXT` | `docker-desktop` | 直接执行 Kubernetes 操作时使用的 context。 |
 | `DOCKER_RT_NAMESPACE` | kubeconfig 配置或 `default` | 直接执行 Kubernetes 操作时使用的 namespace。 |
@@ -246,6 +343,30 @@ Kaniko 执行器镜像必须包含 shell 和 `sleep`，应使用兼容的 `-debu
 
 仓库设置在服务启动时读取。对于 `cn-east-1`，构建仓库前缀必须包含命名空间，例如 `registry-host/pyromind`。仅在希望 docker-rt 自动创建缺失仓库时才需要 ACR AccessKey；使用已存在仓库不需要该凭据。
 
+#### cn-east-1（上海集群）推送需要设的环境变量
+
+下面是上海集群自带仓库的写法；换成你自己的 ACR 也可以，只要集群能访问到它。
+
+```bash
+# 必须：集群能访问到的仓库前缀，且必须带命名空间
+DOCKER_RT_BUILD_REGISTRY=pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind
+
+# 凭据二选一，不是两条都要设
+DOCKER_RT_REGISTRY_USERNAME=<该仓库的用户名>
+DOCKER_RT_REGISTRY_PASSWORD=<密码或临时 token>
+#   或
+DOCKER_RT_REGISTRY_DOCKERCONFIG=<一份已登录该仓库的 config.json 路径>
+```
+
+两条退路：
+
+| 目标 | 设置 |
+| --- | --- |
+| 只出归档、不推送 | `DOCKER_RT_BUILD_PUSH=false` |
+| 跳过推送前连通性检查、照常构建 | `DOCKER_RT_BUILD_PUSH_CHECK=warn` |
+
+这些变量在 `docker-rt` 启动时读取，改完必须重启守护进程。
+
 ### 构建 Sandbox 清理说明
 
 构建正常结束时会删除临时 Sandbox。若服务被强制终止，清理流程无法执行。遗留构建 Sandbox 的自动清理默认关闭，因为 Sandbox 列表是账号级的，可能包含另一台机器正在运行的构建。只有在接受清理该账号下所有匹配 `sandbox-docker-build-*` 的 Sandbox 时，才设置 `DOCKER_RT_BUILD_SANDBOX_SWEEP=true`；否则请手动删除遗留 Sandbox。
@@ -259,7 +380,8 @@ Kaniko 执行器镜像必须包含 shell 和 `sleep`，应使用兼容的 `-debu
 | 服务无法连接 | 检查 API Key、集群名称和 `/tmp/docker-rt.log`。 |
 | Sandbox 无法拉取镜像 | 确认目标集群能访问镜像仓库，并且平台有权限读取镜像。 |
 | 构建无法启动 | 检查构建器镜像是否可拉取、是否包含 shell 和 `sleep`；若 Sandbox 因 OOM 被终止，可增加内存。 |
-| 构建完成但推送失败 | 检查仓库连通性和凭据；镜像归档可能仍保存在 `/workspace/docker_images/`。 |
+| 构建卡在拉取依赖、`connection timed out` 或 `Temporary failure in name resolution` | 构建跑在集群内，用的不是你的网络。Dockerfile 里的 `FROM`、apt/pip/npm 源、`curl` 下载地址必须是国内可达的；见「构建在集群内执行：先确认网络可达」。 |
+| 构建完成但推送失败 | 检查仓库连通性和凭据；上海集群还要确认前缀带了命名空间（只写域名会在最后一步返回 401）。镜像归档可能仍保存在 `/workspace/docker_images/`。 |
 | 仅归档构建后 `docker run` 失败 | 归档位于 workspace storage，不会自动注册为集群镜像；要通过 docker-rt 运行，请推送到集群可访问的仓库。 |
 | `docker exec` 报 `[EXEC_STREAM_LOST]` | **平台自己告诉你原因了**：上游（kubelet/apiserver）的 exec 流在命令给出退出码之前断了（`[EXEC_STREAM_RELAY_FAILED]` 同理，只是断在中继而不是上游）。消息里带着诊断和"已经发给你多少字节"：`0 stdout / 0 stderr` 几乎可以断定命令没跑起来；已经收到输出则是命令跑过、只是尾部/退出码丢了 —— 这种**不要盲目重试**（命令可能已产生副作用）。只对幂等命令重试。 |
 | `docker exec` 偶发报 `docker-rt: exec stream connection lost before any exit event` | **没拿到任何原因**：exec 的 WebSocket 被平台之外的东西中途切断（代理 / LB / 空闲超时 / 网络重置 / 服务端重启），连错误帧都没送到。报错里带着"活了多久、收到多少字节"，读法和上面一行相同。若频繁出现，检查服务进程所在环境是否设置了 `HTTP_PROXY` / `HTTPS_PROXY`（exec 走 WebSocket，代理对长连接的处理远不如 HTTP 稳），必要时给集群域名设 `NO_PROXY`。 |
