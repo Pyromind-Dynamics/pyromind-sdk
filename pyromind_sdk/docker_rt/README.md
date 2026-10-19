@@ -63,23 +63,95 @@ The daemon uses the PyroMind sandbox API to create and manage workloads. Contain
 
 ## Supported commands and limitations
 
-| Area | Supported behavior |
+docker-rt exists so that tools written for Docker keep working without code changes. It is not a replica of Docker Engine on Kubernetes. There is exactly one test for whether a command works: can the Engine API request it sends be mapped onto creating, executing in, or reading files from a sandbox?
+
+### Supported
+
+| Area | Commands | Notes |
+| --- | --- | --- |
+| System | `version`, `info`, `ps`, `inspect` | `inspect` returns the Docker shape by default; `DOCKER_RT_INSPECT_MODE=sandbox` returns the raw sandbox object |
+| Lifecycle | `run`, `create`, `start`, `stop`, `kill`, `restart`, `rm`, `rename`, `wait` | `run -d` returns once the sandbox is running; foreground mode attaches and waits for the command to finish |
+| Exec and attach | `exec`, `exec -i`, `exec -it`, `attach`, terminal resize | `exec` uses the command stream and reports an exit code; `-it` uses the terminal channel |
+| Files | `cp` in both directions | Single transfer limited by `DOCKER_RT_CP_MAX_BYTES` (1 GiB by default) |
+| Images | `images`, `inspect`, `pull`, `rmi`, `build` | `pull` and `rmi` only touch registry bookkeeping; see below |
+| Volumes | `volume create`, `ls`, `inspect`, `rm` | Named volume data is really persisted to a JuiceFS subPath in the workspace |
+| Ports | TCP `-p` / `--publish`, `port` | TCP only |
+
+### Partially supported: works, but not with Docker semantics
+
+These commands **do not fail**, which makes them the easiest to misread. Check what they actually do before relying on them.
+
+| Command / flag | Actual behavior |
 | --- | --- |
-| System | `docker version`, `docker info`, `docker ps`, `docker inspect` |
-| Lifecycle | `run`, `create`, `start`, `stop`, `kill`, `restart`, `rm`, `rename`, `wait` |
-| Exec and attach | Interactive and non-interactive commands, attach, terminal resize |
-| Files | `docker cp` in both directions |
-| Images | `images`, `inspect`, `pull` reference registration, `rmi`, `build` |
-| Ports | TCP `-p` / `--publish` and `docker port` |
+| `docker pull` | Registers an image reference; no layers are downloaded. The cluster pulls the image when the sandbox starts. |
+| `docker rmi` | Removes docker-rt's bookkeeping entry only. The image is not deleted from cluster nodes or the registry. |
+| `--memory` / `-m` without a unit | Read as **Gi**, not bytes: `-m 0.5` means 0.5 GiB. The CLI wrapper appends `g`, without which Docker parses `0.23` as 0 bytes and silently applies no limit at all. |
+| `--cpus` / `-m` | Mapped onto the sandbox CPU / memory. The CPU request defaults to half the limit (rounded up to two decimals); the memory request defaults to **equal to** the limit. |
+| `docker volume` | Data is really persisted, but the `Mountpoint` field in `inspect` is display-only, not a path on your machine. |
+| `-p` | The default `auto` mode uses the Pod IP when directly reachable, otherwise Kubernetes API port-forwarding. UDP is not forwarded. |
 
-Important limitations:
+### Not supported: fails loudly
 
-- `docker pull` registers an image reference; it does not download layers to the local machine. The cluster pulls the image when starting a sandbox.
-- `docker events` is unsupported. `docker logs` is not a full container log driver; use sandbox commands or files to inspect workload output.
-- Docker Compose is unsupported. The SDK's Docker CLI integration does not implement `docker compose` commands or multi-container orchestration; create and manage containers individually with the supported `docker` commands.
-- UDP publishing, privileged execution, Docker detach-key handling, process IDs in `inspect`, and isolated Docker networks are not available.
-- State is local to a daemon process. Multiple daemons do not share container, volume, or network records.
-- `-p` forwards TCP ports to the sandbox. The default `auto` mode chooses direct Pod-IP forwarding when reachable, otherwise Kubernetes API port-forwarding.
+These are unimplemented. docker-rt never succeeds silently — the CLI wrapper exits with an explanation, or the API returns 501 / 404.
+
+| Feature | Behavior |
+| --- | --- |
+| `docker logs` | The CLI wrapper intercepts it and points at `docker exec`; the API returns 501 on the default backend. |
+| `docker events` | Intercepted by the CLI wrapper; the API returns 501. |
+| `docker compose` | The CLI wrapper **blocks every subcommand** (including `up`, `ps`, `build`); use plain `docker` commands to manage containers one by one. See below. |
+| `docker network` | The CLI wrapper **blocks every subcommand**, pointing at `-p` or Pod IPs. The underlying API remains for direct callers such as docker-py. |
+| `docker buildx` | The CLI wrapper **blocks every subcommand** (including `ls` / `create`); it points at `docker build`. |
+| BuildKit | `docker build` forces `DOCKER_BUILDKIT=0` and uses the classic builder path, executed by Kaniko. |
+| Other subcommands | `commit`, `push`, `tag`, `save`, `load`, `pause`, `top`, `stats`, `diff`, `system df`, `login`, `swarm` and friends have no Engine API route and return 404. |
+
+Also unavailable: UDP publishing, privileged execution, Docker detach-key handling, and process IDs in `inspect`. State is local to a single daemon process; multiple daemons do not share container, volume, or network records.
+
+### Why these features are unavailable
+
+#### `docker compose`
+
+docker-rt does not treat Compose as a supported orchestrator. The CLI wrapper blocks two paths — `docker compose build` and `docker compose up --build`. Every other `compose` command is forwarded to docker-rt as usual.
+
+docker-rt does implement the networks, volumes, and `com.docker.compose.*` labels Compose needs, so its requests don't come back 404 — **that is not the same as multi-container orchestration working**:
+
+- Containers do not share a Docker network, so `depends_on` and health-check ordering are not guaranteed.
+- `inspect` never returns `State.Health`, so Compose has no health signal and `depends_on: condition: service_healthy` waits forever.
+- Compose service-name resolution depends on Kubernetes Services (`DOCKER_RT_SERVICE_DNS=true`), but those Services are only created when the sandbox was not created through the middleware API (for example when adopting an existing Pod). A normal deployment goes through the middleware API, creates none, and service names do not resolve.
+- A `compose build` request itself falls inside what `/build` supports — compose v2 falls back to the classic builder when it cannot find BuildKit — so the current rejection comes from the CLI wrapper. That path is not a supported commitment; use `docker build` directly when you need to build.
+
+For multi-container setups, create containers individually with the supported `docker` commands and connect them through Pod IPs or published ports.
+
+#### `docker logs` and `docker events`
+
+Both are intercepted in the CLI wrapper (only under the `docker-rt` context), because the default PyroMind Sandbox API backend neither aggregates container stdout nor exposes an event stream.
+
+- Logs: `docker exec -it <container> bash`, or read files inside the sandbox.
+- State: `docker ps` and `docker inspect`.
+
+The server still carries a direct-Kubernetes `logs` implementation (supporting `--tail`, `--follow`, `--timestamps`), but only a request that bypasses the wrapper reaches it. From the CLI it is always intercepted.
+
+#### `docker network`
+
+All six network endpoints exist and return Docker-shaped payloads, but they are a registry inside the docker-rt process. No cluster-side network object is created:
+
+- **No isolation.** Every sandbox lives in the same Kubernetes namespace, and Pods can already reach each other.
+- **No built-in DNS.** Names passed via `--network` / `--network-alias` do not resolve.
+- `network inspect` always reports `172.18.0.0/16` in `IPAM.Config`, leaves `IPv4Address` / `MacAddress` empty, and lists in `Containers` only the endpoints that were explicitly connected.
+
+So `docker network` only serves flows where a tool insists on creating a network before creating containers. It cannot be used for isolation or service discovery.
+
+#### `docker buildx` and BuildKit
+
+The only build executor on the cluster is Kaniko, which receives a build context the classic-builder way (`POST /build` plus a tar). A BuildKit client does not take that path: it opens a `/session` connection and speaks gRPC to buildkitd, which docker-rt does not implement.
+
+| Usage | Result |
+| --- | --- |
+| `docker buildx build ...` | Rejected by the wrapper, which points at `docker build -t <tag> .` |
+| `docker build --mount` / `--secret` / `--ssh` / `--output` / `-o` / `--cache-to` / `--cache-from` / `--push` / `--load` / `--builder` / `--provenance` / `--sbom` / `--attest` / `--allow` | Rejected flag by flag, with a note that the Kaniko build sandbox cannot honour them |
+| `docker build ...` (ordinary use) | Forces `DOCKER_BUILDKIT=0`, submits the context through the classic builder, and Kaniko builds and pushes |
+| `docker buildx ls` / `create` / `use` | Not intercepted, but they act on the **local** Docker CLI's builders, which have nothing to do with the cluster |
+
+If you need BuildKit-only semantics (cache mounts, secret mounts, multi-platform in one build, `--output type=oci`, …), build outside docker-rt and let the cluster pull the image from a registry.
 
 ## Build and image storage
 
@@ -90,6 +162,23 @@ Important limitations:
 ```
 
 The archive is written on every successful build, whether or not the image is pushed. The workspace is backed by the user's PyroMind storage and remains available after the temporary build sandbox is removed. The filename is made filesystem-safe from the first resolved image destination; for example, an archive-only short tag `myapp:dev` becomes `myapp_dev.tar`. Rebuilding the same destination replaces its archive.
+
+### The build runs inside the cluster: check network reachability first
+
+Every step of `docker build` runs in a temporary sandbox in the cluster, so it uses **the cluster's outbound network, not your machine's**. "It builds on my laptop" does not mean it builds on the Shanghai cluster (`cn-east-1`), which cannot reach Docker Hub, GitHub Releases, `pypi.org`, or similar overseas sources — any step that needs the network will stall or time out.
+
+Dependencies in the Dockerfile must point at addresses reachable from mainland China:
+
+| Where | Usual form | What to use on the Shanghai cluster |
+| --- | --- | --- |
+| `FROM` | `ubuntu:22.04` | An image the cluster can pull, or one synced into ACR beforehand |
+| apt | `deb.debian.org`, `archive.ubuntu.com` | Switch to an Aliyun mirror |
+| pip | `pypi.org` by default | `-i https://mirrors.aliyun.com/pypi/simple/` |
+| npm | `registry.npmjs.org` by default | `--registry=https://registry.npmmirror.com` |
+| Go | `proxy.golang.org` | `GOPROXY=https://goproxy.cn` |
+| Direct downloads | `curl https://github.com/...` | Fetch from a domestic mirror or CDN, or put the file in the build context |
+
+Likewise, **the push target must be a registry the cluster can reach** (for example Alibaba Cloud ACR; when the cluster sits in the same VPC, the internal address `*-vpc.<region>.cr.aliyuncs.com` works). Pushing to Docker Hub fails at authentication or on the network. If you only need the image produced, use `DOCKER_RT_BUILD_PUSH=false` to keep the archive alone — see the next section.
 
 ### Push the image to a registry
 
@@ -104,6 +193,15 @@ docker build -t myapp:dev .
 ```
 
 Fully qualified tags are used as written. Short tags use `DOCKER_RT_BUILD_REGISTRY` or the configured cluster registry profile. Registry push credentials may alternatively come from a Docker `config.json` file.
+
+On the Shanghai cluster (`cn-east-1`) there are two additional requirements:
+
+- **The prefix must include a namespace**, e.g. `registry-host/pyromind`. If you give only the registry host, the image path is treated as part of the namespace, and every build succeeds before the final push returns 401.
+- The registry address must be **reachable from mainland China** — the cluster's outbound network again.
+
+`DOCKER_RT_BUILD_PUSH_CHECK` defaults to `fail`: before building, docker-rt probes reachability from the build sandbox to the registry, so an unreachable registry fails immediately instead of wasting a full build. While diagnosing, set it to `warn` to see the full error, or `off` to skip the check.
+
+See "Registry credentials and cluster profiles" under Environment variables for the full set.
 
 ### Build without pushing
 
@@ -163,7 +261,7 @@ Set these variables in the environment where `docker-rt` starts. The daemon read
 | `DOCKER_RT_GPU_CARD` | unset | Default GPU card type for supported GPU requests. |
 | `DOCKER_RT_INSPECT_MODE` | `standard` | Docker inspect response shape: `standard` or `sandbox`. |
 | `DOCKER_RT_PORT_FORWARD_MODE` | `auto` | TCP forwarding mode: `auto`, `direct`, or `api`. |
-| `DOCKER_RT_SERVICE_DNS` | `true` | Enable Kubernetes Service DNS integration for API requests that provide service labels. This does not add Docker Compose support. |
+| `DOCKER_RT_SERVICE_DNS` | `true` | Enable Kubernetes Service DNS integration for API requests that provide service labels. Only takes effect when the sandbox was not created through the middleware API (so it is inert in a normal deployment). This does not add Docker Compose support. |
 | `DOCKER_RT_KUBECONFIG` / `KUBECONFIG` | SDK discovery | Optional kubeconfig path for features that use Kubernetes directly, such as port forwarding and service DNS integration. |
 | `DOCKER_RT_KUBE_CONTEXT` | `docker-desktop` | Kubernetes context for direct Kubernetes operations. |
 | `DOCKER_RT_NAMESPACE` | From kubeconfig or `default` | Namespace for direct Kubernetes operations. |
@@ -237,6 +335,30 @@ The normal PyroMind Sandbox API backend does not require a local kubeconfig. Kub
 
 Registry settings are read when the daemon starts. For `cn-east-1`, the build registry prefix must include a namespace, for example `registry-host/pyromind`. The ACR AccessKey pair is only needed if docker-rt should create missing repositories; an existing repository can be used without it.
 
+#### Registry settings for a cn-east-1 (Shanghai) push build
+
+The block below uses the Shanghai cluster's own registry; your own ACR works too as long as the cluster can reach it.
+
+```bash
+# Required: a registry prefix the cluster can reach, including a namespace
+DOCKER_RT_BUILD_REGISTRY=pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind
+
+# Credentials: pick one of the two, not both
+DOCKER_RT_REGISTRY_USERNAME=<username for that registry>
+DOCKER_RT_REGISTRY_PASSWORD=<password or temporary token>
+#   or
+DOCKER_RT_REGISTRY_DOCKERCONFIG=<path to a config.json already logged in to it>
+```
+
+Two escape hatches:
+
+| Goal | Setting |
+| --- | --- |
+| Archive only, no push | `DOCKER_RT_BUILD_PUSH=false` |
+| Skip the pre-push reachability check and build anyway | `DOCKER_RT_BUILD_PUSH_CHECK=warn` |
+
+These are read when `docker-rt` starts, so restart the daemon after changing them.
+
 ### Build-sandbox cleanup warning
 
 Normal build completion removes its temporary sandbox. If the daemon is killed forcefully, cleanup cannot run. Automatic cleanup of leftover build sandboxes is disabled by default because the sandbox listing is account-scoped and can include a build running on another machine. Set `DOCKER_RT_BUILD_SANDBOX_SWEEP=true` only if deleting all matching `sandbox-docker-build-*` sandboxes for the account is acceptable. Otherwise remove an abandoned sandbox manually.
@@ -250,7 +372,8 @@ Normal build completion removes its temporary sandbox. If the daemon is killed f
 | Daemon cannot connect | Check API key, cluster name, and `/tmp/docker-rt.log`. |
 | Sandbox cannot pull an image | Verify the target cluster can reach the image registry and the image is accessible to the platform. |
 | Build cannot start | Check the builder image is pullable and has a shell and `sleep`; raise builder memory if the sandbox is OOM-killed. |
-| Build completes but push fails | Check registry reachability and credentials. The image archive may still exist in `/workspace/docker_images/`. |
+| Build hangs while fetching dependencies, with `connection timed out` or `Temporary failure in name resolution` | The build runs in the cluster, not on your network. The `FROM` image, apt/pip/npm sources, and `curl` download URLs in the Dockerfile must all be reachable from mainland China; see "The build runs inside the cluster". |
+| Build completes but push fails | Check registry reachability and credentials. On the Shanghai cluster also confirm the prefix includes a namespace — with only the host, the final push returns 401. The image archive may still exist in `/workspace/docker_images/`. |
 | `docker run` fails after archive-only build | The archive is in workspace storage; it is not automatically installed as an image in the cluster. Push it to a cluster-reachable registry to run it through docker-rt. |
 | `docker exec` fails with `[EXEC_STREAM_LOST]` | The platform **told you why**: the upstream (kubelet/apiserver) exec stream died before the command announced an exit status (`[EXEC_STREAM_RELAY_FAILED]` is the same situation with the break in the relay rather than upstream). The message carries the diagnosis plus how many bytes had already been delivered: `0 stdout / 0 stderr` almost certainly means the command never started; bytes already delivered means it ran and only the tail/exit code was lost — do **not** re-run those blindly. Retry only idempotent commands. |
 | `docker exec` intermittently fails with `docker-rt: exec stream connection lost before any exit event` | **No reason was available**: the exec WebSocket was cut by something outside the platform (proxy / LB / idle timeout / network reset / server restart), so not even an error frame arrived. The message carries how long the stream lived and how many bytes arrived — read it the same way as above. If it is frequent, check whether the daemon's environment sets `HTTP_PROXY` / `HTTPS_PROXY` (exec runs over WebSocket, and proxies handle long-lived connections far less reliably than HTTP); add the cluster domain to `NO_PROXY` if needed. |

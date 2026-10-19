@@ -258,7 +258,7 @@ docker exec demo echo hello
 docker rm -f demo
 ```
 
-`docker-rt-context` 会将 Docker CLI 切换到 `docker-rt` 端点。守护进程需要 Docker CLI，并且必须能访问配置的集群。常见容器生命周期和 exec 命令均可使用；镜像构建和端口转发有额外行为与限制。当前不支持 Docker Compose 命令。安装选项、支持命令详情、环境变量、镜像构建和故障排查请参阅专门的 [`docker-rt` 文档](pyromind_sdk/docker_rt/README.md)。
+`docker-rt-context` 会将 Docker CLI 切换到 `docker-rt` 端点。守护进程需要 Docker CLI，并且必须能访问配置的集群。常见容器生命周期和 exec 命令均可使用；镜像构建和端口转发有额外行为与限制。`docker logs`、`docker events`、`docker compose build`、`docker buildx build` 和 BuildKit 均不支持；`docker network` 只有元数据，没有网络隔离。完整清单与每项不可用的原因请参阅专门的 [`docker-rt` 文档](pyromind_sdk/docker_rt/README.md)。
 
 ## 自定义工作流节点
 
