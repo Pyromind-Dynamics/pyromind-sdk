@@ -247,7 +247,13 @@ class AsyncSandboxClient(PyroMindAsyncClient):
 
         Returns:
             SandboxResponse object
+
+        Raises:
+            ValueError: When ``request.name`` is missing or blank — the server
+                requires a name on create (HTTP 422 request validation).
+                Failing here avoids a pointless round-trip.
         """
+        request.require_name_for_create()
         effective_timeout = self.create_timeout if timeout is None else timeout
         async with self._create_slot():
             response = await self.post(

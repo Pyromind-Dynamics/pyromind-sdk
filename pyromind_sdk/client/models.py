@@ -189,8 +189,11 @@ class SandboxRequest(BaseModel):
         configuration: Optional GUI configuration (screen resolution, VNC password, etc.).
             Ignored for headless sandbox types (``CUSTOM``).
         name: **Required when creating.** Human-readable name shown in the
-            console (up to 200 chars). On update, omit it (or leave ``None``)
-            to keep the current name — the server backfills it.
+            console (up to 200 chars). ``create()`` fails fast with
+            ``ValueError`` when it is missing or blank; the server would
+            otherwise answer HTTP 422 (request validation). On update,
+            omit it (or leave ``None``) to keep the current name — the server
+            backfills it.
         system_image_path: **OSWorld only.** JuiceFS sub-path to a custom system
             image (e.g. ``"template/Ubuntu.qcow2"``). Ignored for other sandbox types;
             the server falls back to its built-in default image when ``None``.
@@ -218,11 +221,13 @@ class SandboxRequest(BaseModel):
     configuration: Optional[SandboxConfiguration] = None
     name: Optional[str] = Field(
         default=None,
+        max_length=200,
         description=(
-            "Human-readable name shown in the console. **Required when "
-            "creating** — the server rejects a create without it "
-            "(HTTP 400, INVALID_INSTANCE_NAME). On update, omit it to keep "
-            "the current name."
+            "Human-readable name shown in the console (≤200 chars). "
+            "**Required when creating** — ``create()`` raises ``ValueError`` if it "
+            "is missing or blank, and the server rejects a missing/blank name "
+            "with HTTP **422** (request validation). "
+            "On update, omit it (or leave ``None``) to keep the current name."
         ),
     )
     system_image_path: Optional[str] = Field(
@@ -268,6 +273,30 @@ class SandboxRequest(BaseModel):
             "Applied when the sandbox is created; ignored on update."
         ),
     )
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _reject_blank_name(cls, value):
+        """空白名等价于没传：与 middleware 模型层同一口径（先 strip，再判空白/长度）。"""
+        if value is None or not isinstance(value, str):
+            return value  # 交给类型校验报错
+        text = value.strip()
+        if not text:
+            raise ValueError("name cannot be blank")
+        return text
+
+    def require_name_for_create(self) -> None:
+        """创建路径的 ``name`` 必填校验。
+
+        模型被 ``update()`` 复用（更新时省略 name 表示"不改名"），所以字段不能
+        声明成 ``Field(...)``；必填性放在**创建入口**，提前失败，而不是让请求
+        打到服务端再收 422。
+        """
+        if not self.name:
+            raise ValueError(
+                "SandboxRequest.name is required when creating a sandbox "
+                "(the server rejects a missing name with HTTP 422)"
+            )
 
 
 

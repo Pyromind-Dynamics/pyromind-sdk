@@ -63,6 +63,18 @@ CLUSTER_RESOURCE = {
 }
 
 
+def available_clusters():
+    """Cluster codes a client / docker-rt can target — the keys of :data:`CLUSTER_RESOURCE`.
+
+    Order follows the table's declaration order (``us-west-1``, ``us-west-2``,
+    ``cn-east-1``) so prompts and ``--help`` read like the config. These keys are
+    the **only** thing exposed to users; per-env addresses stay an implementation
+    detail of the table. Callers that build prompts or help text should use this
+    instead of hard-coding example cluster names.
+    """
+    return list(CLUSTER_RESOURCE)
+
+
 def parse_cluster_code(cluster: str):
     """Split a cluster identifier into (cluster_code, env).
 
@@ -88,12 +100,11 @@ def resolve_base_url_from_cluster(cluster: str) -> str:
     code, env = parse_cluster_code(cluster)
     cfg = CLUSTER_RESOURCE.get(code)
     if not cfg:
-        valid = ", ".join(sorted(CLUSTER_RESOURCE))
+        valid = ", ".join(available_clusters())
         raise ValueError(f"Unknown cluster {code!r}. Valid clusters: {valid}")
     base = cfg.get("http", {}).get(env)
     if not base:
-        valid_envs = ", ".join(sorted(cfg.get("http", {})))
-        raise ValueError(f"Unknown env {env!r} for cluster {code!r}. Valid envs: {valid_envs}")
+        raise ValueError(f"Unknown env {env!r} for cluster {code!r}")
     return base.rstrip("/") + "/api/v1"
 
 
