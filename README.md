@@ -258,7 +258,7 @@ docker exec demo echo hello
 docker rm -f demo
 ```
 
-`docker-rt-context` switches the Docker CLI to the `docker-rt` endpoint. The daemon requires the Docker CLI and access to the configured cluster. Common lifecycle and exec commands are supported; image builds and port forwarding have additional behavior and constraints. `docker logs`, `docker events`, `docker compose build`, `docker buildx build` and BuildKit are not supported, and `docker network` is metadata only with no isolation. For the full matrix and the reason behind each gap, see the dedicated [`docker-rt` documentation](pyromind_sdk/docker_rt/README.md).
+`docker-rt-context` switches the Docker CLI to the `docker-rt` endpoint. The daemon requires the Docker CLI and access to the configured cluster. Common lifecycle and exec commands are supported; image builds and port forwarding have additional behavior and constraints. `docker logs`, `docker events`, `docker compose`, `docker buildx`, and `docker network` are all intercepted by the CLI wrapper with a clear message, and BuildKit is unavailable. For the full matrix and the reason behind each gap, see the dedicated [`docker-rt` documentation](pyromind_sdk/docker_rt/README.md).
 
 ## Custom workflow nodes
 

@@ -112,54 +112,13 @@ docker-rt 的目标是让为 Docker 写的工具不改代码就能跑，而不�
 | --- | --- |
 | `docker logs` | CLI 包装器直接拦截并提示改用 `docker exec`；API 对默认后端返回 501。 |
 | `docker events` | CLI 包装器直接拦截；API 返回 501。 |
-| `docker compose` | CLI 包装器**直接拦截全部子命令**（含 `up`、`ps`、`build`），提示改用 `docker` 基本命令逐容器管理。详见下文。 |
+| `docker compose` | CLI 包装器**直接拦截全部子命令**（含 `up`、`ps`、`build`），提示改用 `docker` 基本命令逐容器管理。 |
 | `docker network` | CLI 包装器**直接拦截全部子命令**，提示用 `-p` 或 Pod IP 互连。底层 API 仅保留给 docker-py 等直接调用方。 |
 | `docker buildx` | CLI 包装器**直接拦截全部子命令**（含 `ls` / `create`），提示改用 `docker build`。 |
 | BuildKit | `docker build` 强制 `DOCKER_BUILDKIT=0`，走经典 builder，由 Kaniko 执行。 |
 | 其他未实现子命令 | `commit`、`push`、`tag`、`save`、`load`、`pause`、`top`、`stats`、`diff`、`system df`、`login`、`swarm` 等没有对应的 Engine API 路由，返回 404。 |
 
 此外不支持：UDP 端口映射、特权容器、Docker detach-key、`inspect` 中的进程 ID。状态属于单个服务进程，多个服务进程不共享容器、卷或网络记录。
-
-### 为什么这几类功能不可用
-
-#### `docker compose`
-
-docker-rt 不再把 Compose 作为可用路径。自 2026-10-19 起，CLI 包装器**直接拦截全部 `docker compose` 子命令**（`up` / `ps` / `build` / `down` 等），在 stderr 给出替代做法，命令不会发往后端。
-
-之前只拦 `compose build` / `up --build`，其余子命令放行 —— 这反而更危险：`up` 看似成功后，容器之间**没有共享 Docker 网络**、Compose 服务名**无法解析**、`inspect` 不返回 `State.Health` 导致 `depends_on: condition: service_healthy` 一直等待。表面成功、实则编排语义全都不成立，比直接报错更误导。
-
-底层仍保留了 Compose 需要的网络、卷与 `com.docker.compose.*` 标签写入（API 层不返回 404），但那是给 docker-py 等绕过 CLI 直接调用方用的，命令行不可达。
-
-需要多容器时，用受支持的 `docker` 命令逐个创建，通过 Pod IP 或已发布端口互连。
-
-#### `docker logs` 与 `docker events`
-
-两者都在 CLI 包装器里直接拦截（仅在 `docker-rt` context 下），因为默认的 PyroMind Sandbox API 后端不聚合容器标准输出，也不提供事件流。
-
-- 看日志：`docker exec -it <container> bash`，或读取沙箱内文件。
-- 看状态：`docker ps`、`docker inspect`。
-
-服务端保留了一份直连 Kubernetes 的 `logs` 实现（支持 `--tail` / `--follow` / `--timestamps`），但只有绕过包装器直接请求 API 时才会走到；从 CLI 使用一律被拦截。
-
-#### `docker network`
-
-自 2026-10-19 起，CLI 包装器**直接拦截全部 `docker network` 子命令**（`create` / `ls` / `inspect` / `rm` / `connect` / `disconnect`），命令不会发往后端。
-
-之前这些端点存在且返回 Docker 结构，但它们只是 docker-rt 进程内的一张注册表，不产生任何集群侧网络资源：没有隔离（所有沙箱在同一个 Kubernetes namespace，Pod 之间本就互通）、没有内建 DNS（`--network` / `--network-alias` 指定的名字不会互相解析），`network inspect` 的 `IPAM.Config` 固定返回 `172.18.0.0/16`、`IPv4Address` / `MacAddress` 为空 —— 让命令"成功"只会让人误以为有了隔离网络。底层 API 仍保留，供 docker-py 等直接调用方使用。
-
-容器之间用已发布端口（`-p`）或 Pod IP 互连。
-
-#### `docker buildx` 与 BuildKit
-
-集群侧唯一的构建执行器是 Kaniko，它以经典 builder 的方式接收构建上下文（`POST /build` + tar 包）。BuildKit 客户端不走这条路：它需要先建立 `/session` 连接并通过 gRPC 与 buildkitd 通信，docker-rt 没有实现。
-
-| 用法 | 结果 |
-| --- | --- |
-| `docker buildx <任何子命令>` | 包装器直接拦截，提示改用 `docker build -t <tag> .` |
-| `docker build --mount` / `--secret` / `--ssh` / `--output` / `-o` / `--cache-to` / `--cache-from` / `--push` / `--load` / `--builder` / `--provenance` / `--sbom` / `--attest` / `--allow` | 包装器逐项拒绝，说明这些参数 Kaniko 构建沙箱无法处理 |
-| `docker build ...`（普通用法） | 强制 `DOCKER_BUILDKIT=0`，用经典 builder 提交上下文，由 Kaniko 构建并推送 |
-
-需要 BuildKit 特有语义（cache mount、secret mount、一次构建多平台、`--output type=oci` 等）时，只能在 docker-rt 之外构建，再让集群从镜像仓库拉取。
 
 ## 镜像构建与存储
 
@@ -383,6 +342,7 @@ DOCKER_RT_REGISTRY_DOCKERCONFIG=<一份已登录该仓库的 config.json 路径>
 | 构建卡在拉取依赖、`connection timed out` 或 `Temporary failure in name resolution` | 构建跑在集群内，用的不是你的网络。Dockerfile 里的 `FROM`、apt/pip/npm 源、`curl` 下载地址必须是国内可达的；见「构建在集群内执行：先确认网络可达」。 |
 | 构建完成但推送失败 | 检查仓库连通性和凭据；上海集群还要确认前缀带了命名空间（只写域名会在最后一步返回 401）。镜像归档可能仍保存在 `/workspace/docker_images/`。 |
 | 仅归档构建后 `docker run` 失败 | 归档位于 workspace storage，不会自动注册为集群镜像；要通过 docker-rt 运行，请推送到集群可访问的仓库。 |
+| `docker compose` / `docker network` / `docker buildx` 命令打印一段提示并以非零码退出 | 这是有意为之，不是报错：这些功能在 docker-rt 下没有真实实现，CLI 包装器直接拦截。改用 `docker run` / `exec` / `cp` 等基本命令；网络互连用 `-p` 或 Pod IP。 |
 | `docker exec` 报 `[EXEC_STREAM_LOST]` | **平台自己告诉你原因了**：上游（kubelet/apiserver）的 exec 流在命令给出退出码之前断了（`[EXEC_STREAM_RELAY_FAILED]` 同理，只是断在中继而不是上游）。消息里带着诊断和"已经发给你多少字节"：`0 stdout / 0 stderr` 几乎可以断定命令没跑起来；已经收到输出则是命令跑过、只是尾部/退出码丢了 —— 这种**不要盲目重试**（命令可能已产生副作用）。只对幂等命令重试。 |
 | `docker exec` 偶发报 `docker-rt: exec stream connection lost before any exit event` | **没拿到任何原因**：exec 的 WebSocket 被平台之外的东西中途切断（代理 / LB / 空闲超时 / 网络重置 / 服务端重启），连错误帧都没送到。报错里带着"活了多久、收到多少字节"，读法和上面一行相同。若频繁出现，检查服务进程所在环境是否设置了 `HTTP_PROXY` / `HTTPS_PROXY`（exec 走 WebSocket，代理对长连接的处理远不如 HTTP 稳），必要时给集群域名设 `NO_PROXY`。 |
 
