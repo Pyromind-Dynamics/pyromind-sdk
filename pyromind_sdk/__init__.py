@@ -60,7 +60,6 @@ from .client import (
     PyroMindAPIClient,
     EchoMindClient,
     ProfileClient,
-    TransferClient,
     StorageAPIClient,
     # Async clients
     PyroMindAsyncClient,
@@ -70,7 +69,6 @@ from .client import (
     AsyncInferenceClient,
     AsyncStudioClient,
     AsyncEchoMindClient,
-    AsyncTransferClient,
     AsyncStorageAPIClient,
     PyroMindAsyncAPIClient,
 )
@@ -157,7 +155,6 @@ __all__ = [
     "PyroMindAPIClient",
     "EchoMindClient",
     "ProfileClient",
-    "TransferClient",
     "StorageAPIClient",
     # Async clients
     "PyroMindAsyncClient",
@@ -167,7 +164,6 @@ __all__ = [
     "AsyncInferenceClient",
     "AsyncStudioClient",
     "AsyncEchoMindClient",
-    "AsyncTransferClient",
     "AsyncStorageAPIClient",
     "PyroMindAsyncAPIClient",
     # Models

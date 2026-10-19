@@ -108,18 +108,6 @@ class PyroMindAsyncAPIClient:
             max_retries=max_retries
         )
 
-    @property
-    def transfers(self):
-        """Backward-compatible alias for ``storage.transfers``."""
-
-        return self.storage.transfers
-
-    @property
-    def transfer(self):
-        """Backward-compatible alias for ``storage.transfer``."""
-
-        return self.storage.transfer
-
     async def close(self):
         """Close all client sessions"""
         await self._base_client.close()
