@@ -4,12 +4,14 @@ Async PyroMind API Client
 This module provides the main async client for the PyroMind API.
 """
 
-from typing import Optional
+from __future__ import annotations
+
 from .async_base import PyroMindAsyncClient as _PyroMindAsyncClientBase
 from .async_echomind import AsyncEchoMindClient
 from .async_inference import AsyncInferenceClient
 from .async_jupyterlab import AsyncJupyterLabClient
 from .async_sandbox import AsyncSandboxClient
+from .async_storage_api import AsyncStorageAPIClient
 from .async_studio import AsyncStudioClient
 
 
@@ -47,9 +49,9 @@ class PyroMindAsyncAPIClient:
 
     def __init__(
         self,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
-        cluster: Optional[str] = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        cluster: str | None = None,
         timeout: int = 30,
         max_retries: int = 3
     ):
@@ -98,6 +100,13 @@ class PyroMindAsyncAPIClient:
             timeout=timeout,
             max_retries=max_retries
         )
+        self.storage = AsyncStorageAPIClient(
+            api_key=api_key,
+            base_url=base_url,
+            cluster=cluster,
+            timeout=timeout,
+            max_retries=max_retries
+        )
 
     async def close(self):
         """Close all client sessions"""
@@ -107,6 +116,7 @@ class PyroMindAsyncAPIClient:
         await self.instances.close()
         await self.sandboxes.close()
         await self.studio.close()
+        await self.storage.close()
 
     async def __aenter__(self):
         """Async context manager entry"""
