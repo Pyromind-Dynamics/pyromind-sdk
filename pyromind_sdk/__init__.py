@@ -91,8 +91,6 @@ from .client.models import (
     TransferCreateResponse,
     TransferActionResponse,
     TransferClearResponse,
-    TransferSyncingResponse,
-    TransferSyncingPath,
 )
 
 # Export workflow functionality
@@ -185,8 +183,6 @@ __all__ = [
     "TransferCreateResponse",
     "TransferActionResponse",
     "TransferClearResponse",
-    "TransferSyncingResponse",
-    "TransferSyncingPath",
     # Workflow functionality
     "WorkflowLiteConverter",
     "LayoutGenerator",

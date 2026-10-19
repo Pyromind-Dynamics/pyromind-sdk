@@ -80,9 +80,9 @@ tasks = client.transfers.list()
 client.transfers.cancel(created.id)
 ```
 
-Use `client.transfers.list_page()`, `delete()`, `clear_finished()`, and
-`list_syncing_paths()` to manage and monitor tasks. The async client exposes
-the same resource as `client.transfers`.
+Use `client.transfers.list_page()`, `delete()`, and `clear_finished()` to manage
+and monitor tasks. The async client exposes the same resource as
+`client.transfers`.
 
 ## Sandboxes（⚠️desperate can not create）
 
