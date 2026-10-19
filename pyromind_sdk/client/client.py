@@ -4,15 +4,18 @@ Main PyroMind API Client
 This module provides the main client class that integrates all resource clients.
 """
 
+from __future__ import annotations
+
 import os
-from typing import Optional
-from .base import PyroMindClient, DEFAULT_API_BASE_URL
-from .sandbox import SandboxClient
-from .jupyterLab import JupyterLabClient
-from .inference import InferenceClient
-from .studio import StudioClient
+
+from .base import DEFAULT_API_BASE_URL, PyroMindClient
 from .echomind import EchoMindClient
+from .inference import InferenceClient
+from .jupyterLab import JupyterLabClient
 from .profile import ProfileClient
+from .sandbox import SandboxClient
+from .storage_api import StorageAPIClient
+from .studio import StudioClient
 
 
 class PyroMindAPIClient:
@@ -62,9 +65,9 @@ class PyroMindAPIClient:
     
     def __init__(
         self,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
-        cluster: Optional[str] = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        cluster: str | None = None,
         timeout: int = 30,
         max_retries: int = 3
     ):
@@ -147,7 +150,14 @@ class PyroMindAPIClient:
             timeout=timeout,
             max_retries=max_retries
         )
-    
+        self.storage = StorageAPIClient(
+            api_key=api_key,
+            base_url=base_url,
+            cluster=cluster,
+            timeout=timeout,
+            max_retries=max_retries
+        )
+
     def close(self):
         """Close all client sessions"""
         self._base_client.close()
@@ -157,6 +167,7 @@ class PyroMindAPIClient:
         self.studio.close()
         self.echomind.close()
         self.profile.close()
+        self.storage.close()
     
     def __enter__(self):
         """Context manager entry"""
