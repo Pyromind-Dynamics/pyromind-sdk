@@ -98,60 +98,13 @@ These are unimplemented. docker-rt never succeeds silently — the CLI wrapper e
 | --- | --- |
 | `docker logs` | The CLI wrapper intercepts it and points at `docker exec`; the API returns 501 on the default backend. |
 | `docker events` | Intercepted by the CLI wrapper; the API returns 501. |
-| `docker compose` | The CLI wrapper **blocks every subcommand** (including `up`, `ps`, `build`); use plain `docker` commands to manage containers one by one. See below. |
+| `docker compose` | The CLI wrapper **blocks every subcommand** (including `up`, `ps`, `build`); use plain `docker` commands to manage containers one by one. |
 | `docker network` | The CLI wrapper **blocks every subcommand**, pointing at `-p` or Pod IPs. The underlying API remains for direct callers such as docker-py. |
 | `docker buildx` | The CLI wrapper **blocks every subcommand** (including `ls` / `create`); it points at `docker build`. |
 | BuildKit | `docker build` forces `DOCKER_BUILDKIT=0` and uses the classic builder path, executed by Kaniko. |
 | Other subcommands | `commit`, `push`, `tag`, `save`, `load`, `pause`, `top`, `stats`, `diff`, `system df`, `login`, `swarm` and friends have no Engine API route and return 404. |
 
 Also unavailable: UDP publishing, privileged execution, Docker detach-key handling, and process IDs in `inspect`. State is local to a single daemon process; multiple daemons do not share container, volume, or network records.
-
-### Why these features are unavailable
-
-#### `docker compose`
-
-docker-rt does not treat Compose as a supported orchestrator. The CLI wrapper blocks two paths — `docker compose build` and `docker compose up --build`. Every other `compose` command is forwarded to docker-rt as usual.
-
-docker-rt does implement the networks, volumes, and `com.docker.compose.*` labels Compose needs, so its requests don't come back 404 — **that is not the same as multi-container orchestration working**:
-
-- Containers do not share a Docker network, so `depends_on` and health-check ordering are not guaranteed.
-- `inspect` never returns `State.Health`, so Compose has no health signal and `depends_on: condition: service_healthy` waits forever.
-- Compose service-name resolution depends on Kubernetes Services (`DOCKER_RT_SERVICE_DNS=true`), but those Services are only created when the sandbox was not created through the middleware API (for example when adopting an existing Pod). A normal deployment goes through the middleware API, creates none, and service names do not resolve.
-- A `compose build` request itself falls inside what `/build` supports — compose v2 falls back to the classic builder when it cannot find BuildKit — so the current rejection comes from the CLI wrapper. That path is not a supported commitment; use `docker build` directly when you need to build.
-
-For multi-container setups, create containers individually with the supported `docker` commands and connect them through Pod IPs or published ports.
-
-#### `docker logs` and `docker events`
-
-Both are intercepted in the CLI wrapper (only under the `docker-rt` context), because the default PyroMind Sandbox API backend neither aggregates container stdout nor exposes an event stream.
-
-- Logs: `docker exec -it <container> bash`, or read files inside the sandbox.
-- State: `docker ps` and `docker inspect`.
-
-The server still carries a direct-Kubernetes `logs` implementation (supporting `--tail`, `--follow`, `--timestamps`), but only a request that bypasses the wrapper reaches it. From the CLI it is always intercepted.
-
-#### `docker network`
-
-All six network endpoints exist and return Docker-shaped payloads, but they are a registry inside the docker-rt process. No cluster-side network object is created:
-
-- **No isolation.** Every sandbox lives in the same Kubernetes namespace, and Pods can already reach each other.
-- **No built-in DNS.** Names passed via `--network` / `--network-alias` do not resolve.
-- `network inspect` always reports `172.18.0.0/16` in `IPAM.Config`, leaves `IPv4Address` / `MacAddress` empty, and lists in `Containers` only the endpoints that were explicitly connected.
-
-So `docker network` only serves flows where a tool insists on creating a network before creating containers. It cannot be used for isolation or service discovery.
-
-#### `docker buildx` and BuildKit
-
-The only build executor on the cluster is Kaniko, which receives a build context the classic-builder way (`POST /build` plus a tar). A BuildKit client does not take that path: it opens a `/session` connection and speaks gRPC to buildkitd, which docker-rt does not implement.
-
-| Usage | Result |
-| --- | --- |
-| `docker buildx build ...` | Rejected by the wrapper, which points at `docker build -t <tag> .` |
-| `docker build --mount` / `--secret` / `--ssh` / `--output` / `-o` / `--cache-to` / `--cache-from` / `--push` / `--load` / `--builder` / `--provenance` / `--sbom` / `--attest` / `--allow` | Rejected flag by flag, with a note that the Kaniko build sandbox cannot honour them |
-| `docker build ...` (ordinary use) | Forces `DOCKER_BUILDKIT=0`, submits the context through the classic builder, and Kaniko builds and pushes |
-| `docker buildx ls` / `create` / `use` | Not intercepted, but they act on the **local** Docker CLI's builders, which have nothing to do with the cluster |
-
-If you need BuildKit-only semantics (cache mounts, secret mounts, multi-platform in one build, `--output type=oci`, …), build outside docker-rt and let the cluster pull the image from a registry.
 
 ## Build and image storage
 
@@ -375,6 +328,7 @@ Normal build completion removes its temporary sandbox. If the daemon is killed f
 | Build hangs while fetching dependencies, with `connection timed out` or `Temporary failure in name resolution` | The build runs in the cluster, not on your network. The `FROM` image, apt/pip/npm sources, and `curl` download URLs in the Dockerfile must all be reachable from mainland China; see "The build runs inside the cluster". |
 | Build completes but push fails | Check registry reachability and credentials. On the Shanghai cluster also confirm the prefix includes a namespace — with only the host, the final push returns 401. The image archive may still exist in `/workspace/docker_images/`. |
 | `docker run` fails after archive-only build | The archive is in workspace storage; it is not automatically installed as an image in the cluster. Push it to a cluster-reachable registry to run it through docker-rt. |
+| `docker compose` / `docker network` / `docker buildx` prints a note and exits non-zero | This is intentional, not an error: these features have no real implementation under docker-rt and the CLI wrapper blocks them outright. Use plain `docker run` / `exec` / `cp`; connect containers with `-p` or Pod IPs. |
 | `docker exec` fails with `[EXEC_STREAM_LOST]` | The platform **told you why**: the upstream (kubelet/apiserver) exec stream died before the command announced an exit status (`[EXEC_STREAM_RELAY_FAILED]` is the same situation with the break in the relay rather than upstream). The message carries the diagnosis plus how many bytes had already been delivered: `0 stdout / 0 stderr` almost certainly means the command never started; bytes already delivered means it ran and only the tail/exit code was lost — do **not** re-run those blindly. Retry only idempotent commands. |
 | `docker exec` intermittently fails with `docker-rt: exec stream connection lost before any exit event` | **No reason was available**: the exec WebSocket was cut by something outside the platform (proxy / LB / idle timeout / network reset / server restart), so not even an error frame arrived. The message carries how long the stream lived and how many bytes arrived — read it the same way as above. If it is frequent, check whether the daemon's environment sets `HTTP_PROXY` / `HTTPS_PROXY` (exec runs over WebSocket, and proxies handle long-lived connections far less reliably than HTTP); add the cluster domain to `NO_PROXY` if needed. |
 
