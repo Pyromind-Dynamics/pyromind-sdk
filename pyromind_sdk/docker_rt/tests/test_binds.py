@@ -46,14 +46,14 @@ def test_host_path_to_subpath(monkeypatch):
     assert host_path_to_subpath("/workspace/nodes", uid=uid) == f"{uid}/nodes"
     assert host_path_to_subpath(f"{uid}/foo", uid=uid) == f"{uid}/foo"
     with pytest.raises(ValueError, match="cannot map"):
-        host_path_to_subpath("/home/niqi.lyu/workspace/foo", uid=uid)
+        host_path_to_subpath("/home/dev/workspace/foo", uid=uid)
 
     monkeypatch.setenv(
         "DOCKER_RT_JUICEFS_HOST_PREFIXES",
-        f"/home/niqi.lyu/workspace={uid}",
+        f"/home/dev/workspace={uid}",
     )
     assert (
-        host_path_to_subpath("/home/niqi.lyu/workspace/miscs", uid=uid)
+        host_path_to_subpath("/home/dev/workspace/miscs", uid=uid)
         == f"{uid}/miscs"
     )
 

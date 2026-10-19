@@ -266,11 +266,11 @@ def test_build_script_writes_config_owner_only(monkeypatch: pytest.MonkeyPatch) 
     from ..backend import kaniko
 
     _fresh(monkeypatch)
-    payload = '{"auths":{"docker.io":{"username":"lvniqi","password":"s3cret-pat"}}}'
+    payload = '{"auths":{"docker.io":{"username":"my-user","password":"s3cret-pat"}}}'
     encoded = base64.b64encode(payload.encode()).decode()
     script = kaniko.build_script(
         args=kaniko.kaniko_args(
-            destinations=["docker.io/lvniqi/app:1"],
+            destinations=["docker.io/my-user/app:1"],
             digest_file=kaniko.digest_file_path(),
             cache=False,
             new_run=False,
@@ -336,8 +336,8 @@ def test_tar_path_is_the_workspace_images_directory() -> None:
     from ..backend import kaniko
 
     assert kaniko.DEFAULT_IMAGES_DIR == "/workspace/docker_images"
-    assert kaniko.tar_path(["pyromind-console:dev"]) == (
-        "/workspace/docker_images/pyromind-console_dev.tar"
+    assert kaniko.tar_path(["my-console:dev"]) == (
+        "/workspace/docker_images/my-console_dev.tar"
     )
     assert kaniko.tar_path(["reg.example.com/rt/myapp:latest"]) == (
         "/workspace/docker_images/reg.example.com_rt_myapp_latest.tar"

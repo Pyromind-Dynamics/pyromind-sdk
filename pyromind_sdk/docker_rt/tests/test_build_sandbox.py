@@ -85,7 +85,7 @@ def _set_push_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     call this — otherwise it aborts on "No push credentials configured" before
     the code under test ever runs.
     """
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_USERNAME", "lvniqi")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_USERNAME", "my-user")
     monkeypatch.setenv("DOCKER_RT_REGISTRY_PASSWORD", PUSH_PASSWORD)
 
 
@@ -491,9 +491,9 @@ def test_resolve_targets_does_not_re_resolve_an_empty_registry(
     _clear(monkeypatch)
     monkeypatch.setenv("DOCKER_RT_REGISTRY_CLUSTER", "us-west-1")  # host, no namespace
 
-    aliases, error = resolve_targets(["docker.io/lvniqi/app:1"], registry="")
+    aliases, error = resolve_targets(["docker.io/my-user/app:1"], registry="")
     assert error is None
-    assert aliases == {"docker.io/lvniqi/app:1": "docker.io/lvniqi/app:1"}
+    assert aliases == {"docker.io/my-user/app:1": "docker.io/my-user/app:1"}
 
     # A short tag with no prefix stays unprefixed rather than raising.
     aliases, error = resolve_targets(["myapp"], registry="")
@@ -511,11 +511,14 @@ def test_build_executor_follows_the_cluster(monkeypatch: pytest.MonkeyPatch) -> 
 
     The mapping lives in ``build_executor`` itself (one function, one place).
     """
-    from ..backend import build_sandbox
+    from ..backend import build_sandbox, registry_push
 
     hub = "docker.io/pyrominddynamics/kaniko-executor-pyromind:0.0.4"
+    # ACR 镜像路径里的 namespace 来自 registry profile 配置，测试里不写死
+    acr_profile = registry_push.registry_profile("cn-east-1")
     acr = (
-        "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/"
+        f"{acr_profile.host}/"
+        f"{registry_push.registry_namespace(acr_profile, 'cn-east-1')}/"
         "kaniko-executor-pyromind:0.0.4"
     )
 
@@ -620,7 +623,7 @@ def test_fully_qualified_tag_needs_no_prefix_on_a_profiled_cluster(
     monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:v1-debug")
     monkeypatch.setenv("DOCKER_RT_REGISTRY_CLUSTER", "us-west-1")
     monkeypatch.setenv("DOCKER_RT_BUILD_PUSH", "true")
-    assert build_prerequisites_error(["docker.io/lvniqi/pyromind-console:dev"]) is None
+    assert build_prerequisites_error(["docker.io/my-user/my-console:dev"]) is None
 
 
 def test_short_tag_still_requires_the_prefix_on_a_profiled_cluster(
@@ -633,14 +636,14 @@ def test_short_tag_still_requires_the_prefix_on_a_profiled_cluster(
     monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:v1-debug")
     monkeypatch.setenv("DOCKER_RT_REGISTRY_CLUSTER", "us-west-1")
     monkeypatch.setenv("DOCKER_RT_BUILD_PUSH", "true")
-    message = build_prerequisites_error(["pyromind-console:dev"])
+    message = build_prerequisites_error(["my-console:dev"])
     assert message
     assert "DOCKER_RT_REGISTRY_NAMESPACE" in message
 
     # ...and a namespace (or an explicit prefix) makes it pass.
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_NAMESPACE", "lvniqi")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_NAMESPACE", "my-user")
     _set_push_credentials(monkeypatch)
-    assert build_prerequisites_error(["pyromind-console:dev"]) is None
+    assert build_prerequisites_error(["my-console:dev"]) is None
 
 
 def test_one_short_tag_among_fully_qualified_ones_still_requires_the_prefix(
@@ -654,7 +657,7 @@ def test_one_short_tag_among_fully_qualified_ones_still_requires_the_prefix(
     monkeypatch.setenv("DOCKER_RT_BUILD_PUSH", "true")
     # NB: use a tag with no colon — ``shortone:1`` looks like ``host:port`` and is
     # (deliberately) classified as fully qualified.
-    message = build_prerequisites_error(["docker.io/lvniqi/app:1", "shortone"])
+    message = build_prerequisites_error(["docker.io/my-user/app:1", "shortone"])
     assert message
     assert "DOCKER_RT_REGISTRY_NAMESPACE" in message
 
@@ -700,7 +703,7 @@ async def test_build_in_sandbox_happy_path(monkeypatch: pytest.MonkeyPatch) -> N
     _clear(monkeypatch)
     monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1.24.0-debug")
     monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_USERNAME", "lvniqi")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_USERNAME", "my-user")
     monkeypatch.setenv("DOCKER_RT_REGISTRY_PASSWORD", PUSH_PASSWORD)
 
     sandbox = _FakeBuildSandbox(stdout=f"INFO building\ndocker-rt-digest: {GOOD_DIGEST}\n")
@@ -789,7 +792,7 @@ async def test_build_in_sandbox_reports_failure_and_still_cleans_up(
 async def test_build_in_sandbox_fully_qualified_tag_without_a_prefix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Full path for ``-t docker.io/lvniqi/app:dev`` on ``us-west-1`` (no namespace).
+    """Full path for ``-t docker.io/my-user/app:dev`` on ``us-west-1`` (no namespace).
 
     Guards three places that used to re-resolve the push prefix and abort:
     ``build_prerequisites_error``, ``resolve_targets`` and the credential load.
@@ -807,7 +810,7 @@ async def test_build_in_sandbox_fully_qualified_tag_without_a_prefix(
     events = await _collect(
         build_sandbox.build_in_sandbox(
             tar_bytes=_context_tar(),
-            tags=["docker.io/lvniqi/pyromind-console:dev"],
+            tags=["docker.io/my-user/my-console:dev"],
             namespace="custom-user-1",
         )
     )
@@ -816,7 +819,7 @@ async def test_build_in_sandbox_fully_qualified_tag_without_a_prefix(
     assert captured["image"] == "reg.example.com/rt/kaniko:1-debug"
     assert sandbox.argv is not None
     script = _worker_script(sandbox)
-    assert "--destination=docker.io/lvniqi/pyromind-console:dev" in script
+    assert "--destination=docker.io/my-user/my-console:dev" in script
 
     # The credential blob was still injected, keyed by the image's own host.
     match = re.search(r"printf '%s' ([A-Za-z0-9+/=]+) \| base64 -d", script)
@@ -827,8 +830,8 @@ async def test_build_in_sandbox_fully_qualified_tag_without_a_prefix(
 
     final = events[-1]
     assert (
-        final["docker_rt"]["aliases"]["docker.io/lvniqi/pyromind-console:dev"]
-        == "docker.io/lvniqi/pyromind-console:dev"
+        final["docker_rt"]["aliases"]["docker.io/my-user/my-console:dev"]
+        == "docker.io/my-user/my-console:dev"
     )
     assert sandbox.cleaned
 
@@ -1034,7 +1037,7 @@ async def test_build_in_sandbox_aborts_before_the_sandbox_when_acr_repo_fails(
     events = await _collect(
         build_sandbox.build_in_sandbox(
             tar_bytes=_context_tar(),
-            tags=["pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind/app:1"],
+            tags=["pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/my-team/app:1"],
             namespace="ns",
         )
     )
@@ -1675,18 +1678,21 @@ def test_push_fix_hints_name_the_clusters_own_registry(
     集群自己的 registry 本来就在 profile 里，所以这里没有理由让用户自己去猜前缀。
     """
     from ..backend.build_sandbox import push_fix_hints
+    from ..backend import registry_push
 
     _clear(monkeypatch)
     monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1#pre")
-    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "docker.io/jiangwc3439")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "docker.io/my-user")
 
     text = _hints_text(push_fix_hints())
-    assert (
-        "DOCKER_RT_BUILD_REGISTRY=pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind"
-        in text
+    # 建议值 = profile 配置里的 host + 默认 namespace，测试里不写死
+    acr_profile = registry_push.registry_profile("cn-east-1")
+    own_prefix = (
+        f"{acr_profile.host}/{registry_push.registry_namespace(acr_profile, 'cn-east-1')}"
     )
+    assert f"DOCKER_RT_BUILD_REGISTRY={own_prefix}" in text
     # 说清"现在是什么"，否则用户不知道自己错在哪
-    assert "docker.io/jiangwc3439" in text
+    assert "docker.io/my-user" in text
     assert "DOCKER_RT_REGISTRY_USERNAME" in text
     assert "DOCKER_RT_REGISTRY_PASSWORD" in text
     assert "DOCKER_RT_REGISTRY_DOCKERCONFIG" in text
@@ -1701,13 +1707,16 @@ def test_push_fix_hints_do_not_re_suggest_the_registry_already_in_use(
 ) -> None:
     """已经推自家 ACR 了就别再让人"换成自家 ACR"。"""
     from ..backend.build_sandbox import push_fix_hints
+    from ..backend import registry_push
 
     _clear(monkeypatch)
     monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1#pre")
-    monkeypatch.setenv(
-        "DOCKER_RT_BUILD_REGISTRY",
-        "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind",
+    # 用 profile 配置推导的"自家前缀"，测试里不写死 namespace
+    acr_profile = registry_push.registry_profile("cn-east-1")
+    own_prefix = (
+        f"{acr_profile.host}/{registry_push.registry_namespace(acr_profile, 'cn-east-1')}"
     )
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", own_prefix)
 
     text = _hints_text(push_fix_hints())
     assert "DOCKER_RT_BUILD_REGISTRY=" not in text
@@ -1829,9 +1838,16 @@ async def test_an_unreachable_push_target_stops_before_the_build(
     assert "index.docker.io" in errors[0]["error"]
     assert "69.171.224.36" in errors[0]["error"]
     # 报错里要**直接给出该改的环境变量**，不能只说"换成能通的 registry"。
+    # 建议值 = profile 配置里的 host + 默认 namespace，测试里不写死
+    from ..backend import registry_push
+
+    acr_profile = registry_push.registry_profile("cn-east-1")
+    own_prefix = (
+        f"{acr_profile.host}/"
+        f"{registry_push.registry_namespace(acr_profile, 'cn-east-1')}"
+    )
     assert (
-        "DOCKER_RT_BUILD_REGISTRY=pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind"
-        in errors[0]["error"]
+        f"DOCKER_RT_BUILD_REGISTRY={own_prefix}" in errors[0]["error"]
     ), errors[0]
     assert "DOCKER_RT_REGISTRY_USERNAME" in errors[0]["error"]
     assert "DOCKER_RT_BUILD_PUSH=false" in errors[0]["error"]
@@ -2815,7 +2831,7 @@ def test_a_host_only_acr_prefix_is_rejected_before_the_build(
     """ACR 的推送前缀少了命名空间 → **构建之前**就拒绝，别等构建跑完才 401。
 
     2026-10-09 用户的真实场景：`DOCKER_RT_BUILD_REGISTRY` 只给了 host，
-    于是推 `…/pyromind-console:dev-5`（少了 `/pyromind`），kaniko 91 秒全成功、
+    于是推 `…/my-console:dev-5`（少了 `/my-team`），kaniko 91 秒全成功、
     最后一行 `401 Unauthorized`；同一个 host 的 `docker login` 却是成功的。
     """
     from ..backend.build_sandbox import build_prerequisites_error
@@ -2828,7 +2844,7 @@ def test_a_host_only_acr_prefix_is_rejected_before_the_build(
     )
     _set_push_credentials(monkeypatch)
 
-    message = build_prerequisites_error(["pyromind-console:dev-5"], push=True)
+    message = build_prerequisites_error(["my-console:dev-5"], push=True)
     assert message
     assert "carries no namespace" in message
     assert "401" in message
@@ -2838,9 +2854,9 @@ def test_a_host_only_acr_prefix_is_rejected_before_the_build(
     # 补上命名空间就该放行
     monkeypatch.setenv(
         "DOCKER_RT_BUILD_REGISTRY",
-        "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind",
+        "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/my-team",
     )
-    assert build_prerequisites_error(["pyromind-console:dev-5"], push=True) is None
+    assert build_prerequisites_error(["my-console:dev-5"], push=True) is None
 
 
 def test_push_rejected_hint_explains_an_acr_401(
@@ -2848,18 +2864,19 @@ def test_push_rejected_hint_explains_an_acr_401(
 ) -> None:
     """kaniko 的推送 401 只有状态码，这里要把可能的原因点出来。"""
     from ..backend.build_sandbox import push_rejected_hint
+    from ..backend import registry_push
 
     _clear(monkeypatch)
     monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1#pre")
     monkeypatch.setenv(
         "DOCKER_RT_BUILD_REGISTRY",
-        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind",
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/my-team",
     )
     _set_push_credentials(monkeypatch)
 
     raw = (
         "INFO[0090] Pushing image to pyromind-registry.cn-shanghai.cr.aliyuncs.com"
-        "/pyromind/pyromind-console:dev-5 \n"
+        "/my-team/my-console:dev-5 \n"
         "error pushing image: failed to push to destination …: unexpected status "
         "code 401 Unauthorized (HEAD responses have no body, use GET for details)\n"
     )
@@ -2868,7 +2885,12 @@ def test_push_rejected_hint_explains_an_acr_401(
     assert "401/403" in hint
     # 说清"仓库路径"和"凭据属于哪个 host"这两件事
     assert "repo path must exist" in hint
-    assert "the namespace is 'pyromind'" in hint
+    # namespace 文案来自 profile 配置默认值，测试里不写死
+    acr_profile = registry_push.registry_profile("cn-east-1")
+    assert (
+        f"the namespace is {registry_push.registry_namespace(acr_profile, 'cn-east-1')!r}"
+        in hint
+    )
     assert "credentials must be valid for that host" in hint
     assert "username_password" in hint
 
@@ -2928,7 +2950,7 @@ def test_push_rejected_hint_points_at_the_missing_acr_repository(
 
     2026-10-09 用户的第二类 401：他把 ``DOCKER_RT_ACR_ACCESS_KEY_SECRET`` 写成了
     ``DOCKER_RT_ACR_SECRET``，建仓那步被静默跳过，构建跑完 216 秒后 ACR 回
-    ``UNAUTHORIZED: authentication required``（仓库 ``pyromind/pyromind-console-1`` 不存在）。
+    ``UNAUTHORIZED: authentication required``（仓库 ``my-team/my-console-1`` 不存在）。
     """
     from ..backend.build_sandbox import push_rejected_hint
 
@@ -2936,25 +2958,25 @@ def test_push_rejected_hint_points_at_the_missing_acr_repository(
     monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1#pre")
     monkeypatch.setenv(
         "DOCKER_RT_BUILD_REGISTRY",
-        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind",
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/my-team",
     )
     _set_push_credentials(monkeypatch)
     # 名字写错了：ID 和实例 ID 都对，只有 secret 那个变量不存在
-    monkeypatch.setenv("DOCKER_RT_ACR_ACCESS_KEY_ID", "LTAI5tG5os7P4Dqyasfmnwhe")
-    monkeypatch.setenv("DOCKER_RT_ACR_INSTANCE_ID", "cri-3a7k1rh8eajwcae8")
+    monkeypatch.setenv("DOCKER_RT_ACR_ACCESS_KEY_ID", "LTAIxxxxxxxxxxxxxxxx")
+    monkeypatch.setenv("DOCKER_RT_ACR_INSTANCE_ID", "cri-xxxxxxxxxxxx")
     monkeypatch.setenv("DOCKER_RT_ACR_SECRET", "typo")
 
     raw = (
         "error pushing image: failed to push to destination "
-        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/pyromind-console-1:dev-5: "
-        "POST https://pyromind-registry.cn-shanghai.cr.aliyuncs.com/v2/pyromind/"
-        "pyromind-console-1/blobs/uploads/: UNAUTHORIZED: authentication required\n"
+        "pyromind-registry.cn-shanghai.cr.aliyuncs.com/my-team/my-console-1:dev-5: "
+        "POST https://pyromind-registry.cn-shanghai.cr.aliyuncs.com/v2/my-team/"
+        "my-console-1/blobs/uploads/: UNAUTHORIZED: authentication required\n"
     )
     hint = push_rejected_hint(
-        raw, ["pyromind-registry.cn-shanghai.cr.aliyuncs.com/pyromind/pyromind-console-1:dev-5"]
+        raw, ["pyromind-registry.cn-shanghai.cr.aliyuncs.com/my-team/my-console-1:dev-5"]
     )
     assert hint
-    assert "pyromind/pyromind-console-1:dev-5" in hint  # 精确指出推的是哪个仓库
+    assert "my-team/my-console-1:dev-5" in hint  # 精确指出推的是哪个仓库
     assert "created *first*" in hint
     assert "DOCKER_RT_ACR_ACCESS_KEY_SECRET" in hint
     # 顺带把"你还有个变量是错的"也带上

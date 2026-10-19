@@ -173,14 +173,14 @@ def main():
     # Example 3: Upload a file (uncomment to test)
     # print("\n3. Uploading a file...")
     # upload_file_example(
-    #     local_file="/Users/demo/Downloads/Doubao_universal.dmg",
+    #     local_file="/path/to/local/file.dmg",
     #     object_name="/dist/tes00000011111.dmg"
     # )
     
     # Example 4: Upload a folder (uncomment to test)
     # print("\n4. Uploading a folder...")
     # upload_folder_example(
-    #     local_folder="/Users/demo/Downloads/",
+    #     local_folder="/path/to/local/folder/",
     #     object_prefix="/dist",
     #
     # )
@@ -194,8 +194,8 @@ def main():
 
 
 #     client = StorageClient(access_key="your-access-key", cluster="us-west-1")
-#     # client.upload_folder("/Users/demo/Downloads/tarballs", "testDir/slime/examples/coding_agent_rl/tarballs/", bucket_name="your-bucket-id", part_size=20 * 1024 * 1024, num_parallel_uploads=5)
-#     client.upload_file("/Users/demo/Downloads/tmax_train_full.jsonl", "testDir/slime/examples/coding_agent_rl/data/tmax_train_full.jsonl", bucket_name="your-bucket-id", part_size=20 * 1024 * 1024, num_parallel_uploads=5)
+#     # client.upload_folder("/path/to/local/tarballs", "testDir/tarballs/", bucket_name="your-bucket-id", part_size=20 * 1024 * 1024, num_parallel_uploads=5)
+#     client.upload_file("/path/to/local/data.jsonl", "testDir/data/data.jsonl", bucket_name="your-bucket-id", part_size=20 * 1024 * 1024, num_parallel_uploads=5)
 
 
 if __name__ == "__main__":

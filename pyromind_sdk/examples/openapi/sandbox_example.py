@@ -740,8 +740,8 @@ if __name__ == "__main__":
     # 测试命令执行
     # exec_command_example("sb-xxxxxxxxxxxx", "ls -lha", cwd="/workspace")
     ## 使用file link 上传本地文件
-    # source = open("/Users/demo/Downloads/2-平安健康保险理赔流程指南.pdf", "rb")
-    # sandbox_client.write_file("sb-xxxxxxxxxxxx", "/workspace/testDir/2-平安健康保险理赔流程指南.pdf", source=source)
+    # source = open("/path/to/local/document.pdf", "rb")
+    # sandbox_client.write_file("sb-xxxxxxxxxxxx", "/workspace/testDir/document.pdf", source=source)
 
     #---
     # client = SandboxClient()
