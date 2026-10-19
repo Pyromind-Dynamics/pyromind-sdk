@@ -2,8 +2,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from pyromind_sdk.client.async_client import PyroMindAsyncAPIClient
 from pyromind_sdk.client.async_transfer import AsyncTransferClient
 from pyromind_sdk.client.base import PyroMindAPIError
+from pyromind_sdk.client.client import PyroMindAPIClient
 from pyromind_sdk.client.models import TransferRequest
 from pyromind_sdk.client.transfer import TransferClient
 
@@ -106,6 +108,16 @@ def test_business_failure_in_http_200_is_reported_as_sdk_error():
         )
 
 
+def test_main_client_exposes_transfer_under_storage_namespace():
+    client = PyroMindAPIClient(api_key="test-key")
+
+    assert client.storage.transfers is client.storage.transfer
+    assert client.transfers is client.storage.transfers
+    assert client.transfer is client.storage.transfer
+
+    client.close()
+
+
 @pytest.mark.asyncio
 async def test_async_client_supports_submit():
     client = AsyncTransferClient(api_key="test-key")
@@ -124,3 +136,14 @@ async def test_async_client_supports_submit():
 
     assert created.transfer_task_id == "task-1"
     client.post.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_async_main_client_exposes_transfer_under_storage_namespace():
+    client = PyroMindAsyncAPIClient(api_key="test-key")
+
+    assert client.storage.transfers is client.storage.transfer
+    assert client.transfers is client.storage.transfers
+    assert client.transfer is client.storage.transfer
+
+    await client.close()

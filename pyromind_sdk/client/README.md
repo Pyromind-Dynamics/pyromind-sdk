@@ -68,7 +68,7 @@ must target the source cluster, and paths are under `/workspace`.
 from pyromind_sdk import PyroMindAPIClient, TransferRequest
 
 client = PyroMindAPIClient(api_key="your-api-key", cluster="us-west-1")
-created = client.transfers.submit(
+created = client.storage.transfers.submit(
     TransferRequest(
         source_path="/workspace/models",
         target_cluster="us-west-2",
@@ -76,13 +76,15 @@ created = client.transfers.submit(
     )
 )
 
-tasks = client.transfers.list()
-client.transfers.cancel(created.id)
+tasks = client.storage.transfers.list()
+client.storage.transfers.cancel(created.id)
 ```
 
-Use `client.transfers.list_page()`, `delete()`, and `clear_finished()` to manage
-and monitor tasks. The async client exposes the same resource as
-`client.transfers`.
+Use `client.storage.transfers.list_page()`, `delete()`, and `clear_finished()`
+to manage and monitor tasks. `client.storage.transfer` is the singular alias.
+The async client exposes the same resource as `client.storage.transfers`.
+The top-level `client.transfers` and `client.transfer` aliases remain
+available for backward compatibility.
 
 ## Sandboxes（⚠️desperate can not create）
 
