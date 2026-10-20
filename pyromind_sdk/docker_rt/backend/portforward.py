@@ -5,8 +5,10 @@ Two backends:
 * **direct** — TCP to ``PodIP:containerPort`` (needs Pod CIDR reachability).
 * **api** — Kubernetes apiserver port-forward websocket (only needs kube API).
 
-``DOCKER_RT_PORT_FORWARD_MODE``: ``direct`` | ``api`` | ``auto`` (default).
-``auto`` probes whether the Pod IP is reachable; if not, uses ``api``.
+``DOCKER_RT_PORT_FORWARD_MODE``: ``direct`` | ``auto`` (default). ``auto``
+probes whether the Pod IP is reachable; if not, the PyromindSDK backend
+records the mapping only, while the direct-k8s backend tunnels through the
+apiserver internally (not a user-selectable mode).
 """
 
 from __future__ import annotations
@@ -59,12 +61,15 @@ class PublishedBinding:
 
 
 def resolve_port_forward_mode(raw: str | None = None) -> str:
-    """Return ``direct``, ``api``, or ``auto``."""
+    """Return ``direct`` or ``auto`` (apiserver tunneling is internal)."""
     text = (raw if raw is not None else os.getenv("DOCKER_RT_PORT_FORWARD_MODE", "auto"))
     text = str(text or "auto").strip().lower()
-    if text in {"direct", "api", "auto"}:
+    if text in {"direct", "auto"}:
         return text
-    logger.warning("unknown DOCKER_RT_PORT_FORWARD_MODE=%r; using auto", text)
+    logger.warning(
+        "unknown DOCKER_RT_PORT_FORWARD_MODE=%r (valid: direct, auto); using auto",
+        text,
+    )
     return "auto"
 
 
