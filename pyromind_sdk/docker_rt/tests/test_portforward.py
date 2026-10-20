@@ -267,9 +267,10 @@ async def test_forwarder_backend_disconnect():
 def test_resolve_port_forward_mode(monkeypatch):
     monkeypatch.delenv("DOCKER_RT_PORT_FORWARD_MODE", raising=False)
     assert resolve_port_forward_mode() == "auto"
-    monkeypatch.setenv("DOCKER_RT_PORT_FORWARD_MODE", "API")
-    assert resolve_port_forward_mode() == "api"
-    assert resolve_port_forward_mode("direct") == "direct"
+    monkeypatch.setenv("DOCKER_RT_PORT_FORWARD_MODE", "DIRECT")
+    assert resolve_port_forward_mode() == "direct"
+    # api is not a user-facing mode: it falls back to auto with a warning.
+    assert resolve_port_forward_mode("api") == "auto"
     assert resolve_port_forward_mode("nope") == "auto"
 
 
