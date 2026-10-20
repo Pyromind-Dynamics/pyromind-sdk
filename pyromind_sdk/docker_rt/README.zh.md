@@ -53,7 +53,18 @@ docker-rt 的目标是让为 Docker 编写的工具无需改动即可运行。�
 | `--memory` / `-m`（不带单位） | 视为 **Gi** 而非字节：`-m 0.5` 表示 0.5 GiB。CLI 包装器会补 `g` 后缀，否则 Docker 会把 `0.23` 解析成 0 字节（等同于「不限制」）。 |
 | `--cpus`、`--memory` / `-m` | 映射为沙箱的 CPU 与内存上限。CPU request 默认取 limit 的一半（向上取整到两位小数）；内存 request 默认**等于** limit。 |
 | `docker volume` | 数据确实持久化，但 `inspect` 中的 `Mountpoint` 仅为展示值，不是本机路径。 |
-| `-p` | 默认 `auto` 模式在可直连时使用 Pod IP，否则通过 Kubernetes API 端口转发。不转发 UDP。 |
+| `-p` | 默认 `auto` 模式：本机到 Pod CIDR 可达时绑定本机端口并直连 Pod IP；不可达时只记录映射（本机无监听）。不转发 UDP。 |
+
+### 端口发布（`-p`）的模式
+
+`-p` 的本机监听行为由 `DOCKER_RT_PORT_FORWARD_MODE` 控制（默认 `auto`，修改后需重启服务）：
+
+| 模式 | 行为 |
+| --- | --- |
+| `auto`（默认） | 先探测本机到 Pod CIDR 的可达性：可达则绑定本机端口并直连 Pod IP；不可达则只记录映射，本机不绑定监听。 |
+| `direct` | 跳过探测，直接绑定本机端口连 Pod IP；取不到 Pod IP 时直接报错，容器启动回滚。 |
+
+PyroMind 后端（默认后端）没有 Kubernetes API 端口转发端点，因此不提供隧道模式：`auto` 探测不可达时**只把映射写进 `inspect` / `ps`，本机不绑定监听**——`docker ps` 照常显示 `0.0.0.0:8635->8635/tcp`，但本机连不通，daemon 日志中有对应的 fallback warning。
 
 ### 不支持：会明确报错
 
@@ -130,6 +141,7 @@ docker build -t myapp:dev .
 | 构建完成但推送失败 | 检查仓库连通性与凭据，并确认前缀包含命名空间（见「中国区集群使用差异」）。镜像归档可能仍保存在 `/workspace/docker_images/`。 |
 | `docker exec` 报 `[EXEC_STREAM_LOST]` / `[EXEC_STREAM_RELAY_FAILED]` | 平台已给出原因：exec 流在命令给出退出码之前中断。消息中包含诊断信息与已投递字节数：`0 stdout / 0 stderr` 基本说明命令未启动；已有字节输出说明命令已执行、仅丢失尾部——**不要盲目重试**，仅对幂等命令重试。 |
 | `docker exec` 偶发报 `exec stream connection lost before any exit event` | 未获得任何原因：exec 的 WebSocket 被平台之外的因素切断（代理 / LB / 空闲超时等）。若频繁出现，检查服务环境中的 `HTTP_PROXY` / `HTTPS_PROXY`，必要时将集群域名加入 `NO_PROXY`。 |
+| `docker ps` 显示 `0.0.0.0:8635` 但本机连不通 | Pod CIDR 不可达时 PyroMind 后端只记录映射、不绑监听（见「端口发布的模式」），daemon 日志有 fallback warning。确认本机能路由到 Pod IP，或用 `DOCKER_RT_PORT_FORWARD_MODE=direct` 强制直连。 |
 
 ## 附录 — PyroMind 相关环境变量
 
@@ -155,3 +167,9 @@ docker build -t myapp:dev .
 | `DOCKER_RT_REGISTRY_DOCKERCONFIG` | 未设置 | Docker `config.json` 路径（与用户名/密码二选一）。 |
 | `DOCKER_RT_REGISTRY_NAMESPACE` | 集群配置 | 短标签使用的命名空间。 |
 | `DOCKER_RT_ACR_ACCESS_KEY_ID` / `DOCKER_RT_ACR_ACCESS_KEY_SECRET` | 未设置 | 仅自动创建 ACR 仓库时需要；使用已存在的仓库不需要。 |
+
+### 端口
+
+| 变量 | 默认值 | 用途 |
+| --- | --- | --- |
+| `DOCKER_RT_PORT_FORWARD_MODE` | `auto` | `-p` 本机监听模式：`auto` / `direct`，含义见「端口发布的模式」。 |

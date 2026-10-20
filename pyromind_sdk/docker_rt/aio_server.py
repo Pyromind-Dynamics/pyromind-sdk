@@ -269,12 +269,9 @@ async def _start_port_forward(record: Any) -> None:
     if kube_env is None:
         raise RuntimeError("cannot publish ports: pod not started")
 
-    if isinstance(kube_env, PyromindSDK):
-        logger.warning(
-            "PyromindSDK backend: only port mappings are exposed; local "
-            "PortForwarder requires k8s_middleware port-forward support id=%s",
-            record.id[:12],
-        )
+    def _expose_mappings_only(*, reason: str) -> None:
+        """Record Ports in inspect/ps without binding a local listener."""
+        logger.warning("%s id=%s", reason, record.id[:12])
         record.published_ports = published_to_network_settings(
             [
                 PublishedBinding(
@@ -286,6 +283,31 @@ async def _start_port_forward(record: Any) -> None:
                 for m in mappings
             ]
         )
+
+    # PyromindSDK (k8s_middleware): no apiserver port-forward endpoint, but
+    # local ``-p`` still works via direct TCP when the Pod CIDR is reachable.
+    if isinstance(kube_env, PyromindSDK):
+        mode_pref = resolve_port_forward_mode()
+        pod_ip = await kube_env.get_pod_ip()
+        if mode_pref == "auto":
+            probe_port = mappings[0].connect_port
+            if not (pod_ip and await probe_pod_network(pod_ip, probe_port)):
+                _expose_mappings_only(
+                    reason=(
+                        "PyromindSDK backend: Pod CIDR not reachable for local -p "
+                        f"(pod_ip={pod_ip or '<none>'}); exposing mappings only"
+                    )
+                )
+                return
+        if not pod_ip:
+            raise RuntimeError(
+                "cannot publish ports: pod has no IP yet "
+                "(PyromindSDK direct -p requires a reachable Pod IP)"
+            )
+        fwd = PortForwarder()
+        published = await fwd.start(pod_ip, mappings, mode="direct")
+        record.port_forwarder = fwd
+        record.published_ports = published_to_network_settings(published)
         return
 
     mode_pref = resolve_port_forward_mode()
@@ -308,7 +330,7 @@ async def _start_port_forward(record: Any) -> None:
         if not pod_ip:
             raise RuntimeError(
                 "cannot publish ports: pod has no IP yet "
-                "(set DOCKER_RT_PORT_FORWARD_MODE=api to use apiserver tunnel)"
+                "(leave DOCKER_RT_PORT_FORWARD_MODE on auto to tunnel via the apiserver)"
             )
         published = await fwd.start(pod_ip, mappings, mode="direct")
     else:

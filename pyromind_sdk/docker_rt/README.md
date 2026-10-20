@@ -53,7 +53,18 @@ These commands **do not fail**, which makes them the easiest to misread. Check w
 | `--memory` / `-m` without a unit | Read as **Gi**, not bytes: `-m 0.5` means 0.5 GiB. The CLI wrapper appends `g`, without which Docker parses `0.23` as 0 bytes and silently applies no limit at all. |
 | `--cpus`, `--memory` / `-m` | Mapped onto the sandbox CPU and memory limits. The CPU request defaults to half the limit (rounded up to two decimals); the memory request defaults to **equal to** the limit. |
 | `docker volume` | Data is really persisted, but the `Mountpoint` field in `inspect` is display-only, not a path on your machine. |
-| `-p` | The default `auto` mode uses the Pod IP when directly reachable, otherwise Kubernetes API port-forwarding. UDP is not forwarded. |
+| `-p` | Default `auto` mode binds a local port and dials the Pod IP when the Pod CIDR is reachable; when it is not, the mapping is recorded only and nothing listens locally. UDP is not forwarded. |
+
+### Port publishing (`-p`) modes
+
+The local listener behaviour of `-p` is controlled by `DOCKER_RT_PORT_FORWARD_MODE` (default `auto`; restart the service after changing it):
+
+| Mode | Behaviour |
+| --- | --- |
+| `auto` (default) | Probes Pod CIDR reachability first: binds a local port and dials the Pod IP when reachable; when unreachable, records the mapping only and binds nothing locally. |
+| `direct` | Skips the probe and dials the Pod IP directly; fails loudly and rolls the container back when no Pod IP is available. |
+
+The PyroMind backend (the default) has no Kubernetes API port-forward endpoint, so there is no tunnel mode: when the `auto` probe fails it **only records the mapping in `inspect` / `ps` and binds nothing locally**. `docker ps` still shows `0.0.0.0:8635->8635/tcp`, but nothing answers on your machine; the daemon log carries the corresponding fallback warning.
 
 ### Not supported: fails loudly
 
@@ -130,6 +141,7 @@ The result is `/workspace/docker_images/myapp_dev.tar`, stored in the remote Pyr
 | Build completes but push fails | Check registry reachability and credentials, and that the prefix includes a namespace (see "China region cluster differences"). The image archive may still exist in `/workspace/docker_images/`. |
 | `docker exec` fails with `[EXEC_STREAM_LOST]` / `[EXEC_STREAM_RELAY_FAILED]` | The platform reported the reason: the exec stream died before the command announced an exit status. The message carries the diagnosis and how many bytes had been delivered: `0 stdout / 0 stderr` almost certainly means the command never started; delivered bytes mean it ran and only the tail was lost — do **not** re-run blindly, retry only idempotent commands. |
 | `docker exec` intermittently fails with `exec stream connection lost before any exit event` | No reason was available: the exec WebSocket was cut by something outside the platform (proxy / LB / idle timeout). If frequent, check `HTTP_PROXY` / `HTTPS_PROXY` in the service environment and add the cluster domain to `NO_PROXY` if needed. |
+| `docker ps` shows `0.0.0.0:8635` but nothing answers locally | When the Pod CIDR is unreachable the PyroMind backend records the mapping only (see "Port publishing modes"); look for the fallback warning in the daemon log. Confirm the Pod IP is routable from your machine, or force direct dialing with `DOCKER_RT_PORT_FORWARD_MODE=direct`. |
 
 ## Appendix — PyroMind-related environment variables
 
@@ -155,3 +167,9 @@ Only the PyroMind-specific variables you **must** know to use builds and pushes 
 | `DOCKER_RT_REGISTRY_DOCKERCONFIG` | unset | Path to a Docker `config.json` (alternative to username/password). |
 | `DOCKER_RT_REGISTRY_NAMESPACE` | Cluster profile | Namespace for short tags. |
 | `DOCKER_RT_ACR_ACCESS_KEY_ID` / `DOCKER_RT_ACR_ACCESS_KEY_SECRET` | unset | Only needed for automatic ACR repository creation; not needed for an existing repository. |
+
+### Ports
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DOCKER_RT_PORT_FORWARD_MODE` | `auto` | Local listener mode for `-p`: `auto` or `direct` — see "Port publishing modes". |
