@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import queue
 import threading
 from typing import (
@@ -20,6 +21,9 @@ import aiohttp
 
 from .client.base import resolve_base_url_from_cluster
 from .client.models import SandboxExecStreamChunk
+from .client.trace import TRACE_ID_HEADER, ensure_trace_id
+
+logger = logging.getLogger("pyromind_sdk.ws")
 
 _SYNC_QUEUE_SIZE = 64
 _STDOUT_CHANNEL = 1
@@ -147,7 +151,12 @@ async def _iter_exec_stream_events(
     timeout_config = aiohttp.ClientTimeout(total=None, sock_connect=30)
     async with aiohttp.ClientSession(timeout=timeout_config) as session:
         try:
-            ws = await session.ws_connect(url, heartbeat=30)
+            # trace 头一并带上：服务端（中间件）会沿用它，
+            # 这条连接就能和发起它的 docker 命令/请求对上
+            ws = await session.ws_connect(
+                url, heartbeat=30, headers={TRACE_ID_HEADER: ensure_trace_id()}
+            )
+            logger.debug("[ws] exec-stream connected %s", url)
         except aiohttp.WSServerHandshakeError as exc:
             raise SandboxExecStreamError(
                 f"exec stream connection rejected (HTTP {exc.status})"

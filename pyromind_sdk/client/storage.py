@@ -4,6 +4,7 @@ Storage API Client
 This module provides a client for managing file storage operations via MinIO/S3-compatible storage.
 """
 
+import logging
 import os
 import mimetypes
 import requests
@@ -23,6 +24,9 @@ except ImportError:
     )
 
 from pyromind_sdk.client.base import PyroMindAPIError, DEFAULT_API_BASE_URL, DEFAULT_CLUSTER, ENV_API_KEY, ENV_BASE_URL, ENV_CLUSTER
+from pyromind_sdk.client.trace import TRACE_ID_HEADER, ensure_trace_id
+
+logger = logging.getLogger("pyromind_sdk.storage")
 
 
 # Constants
@@ -780,10 +784,15 @@ def get_storage_info() -> Dict[str, Any]:
         "Content-Type": "application/json",
         "Accept": "application/json",
         "X-Cluster": cluster,
+        # 存储服务也是平台侧：带上 trace，日志能跟上层的 docker 命令对上
+        TRACE_ID_HEADER: ensure_trace_id(),
     }
 
     try:
         response = requests.post(url, headers=headers, timeout=30)
+        logger.debug(
+            "[RESPONSE] POST %s -> %s", url, response.status_code
+        )
         response.raise_for_status()
 
         result = response.json()

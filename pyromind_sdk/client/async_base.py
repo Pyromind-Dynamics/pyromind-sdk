@@ -7,11 +7,20 @@ HTTP requests, and error handling for all async API clients.
 
 import os
 import logging
+from contextlib import asynccontextmanager
 import asyncio
 import aiohttp
 from typing import Optional, Dict, Any
 
 from .base import append_trace_id, extract_trace_id
+from .trace import (
+    TRACE_ID_HEADER,
+    current_trace_id,
+    ensure_trace_id,
+    new_trace_id,
+    reset_trace_id,
+    set_trace_id,
+)
 
 
 # Constants
@@ -34,19 +43,11 @@ DEFAULT_LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 DEFAULT_LOG_LEVEL = "ERROR"
 
 # Configure logger (always enabled)
+#
+# ⚠️ 这里**不再**自己装 handler：``pyromind_sdk`` 父 logger 已经有唯一一个
+# 带 trace_id 的 handler（见 base.py / trace.py）。这里再装一个 + 向 root 传播
+# ⇒ 同一条日志打印三遍。
 logger = logging.getLogger("pyromind_sdk.async")
-
-# Get log level from environment variable or use default
-_log_level_str = os.getenv(ENV_LOG_LEVEL, DEFAULT_LOG_LEVEL).upper()
-_log_level = getattr(logging, _log_level_str, logging.INFO)
-logger.setLevel(_log_level)
-
-# Configure handler with format from environment variable or default
-_log_format = os.getenv(ENV_LOG_FORMAT, DEFAULT_LOG_FORMAT)
-_handler = logging.StreamHandler()
-_handler.setLevel(_log_level)
-_handler.setFormatter(logging.Formatter(_log_format))
-logger.addHandler(_handler)
 
 
 class PyroMindAsyncAPIError(Exception):
@@ -354,10 +355,14 @@ class PyroMindAsyncClient:
         error_data = self._truncate_error_message(error_data)
         error_message = self._format_error_message(response, error_data)
 
-        # Log error (single line)
-        safe_error_data = self._mask_sensitive_data(error_data)
+        # 单行错误日志（trace_id 在格式前缀里，不再倒整个 headers）
         resp_headers = dict(response.headers)
-        logger.error(f"[ERROR] {request_context} - Status: {response.status} | message: {error_message} | response: {safe_error_data} | headers: {resp_headers}")
+        logger.error(
+            "[ERROR] %s -> %s: %s",
+            request_context,
+            response.status,
+            error_message,
+        )
 
         raise PyroMindAsyncAPIError(
             message=f"{request_context} failed: {error_message}",
@@ -366,9 +371,78 @@ class PyroMindAsyncClient:
             headers=resp_headers
         )
 
+    # ========== Raw (non-JSON) Requests ==========
+
+    def _trace_headers(self) -> Dict[str, str]:
+        """给绕过 ``_request`` 的请求补 trace 头。"""
+        return {TRACE_ID_HEADER: ensure_trace_id()}
+
+    @asynccontextmanager
+    async def _raw_request(self, session, method: str, url: str, **kwargs):
+        """文件读写 / 分块上传这类「非 JSON」请求的薄封装（异步）。
+
+        与同步版同义：带上 trace，进上下文时记「请求」，拿到响应头时记
+        「服务端返回」。用 ``async with`` 保持和原来 ``session.request`` 一样的写法。
+        """
+        headers = dict(kwargs.pop("headers", None) or {})
+        headers.setdefault(TRACE_ID_HEADER, ensure_trace_id())
+        kwargs["headers"] = headers
+        logger.debug("[REQUEST] %s %s", method.upper(), url)
+        async with session.request(method, url, **kwargs) as response:
+            logger.debug(
+                "[RESPONSE] %s %s -> %s", method.upper(), url, response.status
+            )
+            yield response
+
     # ========== Main Request Method ==========
 
     async def _request(
+        self,
+        method: str,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        json_data: Optional[Dict[str, Any]] = None,
+        retry: bool = True,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """入口：保证整次调用（含「服务端返回」那几行日志）都有 trace_id。
+
+        没有上下文（SDK 单独用 / 后台任务）就地开一条，结束还原 ——
+        不能沿用上一次，否则两条不相干的请求会共用一个 trace。
+        """
+        if current_trace_id():
+            return await self._request_inner(
+                method,
+                endpoint,
+                params=params,
+                json_data=json_data,
+                retry=retry,
+                **kwargs,
+            )
+        token = set_trace_id(new_trace_id())
+        try:
+            return await self._request_inner(
+                method,
+                endpoint,
+                params=params,
+                json_data=json_data,
+                retry=retry,
+                **kwargs,
+            )
+        except Exception as exc:
+            # 网关层的 5xx（如 istio "no healthy upstream"）**不带 x-trace-id**，
+            # 那就把我们自己这条挂上去 —— 上层用 format_exception_message 时
+            # 错误文本里也会出现 (trace_id=...)，日志/CLI 两边都能对上。
+            if getattr(exc, "trace_id", None) is None:
+                try:
+                    exc.trace_id = current_trace_id()
+                except Exception:  # noqa: BLE001
+                    pass
+            raise
+        finally:
+            reset_trace_id(token)
+
+    async def _request_inner(
         self,
         method: str,
         endpoint: str,
@@ -399,16 +473,20 @@ class PyroMindAsyncClient:
         request_context = self._build_request_context(method, url)
         session = await self._get_session()
 
-        # Log request
-        logger.debug(f"[REQUEST] {request_context}")
+        # 出站带上 trace_id（middleware 有「来什么用什么」，于是全程同一条）
+        trace_id = ensure_trace_id()
+        extra_headers = dict(kwargs.pop("headers", None) or {})
+        extra_headers.setdefault(TRACE_ID_HEADER, trace_id)
+        kwargs["headers"] = extra_headers
+
+        # 单行请求日志
+        log_parts = [f"[REQUEST] {method.upper()} {url}"]
         if params:
-            logger.debug(f"[REQUEST] params: {params}")
+            log_parts.append(f"params={params}")
         if json_data:
-            safe_json = self._mask_sensitive_data(json_data)
-            logger.debug(f"[REQUEST] body: {safe_json}")
-        # Log request headers (mask authorization)
-        safe_headers = {k: '***' if k.lower() == 'authorization' else v for k, v in session.headers.items()}
-        logger.debug(f"[REQUEST] headers: {safe_headers}")
+            log_parts.append(f"body={self._mask_sensitive_data(json_data)}")
+        log_parts.append(f"trace={trace_id}")
+        logger.debug(" | ".join(log_parts))
 
         last_exception = None
         attempts = max(1, self.max_retries) if retry else 1

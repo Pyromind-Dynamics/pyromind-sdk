@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import signal
 import sys
@@ -40,6 +41,9 @@ from pyromind_sdk.client.base import (
     available_clusters,
     resolve_base_url_from_cluster,
 )
+from pyromind_sdk.client.trace import TRACE_ID_HEADER, ensure_trace_id
+
+logger = logging.getLogger("pyromind_sdk.ws")
 
 
 # Keep-alive / idle policy — must match the server's expectations.
@@ -120,7 +124,13 @@ async def _run_session(url: str) -> None:
 
     async with aiohttp.ClientSession() as session:
         try:
-            ws = await session.ws_connect(url, heartbeat=30)
+            # 同 exec_stream：带上 trace，服务端沿用
+            ws = await session.ws_connect(
+                url,
+                heartbeat=30,
+                headers={TRACE_ID_HEADER: ensure_trace_id()},
+            )
+            logger.debug("[ws] terminal connected %s", url)
         except aiohttp.WSServerHandshakeError as e:
             raise TerminalError(
                 f"Connection rejected (HTTP {e.status}). Check the API key and sandbox id."

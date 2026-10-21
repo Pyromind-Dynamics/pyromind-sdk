@@ -619,7 +619,7 @@ class SandboxClient(PyroMindClient):
         """
         url = self._build_url(f"/sandboxes/{sandbox_id}/files/read")
         # Bypass _request() because the response body is raw bytes, not JSON.
-        response = self.session.request(
+        response = self._raw_request(
             method="GET",
             url=url,
             params={"path": path},
@@ -690,7 +690,7 @@ class SandboxClient(PyroMindClient):
         request_context = f"write_file /sandboxes/{sandbox_id}"
 
         # Step 1: init
-        init_resp = self.session.request(
+        init_resp = self._raw_request(
             method="POST",
             url=f"{base_url}/init",
             params={
@@ -712,7 +712,7 @@ class SandboxClient(PyroMindClient):
                     break
                 uploaded_bytes += len(chunk_data)
 
-                part_resp = self.session.request(
+                part_resp = self._raw_request(
                     method="PUT",
                     url=f"{base_url}/{upload_id}/part",
                     params={"chunk_index": i},
@@ -729,7 +729,7 @@ class SandboxClient(PyroMindClient):
                     )
 
             # Step 3: complete
-            complete_resp = self.session.request(
+            complete_resp = self._raw_request(
                 method="POST",
                 url=f"{base_url}/{upload_id}/complete",
                 params={"path": path, "total_chunks": total_chunks},
@@ -745,7 +745,7 @@ class SandboxClient(PyroMindClient):
             # 也不再用 traceback.print_exc() 往 stderr 喷栈 —— 调用方已经拿到异常了。
             if not _sandbox_is_gone(e):
                 try:
-                    self.session.request(
+                    self._raw_request(
                         method="DELETE",
                         url=f"{base_url}/{upload_id}",
                         timeout=self.timeout,
