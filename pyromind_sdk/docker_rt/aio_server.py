@@ -1201,6 +1201,12 @@ async def _wait_container_ready(record: Any, *, timeout: float) -> str:
         return "running"
 
     deadline = time.monotonic() + max(float(timeout), 0.01)
+    short = (getattr(record, "id", "") or "")[:12]
+    # `docker run -d` / `start` 的 HTTP 响应没有 body，CLI 在 waiting 期间也不读
+    # stdout ⇒ 这行提示只能进 daemon 日志（前台 run 的终端提示在 attach 里单独写）。
+    logger.info(
+        "waiting for the sandbox to be running... id=%s timeout=%ss", short, timeout
+    )
     last_phase: Any = "Unknown"
     while True:
         try:
@@ -1213,6 +1219,7 @@ async def _wait_container_ready(record: Any, *, timeout: float) -> str:
 
         status_word = _status_word_from_phase(last_phase)
         if status_word in {"running", "stopped", "failed"}:
+            logger.info("sandbox %s is %s", short, status_word)
             return status_word
 
         remaining = deadline - time.monotonic()
@@ -3849,6 +3856,60 @@ async def attach_container(request: web.Request) -> web.StreamResponse | web.Res
         want_stream,
     )
     try:
+        # `docker run IMG`（没有命令、没有 -i/-t、也不要日志）：没有命令可跑，
+        # 但要**等 sandbox 真的 running 再告诉用户**（2026-10-21 用户要求：
+        # 返回时容器必须可用，不能给一个"看起来起来了、exec 却撞 409"的 id）。
+        no_command = (
+            not stdin
+            and not tty
+            and not want_logs
+            and not list(getattr(record, "cmd", None) or [])
+        )
+        if record.state != ContainerState.RUNNING:
+            # Pod 从 creating → running 要几十秒到几分钟；期间没有这行提示
+            # 就是"终端卡住不动"（2026-10-21 实测：attach 静默挂了 3 分钟）。
+            try:
+                notice = b"docker-rt: waiting for the sandbox to be running...\r\n"
+                await resp.write(notice if tty else frame_stdout(notice))
+                await resp.drain()
+            except (ConnectionResetError, RuntimeError, ConnectionError):
+                logger.debug("attach waiting notice skipped", exc_info=True)
+        try:
+            record = await _wait_container_running(
+                store,
+                cid,
+                timeout=float(getattr(record, "ready_timeout", 600) or 600),
+            )
+        except Exception as exc:
+            logger.warning("attach wait failed id=%s: %s", cid[:12], exc)
+            session.running = False
+            session.exit_code = 1
+            _force_close_hijack(request, resp)
+            return resp
+
+        if no_command:
+            # 等到 running 了才告知（此时容器确实可用），并把退出码写给
+            # ``wait?condition=next-exit``；不写 CLI 会一直挂到容器真退出
+            # （2026-10-21 实测卡 3 分钟）。容器保持 Running 供后续 docker exec。
+            short = record.short_id
+            sandbox_id = getattr(record, "sandbox_id", None) or ""
+            where = f" (sandbox {sandbox_id})" if sandbox_id else ""
+            message = (
+                "docker-rt: no command given, and the image CMD/ENTRYPOINT is not "
+                f"available here; container {short}{where} is running in the "
+                "background (same as `docker run -d`). Run commands with: "
+                f"docker exec {short} <cmd>\r\n"
+            ).encode("utf-8")
+            try:
+                await resp.write(frame_stdout(message))
+                await resp.drain()
+            except (ConnectionResetError, RuntimeError, ConnectionError):
+                logger.debug("attach no-command notice skipped", exc_info=True)
+            record.foreground_exit_code = 0
+            session.running = False
+            session.exit_code = 0
+            _force_close_hijack(request, resp)
+            return resp
         try:
             record = await _wait_container_running(
                 store,
@@ -3971,6 +4032,13 @@ async def attach_container(request: web.Request) -> web.StreamResponse | web.Res
                 await store.remove(record)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("foreground --rm cleanup failed: %s", exc)
+    elif not stdin and not tty and not foreground_cmd:
+        # `docker run IMG`（没有命令、没有 -i/-t）：容器按 `docker run -d` 的语义
+        # 留在后台，但 CLI 此时正挂在对 `wait?condition=next-exit` 的轮询上
+        # —— ``_hijack_session`` 里那条"容器已在后台运行"的提示没有配套的退出码，
+        # ``wait`` 就会一直等到容器真退出（= 用户 Ctrl-C，2026-10-21 实测卡 3 分钟）。
+        # 这里给 0 让 CLI 立刻结束；容器保持 Running，供后续 ``docker exec``。
+        record.foreground_exit_code = 0
     return resp_out
 
     # 兜底：**任何路径都不许落空返回 None** —— aiohttp 会打
@@ -4171,11 +4239,20 @@ async def _hijack_session(
             return resp
 
         if not stdin and not tty:
-            # 真的没有命令（例如 attach 一个已存在的容器）：如实告知，而不是静默返回 0
+            # `docker run IMG`（没有命令、没有 -i/-t）：
+            # 真 Docker 会用镜像的 CMD/ENTRYPOINT，但 docker-rt **读不到镜像 config**
+            # （inspect 镜像时 Cmd/Entrypoint 恒为 None；平台也不把 Cmd 当主进程），
+            # 所以这里没有命令可跑。容器本身已经起来了（Pod 常驻），按
+            # `docker run -d` 的工作台语义返回 —— 之前这里报
+            # "this container has no command to run; use -d or -it"，
+            # 用户会以为前台 run 根本没被支持（2026-10-21 实测）。
+            short = (getattr(session, "id", "") or "")[:12]
             message = (
-                b"docker-rt: this container has no command to run; "
-                b"use -d or -it.\r\n"
-            )
+                "docker-rt: no command given, and the image CMD/ENTRYPOINT is not "
+                f"available here; container {short} is running in the background "
+                "(same as `docker run -d`). Run commands with: "
+                f"docker exec {short} <cmd>\r\n"
+            ).encode("utf-8")
             try:
                 await resp.write(frame_stdout(message))
                 await resp.drain()
