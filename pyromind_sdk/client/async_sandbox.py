@@ -723,7 +723,7 @@ class AsyncSandboxClient(PyroMindAsyncClient):
         url = self._build_url(f"/sandboxes/{sandbox_id}/files/read")
         session = await self._get_session()
         request_context = f"GET {url}"
-        async with session.request("GET", url, params={"path": path}) as response:
+        async with self._raw_request(session, "GET", url, params={"path": path}) as response:
             if not response.ok:
                 await self._handle_error_response(response, request_context)
             return await response.read()
@@ -782,7 +782,7 @@ class AsyncSandboxClient(PyroMindAsyncClient):
         request_context = f"chunked PUT /sandboxes/{sandbox_id}/files/write"
 
         # Step 1: init
-        async with session.request(
+        async with self._raw_request(session, 
             "POST",
             f"{base_url}/init",
             params={
@@ -806,7 +806,7 @@ class AsyncSandboxClient(PyroMindAsyncClient):
                 if not chunk_data:
                     break
 
-                async with session.request(
+                async with self._raw_request(session, 
                     "PUT",
                     f"{base_url}/{upload_id}/part",
                     params={"chunk_index": i},
@@ -822,7 +822,7 @@ class AsyncSandboxClient(PyroMindAsyncClient):
                         )
 
             # Step 3: complete
-            async with session.request(
+            async with self._raw_request(session, 
                 "POST",
                 f"{base_url}/{upload_id}/complete",
                 params={"path": path, "total_chunks": total_chunks},
@@ -839,7 +839,7 @@ class AsyncSandboxClient(PyroMindAsyncClient):
             # 404/500 到服务端日志。
             if not _sandbox_is_gone(exc):
                 try:
-                    async with session.request(
+                    async with self._raw_request(session, 
                         "DELETE", f"{base_url}/{upload_id}"
                     ):
                         pass

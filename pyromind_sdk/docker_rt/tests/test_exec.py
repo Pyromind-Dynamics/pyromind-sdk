@@ -512,7 +512,7 @@ async def test_pyromind_terminal_bridge_pumps_stdin_and_resize(monkeypatch):
         async def __aexit__(self, *exc):
             return False
 
-        async def ws_connect(self, url, heartbeat=None):
+        async def ws_connect(self, url, heartbeat=None, **_kwargs):
             captured["url"] = url
             captured["ws"] = FakeWs(session_holder)
             return captured["ws"]
@@ -751,7 +751,7 @@ async def _drive_terminal_bridge(
         async def __aexit__(self, *exc):
             return False
 
-        async def ws_connect(self, url, heartbeat=None):
+        async def ws_connect(self, url, heartbeat=None, **_kwargs):
             captured["url"] = url
             captured["ws"] = FakeWs()
             return captured["ws"]

@@ -105,8 +105,155 @@ from .register_context import (  # noqa: E402
 )
 from .api import images as images_mod  # noqa: E402
 from pyromind_sdk.client.base import format_exception_message  # noqa: E402
+from pyromind_sdk.client.trace import (  # noqa: E402
+    TRACE_ID_HEADER,
+    ensure_trace_id,
+    TraceIdFilter,
+    install_console_logging,
+    new_trace_id,
+    reset_trace_id,
+    set_trace_id,
+)
 
 logger = logging.getLogger("docker_rt")
+
+#: 日志里单条 body 的最大长度（超出只报字节数）
+_LOG_BODY_MAX = 2000
+
+
+def _compact(value: Any) -> Any:
+    """去掉 JSON 里的空值（``""``/``null``/``[]``/``{}``/``0``/``false``）。
+
+    ``docker run`` 的 create 体会带一长串默认值（几十个空字段），
+    不压缩的话日志里一行两千字符、关键信息（Image / Binds / GPU）全被淹没。
+    """
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            compact = _compact(item)
+            if compact in (None, "", [], {}, 0, False):
+                continue
+            out[key] = compact
+        return out
+    if isinstance(value, list):
+        return [_compact(item) for item in value]
+    return value
+
+
+def _log_preview(payload: Any, *, limit: int = _LOG_BODY_MAX) -> str:
+    """把 JSON/字节转成一行可读预览（超长截断）。"""
+    if payload is None or payload == b"" or payload == {}:
+        return ""
+    if isinstance(payload, (bytes, bytearray)):
+        size = len(payload)
+        if size > limit:
+            return f"<{size} bytes>"
+        return bytes(payload).decode("utf-8", "replace")
+    try:
+        text = json.dumps(payload, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        text = str(payload)
+    return text if len(text) <= limit else f"{text[:limit]}...<truncated>"
+
+
+async def _request_body_preview(request: web.Request) -> str:
+    """请求体预览。
+
+    ⚠️ 只碰「小的 JSON 体」：``docker cp`` / 镜像导入是流式上传
+    （``Content-Length`` 为 chunked 或很大），这里绝不能 ``read()``，
+    否则会把 handler 要读的流吃掉，或者把 GB 级文件读进内存。
+    """
+    if request.method in {"GET", "HEAD", "OPTIONS"}:
+        return ""
+    ctype = (request.headers.get("Content-Type") or "").lower()
+    if "json" not in ctype:
+        return ""
+    length = request.content_length
+    if length is None or length > 64 * 1024:
+        return f"<body {length if length is not None else 'streamed'} bytes>"
+    try:
+        # aiohttp 会把读到的内容缓存到 request 上，handler 之后照常能 json()
+        raw = await request.read()
+    except Exception:  # noqa: BLE001 - 日志失败不能影响请求
+        return ""
+    try:
+        return _log_preview(_compact(json.loads(raw)))
+    except (ValueError, TypeError):
+        return _log_preview(raw)
+
+
+#: 返回体在日志里更短（``docker inspect`` / ``docker ps`` 的 JSON 太长了）
+_LOG_RESPONSE_MAX = 800
+
+
+def _response_preview(response: Any) -> str:
+    if response is None:
+        return ""
+    body = getattr(response, "body", None)
+    if body is None:
+        # StreamResponse（attach / exec / 镜像导出）不读 body
+        return ""
+    return _log_preview(body, limit=_LOG_RESPONSE_MAX)
+
+
+class _UnixKeepaliveNoiseFilter(logging.Filter):
+    """丢掉 aiohttp 在 unix socket 上 ``setsockopt(SO_KEEPALIVE)`` 的假错误。
+
+    每个新连接都会打一段 ``OSError: [Errno 22]`` 的 traceback（几十行），
+    和业务无关，却把真正的日志淹掉。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        if record.levelno < logging.ERROR:
+            return True
+        message = record.getMessage()
+        return not (
+            "connection_made" in message and "RequestHandler" in message
+        )
+
+
+@web.middleware
+async def _api_trace_middleware(request: web.Request, handler: Any):
+    """给每个 Docker API 请求分配/沿用 trace_id，并记「命令 + 入参 + 返回」。
+
+    这一层是排查的锚点：同一个 trace_id 会跟着 SDK 的出站请求
+    （``X-Trace-Id``）走到 k8s_middleware，三层日志可以串起来。
+
+    * 客户端带了 ``X-Trace-Id`` 就沿用（docker CLI 不带，curl/SDK 可以带）；
+    * 响应头把它回给调用方，方便对着 CLI 的输出查日志；
+    * 入参/返回都**单行 + 截断**，流式请求只记字节数。
+    """
+    incoming = (request.headers.get(TRACE_ID_HEADER) or "").strip()
+    trace_id = incoming or new_trace_id()
+    token = set_trace_id(trace_id)
+    started = time.monotonic()
+    command = f"{request.method} {request.path_qs}"
+    body_in = await _request_body_preview(request)
+    logger.info("[api] --> %s%s", command, f" {body_in}" if body_in else "")
+
+    status = 500
+    response: Any = None
+    try:
+        response = await handler(request)
+        status = response.status
+        response.headers[TRACE_ID_HEADER] = trace_id
+        return response
+    except web.HTTPException as exc:
+        status = exc.status
+        exc.headers[TRACE_ID_HEADER] = trace_id
+        raise
+    finally:
+        elapsed_ms = (time.monotonic() - started) * 1000
+        body_out = _response_preview(response)
+        logger.info(
+            "[api] <-- %s %s %.0fms%s",
+            status,
+            command,
+            elapsed_ms,
+            f" {body_out}" if body_out else "",
+        )
+        reset_trace_id(token)
+
 
 
 def _wait_watchdog_interval() -> float:
@@ -1947,7 +2094,8 @@ async def _start_record(
             except Exception as exc:
                 record.error = format_exception_message(exc)
                 await store.set_state(record, ContainerState.DEAD)
-                logger.exception("resume failed")
+                logger.error("resume failed: %s", record.error)
+                logger.debug("resume failed detail", exc_info=True)
                 return _err(500, format_exception_message(exc))
             record.error = None
             record.finished_at = None
@@ -1973,7 +2121,8 @@ async def _start_record(
                 record.kube_env = None
                 record.pod_name = None
                 await store.set_state(record, ContainerState.DEAD)
-                logger.exception("resume readiness wait failed")
+                logger.error("resume readiness wait failed: %s", record.error)
+                logger.debug("resume readiness detail", exc_info=True)
                 return _err(500, format_exception_message(exc))
             if ready_status == "failed":
                 record.error = (
@@ -2054,7 +2203,8 @@ async def _start_record(
         except Exception as exc:
             record.error = format_exception_message(exc)
             await store.set_state(record, ContainerState.DEAD)
-            logger.exception("start failed")
+            logger.error("start failed: %s", record.error)
+            logger.debug("start failed detail", exc_info=True)
             return _err(500, format_exception_message(exc))
 
         record.kube_env = kube_env
@@ -2087,7 +2237,8 @@ async def _start_record(
                 record.kube_env = None
                 record.pod_name = None
                 await store.set_state(record, ContainerState.DEAD)
-                logger.exception("start readiness wait failed")
+                logger.error("start readiness wait failed: %s", record.error)
+                logger.debug("start readiness detail", exc_info=True)
                 return _err(500, format_exception_message(exc))
 
             if ready_status == "failed":
@@ -2095,6 +2246,7 @@ async def _start_record(
                     f"sandbox failed to start: "
                     f"{getattr(kube_env, 'sandbox_status', 'failed')}"
                 )
+                logger.error("sandbox failed to start: %s", record.error)
                 try:
                     await call_environment_method(kube_env, "cleanup")
                 except Exception:
@@ -2408,7 +2560,8 @@ async def restart_container(request: web.Request) -> web.Response:
         except Exception as exc:
             record.error = format_exception_message(exc)
             await store.set_state(record, ContainerState.DEAD)
-            logger.exception("restart failed")
+            logger.error("restart failed: %s", record.error)
+            logger.debug("restart failed detail", exc_info=True)
             return _err(500, format_exception_message(exc))
         record.kube_env = kube_env
         record.pod_name = kube_env.pod_name
@@ -4517,7 +4670,14 @@ async def _hijack_pyromind_terminal(
     try:
         async with aiohttp.ClientSession() as client:
             try:
-                ws = await client.ws_connect(url, heartbeat=30)
+                ws = await client.ws_connect(
+                    url,
+                    heartbeat=30,
+                    headers={TRACE_ID_HEADER: ensure_trace_id()},
+                )
+                logger.info(
+                    "terminal connected id=%s", getattr(session, "id", "")[:12]
+                )
             except (aiohttp.ClientError, OSError) as exc:
                 session.running = False
                 if cmd is not None:
@@ -5341,7 +5501,10 @@ def _keep_transports_open_after_client_eof() -> None:
 
 def create_aio_app(*, run_reconcile: bool = True) -> web.Application:
     _keep_transports_open_after_client_eof()
-    app = web.Application(client_max_size=0)  # stream docker cp; no body cap
+    app = web.Application(
+        client_max_size=0,  # stream docker cp; no body cap
+        middlewares=[_api_trace_middleware],
+    )
     app["sandbox_client"] = None
     app["store"] = ContainerStore()
     app["volumes"] = VolumeStore()
@@ -5374,14 +5537,41 @@ def create_aio_app(*, run_reconcile: bool = True) -> web.Application:
     return app
 
 
+_LOGGING_CONFIGURED = False
+
+DAEMON_LOG_FORMAT = (
+    "%(asctime)s %(levelname)-5s [%(trace_id)s] %(name)s: %(message)s"
+)
+
+
+def configure_daemon_logging() -> None:
+    """装好 daemon 的日志：时间 + 级别 + [trace_id] + logger，单行。
+
+    幂等 —— ``server.main()`` 在 setup 阶段就要用（否则 "setup failed"
+    那几行是没有时间戳的裸 print），``aio_server.main()`` 还会再调一次。
+    """
+    global _LOGGING_CONFIGURED
+    if _LOGGING_CONFIGURED:
+        return
+    _LOGGING_CONFIGURED = True
+
+    level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
+    logging.basicConfig(level=level, format=DAEMON_LOG_FORMAT)
+    for root_handler in logging.getLogger().handlers:
+        root_handler.addFilter(TraceIdFilter())
+    # SDK 的 logger propagate=False 且有自己的 handler ⇒ 级别/格式也统一成同一套
+    install_console_logging(
+        "pyromind_sdk", level=level, fmt=DAEMON_LOG_FORMAT
+    )
+    # 自己的 [api] 两行已经记全请求了，aiohttp 的 access 行只是重复
+    logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+    logging.getLogger("asyncio").addFilter(_UnixKeepaliveNoiseFilter())
+
+
 def main() -> None:
     import signal
 
-    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(
-        level=getattr(logging, log_level, logging.INFO),
-        format="%(levelname)s %(name)s %(message)s",
-    )
+    configure_daemon_logging()
 
     sock = os.getenv("DOCKER_RT_SOCK", "/tmp/docker-rt.sock")
     host = os.getenv("DOCKER_RT_HOST", "")
@@ -5393,7 +5583,13 @@ def main() -> None:
             logger.info("Listening on TCP %s:%s", host, port)
             web.run_app(app, host=host, port=port, print=lambda *a, **k: None)
         else:
-            assert_socket_available(sock)
+            try:
+                assert_socket_available(sock)
+            except RuntimeError as exc:
+                # 这是个**可预期**的用户错误（另一个 docker-rt 还在跑），
+                # 一行说清楚就够，不必甩 20 行 traceback。
+                logger.error("%s", exc)
+                raise SystemExit(1) from None
             logger.info("Listening on unix://%s", sock)
             web.run_app(app, path=sock, print=lambda *a, **k: None)
     except SystemExit:
