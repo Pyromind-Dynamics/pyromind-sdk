@@ -460,6 +460,15 @@ if outputs:
 }
 ```
 
+### 获取节点日志
+
+```python
+# 查询节点日志，node_id 可以是数据库节点 ID 或节点编码
+logs = client.studio.get_node_logs(task_id="task-id", node_id="node-id")
+for line in logs:
+    print(line)
+```
+
 ### 获取节点信息
 
 ```python

@@ -485,6 +485,15 @@ The output format is:
 }
 ```
 
+### Get node logs
+
+```python
+# Fetch the available log lines for a node (node ID or node code)
+logs = client.studio.get_node_logs(task_id="task-id", node_id="node-id")
+for line in logs:
+    print(line)
+```
+
 ### Get node info
 
 ```python
