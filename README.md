@@ -178,7 +178,7 @@ The following tables are a complete index of the public service methods. Request
 | --- | --- |
 | `list()` / `create()` / `get_job()` / `get_task()` | List, create, and inspect training tasks. |
 | `stop()` / `delete()` | Stop or remove a task. |
-| `get_node_output()` / `get_node_info()` / `reload_nodes()` | Inspect task outputs and available node definitions. |
+| `get_node_output()` / `get_node_logs()` / `get_node_info()` / `reload_nodes()` | Inspect task logs, outputs, and available node definitions. |
 | `create_node()` / `delete_node_by_name()` / `move_node()` | Manage custom node definitions. |
 | `run_with_params()` | Run a stored workflow with supplied primitive-node values. |
 | `export_node_outputs()` | Export outputs for selected workflow nodes. |

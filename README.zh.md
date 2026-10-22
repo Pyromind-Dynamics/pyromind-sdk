@@ -178,7 +178,7 @@ with PyroMindAPIClient(
 | --- | --- |
 | `list()` / `create()` / `get_job()` / `get_task()` | 列出、创建和查询训练任务。 |
 | `stop()` / `delete()` | 停止或删除任务。 |
-| `get_node_output()` / `get_node_info()` / `reload_nodes()` | 查询任务输出和可用节点定义。 |
+| `get_node_output()` / `get_node_logs()` / `get_node_info()` / `reload_nodes()` | 查询节点日志、任务输出和可用节点定义。 |
 | `create_node()` / `delete_node_by_name()` / `move_node()` | 管理自定义节点定义。 |
 | `run_with_params()` | 为已保存工作流注入原始节点参数并运行。 |
 | `export_node_outputs()` | 导出指定工作流节点的输出。 |
