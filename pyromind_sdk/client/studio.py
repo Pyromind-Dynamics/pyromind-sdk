@@ -171,6 +171,22 @@ class StudioClient(PyroMindClient):
             return None
         
         return data if isinstance(data, dict) else None
+
+    def get_node_logs(self, task_id: str, node_id: str) -> List[str]:
+        """Get the log lines for a node in a studio task.
+
+        Args:
+            task_id: ID of the studio task.
+            node_id: Database ID or node code of the node.
+
+        Returns:
+            Log lines for the node, or an empty list when no logs are available.
+        """
+        response = self.get(f"/studio/tasks/{task_id}/nodes/{node_id}/logs")
+        data = self._extract_data(response)
+        if isinstance(data, dict):
+            data = data.get("logs")
+        return data if isinstance(data, list) else []
     
     def get_node_info(self, names: Optional[str] = None) -> Dict[str, Any]:
         """

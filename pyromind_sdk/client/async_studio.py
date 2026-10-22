@@ -136,6 +136,22 @@ class AsyncStudioClient(PyroMindAsyncClient):
 
         return data if isinstance(data, dict) else None
 
+    async def get_node_logs(self, task_id: str, node_id: str) -> List[str]:
+        """Get the log lines for a node in a studio task (async).
+
+        Args:
+            task_id: ID of the studio task.
+            node_id: Database ID or node code of the node.
+
+        Returns:
+            Log lines for the node, or an empty list when no logs are available.
+        """
+        response = await self.get(f"/studio/tasks/{task_id}/nodes/{node_id}/logs")
+        data = self._extract_data(response)
+        if isinstance(data, dict):
+            data = data.get("logs")
+        return data if isinstance(data, list) else []
+
     async def get_node_info(self, names: Optional[str] = None) -> Dict[str, Any]:
         """
         Get node information dictionary for the current user (async).
