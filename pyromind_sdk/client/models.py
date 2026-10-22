@@ -203,10 +203,14 @@ class SandboxRequest(BaseModel):
             expose a node directory inside the container. When creating a
             sandbox for file operations, mount the working directory here and
             use ``mount_path`` in every ``write_file`` / ``read_file`` /
-            ``delete_file`` call.
+            ``delete_file`` call. The server caps the list (20 entries by
+            default, configurable per deployment) and rejects more with
+            HTTP 400.
         port_mappings: Optional port exposures (docker ``-p`` style). Each
             ``PortMapping(container_port=8080)`` opens that port on the node.
-            Useful for CUSTOM sandboxes running HTTP / gRPC servers.
+            Useful for CUSTOM sandboxes running HTTP / gRPC servers. The server
+            caps the list (5 entries by default, configurable per deployment)
+            and rejects more with HTTP 400.
         mount_public_dir: **CUSTOM only.** Set ``True`` to mount the platform's
             shared read-only directories inside the container. The directory
             list is registered by the platform (not by the client) and every
@@ -248,14 +252,18 @@ class SandboxRequest(BaseModel):
         default=None,
         description=(
             "Optional hostPath mounts (docker -v style). Each entry needs a "
-            "host_path and a mount_path."
+            "host_path and a mount_path. The server caps the list — currently "
+            "20 entries by default, configurable per deployment — and rejects "
+            "more with HTTP 400."
         ),
     )
     port_mappings: Optional[List[PortMapping]] = Field(
         default=None,
         description=(
             "Optional port mappings (docker -p style). Each entry needs at "
-            "least a container_port."
+            "least a container_port. The server caps the list — currently "
+            "5 entries by default, configurable per deployment — and rejects "
+            "more with HTTP 400."
         ),
     )
     mount_public_dir: Optional[bool] = Field(

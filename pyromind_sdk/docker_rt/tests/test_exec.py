@@ -512,7 +512,7 @@ async def test_pyromind_terminal_bridge_pumps_stdin_and_resize(monkeypatch):
         async def __aexit__(self, *exc):
             return False
 
-        async def ws_connect(self, url, heartbeat=None):
+        async def ws_connect(self, url, heartbeat=None, **_kwargs):
             captured["url"] = url
             captured["ws"] = FakeWs(session_holder)
             return captured["ws"]
@@ -751,7 +751,7 @@ async def _drive_terminal_bridge(
         async def __aexit__(self, *exc):
             return False
 
-        async def ws_connect(self, url, heartbeat=None):
+        async def ws_connect(self, url, heartbeat=None, **_kwargs):
             captured["url"] = url
             captured["ws"] = FakeWs()
             return captured["ws"]
@@ -2173,6 +2173,81 @@ async def test_hijack_foreground_run_returns_a_response(monkeypatch: Any) -> Non
     )
     assert "foreground" in calls, f"前台 run 必须走 exec，实际调用={calls}"
     assert session.exit_code == 7
+
+
+@pytest.mark.asyncio
+async def test_foreground_run_without_a_command_keeps_the_container() -> None:
+    """`docker run IMG`（不带命令、不带 -i/-t）不能报"没有命令"。
+
+    docker-rt 读不到镜像的 CMD/ENTRYPOINT（inspect 里恒为 None，平台也不把 Cmd
+    当主进程），所以这条路径没有命令可跑。2026-10-21 用户实测：旧实现回
+    ``this container has no command to run; use -d or -it``，让人以为前台 run
+    根本没被支持。现在的语义是**按 `docker run -d` 的工作台方式**返回 0，
+    并把容器 id 告诉用户（容器保持运行，供后续 ``docker exec``）。
+    """
+    from .. import aio_server as mod
+    from ..backend.pyromind_sdk_env import PyromindSDK
+
+    class _Protocol:
+        def force_close(self) -> None:
+            return None
+
+        def is_closing(self) -> bool:
+            return False
+
+    class _Resp:
+        def __init__(self) -> None:
+            self.written: list[bytes] = []
+
+        async def write(self, data: bytes) -> None:
+            self.written.append(bytes(data))
+
+        async def drain(self) -> None:
+            return None
+
+        async def prepare(self, _request: Any) -> Any:
+            return self
+
+    class _Request:
+        def __init__(self, protocol: Any) -> None:
+            self._protocol = protocol
+            self.protocol = protocol
+            self.app = {}
+
+        @property
+        def transport(self) -> Any:
+            return self._protocol
+
+    protocol = _Protocol()
+    resp = _Resp()
+    session = SimpleNamespace(
+        id="c0ffee1234567890abcd", running=False, exit_code=None,
+        tty_cols=80, tty_rows=24,
+    )
+
+    result = await asyncio.wait_for(
+        mod._hijack_session(
+            _Request(protocol),
+            resp,
+            protocol,
+            session,
+            PyromindSDK.__new__(PyromindSDK),
+            None,  # 没有命令
+            False,  # tty=False
+            stdin=False,
+            cwd="",
+            foreground_cmd=None,
+        ),
+        timeout=2,
+    )
+
+    body = b"".join(resp.written)  # stdout 走 frame_stdout，带 8 字节帧头
+    assert result is not None, "无命令也必须返回响应（否则 attach 500）"
+    assert b"no command to run" not in body, "旧文案会让人以为前台 run 不被支持"
+    assert b"running in the background" in body, f"应说明容器已在后台运行，实际={body!r}"
+    assert b"c0ffee123456" in body, "必须给出可 docker exec 的容器 id"
+    assert session.exit_code == 0
+    assert session.running is False
 
 
 @pytest.mark.asyncio
