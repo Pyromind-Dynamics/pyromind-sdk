@@ -13,6 +13,10 @@ import sys
 
 
 def main(argv: list[str] | None = None) -> int:
+    import logging
+
+    from .aio_server import configure_daemon_logging
+    from ..client.trace import trace_scope
     from .bootstrap import check_connection, check_docker_cli, prepare_env
     from .daemon import prepare_server_parser, start_daemon
     from .install_wrapper import ensure_wrapper_installed
@@ -22,6 +26,10 @@ def main(argv: list[str] | None = None) -> int:
         restore_main,
         save_previous_context,
     )
+
+    # 先装日志：setup 阶段失败也要有 时间/级别/trace 前缀，而不是裸 print
+    configure_daemon_logging()
+    logger = logging.getLogger("docker_rt")
 
     args = prepare_server_parser().parse_args(argv)
     if args.ready_timeout is not None:
@@ -64,7 +72,10 @@ def main(argv: list[str] | None = None) -> int:
             print("docker-rt setup cancelled.", file=sys.stderr)
             return 1
         except Exception as exc:
-            print(f"docker-rt setup failed: {exc}", file=sys.stderr)
+            # 这次调用是 SDK 发起的：它失败时上下文已还原，用异常上挂的 trace
+            # 把这条收尾日志也归到同一条 trace 上（否则是 ``[-]``）
+            with trace_scope(getattr(exc, "trace_id", None)):
+                logger.error("docker-rt setup failed: %s", exc)
             return 1
 
     if args.daemon and os.getenv("PYROMIND_DOCKER_RT_DAEMON_CHILD") != "1":
