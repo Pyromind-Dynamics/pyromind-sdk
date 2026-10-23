@@ -26,6 +26,24 @@ def fake_kube() -> FakeKubeEnv:
     return FakeKubeEnv()
 
 
+@pytest.fixture
+def tmp_dir():
+    """A real temporary directory, fresh per test and removed afterwards.
+
+    Same contract as pytest's ``tmp_path``. It exists because ``tmp_path``
+    resolves its base through the sandbox's host-file broker, which refuses
+    the ``mkdir`` in this environment; ``tempfile.mkdtemp`` is not affected.
+    """
+    import shutil
+    import tempfile
+
+    path = Path(tempfile.mkdtemp(prefix="docker-rt-test-"))
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 @pytest.fixture(autouse=True)
 def _disable_pyromind_reconcile(monkeypatch):
     """API unit tests use FakeKubeEnv; avoid real k8s-middleware calls."""

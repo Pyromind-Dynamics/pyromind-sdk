@@ -22,6 +22,13 @@ The control flow (see ``docker_rt/README.md`` for the operator-facing view)::
       → exec ["sh", "-c", status]  ↺ until done        # short polls, incremental log
       → read digest → register short-name alias → cleanup()
 
+When the daemon itself runs inside the cluster — started from a JupyterLab web
+terminal is the recognised case, see :mod:`.jupyter_env` — the "stage" step
+writes the context straight onto the shared workspace filesystem instead of
+uploading it to object storage, so it never travels over the network at all.
+Everything after that step is shared with the upload route; see
+:mod:`.context_staging`.
+
 The build is **detached**, and that is load-bearing rather than incidental: the
 sandbox agent rejects any single exec asking for more than 600 s, so one call
 could never cover a build that takes longer — and a websocket dropped mid-exec
@@ -591,11 +598,18 @@ def kaniko_argv(
     target: str | None = None,
     push: bool = True,
     platform: str | None = None,
+    context: str | None = None,
 ) -> list[str]:
-    """The kaniko argv for one build (pure)."""
+    """The kaniko argv for one build (pure).
+
+    ``context`` overrides the default ``tar://…`` archive: the local route
+    passes ``dir://<unpacked context>`` so kaniko reads the tree in place
+    instead of untarring an archive.
+    """
     return kaniko.kaniko_args(
         destinations=destinations,
         dockerfile=dockerfile or "Dockerfile",
+        context=context,
         buildargs=buildargs,
         labels=labels,
         target=target,
@@ -641,6 +655,7 @@ def start_script(
     push: bool = True,
     docker_config_b64: str = "",
     platform: str | None = None,
+    context: str | None = None,
 ) -> str:
     """The short script that detaches the worker and returns (pure)."""
     return kaniko.start_script(
@@ -652,6 +667,7 @@ def start_script(
             target=target,
             push=push,
             platform=platform,
+            context=context,
         ),
         docker_config_b64=docker_config_b64,
     )
@@ -722,7 +738,7 @@ def decompress_build_context(blob: bytes) -> bytes:
         raise
     except Exception as exc:  # noqa: BLE001 - 统一成一句能照做的话
         raise ValueError(
-            f"the build context looks {kind}-compressed but cannot be unpacked: {exc}"
+            f"the build context looks {kind}-compressed but cannot be unpacked: {_error_text(exc)}"
         ) from exc
     raise ValueError(f"unsupported build-context compression: {kind}")
 
@@ -865,6 +881,50 @@ async def _heartbeat(
     try:
         while True:
             done, _ = await asyncio.wait({task}, timeout=interval)
+            if task in done:
+                return
+            yield stage(
+                f"still waiting for {label}… "
+                f"{time.monotonic() - started:.0f}s elapsed"
+            )
+    finally:
+        if not task.done():
+            task.cancel()
+
+
+def _ready_beat_interval(elapsed: float) -> float:
+    """How often to report "still waiting for the sandbox", by elapsed time.
+
+    A normal sandbox takes 40-90 s to come up (image pull included), so a 15 s
+    drumbeat just fills the log during the part where nothing is wrong. Past the
+    first 90 s something *is* unusual — pull, scheduling, a slow node — and the
+    user wants tighter updates, not sparser ones. 2026-10-23 (a 195 s start):
+    that is the cadence they asked for.
+    """
+    if elapsed < 90.0:
+        return 30.0
+    if elapsed < 120.0:
+        return 15.0
+    return 5.0
+
+
+async def _ready_heartbeat(
+    task: "asyncio.Future[Any]",
+    *,
+    label: str = "the build sandbox to start",
+) -> AsyncIterator[dict[str, Any]]:
+    """A :func:`_heartbeat` whose interval ramps up as the wait drags on.
+
+    Same contract: yields until ``task`` completes, cancels it on the way out so
+    a real exception still propagates from the caller's ``await``.
+    """
+    started = time.monotonic()
+    try:
+        while True:
+            elapsed = time.monotonic() - started
+            done, _ = await asyncio.wait(
+                {task}, timeout=_ready_beat_interval(elapsed)
+            )
             if task in done:
                 return
             yield stage(
@@ -1173,6 +1233,44 @@ _AUTH_FAILURE_MARKERS = (
 )
 
 
+#: What kaniko prints when a file the Dockerfile COPYs is not in the context.
+_CONTEXT_FILE_MISSING = re.compile(
+    r"failed to get files used from context"
+    r"|lstat\s+/kaniko/buildcontext/[^:]+:\s*no such file",
+    re.IGNORECASE,
+)
+
+
+def missing_context_files_hint(raw_log: str) -> str:
+    """Explain "``-f`` points somewhere else" — it reads like a broken Dockerfile.
+
+    The Docker API never transmits the Dockerfile's original path: the CLI
+    copies it into the context tar under a random name (``.dockerfile.<hash>``)
+    and sends that name in the query string, so the daemon has no way to know
+    ``-f`` lived outside the context. What it *can* do is name the argument
+    that was wrong — this failure is overwhelmingly ``-f`` pointing at a
+    project directory while the trailing context still points at the current
+    one.
+
+    2026-10-23, real report: ``docker build -f /workspace/proj/Dockerfile …
+    .`` from ``/workspace/test_swe`` sent 2 MiB of the *wrong* directory to
+    kaniko, which then missed ``go.mod`` and failed inside the Dockerfile —
+    the user read that as "docker-rt forgot to mount the Dockerfile's folder".
+    """
+    if not _CONTEXT_FILE_MISSING.search(raw_log or ""):
+        return ""
+    return (
+        "hint: the build context does not contain the files this Dockerfile "
+        "COPYs. `-f` only selects the Dockerfile *file*; the build context is "
+        "the trailing argument (`.` = the current directory), and it is that "
+        "directory — not the Dockerfile's — that is sent to the builder. If "
+        "the Dockerfile lives in another directory, build from there or pass "
+        "that directory as the context:\n"
+        "  cd <project-dir> && docker build -f Dockerfile -t <tag> .\n"
+        "  docker build -f <project-dir>/Dockerfile -t <tag> <project-dir>\n"
+    )
+
+
 def push_rejected_hint(raw_log: str, destinations: list[str] | None = None) -> str | None:
     """kaniko 的推送 401/403 什么信息都不给，这里把常见原因点出来。
 
@@ -1279,15 +1377,16 @@ async def _check_push_targets(
 
     yield stage(f"Checking the push target from inside the cluster: {', '.join(hosts)}")
     try:
-        result = await _run_exec(
-            sandbox, push_probe_script(hosts), timeout=PUSH_PROBE_TIMEOUT_S
+        result = await asyncio.wait_for(
+            _run_exec(sandbox, push_probe_script(hosts), timeout=PUSH_PROBE_TIMEOUT_S),
+            _exec_deadline(PUSH_PROBE_TIMEOUT_S),
         )
     except Exception as exc:
         # A broken probe must never fail a build — it can only ever add a warning.
         logger.warning("push reachability probe failed: %s", exc)
         yield {
             "stream": (
-                f"warning: could not check the push target ({exc}); building anyway\n"
+                f"warning: could not check the push target ({_error_text(exc)}); building anyway\n"
             )
         }
         return
@@ -1428,78 +1527,147 @@ async def build_in_sandbox(
             )
         }
 
-    script = start_script(
-        destinations=destinations,
-        dockerfile=dockerfile,
-        buildargs=buildargs,
-        labels=labels,
-        target=target,
-        push=push,
-        docker_config_b64=docker_config_b64,
-        platform=platform,
-    )
     # The destinations are worth stating up front: with kaniko, build and output
     # are one process, so "where does this end up" is the question the old
-    # one-liner never answered.
+    # one-liner never answered. The argv itself is built later — it depends on
+    # which transport the context ends up using (``dir://`` vs ``tar://``).
     yield stage(f"Building with kaniko — push target: {', '.join(destinations)}")
     yield stage(f"This image is also archived to {kaniko.tar_path(destinations)}")
 
-    # Pack once, before spending a sandbox: it is the slowest purely-local step,
-    # and its failure should not cost a sandbox.
-    try:
-        pack_started = time.monotonic()
-        yield stage(f"Packing the build context ({human_size(len(tar_bytes))} as received)…")
-        arrived_as = context_compression(tar_bytes)
-        if arrived_as:
-            # 这条很重要：否则"客户端压过"这件事在日志里完全看不出来，
-            # 而它的症状（archive/tar: invalid tar header）看起来像我们自己坏了。
-            yield stage(
-                f"  the client sent it {arrived_as}-compressed; unwrapping it, "
-                "then re-gzipping for kaniko"
-            )
-        packed = pack_build_context(tar_bytes)
-    except Exception as exc:
-        yield buildkit.error_event(f"cannot pack the build context: {exc}")
-        return
-    yield stage(
-        f"Build context packed: {human_size(len(packed))} gzipped "
-        f"in {time.monotonic() - pack_started:.1f}s"
-    )
-
-    # Staging: hand the context to the sandbox through the user's workspace
-    # storage (parallel multipart, local read in the cluster) instead of pushing
-    # it down the exec channel (one websocket per 2 MiB part). See
-    # :mod:`context_staging`. ``stager`` outlives ``staging``: even when the
-    # mount turns out unusable, whatever we uploaded still has to be removed.
+    # ---- how the context reaches the sandbox -------------------------------
+    #
+    # Two routes, picked automatically — nothing to configure:
+    #
+    # * **daemon inside the cluster** (started from a JupyterLab web terminal,
+    #   see :mod:`jupyter_env`): its ``/workspace`` *is* the JuiceFS the build
+    #   sandbox mounts, so the context is unpacked straight into
+    #   ``<prefix>/<build-id>/context/`` and kaniko builds out of that
+    #   directory through the mount. Nothing is uploaded, nothing is copied
+    #   inside the sandbox, and no archive is ever produced.
+    # * **anywhere else**: gzip the context and upload it to the user's
+    #   workspace storage, then let the sandbox copy it in (the storage route).
+    #
+    # ``stager`` outlives ``staging``: whatever we put on the filesystem still
+    # has to be removed, even when the mount turns out to be unusable.
     staging: context_staging.StagingPlan | None = None
-    stager: context_staging.StorageStager | None = None
-    if context_staging.staging_enabled():
-        stager = context_staging.StorageStager(
-            context_staging.plan_staging(archive=kaniko.context_archive_name())
+    stager: Any | None = None
+    packed: bytes | None = None
+    local_context: str | None = None
+
+    use_local = (
+        context_staging.staging_enabled()
+        and context_staging.local_staging_requested()
+    )
+    if use_local and not context_staging.local_workspace_ready():
+        # Only reachable if someone forced the local route by hand; ``auto``
+        # cannot get here because local_staging_requested() already checked.
+        yield buildkit.error_event(
+            "DOCKER_RT_BUILD_CONTEXT_MODE=local, but this daemon does not run "
+            "inside the cluster: no jupyter-lab process in its parent chain, "
+            f"and/or {context_staging.staging_workspace()} is not a writable "
+            "directory. Unset it to go back to the automatic behaviour"
         )
-        upload_started = time.monotonic()
+        return
+
+    if use_local:
+        plan = context_staging.plan_staging(archive=kaniko.context_archive_name())
+        stager = context_staging.LocalStager(plan)
+        unpack_started = time.monotonic()
         try:
-            yield stage(f"Staging the build context at {stager.describe()}…")
-            upload_task = asyncio.ensure_future(
-                asyncio.to_thread(stager.upload, packed)
+            yield stage(
+                f"Unpacking the build context into {stager.describe()} "
+                "(shared workspace filesystem — no upload)…"
+            )
+            unpack_task = asyncio.ensure_future(
+                asyncio.to_thread(stager.unpack, decompress_build_context(tar_bytes))
             )
             async for event in _heartbeat(
-                upload_task, label="the build context to upload"
+                unpack_task, label="the build context to be unpacked"
             ):
                 yield event
-            await upload_task
+            await unpack_task
         except Exception as exc:
-            if context_staging.staging_required():
-                yield buildkit.error_event(f"cannot stage the build context: {exc}")
+            if context_staging.staging_mode() == "local":
+                # The operator ruled the storage route out; honour that.
+                yield buildkit.error_event(f"cannot unpack the build context: {_error_text(exc)}")
                 return
-            logger.warning("context staging unavailable: %s", exc)
-            yield stage(f"Workspace staging unavailable ({exc}); uploading directly")
+            logger.warning("local context staging unavailable: %s", exc)
+            yield stage(
+                "Could not unpack the build context into the shared workspace "
+                f"({_error_text(exc)}); packing and uploading it to the sandbox instead"
+            )
             stager = None
         else:
-            staging = stager.plan
+            staging = plan
+            local_context = plan.staged_context
             yield stage(
-                f"Build context staged in {time.monotonic() - upload_started:.1f}s"
+                f"Build context unpacked in {time.monotonic() - unpack_started:.1f}s"
             )
+
+    if staging is None:
+        # Pack once, before spending a sandbox: it is the slowest purely-local
+        # step, and its failure should not cost a sandbox. The local route
+        # skips this entirely — its context is already in place.
+        try:
+            pack_started = time.monotonic()
+            yield stage(
+                f"Packing the build context ({human_size(len(tar_bytes))} as received)…"
+            )
+            arrived_as = context_compression(tar_bytes)
+            if arrived_as:
+                # 这条很重要：否则"客户端压过"这件事在日志里完全看不出来，
+                # 而它的症状（archive/tar: invalid tar header）看起来像我们自己坏了。
+                yield stage(
+                    f"  the client sent it {arrived_as}-compressed; unwrapping it, "
+                    "then re-gzipping for kaniko"
+                )
+            packed = pack_build_context(tar_bytes)
+        except Exception as exc:
+            yield buildkit.error_event(f"cannot pack the build context: {_error_text(exc)}")
+            return
+        yield stage(
+            f"Build context packed: {human_size(len(packed))} gzipped "
+            f"in {time.monotonic() - pack_started:.1f}s"
+        )
+
+        # A failed local unpack falls through to the direct upload rather than
+        # retrying storage: both end on the same filesystem, so the independent
+        # fallback is the sandbox-local one.
+        if not use_local and context_staging.staging_enabled():
+            stager = context_staging.StorageStager(
+                context_staging.plan_staging(archive=kaniko.context_archive_name())
+            )
+            upload_started = time.monotonic()
+            try:
+                yield stage(f"Staging the build context at {stager.describe()}…")
+                upload_task = asyncio.ensure_future(
+                    asyncio.to_thread(stager.upload, packed)
+                )
+                async for event in _heartbeat(
+                    upload_task, label="the build context to upload"
+                ):
+                    yield event
+                await upload_task
+            except Exception as exc:
+                if context_staging.staging_required():
+                    # ``storage`` mode is the operator ruling the direct upload
+                    # out; a failed stage is a failure, not an invitation to
+                    # take the route they rejected.
+                    yield buildkit.error_event(
+                        f"cannot stage the build context: {_error_text(exc)}"
+                    )
+                    return
+                logger.warning("context staging unavailable: %s", exc)
+                yield stage(
+                    f"Workspace staging unavailable ({_error_text(exc)}); uploading directly"
+                )
+                stager = None
+            else:
+                staging = stager.plan
+                yield stage(
+                    f"Build context staged in "
+                    f"{time.monotonic() - upload_started:.1f}s"
+                )
 
     sandbox = None
     digest = ""
@@ -1546,7 +1714,7 @@ async def build_in_sandbox(
         except Exception as exc:
             if staging is None:
                 yield buildkit.error_event(
-                    f"cannot create build sandbox ({build_executor()}): {exc}"
+                    f"cannot create build sandbox ({build_executor()}): {_error_text(exc)}"
                 )
                 return
             if context_staging.staging_required():
@@ -1554,7 +1722,7 @@ async def build_in_sandbox(
                 # a mount that cannot be created is a staging failure, not an
                 # invitation to fall back to the route they rejected.
                 yield buildkit.error_event(
-                    f"cannot mount the staged build context ({exc})"
+                    f"cannot mount the staged build context ({_error_text(exc)})"
                 )
                 return
             # The staging mount is the one part of this that depends on the
@@ -1563,13 +1731,13 @@ async def build_in_sandbox(
             # optimisation. The images mount stays: without it there is nowhere
             # for the archive to go.
             logger.warning("build sandbox with a staged-context mount failed: %s", exc)
-            yield stage(f"Cannot mount the staged context ({exc}); retrying without it")
+            yield stage(f"Cannot mount the staged context ({_error_text(exc)}); retrying without it")
             staging = None
             try:
                 sandbox = await _create_sandbox_with(_mounts_for(None))
             except Exception as exc2:
                 yield buildkit.error_event(
-                    f"cannot create build sandbox ({build_executor()}): {exc2}"
+                    f"cannot create build sandbox ({build_executor()}): {_error_text(exc2)}"
                 )
                 return
         yield stage(
@@ -1580,13 +1748,11 @@ async def build_in_sandbox(
         ready_started = time.monotonic()
         ready_task = asyncio.ensure_future(sandbox.wait_until_running())
         try:
-            async for event in _heartbeat(
-                ready_task, label="the build sandbox to start"
-            ):
+            async for event in _ready_heartbeat(ready_task):
                 yield event
             await ready_task
         except Exception as exc:
-            yield buildkit.error_event(f"build sandbox never became ready: {exc}")
+            yield buildkit.error_event(f"build sandbox never became ready: {_error_text(exc)}")
             return
         yield stage(
             f"Build sandbox ready after {time.monotonic() - ready_started:.1f}s"
@@ -1599,21 +1765,88 @@ async def build_in_sandbox(
             if event.get("error"):
                 return
 
-        if staging is not None:
+        if local_context is not None and staging is not None:
+            # The local route's replacement for the byte-size check: prove the
+            # mount really exposes the unpacked context before kaniko starts.
+            # A wrong subPath (or a sandbox that cannot see the shared
+            # filesystem) must fall back here, not surface later as a confusing
+            # COPY error that reads like a broken Dockerfile.
+            check_started = time.monotonic()
+            yield stage(f"Checking the unpacked context at {local_context}…")
+            check_task = asyncio.ensure_future(
+                asyncio.wait_for(
+                    _run_exec(
+                        sandbox,
+                        context_staging.verify_context_script(staging),
+                        timeout=STAGE_IN_TIMEOUT_S,
+                    ),
+                    _exec_deadline(STAGE_IN_TIMEOUT_S),
+                )
+            )
+            checked: _ExecResult | None = None
+            try:
+                async for event in _heartbeat(
+                    check_task, label="the unpacked context to be verified"
+                ):
+                    yield event
+                checked = await check_task
+            except Exception as exc:
+                logger.warning("unpacked context check failed: %s", exc)
+                # 脚本是"先校验、再打标记"的顺序：标记已经到了就说明目录没问题，
+                # 只是 exit 帧丢了（见 _run_exec 里的注释）。
+                checked = _partial_result(exc)
+            entries = (
+                context_staging.parse_context_entries(checked.stdout) if checked else None
+            )
+            if checked is None:
+                reason = "the check did not complete"
+            elif checked.returncode != 0:
+                reason = checked.stderr.strip() or f"exit code {checked.returncode}"
+            elif entries is None:
+                reason = "the check reported nothing"
+            else:
+                reason = ""
+            if reason:
+                if context_staging.staging_mode() == "local":
+                    yield buildkit.error_event(
+                        f"cannot use the unpacked build context ({reason})"
+                    )
+                    return
+                logger.warning("unpacked context unusable (%s)", reason)
+                yield stage(f"Unpacked context unusable ({reason}); uploading directly")
+                staging = None
+                local_context = None
+                try:
+                    packed = pack_build_context(tar_bytes)
+                except Exception as exc:
+                    yield buildkit.error_event(
+                        f"cannot pack the build context: {_error_text(exc)}"
+                    )
+                    return
+            else:
+                yield stage(
+                    f"Build context in place ({entries} entries) after "
+                    f"{time.monotonic() - check_started:.1f}s"
+                )
+        elif staging is not None:
             copy_started = time.monotonic()
             yield stage(f"Copying the staged context into {kaniko.build_workdir()}…")
             copy_task = asyncio.ensure_future(
-                _run_exec(
-                    sandbox,
-                    context_staging.stage_in_script(
-                        staging,
-                        workdir=kaniko.build_workdir(),
-                        expected_size=len(packed),
+                asyncio.wait_for(
+                    _run_exec(
+                        sandbox,
+                        context_staging.stage_in_script(
+                            staging,
+                            workdir=kaniko.build_workdir(),
+                            expected_size=len(packed or b""),
+                        ),
+                        timeout=STAGE_IN_TIMEOUT_S,
                     ),
-                    timeout=STAGE_IN_TIMEOUT_S,
+                    _exec_deadline(STAGE_IN_TIMEOUT_S),
                 )
             )
             copied: _ExecResult | None = None
+            recovered = False
             try:
                 async for event in _heartbeat(
                     copy_task, label="the staged context to be copied"
@@ -1622,6 +1855,14 @@ async def build_in_sandbox(
                 copied = await copy_task
             except Exception as exc:
                 logger.warning("staged context copy failed: %s", exc)
+                # The script is ordered "copy → verify the size → clean up →
+                # print the marker", so a marker in the bytes that did arrive
+                # proves the copy finished and only the exit frame was lost
+                # (2026-10-23: exactly 30 stdout bytes = the marker line, and the
+                # build re-uploaded 650 KiB for nothing). Anything less than the
+                # full marker still falls back to the direct upload.
+                copied = _partial_result(exc)
+                recovered = copied is not None
             staged_bytes = (
                 context_staging.parse_staged_size(copied.stdout) if copied else None
             )
@@ -1635,7 +1876,7 @@ async def build_in_sandbox(
                 reason = copied.stderr.strip() or f"exit code {copied.returncode}"
             elif staged_bytes is None:
                 reason = "the copy reported no size"
-            elif staged_bytes != len(packed):
+            elif staged_bytes != len(packed or b""):
                 reason = f"size mismatch ({staged_bytes} of {len(packed)} bytes)"
             else:
                 reason = ""
@@ -1653,11 +1894,19 @@ async def build_in_sandbox(
                 yield stage(f"Staged context unusable ({reason}); uploading directly")
                 staging = None
             else:
+                if recovered:
+                    yield stage(
+                        "The copy's exit frame was lost, but the size marker had "
+                        f"already arrived ({staged_bytes} bytes) — continuing"
+                    )
                 yield stage(
                     f"Build context copied in {time.monotonic() - copy_started:.1f}s"
                 )
 
         if staging is None:
+            if packed is None:  # only possible if a fallback lost the bytes
+                yield buildkit.error_event("the build context was never packed")
+                return
             upload_started = time.monotonic()
             try:
                 context_tar = _single_file_tar(kaniko.context_archive_name(), packed)
@@ -1674,20 +1923,61 @@ async def build_in_sandbox(
                     yield event
                 await upload_task
             except Exception as exc:
-                yield buildkit.error_event(f"cannot upload build context: {exc}")
+                yield buildkit.error_event(f"cannot upload build context: {_error_text(exc)}")
                 return
             yield stage(
                 f"Build context uploaded after {time.monotonic() - upload_started:.1f}s"
             )
 
+        # The argv is built here because it depends on the transport: a local
+        # context is read in place (``dir://…``), the storage route reads the
+        # archive kaniko unpacks itself (``tar://…``).
+        script = start_script(
+            destinations=destinations,
+            dockerfile=dockerfile,
+            buildargs=buildargs,
+            labels=labels,
+            target=target,
+            push=push,
+            docker_config_b64=docker_config_b64,
+            platform=platform,
+            context=f"dir://{local_context}" if local_context else None,
+        )
+
         # Two phases: launch, then poll. Neither call covers the build, which is
         # what frees us from the 600 s ceiling on a single exec — and means a
         # broken websocket costs a round trip instead of the whole build.
         yield stage("Starting kaniko in the sandbox…")
-        try:
-            launched = await _run_exec(sandbox, script, timeout=START_TIMEOUT_S)
-        except Exception as exc:
-            yield buildkit.error_event(f"cannot start the build in the sandbox: {exc}")
+        launched: _ExecResult | None = None
+        for attempt in range(1, LAUNCH_ATTEMPTS + 1):
+            try:
+                launched = await asyncio.wait_for(
+                    _run_exec(sandbox, script, timeout=START_TIMEOUT_S),
+                    _exec_deadline(START_TIMEOUT_S),
+                )
+                break
+            except Exception as exc:
+                never_started = _command_never_started(exc)
+                if not never_started or attempt >= LAUNCH_ATTEMPTS:
+                    detail = (
+                        " (the command never started, so retrying the build is safe)"
+                        if never_started
+                        else ""
+                    )
+                    yield buildkit.error_event(
+                        f"cannot start the build in the sandbox: "
+                        f"{_error_text(exc, timeout=_exec_deadline(START_TIMEOUT_S))}{detail}"
+                    )
+                    return
+                # 中间件没读到我们的首帧 ⇒ 命令没跑 ⇒ 重试安全（启动器不是幂等的，
+                # 只有"确实没开始"才敢重来，见 _command_never_started）。
+                yield stage(
+                    "The sandbox closed the exec stream before the command "
+                    f"started ({_error_text(exc)}); retrying ({attempt + 1}/{LAUNCH_ATTEMPTS})"
+                )
+                await asyncio.sleep(LAUNCH_BACKOFF_S * attempt)
+        if launched is None:  # pragma: no cover - the loop returns or breaks
+            yield buildkit.error_event("cannot start the build in the sandbox")
             return
         if launched.returncode != 0:
             yield buildkit.error_event(
@@ -1717,6 +2007,11 @@ async def build_in_sandbox(
         poll_failures = 0
         gone_strikes = 0
         returncode = 0
+        #: When a poll last *answered*, and what it said. Only needed to explain a
+        #: give-up: "last answered 46s ago, state=running" is the difference
+        #: between "the build is still going" and "we lost the sandbox".
+        last_ok_at: float | None = None
+        last_state = ""
         buffer: list[str] = []
         collapser = _LogCollapser(enabled=not full_log_requested())
         yield stage(
@@ -1725,23 +2020,60 @@ async def build_in_sandbox(
         )
 
         while True:
-            try:
-                poll = await _run_exec(
-                    sandbox, kaniko.status_script(offset=offset), timeout=POLL_TIMEOUT_S
+            # A poll that stalls must not look like a silent build: the heartbeat
+            # prints "still waiting for the build sandbox to answer a check…" and
+            # _exec_deadline() caps the wait. Without both, one dropped frame made
+            # the CLI sit on the last "still building" line forever (2026-10-23).
+            poll_task = asyncio.ensure_future(
+                asyncio.wait_for(
+                    _run_exec(
+                        sandbox,
+                        kaniko.status_script(offset=offset),
+                        timeout=POLL_TIMEOUT_S,
+                    ),
+                    _exec_deadline(POLL_TIMEOUT_S),
                 )
+            )
+            poll: _ExecResult | None = None
+            try:
+                async for event in _heartbeat(
+                    poll_task, label="the build sandbox to answer a check"
+                ):
+                    yield event
+                poll = await poll_task
             except Exception as exc:
                 # A detached worker survives this, so a failing poll is retried
-                # rather than turned into a failed build.
+                # rather than turned into a failed build. The deadline from
+                # _exec_deadline() is what makes "retried" possible at all: a
+                # stalled stream would otherwise never return and this branch
+                # would never be reached (2026-10-23).
                 poll_failures += 1
                 logger.warning("build sandbox poll %d failed: %s", poll_failures, exc)
                 if poll_failures >= MAX_POLL_FAILURES:
+                    if last_ok_at is None:
+                        contact = "no poll has been answered since the build started"
+                    else:
+                        idle_for = time.monotonic() - last_ok_at
+                        contact = (
+                            f"the last answered poll was {idle_for:.0f}s ago and "
+                            f"reported state={last_state or 'unknown'}"
+                        )
+                    target = destinations[0] if destinations else "the image tag"
                     yield buildkit.error_event(
-                        f"build sandbox exec failed {poll_failures} times in a row: {exc}"
+                        f"lost contact with the build sandbox: {poll_failures} polls "
+                        f"in a row failed ({_error_text(exc, timeout=_exec_deadline(POLL_TIMEOUT_S))}); "
+                        f"{contact}, {offset} log bytes seen. "
+                        "kaniko runs detached, so the image may have been pushed "
+                        f"anyway — check {target} before rebuilding"
                     )
                     return
                 await asyncio.sleep(poll_interval())
                 continue
+            if poll is None:  # pragma: no cover - the heartbeat only ends when done
+                yield buildkit.error_event("the build sandbox check returned nothing")
+                return
             poll_failures = 0
+            last_ok_at = time.monotonic()
 
             # The offset advances by what the poll actually delivered, not by
             # what we chose to show: status markers we strip must never be
@@ -1802,6 +2134,7 @@ async def build_in_sandbox(
                 # Defensive: if a future transport merges the channels, the
                 # markers still arrive — just on stdout.
                 state, rc = kaniko.parse_status(poll.stdout)
+            last_state = state or last_state
             logger.debug(
                 "poll state=%r rc=%r bytes=%s stderr=%r",
                 state,
@@ -1878,6 +2211,9 @@ async def build_in_sandbox(
             hint = push_rejected_hint(raw_log, destinations)
             if hint:
                 yield {"stream": f"{hint}\n"}
+            context_hint = missing_context_files_hint(raw_log)
+            if context_hint:
+                yield {"stream": context_hint}
             yield buildkit.error_event(f"kaniko exited with code {returncode}")
             return
 
@@ -1891,16 +2227,16 @@ async def build_in_sandbox(
     finally:
         # Stage-2 cleanup. The sandbox already deleted its own staged directory
         # right after the copy; this is for the paths where it never got that
-        # far (upload ok, sandbox never ready / mount refused / build aborted) —
-        # otherwise a multi-GB object would sit in the user's quota for good.
+        # far (stage ok, sandbox never ready / mount refused / build aborted) —
+        # otherwise a multi-GB context would sit in the user's quota for good.
         # Runs before the sandbox teardown so a hanging delete cannot leave it.
         if stager is not None:
             removed = await asyncio.to_thread(stager.cleanup)
             if not removed:
                 logger.warning(
-                    "staged build context %s was left in storage; it will need "
+                    "staged build context %s was left behind; it will need "
                     "cleaning up by hand",
-                    stager.plan.object_dir,
+                    stager.describe(),
                 )
         if sandbox is not None:
             if keep_sandbox():
@@ -1929,6 +2265,71 @@ class _ExecResult(NamedTuple):
     stdout_bytes: int
 
 
+#: How many times the launch exec is retried when the command provably never
+#: started — see :func:`_command_never_started`.
+LAUNCH_ATTEMPTS = 3
+LAUNCH_BACKOFF_S = 2.0
+
+
+def _command_never_started(exc: BaseException) -> bool:
+    """Whether ``exc`` proves the command never began executing.
+
+    Retrying a *launch* is only safe under that proof: the start script clears
+    the worker's state files and forks kaniko, so a second attempt after a
+    silent failure would run two builds in one sandbox.
+
+    ``EXEC_STREAM_FIRST_FRAME_TIMEOUT`` is the clean case — the middleware gave
+    up waiting for our request frame, i.e. it never even read it, so nothing
+    ran. That is the opposite of ``EXEC_STREAM_LOST`` (stream died *after* the
+    command started), which must never be retried here: the build may already
+    have pushed. 2026-10-23: a user hit the first-frame timeout on a busy pre
+    cluster (that sandbox took 136 s to come up) right after a successful exec
+    on the same sandbox — a delivery stall, not a broken sandbox.
+    """
+    code = str(getattr(exc, "code", "") or "")
+    if code == "EXEC_STREAM_LOST":
+        return False
+    if code == "EXEC_STREAM_FIRST_FRAME_TIMEOUT":
+        return True
+    text = str(exc).lower()
+    return (
+        "no exec-stream request frame" in text
+        or "exec stream connection failed" in text
+    )
+
+
+def _error_text(exc: BaseException, *, timeout: float | None = None) -> str:
+    """One-line description of ``exc`` — **never empty**.
+
+    ``str(asyncio.TimeoutError())`` is ``""``, which printed a bare
+    "cannot start the build in the sandbox: " with nothing after the colon
+    (2026-10-23, real report). A timeout is also the most valuable thing to say
+    about a stalled stream, so the budget is named when we know it.
+    """
+    text = str(exc).strip()
+    if text:
+        return text
+    if isinstance(exc, asyncio.TimeoutError):
+        return f"no answer within {timeout:.0f}s" if timeout else "timed out"
+    return type(exc).__name__
+
+
+def _exec_deadline(timeout: int) -> float:
+    """Client-side wall clock for one exec: the server's timeout plus slack.
+
+    The ``timeout`` a build sends bounds the **command**, not the frame stream.
+    When a stream stalls mid-flight — the socket stays open and the heartbeat
+    still answers, but no output and no exit frame ever arrive — an unbounded
+    ``await`` waits forever. That is not theoretical: on 2026-10-23 a build had
+    finished (kaniko had pushed and written ``build.rc``), but one poll never
+    returned, so the CLI kept printing "still building…" and the sandbox was
+    never released for 10+ minutes. Every exec here is therefore capped;
+    a timeout is an ordinary failure the caller already knows how to handle
+    (retry the poll, retry the launch, fall back to the direct upload).
+    """
+    return max(1.0, float(timeout)) + 15.0
+
+
 async def _run_exec(sandbox: Any, script: str, *, timeout: int) -> _ExecResult:
     """Run one short exec and drain both channels.
 
@@ -1945,27 +2346,55 @@ async def _run_exec(sandbox: Any, script: str, *, timeout: int) -> _ExecResult:
     stdout_bytes = 0
     returncode = 0
 
-    async for chunk in sandbox.iter_exec_stream(shell_argv(script), timeout=timeout):
-        kind = getattr(chunk, "type", "")
-        if kind == "exit":
-            returncode = int(getattr(chunk, "returncode", 0) or 0)
-            continue
-        data = getattr(chunk, "data", "")
-        if isinstance(data, bytes):
-            text = data.decode("utf-8", "replace")
-            size = len(data)
-        else:
-            text = str(data or "")
-            size = len(text.encode("utf-8", "replace"))
-        if not text:
-            continue
-        if kind == "stderr":
-            stderr.append(text)
-        else:
-            stdout.append(text)
-            stdout_bytes += size
+    try:
+        async for chunk in sandbox.iter_exec_stream(shell_argv(script), timeout=timeout):
+            kind = getattr(chunk, "type", "")
+            if kind == "exit":
+                returncode = int(getattr(chunk, "returncode", 0) or 0)
+                continue
+            data = getattr(chunk, "data", "")
+            if isinstance(data, bytes):
+                text = data.decode("utf-8", "replace")
+                size = len(data)
+            else:
+                text = str(data or "")
+                size = len(text.encode("utf-8", "replace"))
+            if not text:
+                continue
+            if kind == "stderr":
+                stderr.append(text)
+            else:
+                stdout.append(text)
+                stdout_bytes += size
+    except Exception as exc:
+        # Keep what already arrived instead of throwing it away with the
+        # exception. The scripts this runs are ordered "do the work, then print
+        # the result": a stream lost at the very end means the work *succeeded*
+        # and only the exit frame vanished — see the stage-in callers, which
+        # accept a partial result when the marker is already in it.
+        result = _ExecResult(returncode, "".join(stdout), "".join(stderr), stdout_bytes)
+        try:
+            exc.partial = result  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - a slotted exception just loses the hint
+            logger.debug("could not attach the partial exec result to %r", exc)
+        raise
 
     return _ExecResult(returncode, "".join(stdout), "".join(stderr), stdout_bytes)
+
+
+def _partial_result(exc: BaseException) -> _ExecResult | None:
+    """What the stream had already delivered when ``exc`` aborted the exec.
+
+    ``None`` when nothing arrived: with no evidence the caller must keep its
+    "the copy did not complete" behaviour rather than guess from an empty
+    result.
+    """
+    result = getattr(exc, "partial", None)
+    if not isinstance(result, _ExecResult):
+        return None
+    if not result.stdout and not result.stderr:
+        return None
+    return result
 
 
 async def _probe_sandbox(sandbox: Any) -> tuple[dict[str, int | str], str]:
@@ -1982,10 +2411,13 @@ async def _probe_sandbox(sandbox: Any) -> tuple[dict[str, int | str], str]:
     the reason, so a dead probe is visible instead of invisible.
     """
     try:
-        result = await _run_exec(sandbox, kaniko.probe_script(), timeout=POLL_TIMEOUT_S)
+        result = await asyncio.wait_for(
+            _run_exec(sandbox, kaniko.probe_script(), timeout=POLL_TIMEOUT_S),
+            _exec_deadline(POLL_TIMEOUT_S),
+        )
     except Exception as exc:
         logger.debug("silence probe failed: %s", exc)
-        return {}, f"{type(exc).__name__}: {exc}"
+        return {}, f"{type(exc).__name__}: {_error_text(exc)}"
     sample = kaniko.parse_probe_sample(result.stdout)
     if sample:
         return sample, ""

@@ -36,6 +36,24 @@ ENV_LOG_FORMAT = "PYROMIND_LOG_FORMAT"
 ENV_LOG_LEVEL = "PYROMIND_LOG_LEVEL"
 RETRY_STATUS_CODES = [502, 503, 504]
 
+#: ``Accept-Encoding`` sent with every async request.
+#:
+#: aiohttp advertises ``br`` on its own as soon as the ``brotli`` package is
+#: importable, and its streaming brotli decoder then fails on what the PyroMind
+#: edge actually returns: a **200** whose body is perfectly valid brotli (curl
+#: and ``brotli.decompress()`` both decode it) comes back as
+#: ``ClientPayloadError: Can not decode content-encoding: br`` — reproduced on
+#: aiohttp 3.14.3 with brotli 1.2.0. That error also carries a misleading
+#: "400" (aiohttp reports ``ContentEncodingError`` as a 400-class exception),
+#: which makes it look like a server rejection when it is purely client-side.
+#:
+#: gzip gets the same compression benefit without the broken path, so that is
+#: what we ask for. Opt back in with
+#: ``PYROMIND_ACCEPT_ENCODING="br, gzip, deflate"`` once aiohttp's br decoding
+#: is known good for the installed pair.
+DEFAULT_ACCEPT_ENCODING = "gzip, deflate"
+ENV_ACCEPT_ENCODING = "PYROMIND_ACCEPT_ENCODING"
+
 ERROR_MESSAGE_MAX_LENGTH = 500
 
 # Default log format and level
@@ -48,6 +66,17 @@ DEFAULT_LOG_LEVEL = "ERROR"
 # 带 trace_id 的 handler（见 base.py / trace.py）。这里再装一个 + 向 root 传播
 # ⇒ 同一条日志打印三遍。
 logger = logging.getLogger("pyromind_sdk.async")
+
+
+def accept_encoding() -> str:
+    """The ``Accept-Encoding`` value async API requests are sent with.
+
+    ``PYROMIND_ACCEPT_ENCODING`` wins when set (``"br, gzip, deflate"`` for an
+    environment whose aiohttp/brotli pair is known good), otherwise
+    :data:`DEFAULT_ACCEPT_ENCODING`. Never empty — an empty header is rejected
+    by some edges.
+    """
+    return (os.getenv(ENV_ACCEPT_ENCODING) or "").strip() or DEFAULT_ACCEPT_ENCODING
 
 
 class PyroMindAsyncAPIError(Exception):
@@ -172,6 +201,10 @@ class PyroMindAsyncClient:
                         "Authorization": f"Bearer {self.api_key}",
                         "Content-Type": "application/json",
                         "Accept": "application/json",
+                        # Explicit, so aiohttp's "advertise br when brotli is
+                        # importable" default cannot pick the decoder that is
+                        # broken here. See DEFAULT_ACCEPT_ENCODING.
+                        "Accept-Encoding": accept_encoding(),
                         "X-Cluster": self.cluster,
                     }
                 )

@@ -11,6 +11,9 @@ a ``finally``, which ``kill -9`` skips:
 
 * the build contexts staged in the user's storage —
   ``backend.context_staging.sweep_stale_staging``;
+* the build contexts staged **on the shared workspace filesystem** (the
+  no-upload route a JupyterLab-terminal daemon takes) —
+  ``backend.context_staging.sweep_local_stale_staging``;
 * the build **sandboxes**, which are the more expensive leftovers because they
   keep running — ``backend.build_sandbox.sweep_stale_build_sandboxes``.
 
@@ -65,6 +68,34 @@ def sweep_leftover_builds(pid: int) -> None:
         )
 
 
+def sweep_leftover_local_builds(pid: int) -> None:
+    """Best-effort: drop locally staged contexts the dead daemon left on disk.
+
+    The no-upload route (a daemon started from a JupyterLab web terminal)
+    writes the context into the user's workspace instead of object storage, so
+    a ``kill -9`` leaves a multi-GB *directory* behind rather than an object.
+    Same contract as :func:`sweep_leftover_builds`: runs after the context
+    restore, never raises, and is a no-op wherever the local route could not
+    have written anything (no ``<workspace>/<prefix>`` directory).
+    """
+    try:
+        from .backend import context_staging
+
+        swept = context_staging.sweep_local_stale_staging(dead_pid=pid)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"docker-rt watcher could not sweep locally staged build contexts: {exc}",
+            file=sys.stderr,
+        )
+        return
+    if swept:
+        print(
+            f"docker-rt watcher removed {len(swept)} leftover locally staged "
+            f"build context(s): {', '.join(swept)}",
+            file=sys.stderr,
+        )
+
+
 def sweep_leftover_sandboxes() -> None:
     """Best-effort: delete build sandboxes the dead daemon left running.
 
@@ -114,9 +145,11 @@ def watch_and_restore(pid: int) -> int:
     except Exception as exc:
         print(f"docker-rt watcher failed to restore context: {exc}", file=sys.stderr)
         rc = 1
-    # Cheapest first: the storage sweep is a couple of storage calls, the
-    # sandbox sweep is a list plus a delete per leftover.
+    # Cheapest first: the storage sweep is a couple of storage calls, the local
+    # sweep a directory walk, the sandbox sweep a list plus a delete per
+    # leftover.
     _best_effort(lambda: sweep_leftover_builds(pid))
+    _best_effort(lambda: sweep_leftover_local_builds(pid))
     _best_effort(sweep_leftover_sandboxes)
     return rc
 
