@@ -1260,6 +1260,124 @@ async def test_pyromind_oneshot_never_uses_thread_pool(monkeypatch):
     assert b"warn\n" in b"".join(written)
 
 
+@pytest.mark.asyncio
+async def test_a_one_shot_exec_logs_its_command_and_output(monkeypatch, caplog):
+    """非交互 exec 的结果行要能回答「跑了什么 / 打印了什么 / 退出码多少」。
+
+    交互式 PTY 不走这条路径（它只有 connected + exited 两行）：PTY 是一条连续
+    字节流，没有"一条命令"的边界，硬记等于把终端录屏——用户明确选择了不记。
+    """
+    import logging as _logging
+
+    from .. import aio_server as mod
+    from ..backend.pyromind_sdk_env import PyromindSDK
+
+    kube_env = PyromindSDK.__new__(PyromindSDK)
+
+    async def fake_stream(cmd, **kwargs):
+        yield SimpleNamespace(type="stdout", data="hello\nworld\n")
+        yield SimpleNamespace(type="stderr", data=b"warn\n")
+        yield SimpleNamespace(type="exit", returncode=0)
+
+    monkeypatch.setattr(kube_env, "iter_exec_stream", fake_stream)
+
+    class FakeResp:
+        async def write(self, chunk):
+            return None
+
+        async def drain(self):
+            return None
+
+    with caplog.at_level(_logging.INFO, logger="docker_rt"):
+        code = await mod._stream_ws_oneshot(
+            resp=FakeResp(),
+            kube_env=kube_env,
+            cmd=["echo", "hello"],
+            session_id="exec-log",
+        )
+
+    assert code == 0
+    line = next(
+        m for m in caplog.messages if m.startswith("pyromind exec stream id=")
+    )
+    assert "cmd=['echo', 'hello']" in line
+    assert "out=12B" in line
+    assert "err=5B" in line
+    assert "code=0" in line
+    assert "hello" in line and "warn" in line
+    # ``%r`` escapes newlines, so the result stays one greppable line.
+    assert "\n" not in line
+
+
+@pytest.mark.asyncio
+async def test_the_output_preview_is_capped(monkeypatch, caplog):
+    """预览必须有上限：一次 exec 可能是几百 MB 的构建日志。"""
+    import logging as _logging
+
+    from .. import aio_server as mod
+    from ..backend.pyromind_sdk_env import PyromindSDK
+
+    kube_env = PyromindSDK.__new__(PyromindSDK)
+    big = "x" * (mod._EXEC_OUTPUT_PREVIEW_MAX * 3)
+
+    async def fake_stream(cmd, **kwargs):
+        yield SimpleNamespace(type="stdout", data=big)
+        yield SimpleNamespace(type="exit", returncode=0)
+
+    monkeypatch.setattr(kube_env, "iter_exec_stream", fake_stream)
+
+    class FakeResp:
+        async def write(self, chunk):
+            return None
+
+        async def drain(self):
+            return None
+
+    with caplog.at_level(_logging.INFO, logger="docker_rt"):
+        await mod._stream_ws_oneshot(
+            resp=FakeResp(),
+            kube_env=kube_env,
+            cmd=["cat", "big.log"],
+            session_id="exec-big",
+        )
+
+    line = next(
+        m for m in caplog.messages if m.startswith("pyromind exec stream id=")
+    )
+    # The byte count is the real total; only the preview is clipped.
+    assert f"out={len(big)}B" in line
+    assert "x" * (mod._EXEC_OUTPUT_PREVIEW_MAX + 1) not in line
+
+
+def test_the_result_log_shows_the_users_command_not_the_handshake_wrapper() -> None:
+    """``sh -c '<cmd>; rc=$?; …__DRT_END_…' sh <cmd>`` is our plumbing, not theirs.
+
+    Without this the result line reads like a shell script nobody wrote, and the
+    actual command is buried in the middle of it.
+    """
+    from .. import aio_server as mod
+
+    wrapped = [
+        "sh",
+        "-c",
+        '"$@"; rc=$?; printf "\\n__DRT_END_abc__\\n" 1>&2; exit $rc',
+        "sh",
+        "echo",
+        "hello",
+    ]
+    assert mod._unwrap_handshake_cmd(wrapped) == ["echo", "hello"]
+
+    # A plain command is left alone, and so is anything that merely looks similar.
+    assert mod._unwrap_handshake_cmd(["echo", "hi"]) == ["echo", "hi"]
+    assert mod._unwrap_handshake_cmd(["sh", "-c", "echo hi", "sh"]) == [
+        "sh",
+        "-c",
+        "echo hi",
+        "sh",
+    ]
+    assert mod._unwrap_handshake_cmd(None) is None
+
+
 def test_exec_concurrency_defaults_to_unlimited(monkeypatch):
     from .. import aio_server as mod
 

@@ -226,6 +226,53 @@ async def test_create_uses_daemon_ready_timeout(
 
 
 @pytest.mark.asyncio
+async def test_create_logs_the_effective_parameters(aiohttp_client, caplog):
+    """创建那一行必须说全「挂载 / 端口 / 命令 / 资源」（2026-10-23 用户反馈）。
+
+    为什么不能只靠通用 body 预览：它按 2000 字符截断，且 ``_compact`` 会吞掉
+    空值——长 Env / 多 Mounts 时恰好把最要紧的部分截在中间。这一行记的是
+    **归一化之后**的值，所以覆盖它等于覆盖「参数到底生效了什么」。
+    """
+    import logging as _logging
+
+    from ..aio_server import create_aio_app
+
+    app = create_aio_app(run_reconcile=False)
+    client = await aiohttp_client(app)
+
+    with caplog.at_level(_logging.INFO, logger="docker_rt"):
+        resp = await client.post(
+            "/containers/create?name=logged",
+            json={
+                "Image": "ubuntu:22.04",
+                "Cmd": ["sleep", "30"],
+                "Env": ["A=1", "B=2"],
+                "WorkingDir": "/app",
+                "HostConfig": {
+                    "Binds": ["/workspace/data:/data:rw"],
+                    "PortBindings": {"8080/tcp": [{"HostPort": "18080"}]},
+                    "NanoCpus": 1_000_000_000,
+                },
+                "Labels": {"docker-rt.test": "yes"},
+            },
+        )
+    assert resp.status == 201
+
+    line = next(m for m in caplog.messages if m.startswith("[create]"))
+    assert "name=logged" in line
+    assert "cmd=['sleep', '30']" in line
+    assert "env=2" in line
+    assert "workdir=/app" in line
+    # The two the user could not see: where it is mounted and what is published.
+    # ``Binds`` keeps Docker's own ``src:dst:mode`` spelling; ``Mounts`` entries
+    # are rendered by ``_mount_summary`` as ``src -> dst (ro|rw)``.
+    assert "'/workspace/data:/data:rw'" in line
+    assert "0.0.0.0:18080->8080/tcp" in line
+    # Only docker-rt's own labels are worth logging; the rest are image metadata.
+    assert "docker-rt.test" in line
+
+
+@pytest.mark.asyncio
 async def test_ping(aiohttp_client):
     from ..aio_server import create_aio_app
 

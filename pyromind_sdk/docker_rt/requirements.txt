@@ -1,5 +1,11 @@
 fastapi>=0.110
 uvicorn[standard]>=0.27
 aiohttp>=3.9
+# The async client sends "Accept-Encoding: gzip, deflate" (see
+# client/async_base.py) because aiohttp's streaming br decoder is broken
+# against brotli 1.2.0; this package is what makes PYROMIND_ACCEPT_ENCODING
+# (opt back in) work, and it covers edges that send br unsolicited.
+# Pinned by tests/pytest/test_runtime_dependencies.py.
+brotli>=1.1.0
 pydantic>=2
 kubernetes>=29.0.0

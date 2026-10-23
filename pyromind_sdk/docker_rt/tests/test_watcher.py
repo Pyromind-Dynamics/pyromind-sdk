@@ -4,13 +4,18 @@ from pytest import MonkeyPatch
 
 
 def _record_sweeps(monkeypatch: MonkeyPatch, calls: list[object]) -> None:
-    """Record both sweeps without letting either touch storage or the API."""
+    """Record all three sweeps without letting any touch storage or disk."""
     from .. import watcher as watcher_mod
 
     monkeypatch.setattr(
         watcher_mod,
         "sweep_leftover_builds",
         lambda pid: calls.append(("storage", pid)),
+    )
+    monkeypatch.setattr(
+        watcher_mod,
+        "sweep_leftover_local_builds",
+        lambda pid: calls.append(("local", pid)),
     )
     monkeypatch.setattr(
         watcher_mod,
@@ -22,7 +27,7 @@ def _record_sweeps(monkeypatch: MonkeyPatch, calls: list[object]) -> None:
 def test_watch_and_restore_restores_then_sweeps_then_exits(
     monkeypatch: MonkeyPatch,
 ) -> None:
-    """Restoring the context comes first; both sweeps are follow-ups.
+    """Restoring the context comes first; the sweeps are follow-ups.
 
     The order is the contract: a sweep can block on unreachable storage or an
     unresponsive API server, and nothing about a crashed build is worth delaying
@@ -49,11 +54,12 @@ def test_watch_and_restore_restores_then_sweeps_then_exits(
         ("wait", 123),
         "restore",
         ("storage", 123),
+        ("local", 123),
         "sandbox",
     ]
 
 
-def test_a_failed_restore_still_gets_both_sweeps(
+def test_a_failed_restore_still_gets_every_sweep(
     monkeypatch: MonkeyPatch,
 ) -> None:
     """The jobs are independent; no failure hides another."""
@@ -71,10 +77,10 @@ def test_a_failed_restore_still_gets_both_sweeps(
     _record_sweeps(monkeypatch, calls)
 
     assert watcher_mod.watch_and_restore(9) == 1
-    assert calls == ["restore", ("storage", 9), "sandbox"]
+    assert calls == ["restore", ("storage", 9), ("local", 9), "sandbox"]
 
 
-def test_a_failed_storage_sweep_still_gets_the_sandbox_sweep(
+def test_a_failed_storage_sweep_still_gets_the_local_and_sandbox_sweeps(
     monkeypatch: MonkeyPatch,
 ) -> None:
     """A dead storage backend must not leave the *running* leftovers behind."""
@@ -92,12 +98,17 @@ def test_a_failed_storage_sweep_still_gets_the_sandbox_sweep(
     monkeypatch.setattr(watcher_mod, "sweep_leftover_builds", boom)
     monkeypatch.setattr(
         watcher_mod,
+        "sweep_leftover_local_builds",
+        lambda pid: calls.append(("local", pid)),
+    )
+    monkeypatch.setattr(
+        watcher_mod,
         "sweep_leftover_sandboxes",
         lambda: calls.append("sandbox"),
     )
 
     assert watcher_mod.watch_and_restore(9) == 0
-    assert calls == [("storage", 9), "sandbox"]
+    assert calls == [("storage", 9), ("local", 9), "sandbox"]
 
 
 def test_sweep_leftover_builds_swallows_any_failure(
@@ -137,6 +148,47 @@ def test_sweep_leftover_builds_reports_what_it_removed(
     assert seen == [7]
     err = capsys.readouterr().err
     assert "removed 2 leftover staged build context(s)" in err
+
+
+def test_sweep_leftover_local_builds_swallows_any_failure(
+    monkeypatch: MonkeyPatch,
+    capsys,
+) -> None:
+    """An unreadable workspace mount must not turn into a watcher failure."""
+    from .. import watcher as watcher_mod
+    from ..backend import context_staging
+
+    def boom(**_kwargs):
+        raise RuntimeError("no route to the workspace mount")
+
+    monkeypatch.setattr(context_staging, "sweep_local_stale_staging", boom)
+
+    watcher_mod.sweep_leftover_local_builds(7)  # must not raise
+
+    assert "could not sweep locally staged build contexts" in capsys.readouterr().err
+
+
+def test_sweep_leftover_local_builds_reports_what_it_removed(
+    monkeypatch: MonkeyPatch,
+    capsys,
+) -> None:
+    from .. import watcher as watcher_mod
+    from ..backend import context_staging
+
+    seen: list[int | None] = []
+    monkeypatch.setattr(
+        context_staging,
+        "sweep_local_stale_staging",
+        lambda **kwargs: seen.append(kwargs.get("dead_pid")) or ["a-1-b"],
+    )
+
+    watcher_mod.sweep_leftover_local_builds(7)
+
+    assert seen == [7]
+    assert (
+        "removed 1 leftover locally staged build context(s)"
+        in capsys.readouterr().err
+    )
 
 
 def test_sweep_leftover_sandboxes_takes_no_pid_and_reports_what_it_removed(

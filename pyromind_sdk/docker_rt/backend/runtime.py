@@ -5,9 +5,13 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Coroutine
 
 from pyromind_sdk.client.async_sandbox import AsyncSandboxClient
+
+# ⚠️ 不要在这里 import ``pyromind_sdk_env``：它自己 ``from .runtime import
+# parse_binds``，模块级互相引用会得到 "partially initialized module"。
+# ``start_kube_environment`` 里已经有局部 import（2026-10-23 一次改动引入环）。
 
 logger = logging.getLogger("docker_rt.runtime")
 
@@ -345,6 +349,36 @@ def parse_binds(binds: list[str] | None) -> list[dict[str, Any]]:
     return out
 
 
+def mount_summary(entry: dict[str, Any]) -> str:
+    """One docker-style mount as ``src -> dst (ro|rw)`` — for log lines.
+
+    Lives here rather than in ``mounts.py`` because the sandbox start-up log
+    needs it and ``mounts.py`` imports *from* this module (the other direction
+    would be a cycle). ``aio_server`` imports it from here too, so the API log
+    and the runtime log render mounts identically.
+    """
+    source = entry.get("Source") or entry.get("source") or ""
+    target = entry.get("Target") or entry.get("target") or ""
+    read_only = bool(entry.get("ReadOnly") or entry.get("read_only"))
+    body = f"{source} -> {target}" if source else str(target)
+    return f"{body} ({'ro' if read_only else 'rw'})"
+
+
+def port_summary(bindings: dict[str, Any] | None) -> list[str]:
+    """``0.0.0.0:8080->80/tcp`` per published port — for log lines."""
+    out: list[str] = []
+    for container_port, hosts in (bindings or {}).items():
+        for host in hosts or [{}]:
+            host = host or {}
+            host_port = host.get("HostPort") or ""
+            host_ip = host.get("HostIp") or "0.0.0.0"
+            if host_port:
+                out.append(f"{host_ip}:{host_port}->{container_port}")
+            else:
+                out.append(f"{container_port} (dynamic)")
+    return out
+
+
 async def start_kube_environment(
     *,
     image: str,
@@ -380,15 +414,33 @@ async def start_kube_environment(
     """Start a sandbox through the k8s-middleware PyromindSDK backend."""
     from .pyromind_sdk_env import PyromindSDK
 
+    # 这一行是「真正发给集群的 sandbox 长什么样」的唯一记录：挂载、端口、资源
+    # 都在这里，出问题时不用去翻 API 层或猜（2026-10-23 用户反馈：构建沙箱的
+    # 日志里看不到挂载盘）。``-`` 表示该维度为空，而不是"忘了打"。
     logger.info(
-        "Starting k8s-middleware sandbox image=%s name=%s namespace=%s "
-        "cmd=%s memory=%s cpu=%s",
+        "Starting k8s-middleware sandbox image=%s name=%s namespace=%s cmd=%s "
+        "env=%d memory=%s(req %s) cpu=%s(req %s) gpu=%s/card:%s "
+        "bind=%s mount=%s tmpfs=%s ports=%s exposed=%s publish_all=%s "
+        "pull_secrets=%s timeout=%s",
         image,
         container_name or hostname or "-",
         namespace,
         list(command or []),
+        len(env or {}),
         memory_limit or "-",
+        memory_request or "-",
         cpu_limit or "-",
+        cpu_request or "-",
+        gpu or "-",
+        gpu_card or "any",
+        list(binds or []) or "-",
+        [mount_summary(m) for m in (mounts or [])] or "-",
+        dict(tmpfs or {}) or "-",
+        port_summary(port_bindings) or "-",
+        list(exposed_ports or {}) or "-",
+        bool(publish_all_ports),
+        list(image_pull_secrets or []) or "-",
+        pod_timeout,
     )
     return await PyromindSDK.create(
         image=image,

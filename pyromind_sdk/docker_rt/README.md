@@ -106,6 +106,8 @@ The build uses Storage as temporary file storage; the final result is stored at:
 /workspace/docker_images/<image-tag>.tar
 ```
 
+The build context reaches the sandbox automatically, with nothing to configure. When docker-rt itself runs inside the cluster — started from a JupyterLab web terminal is the recognised case — the daemon and the sandbox share the same workspace filesystem, so the context is unpacked straight onto it and kaniko builds from that directory: nothing is uploaded, nothing is copied inside the sandbox (the daemon log says `Unpacking the build context into … (shared workspace filesystem — no upload)`). Every other environment (your laptop, a plain SSH session) keeps the workspace-storage upload exactly as before.
+
 ### Push to a registry
 
 Builds push to a registry by default. Short image names require a registry prefix and credentials with push permission:

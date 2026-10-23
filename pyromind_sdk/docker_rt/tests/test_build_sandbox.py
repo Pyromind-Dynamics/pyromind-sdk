@@ -144,6 +144,8 @@ class _FakeBuildSandbox:
         stdout: str = "",
         returncode: int = 0,
         raise_on_exec: Exception | None = None,
+        raise_on_exec_once: Exception | None = None,
+        hang_after_calls: int | None = None,
         raise_on_put: Exception | None = None,
         responses: list[dict[str, Any]] | None = None,
         staged_bytes: int | None = None,
@@ -157,6 +159,12 @@ class _FakeBuildSandbox:
         self.stdout = stdout
         self.returncode = returncode
         self.raise_on_exec = raise_on_exec
+        #: Fails the *first* exec only, then behaves normally — the shape of a
+        #: transient transport hiccup on the launch (retry must recover).
+        self.raise_on_exec_once = raise_on_exec_once
+        #: Never returns once ``len(calls) > hang_after_calls`` — models a stream
+        #: that stalls without closing (the caller must bound it).
+        self.hang_after_calls = hang_after_calls
         self.raise_on_put = raise_on_put
         self.responses = list(responses) if responses is not None else None
         self.waited = False
@@ -193,6 +201,11 @@ class _FakeBuildSandbox:
         self.calls.append({"script": cmd[2], "timeout": timeout})
         if self.raise_on_exec is not None:
             raise self.raise_on_exec
+        if self.raise_on_exec_once is not None:
+            exc, self.raise_on_exec_once = self.raise_on_exec_once, None
+            raise exc
+        if self.hang_after_calls is not None and len(self.calls) > self.hang_after_calls:
+            await asyncio.sleep(3600)
         if self.raise_on_stage_in is not None and len(self.calls) == 1:
             # Only the stage-in call dies (a dropped websocket / the exec
             # deadline); the build itself must still be able to proceed.
@@ -225,6 +238,10 @@ class _FakeBuildSandbox:
             payload = response.get(kind, "")
             if payload:
                 yield SimpleNamespace(type=kind, data=payload, returncode=None)
+        if response.get("raise") is not None:
+            # A scripted transport failure *after* the output: that is the shape
+            # of "the work finished, only the exit frame was lost".
+            raise response["raise"]
         yield SimpleNamespace(
             type="exit", data="", returncode=response.get("returncode", 0)
         )
@@ -246,14 +263,14 @@ def _poll(stdout: str = "", *, state: str = "running") -> dict[str, Any]:
     return {"stdout": stdout, "stderr": f"docker-rt-status: {state}\n"}
 
 
-def _worker_script(sandbox: _FakeBuildSandbox) -> str:
+def _worker_script(sandbox: _FakeBuildSandbox, index: int = 0) -> str:
     """Decode the worker the launcher embedded (base64, so quoting can't bite).
 
     The launch call carries no kaniko flags itself — it only writes this script
     and detaches it — so any assertion about the argv kaniko will see has to go
     through here. It doubles as the check that the real argv reaches the sandbox.
     """
-    launch = sandbox.calls[0]["script"]
+    launch = sandbox.calls[index]["script"]
     match = re.search(r"printf '%s' ([A-Za-z0-9+/=]+) \| base64 -d", launch)
     assert match, launch
     return base64.b64decode(match.group(1)).decode()
@@ -344,10 +361,18 @@ def _install_staging(
     upload_error: Exception | None = None,
     cleanup_ok: bool = True,
 ) -> _StagingRecorder:
-    """Turn workspace staging on; records every stager the build creates."""
+    """Turn workspace staging on; records every stager the build creates.
+
+    Also pins :func:`local_workspace_ready` to ``False``: these tests describe
+    the *storage* route, and on a machine that happens to look like a
+    JupyterLab terminal with a writable ``/workspace`` the auto mode would
+    otherwise quietly take the local route instead. Tests for that route pin
+    it the other way themselves.
+    """
     from ..backend import context_staging as cs
 
     monkeypatch.setenv("DOCKER_RT_BUILD_CONTEXT_MODE", mode)
+    monkeypatch.setattr(cs, "local_workspace_ready", lambda: False)
     recorder = _StagingRecorder()
 
     def factory(plan: Any, **_kwargs: Any) -> _FakeStager:
@@ -1046,7 +1071,7 @@ async def test_build_in_sandbox_aborts_before_the_sandbox_when_acr_repo_fails(
 
 @pytest.mark.asyncio
 async def test_build_in_sandbox_fails_fast_when_configured_credentials_are_unreadable(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
+    monkeypatch: pytest.MonkeyPatch, tmp_dir
 ) -> None:
     from ..backend import build_sandbox
     from ..backend import runtime
@@ -1056,7 +1081,7 @@ async def test_build_in_sandbox_fails_fast_when_configured_credentials_are_unrea
     monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
     # Point the dockerconfig source at a file that does not exist so the test does
     # not depend on what this machine happens to have under /etc.
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_DOCKERCONFIG", str(tmp_path / "absent.json"))
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_DOCKERCONFIG", str(tmp_dir / "absent.json"))
 
     async def boom(**kwargs: Any):  # pragma: no cover - must not run
         raise AssertionError("must not create a sandbox")
@@ -2305,10 +2330,10 @@ async def test_a_failed_cleanup_is_reported_and_does_not_lose_the_build(
             )
         )
 
-    assert staging.stager.cleaned is True
-    assert any(event.get("docker_rt") for event in events)
-    assert "was left in storage" in caplog.text
-    assert staging.stager.plan.object_dir in caplog.text
+        assert staging.stager.cleaned is True
+        assert any(event.get("docker_rt") for event in events)
+        assert "was left behind" in caplog.text
+        assert staging.stager.plan.object_dir in caplog.text
 
 
 @pytest.mark.asyncio
@@ -3162,3 +3187,678 @@ async def test_a_disabled_sweep_deletes_nothing_and_says_how_to_do_it_by_hand(
     assert client.paused == []
     assert "sweep is off" in caplog.text
     assert "docker rm -f" in caplog.text
+
+
+# --------------------------------------------------------------------------
+# the local (no-upload) route — a daemon started from a JupyterLab terminal
+# --------------------------------------------------------------------------
+
+
+class _RecordingLocalStager(context_staging.LocalStager):
+    """The real LocalStager, but cleanup records instead of deleting.
+
+    The end-to-end test needs to see the unpacked tree *after* the build has
+    finished — which is exactly when the real cleanup has removed it. Trading
+    the deletion (unit-tested in test_context_staging) for observability keeps
+    the assertion about what landed on disk honest.
+    """
+
+    def __init__(self, plan: Any) -> None:
+        super().__init__(plan)
+        self.cleaned = False
+
+    def cleanup(self) -> bool:
+        self.cleaned = True
+        return True
+
+
+def _install_local_staging(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_dir: Any,
+    *,
+    ready: bool = True,
+) -> list[_RecordingLocalStager]:
+    """auto mode with the workspace pointed at a temp dir; records stagers."""
+    from ..backend import context_staging as cs
+
+    _staging_ready(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_CONTEXT_MODE", "auto")
+    monkeypatch.setenv("DOCKER_RT_BUILD_STAGING_WORKSPACE", str(tmp_dir))
+    monkeypatch.setattr(cs, "local_workspace_ready", lambda: ready)
+    created: list[_RecordingLocalStager] = []
+
+    def factory(plan: Any, **_kwargs: Any) -> _RecordingLocalStager:
+        stager = _RecordingLocalStager(plan)
+        created.append(stager)
+        return stager
+
+    monkeypatch.setattr(cs, "LocalStager", factory)
+    return created
+
+
+@pytest.mark.asyncio
+async def test_a_jupyterlab_daemon_unpacks_the_context_and_builds_in_place(
+    monkeypatch: pytest.MonkeyPatch, tmp_dir: Any
+) -> None:
+    """The whole point: no upload, no copy inside the sandbox, no archive.
+
+    The context is unpacked onto the shared workspace filesystem — the very one
+    the sandbox mounts — and kaniko is pointed at that directory
+    (``--context dir://…``), so it reads the tree where it lies instead of
+    untarring an archive somebody had to copy in first.
+    """
+    from ..backend import build_sandbox
+
+    context = _context_tar()
+    created = _install_local_staging(monkeypatch, tmp_dir)
+    sandbox = _FakeBuildSandbox(
+        stdout=_STAGED_STDOUT,
+        responses=[
+            # 1. the verify exec — no copy, just prove the mount is real
+            {"stdout": f"{context_staging.CONTEXT_MARKER}1\n"},
+            # 2. the launcher
+            {"stderr": "docker-rt-status: launched\n"},
+            # 3. one poll that reports the build finished
+            {"stdout": _STAGED_STDOUT, "stderr": "docker-rt-status: done rc=0\n"},
+        ],
+    )
+    captured = _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(tar_bytes=context, tags=["myapp"], namespace="ns")
+    )
+    text = "".join(event.get("stream", "") for event in events)
+
+    assert len(created) == 1
+    stager = created[0]
+    # The Dockerfile is on disk, under the very path the mount exposes.
+    unpacked = (
+        tmp_dir / ".docker-rt-build" / stager.plan.build_id / "context" / "Dockerfile"
+    )
+    assert unpacked.is_file()
+    assert unpacked.read_bytes() == b"FROM scratch\n"
+    assert "no upload" in text
+    assert "Build context in place" in text
+
+    # No tar travelled through the sandbox file API and nothing was copied.
+    assert sandbox.archives == []
+    assert captured["mounts"] == [
+        _images_mount(),
+        context_staging.mount_spec(stager.plan),
+    ]
+    verify = sandbox.calls[0]["script"]
+    assert stager.plan.staged_context in verify
+    assert sandbox.calls[0]["timeout"] == build_sandbox.STAGE_IN_TIMEOUT_S
+
+    # kaniko builds out of the mounted directory — no tar:// anywhere.
+    worker = _worker_script(sandbox, index=1)
+    assert f"--context=dir://{stager.plan.staged_context}" in worker
+    assert "tar://" not in worker
+    assert stager.cleaned is True
+    assert any(event.get("docker_rt") for event in events)
+
+
+@pytest.mark.asyncio
+async def test_a_daemon_outside_the_cluster_still_uploads(
+    monkeypatch: pytest.MonkeyPatch, tmp_dir: Any
+) -> None:
+    """A laptop daemon (or a closed terminal): the storage route, unchanged."""
+    from ..backend import build_sandbox
+
+    _staging_ready(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_STAGING_WORKSPACE", str(tmp_dir))
+    # Pins local_workspace_ready False — the environment this test describes.
+    storage = _install_staging(monkeypatch)
+    context = _context_tar()
+    packed = build_sandbox.pack_build_context(context)
+    sandbox = _FakeBuildSandbox(stdout=_STAGED_STDOUT, staged_bytes=len(packed))
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(tar_bytes=context, tags=["myapp"], namespace="ns")
+    )
+
+    assert storage.count == 1
+    assert storage.stager.payload == packed
+    assert sandbox.archives == []
+    # Nothing was written to the workspace by a local route.
+    assert not (tmp_dir / ".docker-rt-build").exists()
+    assert any(event.get("docker_rt") for event in events)
+
+
+@pytest.mark.asyncio
+async def test_forced_local_mode_without_the_environment_fails_before_a_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``local`` forced on a daemon that is not in the cluster is an error.
+
+    It must fail *before* a sandbox is spent, and it must name the variable to
+    unset — an operator who forced this needs to know which switch to flip.
+    """
+    from ..backend import build_sandbox, runtime
+
+    _staging_ready(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_CONTEXT_MODE", "local")
+    monkeypatch.setattr(context_staging, "local_workspace_ready", lambda: False)
+    context = _context_tar()
+    starts: list[Any] = []
+
+    async def fake_start(**kwargs: Any) -> Any:
+        starts.append(kwargs)
+        raise AssertionError("no sandbox may be spent on a misrouted build")
+
+    monkeypatch.setattr(runtime, "start_kube_environment", fake_start)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(tar_bytes=context, tags=["myapp"], namespace="ns")
+    )
+
+    errors = [event for event in events if event.get("error")]
+    assert len(errors) == 1
+    assert "DOCKER_RT_BUILD_CONTEXT_MODE=local" in errors[0]["error"]
+    assert starts == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_local_write_falls_back_to_the_direct_upload(
+    monkeypatch: pytest.MonkeyPatch, tmp_dir: Any
+) -> None:
+    """auto mode: a workspace that cannot hold the context is not fatal.
+
+    Both routes end on the same filesystem, so the independent fallback is the
+    sandbox-local upload — one retry, and the build still succeeds.
+    """
+    from ..backend import build_sandbox
+    from ..backend import context_staging as cs
+
+    _staging_ready(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(cs, "local_workspace_ready", lambda: True)
+    blocker = tmp_dir / "a-file"
+    blocker.write_text("not a directory")
+    monkeypatch.setenv("DOCKER_RT_BUILD_STAGING_WORKSPACE", str(blocker))
+    context = _context_tar()
+    sandbox = _FakeBuildSandbox(stdout=_STAGED_STDOUT)
+    captured = _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(tar_bytes=context, tags=["myapp"], namespace="ns")
+    )
+    text = "".join(event.get("stream", "") for event in events)
+
+    assert "Could not unpack the build context into the shared workspace" in text
+    # No staging mount was requested, and the context went through the exec
+    # channel instead.
+    assert captured["mounts"] == [_images_mount()]
+    assert len(sandbox.archives) == 1
+    assert any(event.get("docker_rt") for event in events)
+
+
+# --------------------------------------------------------------------------
+# failure hints
+# --------------------------------------------------------------------------
+
+
+def test_a_missing_context_file_is_recognised_in_the_real_kaniko_log() -> None:
+    from ..backend import build_sandbox
+
+    log = (
+        "error building image: error building stage: failed to get files used "
+        "from context: failed to get relative files: lstat "
+        "/kaniko/buildcontext/go.mod: no such file or directory\n"
+    )
+    hint = build_sandbox.missing_context_files_hint(log)
+    assert "`-f` only selects the Dockerfile" in hint
+    assert "<project-dir>" in hint
+
+    # An unrelated failure must not get the lecture.
+    assert build_sandbox.missing_context_files_hint("error: exit status 1") == ""
+    assert build_sandbox.missing_context_files_hint("") == ""
+
+
+@pytest.mark.asyncio
+async def test_a_context_missing_the_dockerfiles_files_is_explained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`-f` elsewhere + context `.` is the trap; say which argument was wrong.
+
+    The daemon cannot detect this up front — the Docker API never sends the
+    Dockerfile's original path, only a ``.dockerfile.<hash>`` name inside the
+    tar — so the failure path is where the explanation has to land.
+    """
+    from ..backend import build_sandbox
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
+    _set_push_credentials(monkeypatch)
+    log = (
+        "INFO[0001] Unpacking rootfs as cmd COPY go.mod go.sum ./ requires it.\n"
+        "error building image: error building stage: failed to get files used "
+        "from context: failed to get relative files: lstat "
+        "/kaniko/buildcontext/go.mod: no such file or directory\n"
+    )
+    sandbox = _FakeBuildSandbox(stdout=log, returncode=1)
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
+    )
+    text = "".join(event.get("stream", "") for event in events)
+
+    assert "the build context does not contain the files" in text
+    assert "docker build -f <project-dir>/Dockerfile -t <tag> <project-dir>" in text
+    assert any(event.get("error") for event in events)
+
+
+# --------------------------------------------------------------------------
+# retrying the launch — only when the command provably never started
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_first_frame_timeout_retries_the_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """中间件没读到首帧 ⇒ 命令没跑 ⇒ 重试安全（2026-10-23 用户实测）。
+
+    现象：sandbox 起了 136s，前一次 exec（拷贝 context 3.7s）还成功，紧接着
+    启动 kaniko 却收到 ``no exec-stream request frame within 10s`` —— 那是一帧
+    没送达，不是 sandbox 坏了。一次抖动不该毁掉整个构建。
+    """
+    from ..backend import build_sandbox
+    from ...exec_stream import SandboxExecStreamError
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
+    _set_push_credentials(monkeypatch)
+    monkeypatch.setattr(build_sandbox, "LAUNCH_BACKOFF_S", 0.0)
+    sandbox = _FakeBuildSandbox(
+        stdout=_STAGED_STDOUT,
+        raise_on_exec_once=SandboxExecStreamError(
+            "no exec-stream request frame within 10s; closing",
+            code="EXEC_STREAM_FIRST_FRAME_TIMEOUT",
+        ),
+    )
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
+    )
+    text = "".join(event.get("stream", "") for event in events)
+
+    assert "retrying (2/3)" in text
+    # Two launch attempts, then one poll.
+    assert len(sandbox.calls) == 3
+    assert any(event.get("docker_rt") for event in events)
+
+
+@pytest.mark.asyncio
+async def test_a_lost_stream_is_never_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``EXEC_STREAM_LOST`` 的方向相反：命令可能已经跑过，重试会启动第二个构建。"""
+    from ..backend import build_sandbox
+    from ...exec_stream import SandboxExecStreamError
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
+    _set_push_credentials(monkeypatch)
+    monkeypatch.setattr(build_sandbox, "LAUNCH_BACKOFF_S", 0.0)
+    sandbox = _FakeBuildSandbox(
+        stdout=_STAGED_STDOUT,
+        raise_on_exec=SandboxExecStreamError(
+            "exec stream lost before any exit event", code="EXEC_STREAM_LOST"
+        ),
+    )
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
+    )
+
+    assert len([e for e in events if e.get("error")]) == 1
+    assert len(sandbox.calls) == 1  # no second launch
+    assert not any("retrying" in e.get("stream", "") for e in events)
+
+
+@pytest.mark.asyncio
+async def test_the_last_failed_retry_says_the_build_never_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """重试用尽时要说清"命令没跑过、可以放心重试这次构建"。"""
+    from ..backend import build_sandbox
+    from ...exec_stream import SandboxExecStreamError
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
+    _set_push_credentials(monkeypatch)
+    monkeypatch.setattr(build_sandbox, "LAUNCH_BACKOFF_S", 0.0)
+    sandbox = _FakeBuildSandbox(
+        stdout=_STAGED_STDOUT,
+        raise_on_exec=SandboxExecStreamError(
+            "no exec-stream request frame within 10s; closing",
+            code="EXEC_STREAM_FIRST_FRAME_TIMEOUT",
+        ),
+    )
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
+    )
+    errors = [e for e in events if e.get("error")]
+
+    assert len(errors) == 1
+    assert "never started" in errors[0]["error"]
+    assert len(sandbox.calls) == build_sandbox.LAUNCH_ATTEMPTS
+
+
+def test_only_pre_start_failures_count_as_never_started() -> None:
+    from ..backend import build_sandbox
+    from ...exec_stream import SandboxExecStreamError
+
+    assert build_sandbox._command_never_started(
+        SandboxExecStreamError("x", code="EXEC_STREAM_FIRST_FRAME_TIMEOUT")
+    )
+    assert build_sandbox._command_never_started(
+        SandboxExecStreamError("no exec-stream request frame within 10s; closing")
+    )
+    assert not build_sandbox._command_never_started(
+        SandboxExecStreamError("x", code="EXEC_STREAM_LOST")
+    )
+    assert not build_sandbox._command_never_started(RuntimeError("boom"))
+
+
+# --------------------------------------------------------------------------
+# a lost exit frame is not a failed copy
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_lost_stage_in_stream_is_accepted_when_the_marker_arrived(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """30 字节的标记到了 ⇒ 拷贝成功，只是 exit 帧丢了（2026-10-23 实测）。
+
+    stage-in 脚本的顺序是「cp → ``wc -c`` 校验 → 清理 → 打标记」，标记出现在
+    已收到的字节里，就说明前面每一步都过了。以前这里判成失败，把 650 KiB 又
+    重传了一遍。
+    """
+    from ...exec_stream import SandboxExecStreamError
+    from ..backend import build_sandbox
+
+    context = _context_tar()
+    packed = build_sandbox.pack_build_context(context)
+    _staging_ready(monkeypatch)
+    storage = _install_staging(monkeypatch)
+    sandbox = _FakeBuildSandbox(
+        stdout=_STAGED_STDOUT,
+        responses=[
+            {
+                "stdout": f"{context_staging.SIZE_MARKER}{len(packed)}\n",
+                "raise": SandboxExecStreamError(
+                    "exec stream connection lost before any exit event",
+                    code="EXEC_STREAM_LOST",
+                ),
+            },
+            {"stderr": "docker-rt-status: launched\n"},
+            {"stdout": _STAGED_STDOUT, "stderr": "docker-rt-status: done rc=0\n"},
+        ],
+    )
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=context, tags=["myapp"], namespace="ns"
+        )
+    )
+    text = "".join(event.get("stream", "") for event in events)
+
+    assert storage.count == 1, text
+    assert "exit frame was lost" in text
+    assert "uploading directly" not in text
+    assert sandbox.archives == []  # nothing re-uploaded
+    assert any(event.get("docker_rt") for event in events)
+
+
+@pytest.mark.asyncio
+async def test_a_lost_stage_in_stream_without_the_marker_still_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """只收到半截输出 ⇒ 什么都没法证明 ⇒ 照旧回退直传。"""
+    from ...exec_stream import SandboxExecStreamError
+    from ..backend import build_sandbox
+
+    context = _context_tar()
+    packed = build_sandbox.pack_build_context(context)
+    _staging_ready(monkeypatch)
+    _install_staging(monkeypatch)
+    sandbox = _FakeBuildSandbox(
+        stdout=_STAGED_STDOUT,
+        responses=[
+            {
+                "stdout": "docker-rt-stag",
+                "raise": SandboxExecStreamError("lost", code="EXEC_STREAM_LOST"),
+            },
+            {"stderr": "docker-rt-status: launched\n"},
+            {"stdout": _STAGED_STDOUT, "stderr": "docker-rt-status: done rc=0\n"},
+        ],
+    )
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=context, tags=["myapp"], namespace="ns"
+        )
+    )
+    text = "".join(event.get("stream", "") for event in events)
+
+    assert "Staged context unusable" in text
+    assert len(sandbox.archives) == 1  # fell back to the direct upload
+
+
+@pytest.mark.asyncio
+async def test_run_exec_keeps_the_output_that_arrived_before_the_stream_died() -> None:
+    """``_run_exec`` 把已收到的输出挂在异常上，而不是随异常一起丢掉。"""
+    from ...exec_stream import SandboxExecStreamError
+    from ..backend import build_sandbox
+
+    sandbox = _FakeBuildSandbox(
+        responses=[
+            {
+                "stdout": "half a line",
+                "raise": SandboxExecStreamError("lost", code="EXEC_STREAM_LOST"),
+            }
+        ]
+    )
+
+    with pytest.raises(SandboxExecStreamError) as info:
+        await build_sandbox._run_exec(sandbox, "echo x", timeout=5)
+
+    partial = build_sandbox._partial_result(info.value)
+    assert partial is not None
+    assert partial.stdout == "half a line"
+    # A plain error carries no partial result and must not crash the helper.
+    assert build_sandbox._partial_result(RuntimeError("boom")) is None
+
+
+# --------------------------------------------------------------------------
+# no unbounded await: a stalled exec must not hang the build forever
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_hung_poll_fails_the_build_instead_of_hanging_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """2026-10-23 实测：kaniko 早已推完镜像、``build.rc`` 都写了，轮询却永不返回。
+
+    服务端的 ``timeout`` 只约束命令，不保证一定有结束帧；客户端不加墙钟就会
+    永远等下去（CLI 一直打 "still building…"，沙箱十几分钟不释放）。
+    """
+    from ..backend import build_sandbox
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
+    _set_push_credentials(monkeypatch)
+    monkeypatch.setattr(build_sandbox, "_exec_deadline", lambda timeout: 0.05)
+    monkeypatch.setattr(build_sandbox, "poll_interval", lambda: 0.01)
+    # The launch answers; every poll after it stalls without closing.
+    sandbox = _FakeBuildSandbox(stdout=_STAGED_STDOUT, hang_after_calls=1)
+    _install_fake(monkeypatch, sandbox)
+
+    events = await asyncio.wait_for(
+        _collect(
+            build_sandbox.build_in_sandbox(
+                tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+            )
+        ),
+        timeout=10,
+    )
+
+    errors = [event for event in events if event.get("error")]
+    assert len(errors) == 1
+    assert "in a row" in errors[0]["error"]
+    assert len(sandbox.calls) == 1 + build_sandbox.MAX_POLL_FAILURES
+
+
+@pytest.mark.asyncio
+async def test_a_hung_launch_is_bounded_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """启动阶段的 exec 同样要封顶，否则整个构建停在 "Starting kaniko…"。"""
+    from ..backend import build_sandbox
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
+    _set_push_credentials(monkeypatch)
+    monkeypatch.setattr(build_sandbox, "_exec_deadline", lambda timeout: 0.05)
+    sandbox = _FakeBuildSandbox(stdout=_STAGED_STDOUT, hang_after_calls=0)
+    _install_fake(monkeypatch, sandbox)
+
+    events = await asyncio.wait_for(
+        _collect(
+            build_sandbox.build_in_sandbox(
+                tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+            )
+        ),
+        timeout=10,
+    )
+
+    errors = [event for event in events if event.get("error")]
+    assert len(errors) == 1
+    message = errors[0]["error"]
+    assert "cannot start the build in the sandbox" in message
+    # ...and never a bare colon: `str(TimeoutError())` is "", which produced
+    # "cannot start the build in the sandbox: " with nothing after it (2026-10-23).
+    assert message.split("sandbox:", 1)[1].strip()
+    assert "no answer within" in message
+    # A hung launch is not "the command never started" — no blind retry.
+    assert len(sandbox.calls) == 1
+
+
+def test_an_exception_with_no_message_still_says_something() -> None:
+    from ..backend import build_sandbox
+
+    assert build_sandbox._error_text(RuntimeError("boom")) == "boom"
+    assert build_sandbox._error_text(asyncio.TimeoutError(), timeout=75) == (
+        "no answer within 75s"
+    )
+    assert build_sandbox._error_text(asyncio.TimeoutError()) == "timed out"
+    # A plain empty exception falls back to its type, never to "".
+    assert build_sandbox._error_text(Exception()) == "Exception"
+
+
+def test_the_exec_deadline_leaves_room_for_the_servers_own_timeout() -> None:
+    from ..backend import build_sandbox
+
+    assert build_sandbox._exec_deadline(60) > 60
+    assert build_sandbox._exec_deadline(0) >= 1.0
+
+
+@pytest.mark.asyncio
+async def test_losing_the_sandbox_reports_where_the_build_got_to(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """连续失败时必须回答：上次答话是什么时候、当时到哪一步、镜像可能已推。
+
+    这就是 2026-10-23 那条"卡在 still building…"的收尾文案——那次 kaniko 其实
+    早就推完镜像了，日志却什么都没说，用户只能等着。
+    """
+    from ..backend import build_sandbox
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
+    _set_push_credentials(monkeypatch)
+    monkeypatch.setattr(build_sandbox, "_exec_deadline", lambda timeout: 0.05)
+    monkeypatch.setattr(build_sandbox, "poll_interval", lambda: 0.01)
+    sandbox = _FakeBuildSandbox(
+        stdout=_STAGED_STDOUT,
+        responses=[
+            {"stderr": "docker-rt-status: launched\n"},          # launch
+            {"stderr": "docker-rt-status: running\n"},           # one good poll
+        ],
+        hang_after_calls=2,                                      # then it stalls
+    )
+    _install_fake(monkeypatch, sandbox)
+
+    events = await asyncio.wait_for(
+        _collect(
+            build_sandbox.build_in_sandbox(
+                tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+            )
+        ),
+        timeout=10,
+    )
+    errors = [event for event in events if event.get("error")]
+
+    assert len(errors) == 1
+    message = errors[0]["error"]
+    assert "lost contact with the build sandbox" in message
+    assert "in a row failed" in message
+    assert "reported state=running" in message      # where it got to
+    assert "check reg.example.com/rt/myapp:latest" in message  # what to verify
+
+
+def test_the_ready_heartbeat_ramps_up_as_the_wait_drags_on() -> None:
+    """前 90s 每 30s 报一次（正常情况），之后越来越密（2026-10-23 用户要求）。
+
+    195s 那次启动，15s 一条共 13 条，全是噪音；而真正异常的是 90s 之后那段，
+    恰恰应该更密。
+    """
+    from ..backend import build_sandbox
+
+    assert build_sandbox._ready_beat_interval(0) == 30.0
+    assert build_sandbox._ready_beat_interval(89.9) == 30.0
+    assert build_sandbox._ready_beat_interval(90.0) == 15.0
+    assert build_sandbox._ready_beat_interval(119.9) == 15.0
+    assert build_sandbox._ready_beat_interval(120.0) == 5.0
+    assert build_sandbox._ready_beat_interval(600) == 5.0
+
+
+@pytest.mark.asyncio
+async def test_the_ready_heartbeat_reports_until_the_task_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ..backend import build_sandbox
+
+    monkeypatch.setattr(build_sandbox, "_ready_beat_interval", lambda elapsed: 0.05)
+    task = asyncio.ensure_future(asyncio.sleep(0.2))
+
+    messages = [event async for event in build_sandbox._ready_heartbeat(task)]
+
+    assert messages
+    assert "still waiting for the build sandbox to start" in messages[0]["stream"]
+    assert task.done()

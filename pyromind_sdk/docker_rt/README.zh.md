@@ -106,6 +106,8 @@ PyroMind 后端（默认后端）没有 Kubernetes API 端口转发端点，因�
 /workspace/docker_images/<image-tag>.tar
 ```
 
+构建上下文会**自动**送达 Sandbox，不需要任何配置。当 docker-rt 自身运行在集群内时——从 JupyterLab Web 终端启动即属于此种情况——daemon 与构建 Sandbox 挂载着同一个共享 workspace 文件系统，上下文会被直接解包到该文件系统，kaniko 从这个目录构建：不上传、Sandbox 内也不再复制（daemon 日志显示 `Unpacking the build context into … (shared workspace filesystem — no upload)`）。其他环境（本机、普通 SSH 会话）保持原来的存储上传路径不变。
+
 ### 推送到镜像仓库
 
 构建默认在完成后推送镜像。使用短镜像名时，需要配置仓库前缀以及具备推送权限的凭据：

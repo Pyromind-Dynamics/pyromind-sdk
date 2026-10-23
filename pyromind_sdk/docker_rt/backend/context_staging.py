@@ -58,6 +58,28 @@ wherever it lives. ``build_sandbox.images_mount_spec`` relies on exactly that an
 mounts the user's images directory under ``/workspace``. (The *workdir* is a
 different case — it is a plain directory, not a mount, which is why it has to be
 inside ``/kaniko``: that path is in kaniko's hard-coded default ignore list.)
+
+The local route — no upload at all
+----------------------------------
+
+When docker-rt is started from a **JupyterLab web terminal** it runs inside the
+user's workspace pod, where ``/workspace`` already *is* the JuiceFS the build
+sandbox mounts (see :mod:`jupyter_env` for how that is detected). Uploading the
+context to the storage gateway would then be a detour through the network for a
+file both sides can already reach on the same filesystem.
+
+So in that case :class:`LocalStager` **unpacks the context into
+``<prefix>/<build-id>/context/``** on the shared filesystem. The sandbox mounts
+``<prefix>`` and reads that directory **in place** (kaniko is given
+``--context dir://…``): nothing is uploaded, nothing is copied inside the
+sandbox, and no archive is produced — one unpack, then the build. The same two
+cleanup stages apply, as a local ``rm -rf`` instead of a storage delete.
+
+The route is chosen automatically and needs no configuration: a daemon that
+finds a ``jupyter-lab`` ancestor with a writable workspace takes the local
+route, and every other environment — a laptop, a plain SSH session — keeps the
+storage route exactly as before. (``DOCKER_RT_BUILD_CONTEXT_MODE`` exists as an
+internal escape hatch for operators, not as something a user has to set.)
 """
 
 from __future__ import annotations
@@ -69,15 +91,21 @@ import os
 import re
 import secrets
 import shlex
+import shutil
+import tarfile
 import time
 from datetime import datetime
 from typing import Any, NamedTuple
 
+from . import jupyter_env
+
 logger = logging.getLogger("docker_rt.context_staging")
 
-#: ``auto`` (try storage, fall back to a direct upload), ``storage`` (storage or
+#: ``auto`` (local when inside the cluster, else storage, else a direct
+#: upload), ``local`` (write straight to the shared workspace filesystem — the
+#: no-upload route; fail if that is not possible), ``storage`` (storage or
 #: fail), ``upload`` (never touch storage — the pre-storage behaviour).
-STAGING_MODES = ("auto", "storage", "upload")
+STAGING_MODES = ("auto", "local", "storage", "upload")
 
 #: Default mount target. Inside ``/kaniko`` so kaniko's ``DeleteFilesystem``
 #: (multi-stage builds) cannot wipe it.
@@ -123,7 +151,12 @@ def _env(name: str, default: str = "") -> str:
 
 
 def staging_mode() -> str:
-    """``DOCKER_RT_BUILD_CONTEXT_MODE``, normalised (unknown values → ``auto``)."""
+    """``DOCKER_RT_BUILD_CONTEXT_MODE``, normalised (unknown values → ``auto``).
+
+    ``local`` is the no-upload route for a daemon that runs inside the cluster
+    (a JupyterLab web terminal is the recognised case — see
+    :func:`local_workspace_ready`).
+    """
     mode = _env("DOCKER_RT_BUILD_CONTEXT_MODE", "auto").lower()
     return mode if mode in STAGING_MODES else "auto"
 
@@ -136,6 +169,51 @@ def staging_enabled() -> bool:
 def staging_required() -> bool:
     """Whether a storage failure must fail the build instead of falling back."""
     return staging_mode() == "storage"
+
+
+def local_workspace_ready() -> bool:
+    """Whether this daemon can write the context straight to the shared FS.
+
+    Two conditions, both cheap and both re-checked per build — the parent chain
+    changes while the daemon runs (closing the terminal that started it
+    re-parents the daemon to PID 1, and detection must notice):
+
+    1. a ``jupyter-lab`` process is an **ancestor** of this daemon, i.e. it was
+       started from a JupyterLab web terminal and therefore runs inside the
+       user's workspace pod (:mod:`jupyter_env`);
+    2. the staging workspace (``DOCKER_RT_BUILD_STAGING_WORKSPACE``, default
+       ``/workspace``) exists and is writable.
+
+    This is an *environment* check only — it deliberately knows nothing about
+    ``DOCKER_RT_BUILD_CONTEXT_MODE``; :func:`local_staging_requested` is what
+    combines the two.
+
+    A wrong "yes" is self-healing rather than fatal: the sandbox verifies the
+    staged archive by size before the build starts, and a write or a stage-in
+    that does not check out falls back to the direct upload — so a
+    ``/workspace`` that turns out not to be the shared JuiceFS costs a retry,
+    not a broken build.
+    """
+    if not jupyter_env.is_jupyterlab_terminal():
+        return False
+    workspace = staging_workspace()
+    return os.path.isdir(workspace) and os.access(workspace, os.W_OK)
+
+
+def local_staging_requested() -> bool:
+    """Whether this build should take the no-upload local route.
+
+    - ``local`` — forced on. The caller turns an unready environment into a
+      build error (an explicit operator choice is not second-guessed here);
+    - ``auto``  — on when :func:`local_workspace_ready` says so;
+    - ``storage`` / ``upload`` — never.
+    """
+    mode = staging_mode()
+    if mode == "local":
+        return True
+    if mode == "auto":
+        return local_workspace_ready()
+    return False
 
 
 def staging_mount_path() -> str:
@@ -255,6 +333,21 @@ class StagingPlan(NamedTuple):
         """The per-build directory the sandbox deletes after copying."""
         return f"{self.mount_path}/{self.build_id}"
 
+    @property
+    def rel_context_dir(self) -> str:
+        """``<prefix>/<build-id>/context`` — the unpacked context, workspace-relative."""
+        return f"{self.rel_dir}/context"
+
+    @property
+    def host_context(self) -> str:
+        """Where the local route unpacks the context, on the daemon host."""
+        return f"{self.host_path}/{self.build_id}/context"
+
+    @property
+    def staged_context(self) -> str:
+        """The unpacked context as the sandbox sees it through the mount."""
+        return f"{self.mount_path}/{self.build_id}/context"
+
 
 def plan_staging(*, archive: str) -> StagingPlan:
     return StagingPlan(
@@ -326,14 +419,20 @@ def resolve_bucket(storage: Any, info: Any) -> str:
     Resolution order, cheapest and least privileged first:
 
     1. ``PYROMIND_STORAGE_BUCKET`` (already honoured by ``StorageClient``);
-    2. the single bucket the credentials can list — this is what a real
+    2. ``bucket_name`` straight from ``/storage_info`` — the cluster naming the
+       bucket is authoritative, so it comes before any listing;
+    3. the single bucket the credentials can list — this is what a real
        deployment returns, and the credential is scoped to exactly one bucket;
-    3. ``uid`` from ``/storage_info``;
-    4. the only numeric-looking candidate.
+    4. ``uid`` from ``/storage_info``;
+    5. the only numeric-looking candidate.
     """
     current = getattr(storage, "current_bucket", None)
     if current:
         return str(current)
+
+    named = str(getattr(info, "bucket_name", "") or "")
+    if named:
+        return named
 
     names: list[str] = []
     try:
@@ -363,6 +462,97 @@ def resolve_bucket(storage: Any, info: Any) -> str:
     )
 
 
+#: Where the storage credentials come from: ``POST <cluster>/api/v1/storage_info``.
+#:
+#: A generous read timeout and three attempts are deliberate. This call used to
+#: go to the *portal* (``api-portal.pyromind.ai``), which sits behind a shared
+#: ingress: one Read timeout there (2026-10-23, 30 s) made ``connect_storage``
+#: fail and downgraded the whole build to the slow direct upload. The cluster's
+#: own API answers the same question on a host the build already talks to, and
+#: this is a tiny idempotent request, so retrying it is free.
+STORAGE_INFO_ATTEMPTS = 3
+STORAGE_INFO_TIMEOUT_S = 60
+STORAGE_INFO_BACKOFF_S = 2.0
+
+
+class _StorageInfo(NamedTuple):
+    """The four things the stager needs out of ``/storage_info``."""
+
+    url: str
+    access_key: str
+    secret_key: str
+    uid: str
+    bucket_name: str
+
+
+def storage_info_from_cluster(cluster: str | None) -> _StorageInfo:
+    """Ask the **cluster** for the storage credentials — never the portal.
+
+    ``POST {CLUSTER_RESOURCE[cluster].http[env]}/api/v1/storage_info`` with the
+    API key returns the same payload the portal used to serve
+    (``url``/``access_key``/``secret_key``/``bucket_name``). Raises
+    :class:`StagingError` when the cluster is unknown, the key is missing, or all
+    attempts fail — the caller turns that into "upload directly".
+    """
+    import requests
+
+    from ...client.base import resolve_base_url_from_cluster
+
+    if not cluster:
+        raise StagingError(
+            "PYROMIND_CLUSTER is not set; cannot resolve the storage endpoint"
+        )
+    api_key = (os.getenv("PYROMIND_API_KEY") or "").strip()
+    if not api_key:
+        raise StagingError(
+            "PYROMIND_API_KEY is not set; cannot resolve storage credentials"
+        )
+    try:
+        base = resolve_base_url_from_cluster(cluster).rstrip("/")
+    except ValueError as exc:
+        raise StagingError(str(exc)) from exc
+    url = f"{base}/storage_info"
+
+    last_error: Exception | None = None
+    for attempt in range(1, STORAGE_INFO_ATTEMPTS + 1):
+        try:
+            response = requests.post(
+                url,
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={},
+                timeout=STORAGE_INFO_TIMEOUT_S,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(data, dict) or not data.get("access_key"):
+                raise StagingError(f"unexpected /storage_info payload from {url}")
+            endpoint = str(data.get("url") or "")
+            if not endpoint:
+                raise StagingError(f"/storage_info from {url} carried no endpoint")
+            return _StorageInfo(
+                url=endpoint,
+                access_key=str(data["access_key"]),
+                secret_key=str(data.get("secret_key") or ""),
+                uid=str(data.get("uid") or ""),
+                bucket_name=str(data.get("bucket_name") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001 - retried below
+            last_error = exc
+            logger.warning(
+                "storage_info %d/%d from %s failed: %s",
+                attempt,
+                STORAGE_INFO_ATTEMPTS,
+                url,
+                exc,
+            )
+            if attempt < STORAGE_INFO_ATTEMPTS:
+                time.sleep(STORAGE_INFO_BACKOFF_S * attempt)
+    raise StagingError(
+        f"cannot resolve storage credentials from {url}: {last_error}"
+    )
+
+
 def connect_storage(cluster: str | None = None) -> tuple[Any, str]:
     """Open a storage client and resolve the bucket holding the workspace.
 
@@ -370,18 +560,20 @@ def connect_storage(cluster: str | None = None) -> tuple[Any, str]:
     ``minio`` import lives in here so that merely importing this module — which
     the ``upload`` staging mode and the sweeper both do — never needs it.
 
+    Credentials come from the cluster's own API (see
+    :func:`storage_info_from_cluster`); the portal is not used at all.
+
     Raises :class:`StagingError` when the client or the credentials are
     unavailable, or when the bucket cannot be determined.
     """
     try:
-        from ...client.profile import ProfileClient
         from ...client.storage import StorageClient
     except Exception as exc:  # noqa: BLE001 - minio missing / SDK trimmed
         raise StagingError(f"storage client unavailable: {exc}") from exc
+    info = storage_info_from_cluster(cluster)
     try:
-        info = ProfileClient(cluster=cluster).get_storage_info()
         storage = StorageClient(
-            endpoint=getattr(info, "url", None),
+            endpoint=info.url,
             access_key=info.access_key,
             secret_key=info.secret_key,
             cluster=cluster,
@@ -488,6 +680,176 @@ class StorageStager:
         self._uploaded = False
         logger.debug("staged build context %s removed", self.plan.object_dir)
         return True
+
+
+# --------------------------------------------------------------------------
+# the local (no-upload) route — for a daemon inside the cluster
+# --------------------------------------------------------------------------
+
+
+#: Marker :func:`verify_context_script` prints once the mount is proven good.
+CONTEXT_MARKER = "docker-rt-context-ok:"
+
+
+def _extract_safely(tar: tarfile.TarFile, dest: str) -> int:
+    """Extract ``tar`` into ``dest``, refusing anything that would escape it.
+
+    ``docker build`` members are relative by construction, but this content
+    arrives over an API — treating it as trusted would be a way to write
+    anywhere on the shared filesystem. Absolute names and ``..`` are rejected,
+    as are links pointing outside; links that stay inside are kept, because a
+    real build context may legitimately contain them.
+
+    Returns the number of members written.
+    """
+    base = os.path.realpath(dest)
+    written = 0
+    for member in tar:
+        target = os.path.realpath(os.path.join(dest, member.name))
+        if target != base and not target.startswith(base + os.sep):
+            raise StagingError(
+                f"refusing to unpack {member.name!r} outside {dest}"
+            )
+        if member.issym():
+            # Relative to the symlink's own directory.
+            link = os.path.realpath(
+                os.path.join(os.path.dirname(target), member.linkname)
+            )
+        elif member.islnk():
+            # Hard links are relative to the archive root.
+            link = os.path.realpath(os.path.join(base, member.linkname))
+        else:
+            link = None
+        if link is not None and link != base and not link.startswith(base + os.sep):
+            raise StagingError(
+                f"refusing to unpack link {member.name!r} -> {member.linkname!r}"
+            )
+        tar.extract(member, dest)
+        written += 1
+    return written
+
+
+class LocalStager:
+    """Unpack the context onto the shared workspace filesystem.
+
+    The sibling of :class:`StorageStager` for the case where the daemon itself
+    runs inside the cluster — started from a JupyterLab web terminal is the
+    recognised one, see :mod:`jupyter_env`. Its ``/workspace`` **is** the
+    JuiceFS the build sandbox mounts, so the context is unpacked *here*, once,
+    and kaniko then builds out of that directory through the mount
+    (``--context dir://…``). Nothing is uploaded, nothing is copied inside the
+    sandbox, and no archive is produced at all.
+
+    Why unpack rather than ship an archive: a ``context.tar.gz`` costs a gzip
+    pass, a multi-gigabyte write, a second copy inside the sandbox and an
+    untar by kaniko. A directory costs one unpack and is read in place. The
+    layout is ``<prefix>/<build-id>/context/`` — the very path the sandbox's
+    mount exposes as :attr:`StagingPlan.staged_context`.
+
+    ``.dockerignore`` semantics are unaffected: the Docker CLI already applied
+    it when it assembled the tar, so what lands here is exactly what the
+    client would have built.
+    """
+
+    def __init__(self, plan: StagingPlan) -> None:
+        self.plan = plan
+        self._staged = False
+
+    @property
+    def build_dir(self) -> str:
+        """``<workspace>/<prefix>/<build-id>`` — this build's own directory."""
+        return os.path.join(self.plan.workspace, self.plan.rel_dir)
+
+    @property
+    def context_dir(self) -> str:
+        """``<workspace>/<prefix>/<build-id>/context`` — the unpacked context."""
+        return os.path.join(self.plan.workspace, self.plan.rel_context_dir)
+
+    def describe(self) -> str:
+        """One-line human description, safe to print before unpacking."""
+        return self.context_dir
+
+    @property
+    def staged(self) -> bool:
+        """Whether something of ours may still be sitting in the workspace."""
+        return self._staged
+
+    def unpack(self, raw_tar: bytes) -> None:
+        """Extract an **uncompressed** context tar into :attr:`context_dir`.
+
+        Built beside the final directory and renamed into place, so the sandbox
+        can never observe a half-extracted context — the same guarantee the
+        storage gateway gives by only publishing a completed object. Raises
+        :class:`StagingError` / ``OSError`` on failure; the caller decides
+        whether that is fatal.
+        """
+        os.makedirs(self.build_dir, exist_ok=True)
+        partial = self.context_dir + ".part"
+        shutil.rmtree(partial, ignore_errors=True)
+        os.makedirs(partial)
+        try:
+            with tarfile.open(fileobj=io.BytesIO(raw_tar), mode="r:") as tar:
+                written = _extract_safely(tar, partial)
+            if written <= 0:
+                raise StagingError("the build context archive was empty")
+        except Exception:
+            shutil.rmtree(partial, ignore_errors=True)
+            raise
+        shutil.rmtree(self.context_dir, ignore_errors=True)
+        os.replace(partial, self.context_dir)
+        self._staged = True
+
+    def cleanup(self) -> bool:
+        """Remove this build's directory. Idempotent; never raises.
+
+        Unconditional rather than gated on ``staged``: an unpack that failed
+        halfway still leaves the directory (and its ``.part`` tree) behind, and
+        the daemon's ``finally`` is the only thing that comes back for it.
+        """
+        try:
+            shutil.rmtree(self.build_dir)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning(
+                "could not clean up the locally staged build context %s: %s",
+                self.build_dir,
+                exc,
+            )
+            return False
+        self._staged = False
+        return True
+
+
+def verify_context_script(plan: StagingPlan) -> str:
+    """Assert the unpacked context is visible through the mount — one short exec.
+
+    The local route's replacement for the byte-size check, and it exists for
+    the same reason: a mount that is not actually the workspace (a wrong
+    ``subPath``, a sandbox that cannot see the shared filesystem) has to be
+    caught **before** kaniko starts, otherwise it surfaces as a
+    ``COPY …: no such file`` error that reads like a broken Dockerfile.
+    """
+    q = shlex.quote
+    ctx = plan.staged_context
+    return (
+        "set -e; "
+        f"test -d {q(ctx)}; "
+        f"n=$(ls -A {q(ctx)} | wc -l); "
+        'if [ "$n" -le 0 ]; then echo "the unpacked context is empty" >&2; exit 9; fi; '
+        f'echo "{CONTEXT_MARKER}$n"'
+    )
+
+
+def parse_context_entries(stdout: str) -> int | None:
+    """Read the entry count :func:`verify_context_script` reported."""
+    for line in reversed((stdout or "").splitlines()):
+        if CONTEXT_MARKER in line:
+            try:
+                return int(line.split(CONTEXT_MARKER, 1)[1].strip())
+            except ValueError:
+                return None
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -651,6 +1013,98 @@ def sweep_stale_staging(
             continue
         swept.append(build_id)
         logger.info("removed leftover staged build context %s/%s", bucket, name)
+
+    if swept:
+        logger.info("%d leftover staged build context(s) removed", len(swept))
+    return swept
+
+
+def sweep_local_stale_staging(
+    *,
+    dead_pid: int | None = None,
+    workspace: str | None = None,
+    prefix: str | None = None,
+    max_age_s: int | None = None,
+    now: float | None = None,
+) -> list[str]:
+    """Remove locally staged build contexts left behind by a dead daemon.
+
+    The local counterpart of :func:`sweep_stale_staging`, for the JupyterLab
+    route where nothing ever reached object storage: a ``kill -9`` skips the
+    build's ``finally`` and leaves a multi-GB directory in the user's
+    workspace. The watcher runs on the same host, so a plain filesystem walk is
+    enough — and leftovers are attributed exactly like the storage sweep does
+    it, by the pid embedded in the build id:
+
+    1. the build id names ``dead_pid`` — the process the caller watched exit;
+    2. the build id names a pid that is no longer running (an older crash);
+    3. the build id cannot be attributed, and the directory is older than
+       ``max_age_s``.
+
+    Rule 2 is machine-local by nature (pids only collide across *different*
+    hosts, where a local route could not have written anything in the first
+    place — a laptop daemon has no ``<workspace>/<prefix>`` and the walk is a
+    no-op), so the risk it carries is narrower than the storage sweep's.
+
+    Never raises. Returns the build ids removed.
+    """
+    if not sweep_enabled():
+        logger.debug("staging sweep disabled by DOCKER_RT_BUILD_STAGING_SWEEP")
+        return []
+
+    prefix = (prefix if prefix is not None else staging_prefix()).strip("/")
+    if not prefix:
+        return []
+    root = os.path.join(
+        workspace if workspace is not None else staging_workspace(), prefix
+    )
+    age_limit = sweep_max_age_s() if max_age_s is None else max(0, max_age_s)
+    now = time.time() if now is None else now
+
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        # No such directory (the normal case for a daemon that never used the
+        # local route) or not readable: nothing here could be ours.
+        return []
+
+    swept: list[str] = []
+    for name in sorted(entries):
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            # This layout only ever creates directories. Anything else was not
+            # written by us, so deleting it would be guesswork.
+            logger.warning("leaving unexpected file %s alone", path)
+            continue
+
+        pid = parse_build_id_pid(name)
+        if pid is not None:
+            if pid != dead_pid and _pid_alive(pid):
+                logger.debug("keeping %s: build id names live pid %s", path, pid)
+                continue
+        else:
+            try:
+                age = now - os.path.getmtime(path)
+            except OSError:
+                logger.warning("leaving %s alone: cannot read its age", path)
+                continue
+            if age <= age_limit:
+                logger.warning(
+                    "leaving unattributable staging directory %s "
+                    "(age %.0fs, limit %ss)",
+                    path,
+                    age,
+                    age_limit,
+                )
+                continue
+
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            logger.warning("could not remove staged context %s: %s", path, exc)
+            continue
+        swept.append(name)
+        logger.info("removed leftover staged build context %s", path)
 
     if swept:
         logger.info("%d leftover staged build context(s) removed", len(swept))

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pyromind-sdk"
 ## todo update_version
-version = "0.1.12"
+version = "0.1.18.dev"
 description = "Lightweight SDK stub for local development and testing of third-party nodes without the full platform codebase"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -32,6 +32,15 @@ dependencies = [
     "urllib3>=1.26.0",
     "minio>=7.0.0",
     "aiohttp>=3.8.0",
+    # aiohttp only decodes a "Content-Encoding: br" response when brotli is
+    # importable. The async client therefore asks for "gzip, deflate" by
+    # default (DEFAULT_ACCEPT_ENCODING in client/async_base.py) — aiohttp
+    # 3.14's streaming br decoder is broken against brotli 1.2.0, which turned
+    # every API call into "Can not decode content-encoding: br". This
+    # dependency is what makes opting back in with PYROMIND_ACCEPT_ENCODING
+    # work, and it covers edges that send br unsolicited.
+    # Pinned by tests/pytest/test_runtime_dependencies.py — do not drop it.
+    "brotli>=1.1.0",
     "kubernetes>=29.0.0",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",

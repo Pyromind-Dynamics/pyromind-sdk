@@ -45,8 +45,10 @@ from .backend.runtime import (  # noqa: E402
     DEFAULT_IMAGE,
     DEFAULT_NAMESPACE,
     docker_rt_pod_meta,
+    mount_summary,
     parse_binds,
     parse_env_list,
+    port_summary,
     probe_kube_auth,
     resolve_kubeconfig,
     resolve_namespace,
@@ -119,6 +121,22 @@ logger = logging.getLogger("docker_rt")
 
 #: 日志里单条 body 的最大长度（超出只报字节数）
 _LOG_BODY_MAX = 2000
+#: How long one write to a streaming client may block before it is considered gone.
+#:
+#: A stalled flow — Wi-Fi dropped, or a local proxy that keeps the socket open but
+#: forwards nothing — makes ``drain()`` wait forever. Without this bound the
+#: build loop stops there: the sandbox is never released and the result is never
+#: delivered (2026-10-23, real report: kaniko had finished, the daemon was alive
+#: and answering ``_ping`` in 12 ms, yet the build never completed).
+BUILD_WRITE_TIMEOUT_S = 60.0
+#: How much of a one-shot exec's output is kept for the result log line.
+#:
+#: Only the *non-interactive* command channel is captured (``docker exec CID
+#: CMD``, the terminal fallback, foreground ``docker run``): those have a
+#: beginning, an end and an exit code. An interactive PTY has none of that —
+#: it is one continuous byte stream — so it only ever gets "connected" and
+#: "exited" lines (see ``_hijack_pyromind_terminal``).
+_EXEC_OUTPUT_PREVIEW_MAX = 2000
 
 
 def _compact(value: Any) -> Any:
@@ -693,6 +711,31 @@ def _ws_close_note(ws: Any, msg: Any) -> str:
     return f"transport-closed-without-close-frame ({suffix})"
 
 
+def _unwrap_handshake_cmd(cmd: list[str] | None) -> list[str] | None:
+    """The user's command, without docker-rt's own ``sh -c`` handshake wrapper.
+
+    Everything one-shot is wrapped as ``sh -c '<cmd>; rc=$?; …__DRT_END_x__…' sh
+    <cmd…>`` so the tail of the output cannot be lost (see
+    ``argv_with_exec_handshake``). That wrapper is an implementation detail —
+    logging it makes the result line unreadable, so it is peeled off when the
+    shape and the marker both match. Anything else is returned untouched.
+    """
+    if not cmd:
+        return cmd
+    out = list(cmd)
+    # Peel every layer: a ``-w`` exec can be cwd-wrapped, and the handshake wraps
+    # whatever it is given.
+    while (
+        len(out) >= 5
+        and out[0] == "sh"
+        and out[1] == "-c"
+        and out[3] == "sh"
+        and "__DRT_END_" in out[2]
+    ):
+        out = out[4:]
+    return out
+
+
 async def _stream_pyromind_exec(
     *,
     resp: web.StreamResponse,
@@ -715,6 +758,9 @@ async def _stream_pyromind_exec(
     returncode = -1
     out_n = 0
     err_n = 0
+    #: First :data:`_EXEC_OUTPUT_PREVIEW_MAX` bytes of what the command printed.
+    #: Kept for the result log line only — it never enters the response stream.
+    preview = bytearray()
     # 结束标记的滚动缓冲：标记可能被拆在两帧里，所以尾巴要留一截不急着发。
     # 留多少由 :func:`_marker_holdback` 按"真的可能是标记前缀"算 —— **不是**
     # 无条件 len(marker)+1（那会把不足 47 字节的输出整体扣住）。
@@ -784,6 +830,10 @@ async def _stream_pyromind_exec(
             else:
                 out_n += len(raw)
                 payload = frame_stdout(raw)
+            # 只留开头一小段给人看（限制在 _EXEC_OUTPUT_PREVIEW_MAX）；
+            # 大输出（构建日志、dump）照旧整段流给客户端，不在这里攒。
+            if len(preview) < _EXEC_OUTPUT_PREVIEW_MAX:
+                preview.extend(raw[: _EXEC_OUTPUT_PREVIEW_MAX - len(preview)])
             await resp.write(payload)
             await resp.drain()
     except (ConnectionResetError, ConnectionError):
@@ -846,12 +896,16 @@ async def _stream_pyromind_exec(
             except (ConnectionResetError, ConnectionError):
                 pass
 
+    # 结果行：命令 + 退出码 + 两个方向的字节数 + 输出开头（``%r`` 会把换行
+    # 转义成 ``\n``，所以这仍然是一行，grep 得到）。交互式 PTY 不经过这里。
     logger.info(
-        "pyromind exec stream id=%s out=%d err=%d code=%s",
+        "pyromind exec stream id=%s cmd=%s out=%dB err=%dB code=%s first=%r",
         session_id[:12] or "?",
+        _unwrap_handshake_cmd(cmd) or "(attach)",
         out_n,
         err_n,
         returncode,
+        bytes(preview).decode("utf-8", "replace"),
     )
     return returncode
 
@@ -2051,6 +2105,40 @@ async def create_container(request: web.Request) -> web.Response:
         )
 
     await _emit(request, action="create", record=record)
+    # 一行把「真正生效的参数」说全（2026-10-23 用户反馈：创建时看不到挂载/端口）。
+    # 为什么不靠上面的通用 body 预览：它按 2000 字符截断、且 ``_compact`` 会吞掉
+    # 空值，长 Env / 多 Mounts 时恰好把最要紧的部分截在中间。这里记录的是
+    # **归一化之后**的值（镜像已解析、资源已合并 request/limit、label 已生效），
+    # 排查时不用再去猜 CLI 传了什么、我们用了什么。
+    logger.info(
+        "[create] id=%s name=%s image=%s cmd=%s tty=%s workdir=%s env=%d "
+        "bind=%s mount=%s tmpfs=%s ports=%s exposed=%s publish_all=%s "
+        "cpu=%s(req %s) mem=%s(req %s) gpu=%s/card:%s hosts=%s timeout=%s "
+        "pull_secrets=%s labels=%s",
+        record.id[:12],
+        name or "-",
+        image,
+        list(cmd) or "-",
+        bool(body.get("Tty", False)),
+        working_dir,
+        len(env),
+        binds or "-",
+        [mount_summary(m) for m in mounts] or "-",
+        tmpfs or "-",
+        port_summary(port_bindings) or "-",
+        list(exposed_ports) or "-",
+        publish_all_ports,
+        cpu_limit,
+        cpu_request,
+        memory_limit,
+        memory_request,
+        gpu_count,
+        gpu_card or "any",
+        extra_hosts or "-",
+        pod_timeout,
+        image_pull_secrets or "-",
+        {k: v for k, v in labels.items() if k.startswith("docker-rt.")} or "-",
+    )
     # 注意：create 保持**标准 Docker 语义**——只登记容器、立刻返回（不启动）。
     # 真正的启动发生在 start / run；前台 run 会在 attach 阶段
     # ``_wait_container_running`` 等 sandbox 变成 Running/Up 之后才执行命令。
@@ -3879,6 +3967,7 @@ async def _exec_hijack(
         stdin,
         cwd or "/",
     )
+    started_at = time.monotonic()
     try:
         return await _hijack_session(
             request,
@@ -3892,7 +3981,17 @@ async def _exec_hijack(
             cwd=cwd,
         )
     finally:
-        logger.info("exec hijack end id=%s", exec_rec.id[:12])
+        # 命令在 start 那行已经记过，这里补的是**结果**：退出码和耗时。
+        # 输出本身不能整段落盘（一次 exec 可能是几百 MB 的构建日志），
+        # 交互式会话的字节数在 terminal summary 里单独记。
+        logger.info(
+            "exec hijack end id=%s cmd=%s tty=%s exit=%s elapsed=%.1fs",
+            exec_rec.id[:12],
+            cmd or "(attach)",
+            tty,
+            getattr(exec_rec, "exit_code", None),
+            time.monotonic() - started_at,
+        )
         try:
             request.app["store"].prune_execs()
         except Exception:
@@ -4008,6 +4107,7 @@ async def attach_container(request: web.Request) -> web.StreamResponse | web.Res
         want_logs,
         want_stream,
     )
+    attach_started_at = time.monotonic()
     try:
         # `docker run IMG`（没有命令、没有 -i/-t、也不要日志）：没有命令可跑，
         # 但要**等 sandbox 真的 running 再告诉用户**（2026-10-21 用户要求：
@@ -4153,7 +4253,16 @@ async def attach_container(request: web.Request) -> web.StreamResponse | web.Res
                                         pass
                     await _emit(request, action="die", record=latest)
     finally:
-        logger.info("attach hijack end id=%s", record.short_id if record else cid[:12])
+        # 与 exec 一致：起点那行记的是「跑了什么」，这里记「结果」——
+        # 前台 run 的退出码是用户唯一能看到的结论，日志里必须有。
+        logger.info(
+            "attach hijack end id=%s cmd=%s tty=%s exit=%s elapsed=%.1fs",
+            record.short_id if record else cid[:12],
+            foreground_cmd or "(pod main process)",
+            tty,
+            getattr(session, "exit_code", None),
+            time.monotonic() - attach_started_at,
+        )
 
     # 前台 run 的收尾：exec 的退出码写回 record（/wait 直接回它，CLI 拿到 rc）；
     # `--rm`（AutoRemove）⇒ 清理并删除容器（与 docker rm 同一清理路径）。
@@ -5014,9 +5123,13 @@ async def _hijack_pyromind_terminal(
         #   reason=peer-close-frame (code=1012) ⇒ **中间件在重启**（见 _ws_close_note）。
         # 那条 16 分钟悬案就是缺了这一行：只有事后的 ``No such exec``，无因可查。
         logger.info(
-            "pyromind terminal hijack summary id=%s reason=%s "
-            "elapsed=%.1fs pty->cli=%dB cli->pty=%dB frames=%d client-conn=%s",
+            "pyromind terminal hijack summary id=%s cmd=%s tty=%s exit=%s "
+            "reason=%s elapsed=%.1fs pty->cli=%dB cli->pty=%dB frames=%d "
+            "client-conn=%s",
             getattr(session, "id", "")[:12],
+            cmd or "(login shell)",
+            tty,
+            session.exit_code,
             stop[0] or "unknown",
             time.monotonic() - started_at,
             stats["pty_to_cli"],
@@ -5127,8 +5240,24 @@ async def build_image(request: web.Request) -> web.StreamResponse:
                 failed = True
             if quiet and "stream" in event and not event.get("error"):
                 continue
-            await resp.write((json.dumps(event) + "\n").encode())
-            await resp.drain()
+            # 写回 CLI 也必须封顶（2026-10-23）。对端假死时 —— 网络掉了、或者
+            # 代理把 socket 留着却不转发 —— ``drain()`` 会永远等下去，整个构建
+            # 循环停在这里：沙箱不释放、结果也送不出去。60s 没有进展就认定客户端
+            # 已经不在了，退出循环让 ``finally`` 收掉沙箱。
+            try:
+                await asyncio.wait_for(
+                    resp.write((json.dumps(event) + "\n").encode()),
+                    BUILD_WRITE_TIMEOUT_S,
+                )
+                await asyncio.wait_for(resp.drain(), BUILD_WRITE_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "build client stopped reading for %ss; dropping the stream so "
+                    "the build can be torn down",
+                    BUILD_WRITE_TIMEOUT_S,
+                )
+                failed = True
+                break
     except Exception as exc:
         failed = True
         message = format_exception_message(exc)
