@@ -8,6 +8,7 @@ import logging
 import time
 from typing import List, Dict, Any, Optional
 from .base import PyroMindClient
+from ._node_logs import build_node_logs_request, extract_node_logs
 from .models import (
 
     TrainingTaskCreateRequest,
@@ -182,11 +183,30 @@ class StudioClient(PyroMindClient):
         Returns:
             Log lines for the node, or an empty list when no logs are available.
         """
-        response = self.get(f"/studio/tasks/{task_id}/nodes/{node_id}/logs")
-        data = self._extract_data(response)
-        if isinstance(data, dict):
-            data = data.get("logs")
-        return data if isinstance(data, list) else []
+        endpoint, _ = build_node_logs_request(task_id, node_id)
+        response = self.get(endpoint)
+        return extract_node_logs(self._extract_data(response))
+
+    def scroll_node_logs(
+        self,
+        task_id: str,
+        node_id: str,
+        timestamp: Optional[str] = None,
+        expect_count: int = 500,
+    ) -> List[str]:
+        """Read the next bounded chunk of node logs.
+
+        The backend supports forward scrolling only. ``expect_count`` must be
+        between 1 and 5,000 (default 500).
+        """
+        endpoint, params = build_node_logs_request(
+            task_id,
+            node_id,
+            timestamp=timestamp,
+            expect_count=expect_count,
+        )
+        response = self.get(endpoint, params=params)
+        return extract_node_logs(self._extract_data(response))
     
     def get_node_info(self, names: Optional[str] = None) -> Dict[str, Any]:
         """

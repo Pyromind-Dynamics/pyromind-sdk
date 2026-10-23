@@ -469,6 +469,24 @@ for line in logs:
     print(line)
 ```
 
+`get_node_logs()` 返回当前可用日志，服务端最多返回 62,000 行。需要限制
+单次响应大小或重复读取时，可以使用下面的滚动查询方法。
+
+需要直接使用现有滚动查询行为时，可以调用 `scroll_node_logs()`：
+
+```python
+logs = client.studio.scroll_node_logs(
+    task_id="task-id",
+    node_id="node-id",
+    timestamp="2026-10-22T00:00:00Z",
+    expect_count=500,
+)
+```
+
+该方法从传入时间戳向后查询并返回原始日志行列表。每次可请求 1 至
+5,000 行，默认 500 行；服务端会将传入时间戳加一秒后再查询。这是现有的
+时间戳滚动行为，不是无损分页游标；被跳过的这一秒内可能有日志遗漏。
+
 ### 获取节点信息
 
 ```python
