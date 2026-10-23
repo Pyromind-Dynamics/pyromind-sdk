@@ -494,6 +494,27 @@ for line in logs:
     print(line)
 ```
 
+`get_node_logs()` returns currently available logs, capped at 62,000 lines by
+the server. For smaller responses or repeated reads, use the bounded scroll
+method below.
+
+To use the existing Studio scroll behavior directly, call `scroll_node_logs()`:
+
+```python
+logs = client.studio.scroll_node_logs(
+    task_id="task-id",
+    node_id="node-id",
+    timestamp="2026-10-22T00:00:00Z",
+    expect_count=500,
+)
+```
+
+This method reads forward from the supplied timestamp and returns raw log lines.
+The server accepts 1 to 5,000 lines per request (default 500); it advances a
+supplied timestamp by one second before querying. This is the existing
+timestamp-based scroll behavior, not a lossless pagination cursor; logs in the
+skipped second may be missed.
+
 ### Get node info
 
 ```python
