@@ -61,8 +61,6 @@ CLUSTER_RESOURCE = {
         },
         "storage":"https://storage-us-west-2.pyromind.ai"
     },
-    # TODO(us-west-3): hosts below are placeholders following the us-west-2
-    # naming pattern. Replace prod/pre/pre2/dev/storage with the real addresses.
     "us-west-3": {
         "http": {
             "prod": "https://api-us-west-3.pyromind.ai",
