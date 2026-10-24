@@ -61,6 +61,17 @@ CLUSTER_RESOURCE = {
         },
         "storage":"https://storage-us-west-2.pyromind.ai"
     },
+    # TODO(us-west-3): hosts below are placeholders following the us-west-2
+    # naming pattern. Replace prod/pre/pre2/dev/storage with the real addresses.
+    "us-west-3": {
+        "http": {
+            "prod": "https://api-us-west-3.pyromind.ai",
+            "pre": "https://pre-api-us-west-3.pyromind.ai",
+            "pre2": "https://pre2-api-us-west-3.pyromind.ai",
+            "dev": "http://localhost:8003",
+        },
+        "storage": "https://storage-us-west-3.pyromind.ai",
+    },
     "cn-east-1": {
         "http": {
             "prod": "https://api-cn-east-1.pyromind-asia.cn",
@@ -77,7 +88,7 @@ def available_clusters():
     """Cluster codes a client / docker-rt can target — the keys of :data:`CLUSTER_RESOURCE`.
 
     Order follows the table's declaration order (``us-west-1``, ``us-west-2``,
-    ``cn-east-1``) so prompts and ``--help`` read like the config. These keys are
+    ``us-west-3``, ``cn-east-1``) so prompts and ``--help`` read like the config. These keys are
     the **only** thing exposed to users; per-env addresses stay an implementation
     detail of the table. Callers that build prompts or help text should use this
     instead of hard-coding example cluster names.
