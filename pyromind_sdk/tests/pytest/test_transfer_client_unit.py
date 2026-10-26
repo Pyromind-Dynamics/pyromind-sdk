@@ -22,12 +22,17 @@ def mock_networking(monkeypatch):
     )
 
 
-def test_submit_supports_request_model_and_uses_storage_transfer_endpoint():
-    client = StorageAPIClient(api_key="test-key")
-    calls = []
+def test_submit_posts_transfer_request_to_portal_source_route():
+    client = StorageAPIClient(
+        api_key="test-key",
+        base_url="https://api-portal.pyromind.ai/api/v1",
+        cluster="us-west-1#pre",
+    )
+    client.get = MagicMock(side_effect=AssertionError("unexpected SDK preflight"))
+    events = []
 
     def fake_post(endpoint, json_data=None, **kwargs):
-        calls.append((endpoint, json_data, kwargs))
+        events.append(("post", endpoint, json_data, kwargs))
         return {
             "success": True,
             "data": {"transfer_task_id": "task-1", "id": 7, "status": "packing"},
@@ -37,24 +42,26 @@ def test_submit_supports_request_model_and_uses_storage_transfer_endpoint():
     result = client.submit(
         TransferRequest(
             source_path="/workspace/src",
-            target_cluster="us-west-2",
+            target_cluster="us-west-2#pre",
             target_path="/workspace/dst",
         )
     )
 
     assert result.transfer_task_id == "task-1"
-    assert calls == [
+    assert events == [
         (
+            "post",
             "/storage/transfer",
             {
                 "source_path": "/workspace/src",
-                "target_cluster": "us-west-2",
+                "target_cluster": "us-west-2#pre",
                 "target_path": "/workspace/dst",
                 "overwrite": "skip",
             },
             {},
         )
     ]
+    client.get.assert_not_called()
 
 
 def test_list_page_maps_backend_list_shape_and_query_params():
@@ -94,7 +101,11 @@ def test_list_page_maps_backend_list_shape_and_query_params():
 
 
 def test_business_failure_in_http_200_is_reported_as_sdk_error():
-    client = StorageAPIClient(api_key="test-key")
+    client = StorageAPIClient(
+        api_key="test-key",
+        base_url="https://api-portal.pyromind.ai/api/v1",
+        cluster="us-west-1",
+    )
     client.post = lambda *args, **kwargs: {
         "success": False,
         "message": "target cluster invalid",
@@ -103,7 +114,7 @@ def test_business_failure_in_http_200_is_reported_as_sdk_error():
     with pytest.raises(PyroMindAPIError, match="target cluster invalid"):
         client.submit(
             source_path="/workspace/src",
-            target_cluster="unknown",
+            target_cluster="us-west-2",
             target_path="/workspace/dst",
         )
 
@@ -122,7 +133,12 @@ def test_main_client_exposes_transfer_under_storage_namespace():
 
 @pytest.mark.asyncio
 async def test_async_client_supports_submit():
-    client = AsyncStorageAPIClient(api_key="test-key")
+    client = AsyncStorageAPIClient(
+        api_key="test-key",
+        base_url="https://api-portal.pyromind.ai/api/v1",
+        cluster="us-west-1#pre",
+    )
+    client.get = AsyncMock(side_effect=AssertionError("unexpected SDK preflight"))
     client.post = AsyncMock(
         return_value={
             "success": True,
@@ -132,12 +148,21 @@ async def test_async_client_supports_submit():
 
     created = await client.submit(
         source_path="/workspace/src",
-        target_cluster="us-west-2",
+        target_cluster="us-west-2#pre",
         target_path="/workspace/dst",
     )
 
     assert created.transfer_task_id == "task-1"
-    client.post.assert_awaited_once()
+    client.get.assert_not_awaited()
+    client.post.assert_awaited_once_with(
+        "/storage/transfer",
+        json_data={
+            "source_path": "/workspace/src",
+            "target_cluster": "us-west-2#pre",
+            "target_path": "/workspace/dst",
+            "overwrite": "skip",
+        },
+    )
 
 
 @pytest.mark.asyncio
