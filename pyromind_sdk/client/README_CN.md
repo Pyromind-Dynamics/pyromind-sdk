@@ -59,6 +59,16 @@ with PyroMindAPIClient(api_key="your-api-key") as client:
     pass
 ```
 
+## 跨集群文件传输
+
+调用 `client.storage.transfers.submit(...)` 时，SDK 只向 Portal 发送一次请求。
+Portal 在同一请求中认证 API Key、检查源集群和目标集群权限，以及 `cluster`、
+`studio`、`storage` 服务是否已激活；通过后再把创建任务的请求转发到源集群。
+Portal 不会把用户 API Key 发给目标集群。权限或服务未开通时，Portal 会在创建任务前拒绝请求。
+
+请将 SDK 的 `base_url` 指向当前环境的 Portal。SDK 默认使用标准 Portal 地址；
+如果使用其他 Portal 环境，通过 `base_url` 或 `PYROMIND_BASE_URL` 配置即可。
+
 ## 沙箱（Sandbox）⚠️已废弃不能创建
 
 ### 列出所有沙箱
@@ -632,6 +642,13 @@ print(f"UID: {user_info.user.uid}")
 user_info_with_credit = profile_client.get_user_info(credit_info=True)
 print(f"Credit Amount: {user_info_with_credit.user.credit_amount}")
 print(f"Cash Balance: {user_info_with_credit.user.cash_balance}")
+```
+
+### 查询已开通的集群
+
+```python
+clusters = profile_client.get_user_clusters()
+print(clusters)  # 例如：["us-west-1", "us-west-3"]
 ```
 
 ### 获取访问密钥
