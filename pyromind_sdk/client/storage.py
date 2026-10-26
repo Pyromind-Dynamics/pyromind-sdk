@@ -40,6 +40,8 @@ ENV_STORAGE_BUCKET = "PYROMIND_STORAGE_BUCKET"
 CLUSTER_STORAGE_ENDPOINTS = {
     "us-west-1": "https://storage.pyromind.ai",
     "us-west-2": "https://storage-us-west-2.pyromind.ai",
+    # TODO(us-west-3): placeholder. Replace with the real storage endpoint.
+    "us-west-3": "https://storage-us-west-3.pyromind.ai",
 }
 
 
