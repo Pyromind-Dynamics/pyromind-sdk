@@ -83,6 +83,17 @@ client.storage.transfers.cancel(created.id)
 Use `client.storage.transfers.list_page()`, `delete()`, and `clear_finished()`
 to manage and monitor tasks. `client.storage.transfer` is the singular alias.
 The async client exposes the same resource as `client.storage.transfers`.
+`submit()` sends one request to Portal. Portal authenticates the API key,
+checks access to both clusters and activation of `cluster`, `studio`, and
+`storage`, then forwards the task creation to the source cluster. The user's
+key is not sent to the target cluster for these checks. If access or a required
+service is missing, Portal rejects the request before creating a transfer task.
+Use the Portal API base URL for the environment you are using. The SDK defaults
+to the standard Portal endpoint; set `base_url` or `PYROMIND_BASE_URL` when
+using a different Portal environment.
+For a single file, `target_path` may be either the destination directory or the
+full destination file path without a trailing slash when its basename matches
+the source filename.
 
 ## Sandboxes（⚠️desperate can not create）
 
@@ -794,6 +805,13 @@ print(f"UID: {user_info.user.uid}")
 user_info_with_credit = profile_client.get_user_info(credit_info=True)
 print(f"Credit Amount: {user_info_with_credit.user.credit_amount}")
 print(f"Cash Balance: {user_info_with_credit.user.cash_balance}")
+```
+
+### Get enabled clusters
+
+```python
+clusters = profile_client.get_user_clusters()
+print(clusters)  # e.g. ["us-west-1", "us-west-3"]
 ```
 
 ### Get access key

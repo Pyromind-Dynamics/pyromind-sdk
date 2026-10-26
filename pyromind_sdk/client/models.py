@@ -1232,6 +1232,12 @@ class ProfileStorageInfoResponse(BaseModel):
     uid: Optional[str] = None
 
 
+class ProfileUserClustersResponse(BaseModel):
+    """Cluster codes enabled for the authenticated user."""
+
+    clusters: List[str] = Field(default_factory=list)
+
+
 class UserPubKeyRequest(BaseModel):
     """User public key request model"""
     name: Optional[str] = None
@@ -1271,7 +1277,11 @@ class TransferRequest(BaseModel):
     target_cluster: str = Field(..., description="Destination cluster code.")
     target_path: str = Field(
         ...,
-        description="Destination path under /workspace on the target cluster.",
+        description=(
+            "Destination directory under /workspace; for a single file, a full "
+            "target file path without a trailing slash is accepted when its "
+            "basename matches the source."
+        ),
     )
     overwrite: Literal["skip", "overwrite"] = Field(
         default="skip",

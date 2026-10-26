@@ -86,7 +86,7 @@ def available_clusters():
     """Cluster codes a client / docker-rt can target — the keys of :data:`CLUSTER_RESOURCE`.
 
     Order follows the table's declaration order (``us-west-1``, ``us-west-2``,
-    ``us-west-3``, ``cn-east-1``) so prompts and ``--help`` read like the config. These keys are
+    ``cn-east-1``) so prompts and ``--help`` read like the config. These keys are
     the **only** thing exposed to users; per-env addresses stay an implementation
     detail of the table. Callers that build prompts or help text should use this
     instead of hard-coding example cluster names.
