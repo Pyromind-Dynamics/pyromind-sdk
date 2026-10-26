@@ -10,6 +10,7 @@ from .base import PyroMindClient
 from .models import (
     ProfileAccessKeyResponse,
     ProfileStorageInfoResponse,
+    ProfileUserClustersResponse,
     ProfileUserInfoResponse,
     UserPubKey,
     UserPubKeyListResponse,
@@ -38,6 +39,13 @@ class ProfileClient(PyroMindClient):
         response = self.post("/user_info", json_data={"credit_info": credit_info})
         data = self._extract_data(response)
         return ProfileUserInfoResponse(**data)
+
+    def get_user_clusters(self) -> List[str]:
+        """List cluster codes enabled for the authenticated user."""
+
+        response = self.get("/user_clusters")
+        data = self._extract_data(response)
+        return ProfileUserClustersResponse(**data).clusters
 
     def get_access_key(self) -> str:
         """
