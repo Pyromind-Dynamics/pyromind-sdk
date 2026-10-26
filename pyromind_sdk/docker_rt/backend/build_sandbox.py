@@ -82,6 +82,8 @@ def build_executor() -> str:
     在 :func:`build_prerequisites_error` 里校验。
     """
     #: 集群 id（已去掉 ``#stage``）→ 完整镜像；``""`` 是其它集群的兜底。
+    # TODO(us-west-3): 目前走 ``""`` 的 Docker Hub 兜底。如果这个集群拉不到
+    # docker.io，在这里加一条专属镜像。
     images = {
         "": "docker.io/pyrominddynamics/kaniko-executor-pyromind:0.0.4",
         "cn-east-1": (

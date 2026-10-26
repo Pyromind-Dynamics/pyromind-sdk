@@ -1,12 +1,12 @@
 """Where a build pushes to, and with which credentials — per cluster.
 
-The three prod clusters do **not** share a registry, and they do not even share
+The prod clusters do **not** share a registry, and they do not even share
 the *kind* of work needed to push:
 
 ===============  =========================================  ==========================
 cluster          target                                     pre-step
 ===============  =========================================  ==========================
-us-west-1/2      Docker Hub ``docker.io/<ns>``              repository auto-created
+us-west-1/2/3    Docker Hub ``docker.io/<ns>``              repository auto-created
 cn-east-1        阿里云 ACR 企业版（上海）                    **must create the repo**
 ===============  =========================================  ==========================
 
@@ -78,6 +78,9 @@ class RegistryProfile:
 CLUSTER_REGISTRY_PROFILES: dict[str, RegistryProfile] = {
     "us-west-1": RegistryProfile(kind="dockerhub", host=DOCKER_HUB_HOST),
     "us-west-2": RegistryProfile(kind="dockerhub", host=DOCKER_HUB_HOST),
+    # TODO(us-west-3): assumed Docker Hub, same as us-west-1/2. Replace kind/host
+    # if this cluster pushes somewhere else.
+    "us-west-3": RegistryProfile(kind="dockerhub", host=DOCKER_HUB_HOST),
     "cn-east-1": RegistryProfile(
         kind="acr",
         host="pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com",
