@@ -100,6 +100,8 @@ from .backend.pyromind_sdk_env import (  # noqa: E402
     close_sandbox_client,
     get_sandbox_client,
 )
+from .backend.rift.config import load_rift_config  # noqa: E402
+from .backend.rift.errors import RiftError, RiftUnavailable  # noqa: E402
 from .bootstrap import check_connection, print_connected  # noqa: E402
 from .register_context import (  # noqa: E402
     ensure_docker_rt_context,
@@ -854,8 +856,11 @@ async def _stream_pyromind_exec(
         # 命令没给出退出码）和 ``EXEC_STREAM_RELAY_FAILED``（中继炸了）对调用方的
         # 含义完全不同 —— 前者"命令可能已经跑过"，脚本/agent 该据此决定**不要盲目
         # 重试**；只留一句人话文本的话，这个区分就丢了。
-        code = getattr(exc, "code", None)
-        reason = f"docker-rt: {exc}" + (f" [{code}]" if code else "")
+        if isinstance(exc, RiftError):
+            reason = f"[RIFT_UNAVAILABLE] {exc}"
+        else:
+            code = getattr(exc, "code", None)
+            reason = f"docker-rt: {exc}" + (f" [{code}]" if code else "")
         logger.warning(
             "pyromind exec stream failed id=%s: %s",
             session_id[:12] or "?",
@@ -1262,6 +1267,13 @@ def _status_text(state: ContainerState) -> str:
 
 def _display_status(c: Any) -> str:
     """Map a record to one of: running / stopped / pending / failed."""
+    kube_env = getattr(c, "kube_env", None)
+    if isinstance(kube_env, PyromindSDK) and not getattr(
+        kube_env, "rift_ready", False
+    ):
+        # The Pod may be Running, but the container is not exec-ready until
+        # rift-client answers Ping. Docker should not show it as Up yet.
+        return "pending"
     _, sandbox_status = _sandbox_identity(c)
     s = (sandbox_status or "").strip().lower()
     if s in {"failed", "error", "dead"}:
@@ -2166,6 +2178,69 @@ async def _auto_remove_container(app: Any, record: Any) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("foreground --rm failed for %s: %s", record.id[:12], exc)
 
+async def _bootstrap_rift_for_record(record: Any) -> web.Response | None:
+    """Make rift-client ready before the container is reported as Up.
+
+    For PyromindSDK containers rift is the only business data plane. Pod
+    Running is just a prerequisite: ``docker start`` must not succeed (and the
+    record must not become RUNNING) until the injected client answers Ping.
+    A failure after the three bootstrap attempts returns 503.
+    """
+    kube_env = getattr(record, "kube_env", None)
+    if not isinstance(kube_env, PyromindSDK):
+        return None
+    try:
+        await kube_env.bootstrap_rift()
+        record.error = None
+        return None
+    except RiftUnavailable as exc:
+        record.error = f"[RIFT_UNAVAILABLE] {exc}"
+        logger.error("rift bootstrap failed id=%s: %s", record.id[:12], exc)
+        return _err(503, record.error)
+
+
+async def _rift_health_loop(app: web.Application) -> None:
+    """Keep the rift channel alive: ping, then re-bootstrap (3 attempts inside)."""
+    interval = load_rift_config().health_interval
+    if interval <= 0:
+        return
+    store: ContainerStore = app["store"]
+    locks: dict[str, asyncio.Lock] = {}
+    while True:
+        # Check once immediately: adopted sandboxes are not usable until this
+        # pass injects and starts their rift-client.
+        for record in list(store.list(all_containers=False)):
+            if record.state != ContainerState.RUNNING:
+                continue
+            env = getattr(record, "kube_env", None)
+            if not isinstance(env, PyromindSDK):
+                continue
+            lock = locks.setdefault(record.id, asyncio.Lock())
+            if lock.locked():
+                continue
+            async with lock:
+                if record.state != ContainerState.RUNNING:
+                    continue
+                try:
+                    if env.rift_ready and await env.ping_rift():
+                        continue
+                    env.rift_ready = False
+                    logger.warning(
+                        "rift channel unhealthy id=%s; re-bootstrapping",
+                        record.id[:12],
+                    )
+                    await env.bootstrap_rift(force=True)
+                except RiftError as exc:
+                    logger.warning(
+                        "rift recovery failed id=%s: %s", record.id[:12], exc
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "rift health check failed id=%s", record.id[:12]
+                    )
+        await asyncio.sleep(interval)
+
+
 async def _start_record(
     request: web.Request,
     store: ContainerStore,
@@ -2175,6 +2250,15 @@ async def _start_record(
     await _refresh_record_state(record, store)
     async with record.lock:
         if record.state == ContainerState.RUNNING:
+            kube_env = getattr(record, "kube_env", None)
+            if isinstance(kube_env, PyromindSDK) and not getattr(
+                kube_env, "rift_ready", False
+            ):
+                # Adopted/restarted sandbox: heal the data plane before telling
+                # the caller it is already running.
+                rift_error = await _bootstrap_rift_for_record(record)
+                if rift_error is not None:
+                    return rift_error
             return _empty(304)
         if record.kube_env is not None and hasattr(record.kube_env, "resume"):
             try:
@@ -2244,6 +2328,15 @@ async def _start_record(
                 await store.set_state(record, ContainerState.DEAD)
                 logger.exception("port publish failed")
                 return _err(500, format_exception_message(exc))
+            rift_error = await _bootstrap_rift_for_record(record)
+            if rift_error is not None:
+                try:
+                    await _stop_port_forward(record)
+                except Exception:
+                    logger.debug("stop port forward after rift failure failed", exc_info=True)
+                record.finished_at = time.time()
+                await store.set_state(record, ContainerState.DEAD)
+                return rift_error
             await store.set_state(record, ContainerState.RUNNING)
             _spawn_pod_watch(request.app, record.id)
             await _emit(request, action="start", record=record)
@@ -2399,6 +2492,18 @@ async def _start_record(
                             record.name,
                             exc,
                         )
+                rift_error = await _bootstrap_rift_for_record(record)
+                if rift_error is not None:
+                    try:
+                        await _stop_port_forward(record)
+                    except Exception:
+                        logger.debug(
+                            "stop port forward after rift failure failed",
+                            exc_info=True,
+                        )
+                    record.finished_at = time.time()
+                    await store.set_state(record, ContainerState.DEAD)
+                    return rift_error
                 await store.set_state(record, ContainerState.RUNNING)
                 _spawn_pod_watch(request.app, record.id)
 
@@ -3466,6 +3571,9 @@ async def put_container_archive(request: web.Request) -> web.Response:
     except (ConnectionResetError, ConnectionError, ClientConnectionResetError):
         logger.debug("archive put client disconnected id=%s", cid[:12])
         return _empty(499)
+    except RiftError as exc:
+        logger.warning("archive put rift unavailable id=%s: %s", cid[:12], exc)
+        return _err(503, f"[RIFT_UNAVAILABLE] {format_exception_message(exc)}")
     except Exception as exc:
         logger.exception("archive put failed id=%s", cid[:12])
         return _err(500, format_exception_message(exc))
@@ -3599,6 +3707,14 @@ async def start_exec(request: web.Request) -> web.StreamResponse | web.Response:
     detach = bool(body.get("Detach", False))
     tty = bool(body.get("Tty", exec_rec.tty))
     kube_env = container.kube_env
+    if isinstance(kube_env, PyromindSDK) and not getattr(
+        kube_env, "rift_ready", False
+    ):
+        return _err(
+            503,
+            "[RIFT_UNAVAILABLE] rift channel is not ready for this sandbox; "
+            "docker-rt does not fall back to the platform exec stream",
+        )
     cmd = list(exec_rec.cmd)
     # Docker: exec WorkingDir defaults to the container's WorkingDir.
     cwd = (exec_rec.working_dir or container.working_dir or "").strip()
@@ -4405,6 +4521,20 @@ async def _hijack_session(
     #   style automation drives.
     if isinstance(kube_env, PyromindSDK) and cmd is not None:
         if stdin or tty:
+            if getattr(kube_env, "rift_ready", False):
+                # Rift is the primary channel: interactive exec rides rift's
+                # bidi Exec stream (a real PTY through the gateway). Never fall
+                # back to the platform terminal.
+                return await _hijack_rift_terminal(
+                    request,
+                    resp,
+                    protocol,
+                    session,
+                    kube_env,
+                    tty,
+                    cmd=cmd,
+                    cwd=cwd,
+                )
             # 交互路径同样要"结束标记 + 等回执"：harness（mini-swe 等）就是用
             # `docker exec -i` 跑的，尾部丢数据一样会咬到它。PTY 是合并流，
             # 标记在 pump_out 里按字节流摘掉；回执走文件 API，不占 stdin。
@@ -4526,6 +4656,15 @@ async def _hijack_session(
             return resp
         # Attach has no command channel to fall back to: the terminal is the
         # only way in, so a failure is reported on the stream itself.
+        if getattr(kube_env, "rift_ready", False):
+            return await _hijack_rift_terminal(
+                request,
+                resp,
+                protocol,
+                session,
+                kube_env,
+                tty,
+            )
         await _hijack_pyromind_terminal(
             request,
             resp,
@@ -4721,6 +4860,116 @@ def _pty_output_for_client(data: bytes, *, tty: bool) -> bytes:
     if tty:
         return data
     return frame_stdout(data.replace(b"\r\n", b"\n"))
+
+
+async def _hijack_rift_terminal(
+    request: web.Request,
+    resp: web.StreamResponse,
+    protocol: Any,
+    session: Any,
+    kube_env: PyromindSDK,
+    tty: bool,
+    *,
+    cmd: list[str] | None = None,
+    cwd: str = "",
+) -> web.StreamResponse:
+    """Bridge a Docker TCP upgrade to rift's bidi Exec stream (gateway -> PTY).
+
+    Rift is the primary channel: this path deliberately has no fallback to the
+    platform terminal. ``cmd is None`` (attach) opens an interactive login
+    shell, matching what the platform terminal did.
+    """
+    cols = int(getattr(session, "tty_cols", 0) or 0) or 80
+    rows = int(getattr(session, "tty_rows", 0) or 0) or 24
+    argv = list(cmd) if cmd else ["/bin/sh", "-i"]
+    session.running = True
+    logger.info(
+        "rift terminal hijack start id=%s sandbox=%s %dx%d cmd=%s",
+        getattr(session, "id", "")[:12],
+        kube_env.sandbox_id,
+        cols,
+        rows,
+        argv,
+    )
+    if kube_env._rift_client is None:
+        session.running = False
+        await _write_exec_error(
+            resp,
+            "[RIFT_UNAVAILABLE] rift client is not initialized",
+            tty=tty,
+        )
+        return resp
+    try:
+        exec_session = await kube_env._rift_client.open_exec(
+            argv,
+            cwd=cwd or kube_env.working_dir,
+            tty=tty,
+            rows=rows,
+            cols=cols,
+        )
+    except RiftError as exc:
+        session.running = False
+        await _write_exec_error(resp, f"[RIFT_UNAVAILABLE] {exc}", tty=tty)
+        return resp
+
+    session_over = asyncio.Event()
+    exit_code = [0]
+
+    async def push_resize(width: int, height: int) -> None:
+        try:
+            await exec_session.resize(height, width)
+        except Exception:  # noqa: BLE001 — resize is best-effort
+            logger.debug("rift resize failed", exc_info=True)
+
+    session.resize_hook = push_resize
+
+    async def pump_out() -> None:
+        try:
+            async for frame in exec_session.frames():
+                body = frame.WhichOneof("body")
+                if body == "stdout":
+                    await resp.write(
+                        _pty_output_for_client(frame.stdout, tty=tty)
+                    )
+                    await resp.drain()
+                elif body == "stderr":
+                    await resp.write(frame_stderr(frame.stderr))
+                    await resp.drain()
+                elif body == "exit":
+                    exit_code[0] = int(frame.exit.code)
+                    return
+        except (ConnectionResetError, ConnectionError):
+            logger.debug(
+                "rift terminal client disconnected id=%s",
+                getattr(session, "id", "")[:12],
+            )
+        except RiftError as exc:
+            await _write_exec_error(resp, f"[RIFT_UNAVAILABLE] {exc}", tty=tty)
+        finally:
+            session_over.set()
+
+    async def pump_in() -> None:
+        while not session_over.is_set():
+            data = _take_client_stdin(protocol)
+            if data:
+                await exec_session.write_stdin(data)
+                continue
+            if _client_stdin_eof(protocol):
+                try:
+                    await exec_session.close_stdin()
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            await asyncio.sleep(0.02)
+
+    try:
+        await asyncio.gather(pump_out(), pump_in())
+    finally:
+        session.running = False
+        session.exit_code = exit_code[0]
+        await exec_session.cancel()
+        _force_close_hijack(request, resp)
+    return resp
 
 
 async def _hijack_pyromind_terminal(
@@ -5551,6 +5800,15 @@ async def on_startup(app: web.Application) -> None:
     except Exception:
         logger.exception("reconcile_on_startup failed (continuing with empty store)")
 
+    # Adopted PyromindSDK records are RUNNING in the store but their rift-client
+    # is gone. Start the health loop after reconcile so its first pass runs
+    # immediately and makes them exec-ready; until then exec/cp return 503 and
+    # `docker ps` shows them as Created.
+    if load_rift_config().health_interval > 0:
+        health_task = asyncio.create_task(
+            _rift_health_loop(app), name="rift-health"
+        )
+        app["watch_tasks"].add(health_task)
 
     # Rebuild TCP publishes for adopted Running containers.
     for record in store.list(all_containers=False):

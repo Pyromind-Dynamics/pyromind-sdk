@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package rift;
+
+option go_package = "rift-client/pb;pb";
+
+// Rift in-pod agent: exec + archive over gRPC (cluster-internal).
+service Rift {
+  rpc Ping(PingRequest) returns (PingReply);
+  rpc Exec(stream ExecFrame) returns (stream ExecFrame);
+  rpc GetArchive(GetArchiveRequest) returns (stream ArchiveChunk);
+  rpc PutArchive(stream PutArchiveFrame) returns (PutArchiveReply);
+}
+
+message PingRequest {}
+
+message PingReply {
+  string version = 1;
+}
+
+message ExecOpen {
+  repeated string argv = 1;
+  string cwd = 2;
+  map<string, string> env = 3;  // overlay on process env
+  bool tty = 4;
+  bool stdin = 5;
+  uint32 rows = 6;
+  uint32 cols = 7;
+  string user = 8;  // optional uid/user; empty = current
+}
+
+message ExecResize {
+  uint32 rows = 1;
+  uint32 cols = 2;
+}
+
+message ExecExit {
+  int32 code = 1;
+}
+
+message ExecFrame {
+  oneof body {
+    ExecOpen open = 1;
+    bytes stdin = 2;
+    bytes stdout = 3;
+    bytes stderr = 4;
+    ExecResize resize = 5;
+    ExecExit exit = 6;
+    bool stdin_close = 7;
+  }
+}
+
+message GetArchiveRequest {
+  string path = 1;
+}
+
+message ArchiveChunk {
+  bytes data = 1;
+  // Optional Docker-ish path stat on first chunk only.
+  string name = 2;
+  int64 size = 3;
+  int64 mode = 4;
+}
+
+message PutArchiveStart {
+  string dest_path = 1;
+}
+
+message PutArchiveFrame {
+  oneof body {
+    PutArchiveStart start = 1;
+    bytes chunk = 2;
+  }
+}
+
+message PutArchiveReply {
+  int64 bytes_written = 1;
+}

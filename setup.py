@@ -61,6 +61,13 @@ setup(
     package_data={
         "pyromind_sdk": ["*.md"],
         "pyromind_sdk.docker_rt": ["*.md", "requirements.txt", "requirements-dev.txt"],
+        # Build these first: backend/rift/client -> `make build-linux`.
+        "pyromind_sdk.docker_rt.backend.rift": [
+            "README.md",
+            "proto/*.proto",
+            "bin/rift-client-linux-*",
+            "bin/rift-client.sha256",
+        ],
         "pyromind_sdk.tests": ["nodes/*.yaml"],
     },
     include_package_data=True,

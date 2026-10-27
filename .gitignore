@@ -41,3 +41,6 @@ build/
 /skills-lock.json
 /script/sec.txt
 
+
+# rift-client release binaries (built per architecture, not committed)
+pyromind_sdk/docker_rt/backend/rift/bin/rift-client-linux-*
