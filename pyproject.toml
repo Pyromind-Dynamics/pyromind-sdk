@@ -44,6 +44,8 @@ dependencies = [
     "kubernetes>=29.0.0",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
+    "grpcio>=1.71.2",
+    "protobuf>=5.29,<6",
 ]
 
 [project.scripts]
@@ -78,12 +80,22 @@ packages = [
     "pyromind_sdk.docker_rt.api",
     "pyromind_sdk.docker_rt.backend",
     "pyromind_sdk.docker_rt.backend.kube",
+    "pyromind_sdk.docker_rt.backend.rift",
+    "pyromind_sdk.docker_rt.backend.rift.pb",
     "pyromind_sdk.docker_rt.tests",
 ]
 
 [tool.setuptools.package-data]
 pyromind_sdk = ["*.md"]
 "pyromind_sdk.docker_rt" = ["*.md", "requirements.txt", "requirements-dev.txt"]
+# rift-client is shipped as architecture-specific release binaries; build them
+# with `backend/rift/client/make build-linux` before building the wheel.
+"pyromind_sdk.docker_rt.backend.rift" = [
+    "README.md",
+    "proto/*.proto",
+    "bin/rift-client-linux-*",
+    "bin/rift-client.sha256",
+]
 "pyromind_sdk.examples" = ["*.yaml", "utils/*.py"]
 
 [tool.pytest.ini_options]

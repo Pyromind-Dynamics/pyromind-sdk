@@ -260,6 +260,41 @@ docker rm -f demo
 
 `docker-rt-context` 会将 Docker CLI 切换到 `docker-rt` 端点。守护进程需要 Docker CLI，并且必须能访问配置的集群。常见容器生命周期和 exec 命令均可使用；镜像构建和端口转发有额外行为与限制。`docker logs`、`docker events`、`docker compose`、`docker buildx`、`docker network` 这些命令在 docker-rt 下会直接被 CLI 包装器拦截并给出提示，BuildKit 也不可用。完整清单与每项不可用的原因请参阅专门的 [`docker-rt` 文档](pyromind_sdk/docker_rt/README.md)。
 
+### 命令通道（rift）
+
+`docker exec`、`docker cp`、交互式 `docker exec -it` 与 `docker attach` **不走**平台
+的 exec WebSocket。Pod Running 只是前置条件：`docker-rt` 注入 `rift-client`，等它
+Ping 通之后才把容器标成 Running/Up。这些调用**始终**经 **rift gateway**（HTTP/2 上的
+gRPC）转发到沙箱 Service 的 `7500` 端口——不是运行时切换，平台 exec 接口只在
+bootstrap 内部使用：
+
+```text
+docker exec / cp -> docker-rt -> rift gateway（鉴权）-> Service:7500 -> rift-client
+```
+
+要求与行为：
+
+- 设置 `DOCKER_RT_RIFT_GATEWAY` 指向可达的 gateway：公网 CA 用
+  `DOCKER_RT_RIFT_GATEWAY_TLS=true`，自签/私有 CA 用
+  `DOCKER_RT_RIFT_GATEWAY_CA=/path/ca.pem`。gateway 侧用 `RIFT_AUTH_URL` 指向平台
+  鉴权接口。没有 gateway 时，exec/cp 会直接以 `[RIFT_UNAVAILABLE]` 失败。
+- 对应架构的二进制随 SDK 一起发布（`rift-client-linux-amd64` / `arm64`），可用
+  `DOCKER_RT_RIFT_BIN_DIR` 覆盖目录。
+- `docker start` 在 rift-client 就绪前不会返回：默认重试
+  `DOCKER_RT_RIFT_RETRY` 次（3 次），始终起不来则 start 失败、容器不会显示为
+  Running；已就绪的通道按 `DOCKER_RT_RIFT_HEALTH_INTERVAL` 周期复检。
+- **刻意不提供**回落到平台 exec 通道的行为：rift 不可用就明确报错，而不是静默换传输。
+- `docker stop` + `docker start` 会重建沙箱 Pod，docker-rt 会重新 bootstrap 并**重启
+  进程**；10MB 二进制只有在注入目录位于持久卷且 sha 一致时才跳过重传
+  （`DOCKER_RT_RIFT_REMOTE_DIR`，默认 `/opt/docker-rt/rift`）。
+- Gateway 每次 RPC 用 Ed25519 私钥签发短期 token，Pod 里只有公钥；所以 SDK 开源
+  仓库里的验签逻辑公开也无法伪造 token。
+- `rift-client` 不可达的飞书告警由 **gateway** 发出（按 sandbox 统计连续失败），本机
+  daemon 不发通知。
+
+完整环境变量表与 bootstrap 时序见
+[`pyromind_sdk/docker_rt/backend/rift/README.md`](pyromind_sdk/docker_rt/backend/rift/README.md)。
+
 ## 自定义工作流节点
 
 SDK 支持从 YAML 加载节点定义，也可以将 Python 函数转换为节点配置。例如：

@@ -260,6 +260,49 @@ docker rm -f demo
 
 `docker-rt-context` switches the Docker CLI to the `docker-rt` endpoint. The daemon requires the Docker CLI and access to the configured cluster. Common lifecycle and exec commands are supported; image builds and port forwarding have additional behavior and constraints. `docker logs`, `docker events`, `docker compose`, `docker buildx`, and `docker network` are all intercepted by the CLI wrapper with a clear message, and BuildKit is unavailable. For the full matrix and the reason behind each gap, see the dedicated [`docker-rt` documentation](pyromind_sdk/docker_rt/README.md).
 
+### Command channel (rift)
+
+`docker exec`, `docker cp`, interactive `docker exec -it` and `docker attach` do
+not use the platform exec WebSocket. Pod Running is only a prerequisite:
+`docker-rt` injects `rift-client`, waits until it answers Ping, and only then
+reports the container as Running/Up. These calls **always** go through the
+**rift gateway** (gRPC over HTTP/2) to the sandbox Service on port `7500` — this
+is not a runtime switch and the platform exec API is only used internally by
+the bootstrap itself:
+
+```text
+docker exec / cp -> docker-rt -> rift gateway (auth) -> Service:7500 -> rift-client
+```
+
+Requirements and behaviour:
+
+- Set `DOCKER_RT_RIFT_GATEWAY` to a reachable gateway. Use
+  `DOCKER_RT_RIFT_GATEWAY_TLS=true` for a public-CA TLS endpoint, or
+  `DOCKER_RT_RIFT_GATEWAY_CA=/path/ca.pem` for a private CA. The gateway itself
+  is configured with `RIFT_AUTH_URL` pointing at the platform authorizer.
+  Without a gateway, exec/cp fail with `[RIFT_UNAVAILABLE]`.
+- The architecture-specific binary ships with the SDK
+  (`rift-client-linux-amd64` / `arm64`); override its directory with
+  `DOCKER_RT_RIFT_BIN_DIR`.
+- `docker start` does not return until rift-client is ready. Bootstrap retries
+  `DOCKER_RT_RIFT_RETRY` times (default 3); if the channel never comes up,
+  start fails and the container is not reported as Running. A live channel is
+  re-checked every `DOCKER_RT_RIFT_HEALTH_INTERVAL` seconds.
+- There is deliberately **no fallback** to the platform exec channel: if rift
+  is unavailable the command fails loudly instead of silently switching
+  transport.
+- `docker stop` + `docker start` recreates the sandbox Pod, so docker-rt re-runs
+  the bootstrap and always restarts the process. The 10 MB binary is re-uploaded
+  unless the injection directory survives on a persistent mount and its hash
+  matches (`DOCKER_RT_RIFT_REMOTE_DIR`, default `/opt/docker-rt/rift`).
+- The gateway mints a short-lived Ed25519 token per RPC and the pod holds only
+  the public key, so the open-source verification code cannot forge tokens.
+- Feishu alerts for an unreachable `rift-client` are emitted by the gateway
+  (it counts consecutive failures per sandbox), not by the local daemon.
+
+See [`pyromind_sdk/docker_rt/backend/rift/README.md`](pyromind_sdk/docker_rt/backend/rift/README.md)
+for the full environment-variable table and the bootstrap sequence.
+
 ## Custom workflow nodes
 
 The SDK can load node definitions from YAML and convert Python functions to node configuration. For example:

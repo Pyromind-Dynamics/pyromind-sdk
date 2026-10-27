@@ -42,6 +42,9 @@ from pyromind_sdk.exec_stream import (
 )
 
 from .portforward import parse_publish_spec
+from .rift.bootstrap import bootstrap_once
+from .rift.config import load_rift_config
+from .rift.errors import RiftError, RiftUnavailable
 from .runtime import parse_binds
 
 logger = logging.getLogger("docker_rt.pyromind_sdk")
@@ -509,6 +512,12 @@ class PyromindSDK:
         obj.system_image_path = system_image_path
         obj.screen_size = obj._json_ready(screen_size)
         obj._client = client or get_sandbox_client()
+        obj.rift_ready = False
+        obj.rift_degraded = False
+        obj.rift_attempts = 0
+        obj.rift_last_error = ""
+        obj.rift_info = None
+        obj._rift_client = None
         return obj
 
     def __init__(
@@ -570,6 +579,12 @@ class PyromindSDK:
             gpu_card=gpu_card,
         )
         self._client = client or get_sandbox_client()
+        self.rift_ready = False
+        self.rift_degraded = False
+        self.rift_attempts = 0
+        self.rift_last_error = ""
+        self.rift_info = None
+        self._rift_client = None
 
     @classmethod
     async def create(
@@ -775,9 +790,12 @@ class PyromindSDK:
         cwd: str = "",
         *,
         timeout: int | None = None,
+        _force_platform: bool = False,
     ) -> dict[str, Any]:
         if not self.sandbox_id:
             raise RuntimeError("sandbox is not started")
+        if self.rift_ready and not _force_platform:
+            return await self._execute_rift(action, cwd, timeout)
         command = action.get("command", "")
         result = await self._client.exec_command(
             self.sandbox_id,
@@ -791,6 +809,104 @@ class PyromindSDK:
             "returncode": result.returncode,
             "exception_info": result.exception_info or "",
         }
+
+    async def _execute_rift(
+        self,
+        action: dict[str, Any],
+        cwd: str,
+        timeout: int | None,
+    ) -> dict[str, Any]:
+        if self._rift_client is None:
+            raise RiftUnavailable("rift client is not initialized")
+        command = action.get("command", "")
+        if isinstance(command, str):
+            argv = ["/bin/sh", "-c", command]
+        elif isinstance(command, (list, tuple)):
+            argv = [str(part) for part in command]
+        else:
+            raise RiftUnavailable(
+                f"unsupported command type: {type(command).__name__}"
+            )
+        stdout, stderr, code = await self._rift_client.exec_once(
+            argv,
+            cwd=cwd or self.working_dir,
+            timeout=timeout,
+        )
+        return {
+            "output": stdout.decode("utf-8", "replace"),
+            "stderr": stderr.decode("utf-8", "replace"),
+            "returncode": code,
+            "exception_info": "",
+        }
+
+    async def ping_rift(self) -> bool:
+        if self._rift_client is None:
+            return False
+        try:
+            await self._rift_client.ping()
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def bootstrap_rift(self, *, force: bool = False) -> None:
+        """Upload/start rift-client and wait until the gateway can Ping it.
+
+        Three attempts by default. On final failure the sandbox is marked
+        degraded and a Feishu alert is sent; callers must surface an error and
+        must not fall back to the platform exec WebSocket.
+        """
+        cfg = load_rift_config()
+        if self.rift_ready and not force:
+            if await self.ping_rift():
+                return
+            self.rift_ready = False
+
+        last_error: BaseException | None = None
+        for attempt in range(1, cfg.retry + 1):
+            self.rift_attempts = attempt
+            try:
+                await bootstrap_once(self)
+                self.rift_ready = True
+                self.rift_degraded = False
+                self.rift_last_error = ""
+                self.logger.info(
+                    "rift ready sandbox=%s attempt=%s",
+                    self.sandbox_id,
+                    attempt,
+                )
+                return
+            except RiftError as exc:
+                last_error = exc
+                self.logger.warning(
+                    "rift bootstrap %s/%s failed: %s",
+                    attempt,
+                    cfg.retry,
+                    exc,
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                self.logger.exception(
+                    "rift bootstrap %s/%s failed", attempt, cfg.retry
+                )
+            if attempt < cfg.retry:
+                await asyncio.sleep(cfg.retry_backoff * attempt)
+
+        self.rift_ready = False
+        self.rift_degraded = True
+        self.rift_last_error = str(last_error or "unknown")
+        # The gateway owns Feishu alerting: it is the side that keeps observing
+        # rift-client reachability. Here we only mark the sandbox degraded.
+        raise RiftUnavailable(self.rift_last_error)
+
+    async def _close_rift(self) -> None:
+        client = getattr(self, "_rift_client", None)
+        self._rift_client = None
+        self.rift_ready = False
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:  # noqa: BLE001
+                self.logger.debug("closing rift client failed", exc_info=True)
 
     def attach_exec(
         self,
@@ -837,6 +953,42 @@ class PyromindSDK:
         """
         if not self.sandbox_id:
             raise RuntimeError("sandbox is not started")
+        if self.rift_ready:
+            if self._rift_client is None:
+                raise RiftUnavailable("rift client is not initialized")
+            argv = (
+                list(cmd)
+                if isinstance(cmd, (list, tuple))
+                else ["/bin/sh", "-c", str(cmd)]
+            )
+            session = await self._rift_client.open_exec(
+                argv,
+                cwd=cwd or self.working_dir,
+                tty=tty,
+            )
+            try:
+                async for frame in session.frames():
+                    body = frame.WhichOneof("body")
+                    if body == "stdout":
+                        yield SandboxExecStreamChunk(
+                            type="stdout", data=frame.stdout
+                        )
+                    elif body == "stderr":
+                        yield SandboxExecStreamChunk(
+                            type="stderr", data=frame.stderr
+                        )
+                    elif body == "exit":
+                        yield SandboxExecStreamChunk(
+                            type="exit",
+                            data="",
+                            returncode=int(frame.exit.code),
+                        )
+            finally:
+                try:
+                    await session.close_stdin()
+                except Exception:  # noqa: BLE001
+                    pass
+            return
         url = build_exec_stream_websocket_url(
             self._client.base_url,
             self.sandbox_id,
@@ -951,6 +1103,7 @@ class PyromindSDK:
             return self._phase_from_status(status)
 
     async def cleanup(self) -> None:
+        await self._close_rift()
         if not self.sandbox_id:
             return
         sandbox_id = self.sandbox_id
@@ -1088,12 +1241,18 @@ class PyromindSDK:
     async def stop(self) -> None:
         if not self.sandbox_id:
             return
+        await self._close_rift()
         await self._client.pause(self.sandbox_id)
         self.sandbox_status = "Stopped"
 
     async def resume(self) -> None:
         if not self.sandbox_id:
             raise RuntimeError("sandbox is not started")
+        # resume creates a brand-new Pod: the old rift channel is already dead
+        # with it, so there is nothing to close or wait for here. Just mark the
+        # channel unready; _start_record re-runs bootstrap (copy + start).
+        # bootstrap_once closes the stale client after the new one is ready.
+        self.rift_ready = False
         response = await self._client.resume(self.sandbox_id)
         self._bind_response(response)
         self._terminal_phase = None
@@ -1164,6 +1323,12 @@ class PyromindSDK:
 
     async def iter_archive_chunks(self, path: str):
         """Yield tar bytes for ``docker cp`` from a k8s-middleware sandbox."""
+        if self.rift_ready:
+            if self._rift_client is None:
+                raise RiftUnavailable("rift client is not initialized")
+            async for chunk in self._rift_client.get_archive(path):
+                yield chunk
+            return
         target = path if path.startswith("/") else f"/{path}"
         parent = target.rsplit("/", 1)[0] or "/"
         base = target.rsplit("/", 1)[-1]
@@ -1234,6 +1399,23 @@ class PyromindSDK:
 
     async def put_archive(self, dest_path: str, tar_bytes: bytes) -> None:
         """Extract ``docker cp`` tar bytes into a k8s-middleware sandbox."""
+        if self.rift_ready:
+            if self._rift_client is None:
+                raise RiftUnavailable("rift client is not initialized")
+            with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as tar:
+                for member in tar.getmembers():
+                    name = member.name.lstrip("/")
+                    normalized = posixpath.normpath(name)
+                    if (
+                        normalized == ".."
+                        or normalized.startswith("../")
+                        or posixpath.isabs(normalized)
+                    ):
+                        raise ValueError(
+                            f"unsafe path in tar archive: {member.name!r}"
+                        )
+            await self._rift_client.put_archive(dest_path or "/", tar_bytes)
+            return
         dest = dest_path or "/"
         with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r") as tar:
             for member in tar.getmembers():
