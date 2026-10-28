@@ -59,6 +59,7 @@ pyromind-docker-uninstall = "pyromind_sdk.docker_rt.install_wrapper:uninstall_ma
 dev = [
     "build",
     "twine",
+    "grpcio-tools>=1.71,<1.72",
 ]
 
 [project.urls]
@@ -95,6 +96,7 @@ pyromind_sdk = ["*.md"]
     "proto/*.proto",
     "bin/rift-client-linux-*",
     "bin/rift-client.sha256",
+    "bin/rift-client.version",
 ]
 "pyromind_sdk.examples" = ["*.yaml", "utils/*.py"]
 

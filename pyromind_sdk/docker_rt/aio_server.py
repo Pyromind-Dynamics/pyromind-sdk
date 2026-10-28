@@ -19,13 +19,10 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 from .api.system import API_VERSION, MIN_API_VERSION  # noqa: E402
 from .backend.archive import (  # noqa: E402
     TarHead,
-    finish_put_archive,
     iter_archive_chunks,
-    open_put_archive,
     path_stat,
     put_archive,
     scan_tar_head,
-    write_put_chunk,
 )
 import uuid
 from .backend.events import EventBus  # noqa: E402
@@ -137,7 +134,7 @@ BUILD_WRITE_TIMEOUT_S = 60.0
 #: CMD``, the terminal fallback, foreground ``docker run``): those have a
 #: beginning, an end and an exit code. An interactive PTY has none of that —
 #: it is one continuous byte stream — so it only ever gets "connected" and
-#: "exited" lines (see ``_hijack_pyromind_terminal``).
+#: "exited" lines (see ``_hijack_rift_terminal``).
 _EXEC_OUTPUT_PREVIEW_MAX = 2000
 
 
@@ -679,7 +676,7 @@ def _ws_close_note(ws: Any, msg: Any) -> str:
       （1001 走了、1011 keepalive ping 超时）。
 
     ⚠️ **最该找的那一行**：本文件连平台用的是 aiohttp 客户端
-    （``client.ws_connect(url, heartbeat=30)``，见 :func:`_hijack_pyromind_terminal`；
+    （``client.ws_connect(url, heartbeat=30)``，见 :func:`_hijack_rift_terminal`；
     ``pyromind_sdk/terminal.py`` / ``exec_stream.py`` 也是 30），它的客户端心跳是
     **ping 每 30s、等 PONG 只等 ``heartbeat/2 = 15s``**；等不到就
     ``_handle_ping_pong_exception`` → ``_close_code = ABNORMAL_CLOSURE(1006)``，
@@ -754,7 +751,7 @@ async def _stream_pyromind_exec(
 
     Output-only by design: this is the exec-stream *command* channel, used for
     ``docker exec CID CMD``. Interactive ``-i``/``-t`` never lands here any
-    more — it rides the platform terminal PTY (see ``_hijack_pyromind_terminal``),
+    more — it rides rift's PTY stream (see ``_hijack_rift_terminal``),
     which is the only channel that can carry keystrokes.
     """
     returncode = -1
@@ -4507,44 +4504,13 @@ async def _hijack_session(
             _force_close_hijack(request, resp)
         return resp
 
-    # ``docker exec`` against a PyromindSDK sandbox has two very different
-    # shapes and they need different transports:
-    #
-    # * **Interactive** (``-i`` / ``-t``) must ride the platform *terminal*
-    #   WebSocket — a real PTY. The exec-stream WebSocket is a one-shot command
-    #   channel: no PTY, no job control, so Ctrl-C, arrow keys, ``sudo`` /
-    #   ``ssh`` prompts and full-screen TUIs never work there. That was the old
-    #   route and it presented exactly as "keys do nothing, Ctrl-D doesn't even
-    #   end it".
-    # * **Non-interactive** (``docker exec cid <cmd>``) stays on the exec
-    #   stream: it is a plain stdout/stderr channel, which is what SWE-bench
-    #   style automation drives.
+    # Interactive ``docker exec`` (-i/-t) against a PyromindSDK sandbox rides
+    # rift's bidi Exec stream (a real PTY through the gateway). There is no
+    # platform terminal/exec-stream fallback: when rift is not ready the caller
+    # already gets a 503 from create_exec, and this path fails explicitly too.
     if isinstance(kube_env, PyromindSDK) and cmd is not None:
-        if stdin or tty:
-            if getattr(kube_env, "rift_ready", False):
-                # Rift is the primary channel: interactive exec rides rift's
-                # bidi Exec stream (a real PTY through the gateway). Never fall
-                # back to the platform terminal.
-                return await _hijack_rift_terminal(
-                    request,
-                    resp,
-                    protocol,
-                    session,
-                    kube_env,
-                    tty,
-                    cmd=cmd,
-                    cwd=cwd,
-                )
-            # 交互路径同样要"结束标记 + 等回执"：harness（mini-swe 等）就是用
-            # `docker exec -i` 跑的，尾部丢数据一样会咬到它。PTY 是合并流，
-            # 标记在 pump_out 里按字节流摘掉；回执走文件 API，不占 stdin。
-            pty_marker = ""
-            pty_ack = ""
-            token = uuid.uuid4().hex
-            pty_marker = f"__DRT_END_{token}__"
-            pty_ack = f"/tmp/.drt-ack-{token}"
-            cmd = argv_with_exec_handshake(cmd, marker=pty_marker, ack_path=pty_ack)
-            handled = await _hijack_pyromind_terminal(
+        if getattr(kube_env, "rift_ready", False):
+            return await _hijack_rift_terminal(
                 request,
                 resp,
                 protocol,
@@ -4553,46 +4519,18 @@ async def _hijack_session(
                 tty,
                 cmd=cmd,
                 cwd=cwd,
-                marker=pty_marker,
-                ack_path=pty_ack,
             )
-            if handled:
-                return resp
-            # The terminal could not be opened and nothing has reached the wire
-            # yet, so degrading is still safe: fall back to the output-only
-            # command channel instead of handing the user a dead terminal.
-            # Say it out loud — that channel cannot carry keystrokes, and
-            # silently eating them is the very symptom we are fixing.
-            logger.warning(
-                "terminal channel unavailable for id=%s; falling back to the "
-                "exec stream (no PTY, stdin is NOT forwarded)",
-                getattr(session, "id", "")[:12],
-            )
-            if stdin:
-                await _write_exec_error(
-                    resp,
-                    "docker-rt: interactive terminal unavailable; running the "
-                    "command without a PTY (stdin is not forwarded)",
-                    tty=tty,
-                )
-        try:
-            # ⚠️ ``_stream_pyromind_exec`` 不接 ``foreground_cmd``（前台 run 的退出码
-            # 收尾在本函数下面自己做）。这里曾经把它当关键字传了进去 —— 那条路径
-            # 只在"terminal 打不开、回落到 exec stream"时才会走到，于是 ``docker
-            # exec -i/-t`` 一旦回落就得到 ``TypeError``，用户连回落的提示都看不到。
-            session.exit_code = await _stream_pyromind_exec(
-                resp=resp,
-                kube_env=kube_env,
-                cmd=cmd,
-                tty=tty,
-                session_id=getattr(session, "id", "") or "",
-                cwd=cwd,
-            )
-        finally:
-            session.running = False
-            _force_close_hijack(request, resp)
+        session.running = False
+        await _write_exec_error(
+            resp,
+            "[RIFT_UNAVAILABLE] rift channel is not ready for this sandbox; "
+            "docker-rt does not fall back to the platform terminal",
+            tty=tty,
+        )
+        _force_close_hijack(request, resp)
+        return resp
 
-        # 前台 run 的收尾（退出码回写 record、`--rm` 清理）**不在这里做**：这一层
+    # 前台 run 的收尾（退出码回写 record、`--rm` 清理）**不在这里做**：这一层
         # 拿不到 ``record`` / ``store`` / ``networks`` —— 它们属于 attach 那条路径
         # （见 ``attach_container``）。这里原来是从那里复制过来的残留，引用了三个
         # 未定义的名字（``record`` / ``store`` / ``resp_out``）：真跑到就 ``NameError``。
@@ -4665,14 +4603,14 @@ async def _hijack_session(
                 kube_env,
                 tty,
             )
-        await _hijack_pyromind_terminal(
-            request,
+        session.running = False
+        await _write_exec_error(
             resp,
-            protocol,
-            session,
-            kube_env,
-            tty,
+            "[RIFT_UNAVAILABLE] rift channel is not ready for this sandbox; "
+            "docker-rt does not fall back to the platform terminal",
+            tty=tty,
         )
+        _force_close_hijack(request, resp)
         return resp
 
     try:
@@ -5672,6 +5610,7 @@ async def connect_network(request: web.Request) -> web.Response:
     except KeyError:
         return _err(404, f"network {nid} not found")
     return _empty(200)
+
 
 
 async def disconnect_network(request: web.Request) -> web.Response:

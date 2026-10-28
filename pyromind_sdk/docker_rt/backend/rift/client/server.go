@@ -1,6 +1,8 @@
 package main
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -8,13 +10,18 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 
 	pb "rift-client/pb"
 )
@@ -23,6 +30,13 @@ func serve(lis net.Listener, auth tokenAuth) error {
 	s := grpc.NewServer(
 		grpc.UnaryInterceptor(auth.unary),
 		grpc.StreamInterceptor(auth.stream),
+		// rift-gateway pings the upstream every 30s
+		// (PermitWithoutStream=true); the default MinTime=5m would return
+		// GOAWAY/too_many_pings and break long sessions.
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
 	)
 	pb.RegisterRiftServer(s, &riftServer{})
 	return s.Serve(lis)
@@ -289,35 +303,179 @@ func (r *riftServer) PutArchive(stream pb.Rift_PutArchiveServer) error {
 		return err
 	}
 
-	var written int64
+	// Frames -> io.Pipe -> validation/repack -> tar. The repack is what makes
+	// the checks effective: tar itself follows a symlink created earlier in the
+	// same archive, so a member list like `link -> /etc` + `link/passwd` would
+	// otherwise write outside dest.
+	pr, pw := io.Pipe()
+	var received int64
+	recvErr := make(chan error, 1)
+	go func() {
+		for {
+			fr, err := stream.Recv()
+			if err == io.EOF {
+				recvErr <- nil
+				_ = pw.Close()
+				return
+			}
+			if err != nil {
+				recvErr <- err
+				_ = pw.CloseWithError(err)
+				return
+			}
+			chunk := fr.GetChunk()
+			if len(chunk) == 0 {
+				continue
+			}
+			atomic.AddInt64(&received, int64(len(chunk)))
+			if _, werr := pw.Write(chunk); werr != nil {
+				recvErr <- werr
+				return
+			}
+		}
+	}()
+
+	var errBuf bytes.Buffer
+	stderrDone := make(chan struct{})
+	go func() {
+		defer close(stderrDone)
+		_, _ = io.Copy(&errBuf, stderr)
+	}()
+
+	validateErr := copyValidatedTar(pr, stdin, dest)
+	_ = stdin.Close()
+	// No reader is left, so a writer stuck after the end-of-archive marker gets
+	// ErrClosedPipe instead of blocking the handler.
+	_ = pr.Close()
+	if validateErr != nil {
+		_ = pw.CloseWithError(validateErr)
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		<-stderrDone
+		// The receive goroutine unblocks when this handler returns and gRPC
+		// cancels the stream; waiting for it here could hang on a stalled peer.
+		return validateErr
+	}
+
+	waitErr := cmd.Wait()
+	<-stderrDone
+	select {
+	case err := <-recvErr:
+		if err != nil && err != io.ErrClosedPipe {
+			return err
+		}
+	case <-stream.Context().Done():
+		return stream.Context().Err()
+	}
+	if waitErr != nil {
+		return fmt.Errorf("tar extract: %v: %s", waitErr, errBuf.String())
+	}
+	return stream.SendAndClose(&pb.PutArchiveReply{
+		BytesWritten: atomic.LoadInt64(&received),
+	})
+}
+
+// tarMemberPath normalises a member name the way GNU tar does: leading slashes
+// are dropped, then the path is cleaned. Cleaning before dropping "/" would
+// turn "/../etc" into "etc" and hide the traversal.
+func tarMemberPath(name string) string {
+	raw := strings.TrimLeft(strings.ReplaceAll(name, "\\", "/"), "/")
+	if raw == "" {
+		return ""
+	}
+	return path.Clean(raw)
+}
+
+func tarParents(rel string) []string {
+	parts := strings.Split(rel, "/")
+	parents := make([]string, 0, len(parts))
+	for i := 1; i < len(parts); i++ {
+		parents = append(parents, strings.Join(parts[:i], "/"))
+	}
+	return parents
+}
+
+// validateTarHeader rejects members that could write outside dest:
+// traversal paths, absolute or escaping links, device nodes, and members that
+// go through a symlink (created in this archive or already in dest).
+func validateTarHeader(hdr *tar.Header, dest string, symlinks map[string]struct{}) error {
+	name := hdr.Name
+	rel := tarMemberPath(name)
+	if rel == "" || rel == "." {
+		return nil
+	}
+	if rel == ".." || strings.HasPrefix(rel, "../") || path.IsAbs(rel) {
+		return fmt.Errorf("unsafe path in tar archive: %q", name)
+	}
+	if hdr.Typeflag == tar.TypeChar || hdr.Typeflag == tar.TypeBlock {
+		return fmt.Errorf("device node in tar archive: %q", name)
+	}
+	for _, parent := range tarParents(rel) {
+		if _, ok := symlinks[parent]; ok {
+			return fmt.Errorf("tar member %q writes through symlink %q", name, parent)
+		}
+		info, err := os.Lstat(filepath.Join(dest, filepath.FromSlash(parent)))
+		if err == nil && info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("tar member %q writes through existing symlink %q", name, parent)
+		}
+	}
+	switch hdr.Typeflag {
+	case tar.TypeSymlink:
+		target := hdr.Linkname
+		if path.IsAbs(target) {
+			return fmt.Errorf("tar symlink %q has absolute target %q", name, target)
+		}
+		resolved := path.Clean(path.Join(path.Dir(rel), target))
+		if resolved == ".." || strings.HasPrefix(resolved, "../") {
+			return fmt.Errorf("tar symlink %q escapes the destination: %q", name, target)
+		}
+	case tar.TypeLink:
+		target := hdr.Linkname
+		if path.IsAbs(target) {
+			return fmt.Errorf("tar hardlink %q has absolute target %q", name, target)
+		}
+		resolved := tarMemberPath(target)
+		if resolved == ".." || strings.HasPrefix(resolved, "../") {
+			return fmt.Errorf("tar hardlink %q escapes the destination: %q", name, target)
+		}
+	}
+	return nil
+}
+
+// copyValidatedTar streams members from src to dst, dropping the ones that
+// fail validation instead of handing them to tar.
+func copyValidatedTar(src io.Reader, dst io.Writer, dest string) error {
+	tr := tar.NewReader(src)
+	tw := tar.NewWriter(dst)
+	symlinks := make(map[string]struct{})
 	for {
-		fr, err := stream.Recv()
+		hdr, err := tr.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			_ = stdin.Close()
-			_ = cmd.Process.Kill()
-			return err
+			return fmt.Errorf("tar: %v", err)
 		}
-		b := fr.GetChunk()
-		if len(b) == 0 {
+		if hdr.Typeflag == tar.TypeXGlobalHeader {
 			continue
 		}
-		n, werr := stdin.Write(b)
-		written += int64(n)
-		if werr != nil {
-			_ = stdin.Close()
-			_ = cmd.Process.Kill()
-			return werr
+		if err := validateTarHeader(hdr, dest, symlinks); err != nil {
+			return err
+		}
+		if hdr.Typeflag == tar.TypeSymlink {
+			symlinks[tarMemberPath(hdr.Name)] = struct{}{}
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return fmt.Errorf("tar: %v", err)
+		}
+		if _, err := io.Copy(tw, tr); err != nil {
+			return fmt.Errorf("tar: %v", err)
 		}
 	}
-	_ = stdin.Close()
-	errBuf, _ := io.ReadAll(stderr)
-	if waitErr := cmd.Wait(); waitErr != nil {
-		return fmt.Errorf("tar extract: %v: %s", waitErr, string(errBuf))
+	if err := tw.Close(); err != nil {
+		return fmt.Errorf("tar: %v", err)
 	}
-	return stream.SendAndClose(&pb.PutArchiveReply{BytesWritten: written})
+	return nil
 }
 
 func exitCode(err error) int {

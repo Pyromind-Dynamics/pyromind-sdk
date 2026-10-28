@@ -4,8 +4,6 @@ import asyncio
 import io
 import json
 import tarfile
-import threading
-import time
 import weakref
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -34,7 +32,6 @@ from ..aio_server import (
 from ..api.images import image_id
 from ..backend.pyromind_sdk_env import PyromindSDK, _OneShotWs
 from ..backend import pyromind_sdk_env as env_mod
-from ..backend.pyromind_sdk_env import _SdkExecStreamWs
 from ..backend.reconcile import _container_state_from_status
 from ..backend.store import ContainerRecord, ContainerState
 
@@ -426,186 +423,6 @@ def test_archive_path_stat_uses_shell_exec(monkeypatch: MonkeyPatch) -> None:
     assert stat["size"] == 123
 
 
-def test_attach_exec_preserves_argv_quoting(monkeypatch: MonkeyPatch):
-    """argv (e.g. ``sh -c '<script>'``) must be sent as a list, not space-joined."""
-    adapter, client = _adapter_with_fake_client()
-    captured = {}
-
-    def fake_stream(**kwargs):
-        captured.update(kwargs)
-
-        async def events():
-            yield SimpleNamespace(type="stdout", data="OK\n")
-            yield SimpleNamespace(type="exit", returncode=0)
-
-        return events()
-
-    monkeypatch.setattr(env_mod, "iter_exec_stream_async", fake_stream)
-
-    adapter.working_dir = "/workspace"
-    ws = adapter.attach_exec(
-        ["sh", "-c", "test -d /home/user && echo OK || echo NOT_EXIST"],
-        stdin=False,
-        tty=False,
-        cwd="",
-    )
-
-    assert captured["command"] == [
-        "sh", "-c", "test -d /home/user && echo OK || echo NOT_EXIST"
-    ]
-    assert captured["tty"] is False
-    assert captured["cwd"] == "/workspace"
-    assert captured["timeout"] is None
-    assert captured["stop_event"].is_set() is False
-    for _ in range(100):
-        ws.update(timeout=0.01)
-        if ws.peek_stdout() and not ws.is_open():
-            break
-    assert ws.read_stdout() == b"OK\n"
-    assert ws.returncode == 0
-    assert client.exec_command_stream.call_count == 0
-
-
-def test_attach_exec_surfaces_stream_errors(monkeypatch: MonkeyPatch):
-    adapter, _ = _adapter_with_fake_client()
-
-    def fake_stream(**kwargs):
-        async def events():
-            yield SimpleNamespace(type="stdout", data="partial\n")
-            raise RuntimeError("stream disconnected")
-
-        return events()
-
-    monkeypatch.setattr(env_mod, "iter_exec_stream_async", fake_stream)
-
-    ws = adapter.attach_exec(["echo", "hi"], stdin=False, tty=False)
-    for _ in range(100):
-        ws.update(timeout=0.01)
-        if not ws.is_open():
-            break
-
-    assert ws.read_stdout() == b"partial\n"
-    assert ws.read_stderr() == b"exec stream error: stream disconnected\n"
-    assert ws.returncode == 1
-
-
-def test_attach_exec_interactive_streams_output_with_tty(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    adapter, _ = _adapter_with_fake_client()
-    captured = {}
-
-    def fake_stream(**kwargs):
-        captured.update(kwargs)
-
-        async def events():
-            yield SimpleNamespace(type="stdout", data=b"ready\n")
-            yield SimpleNamespace(type="exit", returncode=0)
-
-        return events()
-
-    monkeypatch.setattr(env_mod, "iter_exec_stream_async", fake_stream)
-
-    ws = adapter.attach_exec(["bash"], stdin=True, tty=True)
-    for _ in range(100):
-        if captured:
-            break
-        time.sleep(0.01)
-    assert captured["command"] == ["bash"]
-    assert captured["tty"] is True
-    for _ in range(100):
-        ws.update(timeout=0.01)
-        if ws.peek_stdout() and not ws.is_open():
-            break
-    assert ws.read_stdout() == b"ready\n"
-
-
-def test_exec_stream_completes_when_output_queue_was_full(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(env_mod, "_EXEC_STREAM_QUEUE_SIZE", 2)
-
-    def events():
-        yield SimpleNamespace(type="stdout", data=b"one")
-        yield SimpleNamespace(type="stdout", data=b"two")
-        yield SimpleNamespace(type="exit", returncode=7)
-
-    ws = _SdkExecStreamWs(events())
-    time.sleep(0.6)
-
-    for _ in range(20):
-        ws.update(timeout=0.01)
-        if not ws.is_open():
-            break
-
-    assert ws.is_open() is False
-    assert ws.read_stdout() == b"onetwo"
-    assert ws.returncode == 7
-
-
-def test_exec_stream_preserves_binary_output() -> None:
-    def events():
-        yield SimpleNamespace(type="stdout", data=b"\x00\xff\xe4")
-        yield SimpleNamespace(type="stderr", data=b"\xfe\x01")
-        yield SimpleNamespace(type="exit", returncode=0)
-
-    ws = _SdkExecStreamWs(events())
-    for _ in range(20):
-        ws.update(timeout=0.01)
-        if not ws.is_open():
-            break
-
-    assert ws.read_stdout() == b"\x00\xff\xe4"
-    assert ws.read_stderr() == b"\xfe\x01"
-
-
-def test_async_exec_stream_uses_one_reader_thread(monkeypatch: MonkeyPatch) -> None:
-    adapter, _ = _adapter_with_fake_client()
-    starting_threads = threading.active_count()
-    seen_threads = []
-
-    def fake_stream(**kwargs):
-        async def events():
-            seen_threads.append(threading.active_count())
-            yield SimpleNamespace(type="exit", returncode=0)
-
-        return events()
-
-    monkeypatch.setattr(env_mod, "iter_exec_stream_async", fake_stream)
-
-    ws = adapter.attach_exec(["true"], stdin=False, tty=False)
-    for _ in range(100):
-        ws.update(timeout=0.01)
-        if not ws.is_open():
-            break
-
-    assert seen_threads == [starting_threads + 1]
-
-
-def test_async_exec_stream_close_stops_reader(monkeypatch: MonkeyPatch) -> None:
-    adapter, _ = _adapter_with_fake_client()
-    stopped = threading.Event()
-
-    def fake_stream(**kwargs):
-        stop_event = kwargs["stop_event"]
-
-        async def events():
-            while not stop_event.is_set():
-                await asyncio.sleep(0.01)
-            stopped.set()
-            if False:
-                yield SimpleNamespace(type="exit", returncode=0)
-
-        return events()
-
-    monkeypatch.setattr(env_mod, "iter_exec_stream_async", fake_stream)
-
-    ws = adapter.attach_exec(["cat"], stdin=True, tty=True)
-    ws.close()
-
-    assert stopped.wait(timeout=1)
-
-
 def test_container_state_from_status_hides_pending_from_running_ps() -> None:
     assert _container_state_from_status("Pending") == ContainerState.CREATED
     assert _container_state_from_status("running") == ContainerState.RUNNING
@@ -640,6 +457,9 @@ def test_refresh_record_state_queries_backend_before_lifecycle() -> None:
 
 def test_put_archive_writes_files_into_sandbox() -> None:
     adapter, client = _adapter_with_fake_client()
+    adapter.rift_ready = True
+    rift = SimpleNamespace(put_archive=AsyncMock())
+    adapter._rift_client = rift
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
         info = tarfile.TarInfo(name="hello.txt")
@@ -648,15 +468,15 @@ def test_put_archive_writes_files_into_sandbox() -> None:
 
     asyncio.run(adapter.put_archive("/var", buf.getvalue()))
 
-    client.write_file.assert_called_once()
-    args = client.write_file.call_args.args
-    assert args[0] == "sb-test-1"
-    assert args[1] == "/var/hello.txt"
-    assert args[2] == b"hello"
+    rift.put_archive.assert_awaited_once_with("/var", buf.getvalue())
+    client.write_file.assert_not_called()
 
 
 def test_put_archive_rejects_path_traversal() -> None:
     adapter, client = _adapter_with_fake_client()
+    adapter.rift_ready = True
+    rift = SimpleNamespace(put_archive=AsyncMock())
+    adapter._rift_client = rift
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
         info = tarfile.TarInfo(name="../../etc/passwd")
@@ -669,6 +489,7 @@ def test_put_archive_rejects_path_traversal() -> None:
         assert "unsafe path" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+    rift.put_archive.assert_not_awaited()
     client.write_file.assert_not_called()
 
 

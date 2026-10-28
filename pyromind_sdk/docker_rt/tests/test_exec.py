@@ -317,23 +317,15 @@ async def test_exec_all_create_options_are_applied_and_inspected(
 @pytest.mark.parametrize(
     "stdin,tty,expected",
     [
-        (True, True, "terminal"),    # docker exec -it
-        (True, False, "terminal"),   # docker exec -i
-        (False, True, "terminal"),   # docker exec -t
-        (False, False, "oneshot"),   # docker exec cid <cmd>
+        (True, True, "rift"),     # docker exec -it
+        (True, False, "rift"),    # docker exec -i
+        (False, True, "rift"),    # docker exec -t
+        (False, False, "oneshot"),# docker exec cid <cmd>
     ],
 )
 @pytest.mark.asyncio
-async def test_pyromind_exec_transport_routing(
-    monkeypatch, stdin, tty, expected
-):
-    """Interactive exec must ride the PTY terminal WS, not the exec stream.
-
-    The exec-stream WebSocket is a one-shot command channel: no PTY, no job
-    control. Routing ``-i``/``-t`` there is what made keystrokes, Ctrl-C and
-    Ctrl-D look like they did nothing. Non-interactive ``docker exec`` keeps
-    using the command channel, which is what automation drives.
-    """
+async def test_pyromind_exec_transport_routing(monkeypatch, stdin, tty, expected):
+    """Interactive exec rides rift's bidi PTY stream; no platform fallback."""
     from .. import aio_server as mod
     from ..backend.exec_utils import argv_with_exec_cwd
     from ..backend.pyromind_sdk_env import PyromindSDK
@@ -353,11 +345,12 @@ async def test_pyromind_exec_transport_routing(
             return None
 
     kube_env = PyromindSDK.__new__(PyromindSDK)
+    kube_env.rift_ready = True
     calls: dict[str, dict] = {}
 
-    async def terminal(*args, **kwargs):
-        calls["terminal"] = kwargs
-        return True
+    async def rift(*args, **kwargs):
+        calls["rift"] = kwargs
+        return resp
 
     async def stream(*args, **kwargs):
         calls["stream"] = kwargs
@@ -367,7 +360,7 @@ async def test_pyromind_exec_transport_routing(
         calls["oneshot"] = kwargs
         return 0
 
-    monkeypatch.setattr(mod, "_hijack_pyromind_terminal", terminal)
+    monkeypatch.setattr(mod, "_hijack_rift_terminal", rift)
     monkeypatch.setattr(mod, "_stream_pyromind_exec", stream)
     monkeypatch.setattr(mod, "_stream_ws_oneshot", oneshot)
 
@@ -393,37 +386,22 @@ async def test_pyromind_exec_transport_routing(
 
     assert expected in calls, f"expected the {expected} transport, got {calls}"
     assert len(calls) == 1, f"exactly one transport must be used, got {calls}"
-    if expected == "terminal":
-        # The requested argv has to reach the PTY, otherwise the terminal would
-        # quietly open a login shell instead of the command the user asked for.
-        # 现在有两层包装：外层「结束标记 + 等回执」（防退出瞬间丢尾部），
-        # 内层 cd 包装（cwd 传空）。内层从第 4 个元素开始。
-        outer = calls["terminal"]["cmd"]
-        assert outer[:2] == ["sh", "-c"], outer
-        assert "__DRT_END_" in outer[2] and '"$@"' in outer[2]
-        assert outer[4:] == argv_with_exec_cwd(
+    if expected == "rift":
+        assert calls["rift"]["cmd"] == argv_with_exec_cwd(
             ["cat"], "/workspace", create_missing=True
         )
-        assert calls["terminal"]["cwd"] == ""
-        assert calls["terminal"]["marker"].startswith("__DRT_END_")
-        assert calls["terminal"]["ack_path"].startswith("/tmp/.drt-ack-")
+        assert calls["rift"]["cwd"] == ""
     else:
-        # 非交互 exec 现在有两层包装：外层是「结束标记 + 等回执」（防"进程退出瞬间
-        # k8s exec 代理丢尾部"），内层是 cd 包装（cwd 传空，后端不再包第二层）。
         outer = calls["oneshot"]["cmd"]
         assert outer[:2] == ["sh", "-c"], outer
         assert "__DRT_END_" in outer[2] and '"$@"' in outer[2]
-        # 外层 ["sh","-c",script,"sh", *内层] ⇒ 内层从第 4 个元素开始
         assert calls["oneshot"]["cmd"][4:] == argv_with_exec_cwd(
             ["cat"], "/workspace", create_missing=True
         )
         assert calls["oneshot"]["cwd"] == ""
         assert calls["oneshot"]["marker"].startswith("__DRT_END_")
-        # exec-stream 这条路有 stdin 通道 ⇒ 回执 = 半关闭 stdin（不是文件），
-        # 所以这里不该有 ack_path，而是拿到一个可 set 的事件。
         assert calls["oneshot"]["ack_path"] == ""
         assert calls["oneshot"]["stdin_close"] is not None
-        assert "__DRT_END_" in outer[2] and "cat > /dev/null" in outer[2]
 
 
 @pytest.mark.asyncio
@@ -2369,7 +2347,7 @@ async def test_foreground_run_without_a_command_keeps_the_container() -> None:
 
 
 @pytest.mark.asyncio
-async def test_interactive_fallback_matches_the_exec_stream_signature(monkeypatch):
+async def test_interactive_without_rift_fails_without_platform_fallback(monkeypatch):
     """terminal 打不开时回落到 exec stream —— 调用必须与真实签名逐字相符。
 
     2026-08-15 之后的这条路上，调用点曾经多传了一个 ``foreground_cmd=``
@@ -2454,11 +2432,11 @@ async def test_interactive_fallback_matches_the_exec_stream_signature(monkeypatc
         timeout=2,
     )
 
-    assert "cmd" in calls, "terminal 打不开必须回落到 exec stream"
-    assert session.exit_code == 3
+    assert "cmd" not in calls, "rift 未就绪时不许回落到平台 exec stream"
+    assert session.exit_code is None
     assert any(
-        b"interactive terminal unavailable" in chunk for chunk in resp.written
-    ), "回落必须说出来（那条通道没有 PTY，stdin 不会被透传）"
+        b"RIFT_UNAVAILABLE" in chunk for chunk in resp.written
+    ), "必须明确告诉客户端 rift 不可用"
 
 
 @pytest.mark.asyncio

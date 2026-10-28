@@ -44,3 +44,5 @@ build/
 
 # rift-client release binaries (built per architecture, not committed)
 pyromind_sdk/docker_rt/backend/rift/bin/rift-client-linux-*
+pyromind_sdk/docker_rt/backend/rift/bin/rift-client.version
+pyromind_sdk/docker_rt/backend/rift/bin/rift-client.source.sha256

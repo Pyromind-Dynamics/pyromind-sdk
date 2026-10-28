@@ -8,7 +8,9 @@ import (
 	"strconv"
 )
 
-const version = "0.6.0"
+// version is injected by the Makefile (-X main.version=...) so a stale binary
+// in a sandbox can be told apart from the one this SDK ships.
+var version = "dev"
 
 func main() {
 	port := flag.Int("port", 7500, "gRPC listen port")

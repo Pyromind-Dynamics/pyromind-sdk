@@ -416,6 +416,76 @@ def path_stat(kube_env: Any, path: str) -> dict[str, Any] | None:
     }
 
 
+def _tar_member_rel(name: str) -> str:
+    """Archive-relative member path (leading ``/`` stripped like GNU tar)."""
+    raw = str(name or "").replace("\\", "/").lstrip("/")
+    return posixpath.normpath(raw) if raw else ""
+
+
+def _tar_parents(rel: str) -> Iterator[str]:
+    parts = [part for part in rel.split("/") if part and part != "."]
+    for index in range(1, len(parts)):
+        yield "/".join(parts[:index])
+
+
+def validate_tar_members(data: bytes) -> None:
+    """Reject archive members that could escape ``dest_path``.
+
+    ``docker cp`` ends up as ``tar -xf -`` inside the container. tar itself
+    rejects ``..`` and absolute names, but it *does* follow a symlink that was
+    created earlier in the same archive, so ``link -> /etc`` followed by
+    ``link/passwd`` would write outside the destination. Device nodes are
+    rejected too: ``docker cp`` has no reason to create them, and as root they
+    reach host devices in a privileged sandbox.
+    """
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tar:
+            symlinks: set[str] = set()
+            for member in tar:
+                name = member.name
+                rel = _tar_member_rel(name)
+                if rel in {"", "."}:
+                    continue
+                if rel == ".." or rel.startswith("../"):
+                    raise ValueError(f"unsafe path in tar archive: {name!r}")
+                if member.ischr() or member.isblk():
+                    raise ValueError(f"device node in tar archive: {name!r}")
+                for parent in _tar_parents(rel):
+                    if parent in symlinks:
+                        raise ValueError(
+                            f"tar member {name!r} writes through symlink {parent!r}"
+                        )
+                if member.issym():
+                    target = member.linkname
+                    resolved = posixpath.normpath(
+                        posixpath.join(posixpath.dirname(rel), target)
+                    )
+                    if (
+                        posixpath.isabs(target)
+                        or resolved == ".."
+                        or resolved.startswith("../")
+                    ):
+                        raise ValueError(
+                            f"tar symlink {name!r} escapes the destination: "
+                            f"{target!r}"
+                        )
+                    symlinks.add(rel)
+                elif member.islnk():
+                    target = member.linkname
+                    resolved = _tar_member_rel(target)
+                    if (
+                        posixpath.isabs(target)
+                        or resolved == ".."
+                        or resolved.startswith("../")
+                    ):
+                        raise ValueError(
+                            f"tar hardlink {name!r} escapes the destination: "
+                            f"{target!r}"
+                        )
+    except tarfile.TarError as exc:
+        raise ValueError(f"invalid tar archive: {exc}") from exc
+
+
 def put_archive_via_exec(kube_env: Any, dest_path: str, tar_bytes: bytes) -> None:
     """Extract tar using ``execute`` (stdin=False) — avoids flaky stdin websockets."""
     assert kube_env.pod_name
@@ -508,8 +578,11 @@ def put_archive_stream(kube_env: Any, dest_path: str, chunks: Iterable[bytes]) -
 def put_archive(kube_env: Any, dest_path: str, tar_bytes: bytes) -> None:
     """Extract ``tar_bytes`` into ``dest_path`` (exec preferred, stream fallback)."""
     if hasattr(kube_env, "put_archive"):
+        # The adapter validates too; keeping this branch free of a second scan
+        # avoids walking a multi-GB tar twice.
         kube_env.put_archive(dest_path, tar_bytes)
         return
+    validate_tar_members(tar_bytes)
     if len(tar_bytes) <= _EMBED_MAX and callable(getattr(kube_env, "execute", None)):
         try:
             put_archive_via_exec(kube_env, dest_path, tar_bytes)

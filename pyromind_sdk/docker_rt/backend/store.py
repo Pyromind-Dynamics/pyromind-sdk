@@ -444,6 +444,8 @@ class ContainerStore:
         exposed_ports: dict[str, Any] | None = None,
         publish_all_ports: bool = False,
         state: ContainerState | None = None,
+        sandbox_id: str | None = None,
+        sandbox_status: str | None = None,
     ) -> ContainerRecord:
         """Re-register a running Pod after daemon restart."""
         async with self._lock:
@@ -458,6 +460,8 @@ class ContainerStore:
                 state=state or ContainerState.RUNNING,
                 namespace=namespace,
                 pod_name=pod_name,
+                sandbox_id=sandbox_id or pod_name,
+                sandbox_status=sandbox_status,
                 kube_env=kube_env,
                 started_at=time.time(),
                 port_bindings=dict(port_bindings or {}),
