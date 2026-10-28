@@ -151,18 +151,47 @@ async def _prepare_remote(
     return arch, _kv(output, "RIFT_SHA")
 
 
-async def _wait_ping(client: RiftGatewayClient, *, attempts: int, interval: float) -> None:
+async def _wait_ping(client: RiftGatewayClient, *, attempts: int, interval: float) -> str:
     last_error: BaseException | None = None
     for _ in range(attempts):
         try:
-            await client.ping()
-            return
+            return await client.ping()
         except (RiftUnauthenticated, RiftPermissionDenied):
             raise
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             await asyncio.sleep(interval)
     raise RiftUnavailable(f"rift-client did not answer Ping: {last_error}")
+
+
+async def _force_restart(
+    env: "PyromindSDK",
+    *,
+    bin_path: str,
+    script_path: str,
+    pid_path: str,
+) -> None:
+    """Kill whatever is listening for this binary and start it again.
+
+    A stale pid file can make ``start.sh`` take its "already running" shortcut
+    while an *older* build still owns the port, so the new binary never starts.
+    """
+    command = (
+        f"if [ -f {shlex.quote(pid_path)} ]; then "
+        f"kill $(cat {shlex.quote(pid_path)}) 2>/dev/null || true; "
+        f"rm -f {shlex.quote(pid_path)}; fi; "
+        f"if command -v pkill >/dev/null 2>&1; then "
+        f"pkill -f {shlex.quote(bin_path)} 2>/dev/null || true; fi; "
+        f"sleep 0.3; sh {shlex.quote(script_path)}"
+    )
+    result = await env.execute(
+        {"command": command}, cwd="/", _force_platform=True
+    )
+    if int(result.get("returncode", 0) or 0) != 0:
+        raise RiftUnavailable(
+            f"rift-client restart failed: "
+            f"{result.get('stderr') or result.get('output')}"
+        )
 
 
 async def bootstrap_once(env: "PyromindSDK") -> dict[str, Any]:
@@ -230,11 +259,44 @@ async def bootstrap_once(env: "PyromindSDK") -> dict[str, Any]:
 
     client = RiftGatewayClient(cfg, env._client.api_key, env.sandbox_id)
     try:
-        await _wait_ping(
+        running_version = await _wait_ping(
             client,
             attempts=cfg.ping_attempts,
             interval=cfg.ping_interval,
         )
+        if cfg.expected_version and running_version != cfg.expected_version:
+            logger.warning(
+                "rift-client version mismatch sandbox=%s running=%s expected=%s; "
+                "restarting from the local binary",
+                env.sandbox_id,
+                running_version,
+                cfg.expected_version,
+            )
+            await _force_restart(
+                env,
+                bin_path=bin_path,
+                script_path=script_path,
+                pid_path=pid_path,
+            )
+            running_version = await _wait_ping(
+                client,
+                attempts=cfg.ping_attempts,
+                interval=cfg.ping_interval,
+            )
+            if running_version != cfg.expected_version:
+                await client.close()
+                raise RiftUnavailable(
+                    f"rift-client version mismatch after restart: "
+                    f"running={running_version} expected={cfg.expected_version}; "
+                    f"the sandbox may still be serving an old build from "
+                    f"{remote_dir}"
+                )
+        elif not cfg.expected_version:
+            logger.warning(
+                "rift-client.version is missing next to the binary; skipping the "
+                "stale-binary check for sandbox=%s",
+                env.sandbox_id,
+            )
     except Exception as exc:
         tail = await _log_tail(env, log_path)
         await client.close()

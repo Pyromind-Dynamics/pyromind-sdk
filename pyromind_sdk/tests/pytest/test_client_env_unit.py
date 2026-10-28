@@ -293,3 +293,16 @@ class TestResolveApiBaseUrl:
         assert ProfileClient(api_key="test-key").base_url == (
             DEFAULT_API_BASE_URL.rstrip("/")
         )
+
+def test_rift_gateway_resolves_from_cluster_map(monkeypatch):
+    """The rift data-plane domain is part of CLUSTER_RESOURCE, not user config."""
+    monkeypatch.delenv("DOCKER_RT_RIFT_GATEWAY", raising=False)
+    monkeypatch.delenv("DOCKER_RT_RIFT_GATEWAY_TLS", raising=False)
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-1#pre")
+
+    from pyromind_sdk.docker_rt.backend.rift.config import load_rift_config
+
+    cfg = load_rift_config()
+    assert cfg.gateway == "pre-rift.pyromind.ai:443"
+    assert cfg.gateway_tls is True
+    assert cfg.gateway_ca is None

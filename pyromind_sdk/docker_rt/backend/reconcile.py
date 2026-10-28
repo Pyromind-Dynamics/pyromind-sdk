@@ -174,6 +174,8 @@ async def reconcile_pyromind_sandboxes(
                     pod_name=sandbox_id,
                     kube_env=kube_env,
                     state=state,
+                    sandbox_id=sandbox_id,
+                    sandbox_status=sandbox.status,
                 )
                 adopted_record.published_ports = _published_ports(sandbox)
             adopted += 1

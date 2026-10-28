@@ -9,15 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import io
 import inspect
 import logging
 import os
-import posixpath
-import queue
 import shlex
 import uuid
-import tarfile
 import threading
 import weakref
 from typing import Any, AsyncIterator
@@ -36,11 +32,7 @@ from pyromind_sdk.client.models import (
     SandboxType,
     VolumeMount,
 )
-from pyromind_sdk.exec_stream import (
-    build_exec_stream_websocket_url,
-    iter_exec_stream_async,
-)
-
+from .archive import validate_tar_members
 from .portforward import parse_publish_spec
 from .rift.bootstrap import bootstrap_once
 from .rift.config import load_rift_config
@@ -62,7 +54,6 @@ _SDK_API_ERRORS = (PyroMindAPIError, PyroMindAsyncAPIError)
 
 DEFAULT_CPU = "1"
 DEFAULT_MEMORY = "2Gi"
-_EXEC_STREAM_QUEUE_SIZE = 64
 _CLEANUP_RUNNING_STATUS = "running"
 _CLEANUP_RETRY_ATTEMPTS = 60
 _CLEANUP_DELETE_RETRY_DELAY_S = 1.0
@@ -304,140 +295,6 @@ class _OneShotWs:
 
     def close(self) -> None:
         self._started = True
-
-
-class _SdkExecStreamWs:
-    """Kubernetes-WS-like adapter backed by streaming exec events."""
-
-    def __init__(
-        self,
-        events: Any,
-        stop_event: threading.Event | None = None,
-        *,
-        async_events: bool = False,
-    ) -> None:
-        self._events = events
-        self._stop_event = stop_event or threading.Event()
-        self._async_events = async_events
-        self._queue: "queue.Queue[tuple[str, Any] | None]" = queue.Queue(
-            maxsize=_EXEC_STREAM_QUEUE_SIZE
-        )
-        self._stdout = bytearray()
-        self._stderr = bytearray()
-        self._returncode = 0
-        self._done = False
-        self._error: BaseException | None = None
-        self._thread = threading.Thread(target=self._read_events, daemon=True)
-        self._thread.start()
-
-    def _put_event(self, event: tuple[str, Any] | None) -> bool:
-        """Queue one event, respecting early close as backpressure."""
-        while not self._stop_event.is_set():
-            try:
-                self._queue.put(event, timeout=0.2)
-                return True
-            except queue.Full:
-                continue
-        return False
-
-    def _handle_event(self, event: Any) -> bool:
-        event_type = getattr(event, "type", "")
-        if event_type in {"stdout", "stderr"}:
-            return self._put_event(
-                (event_type, getattr(event, "data", ""))
-            )
-        if event_type == "exit":
-            self._returncode = int(getattr(event, "returncode", 0) or 0)
-        return True
-
-    def _record_error(self, exc: BaseException) -> None:
-        self._error = exc
-        self._returncode = 1
-        message = str(exc).strip() or type(exc).__name__
-        self._put_event(
-            ("stderr", f"exec stream error: {message}\n".encode("utf-8"))
-        )
-
-    def _signal_done(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                self._queue.put(None, timeout=0.2)
-                break
-            except queue.Full:
-                continue
-
-    async def _consume_async_events(self) -> None:
-        async for event in self._events:
-            if not self._handle_event(event):
-                return
-
-    def _read_events(self) -> None:
-        try:
-            if self._async_events:
-                asyncio.run(self._consume_async_events())
-            else:
-                for event in self._events:
-                    if not self._handle_event(event):
-                        return
-        except BaseException as exc:
-            self._record_error(exc)
-        finally:
-            self._signal_done()
-
-    def is_open(self) -> bool:
-        return not self._done
-
-    def update(self, timeout: float = 0.2) -> None:
-        try:
-            event = self._queue.get(timeout=max(timeout, 0))
-        except queue.Empty:
-            return
-        if event is None:
-            self._done = True
-            return
-        stream_type, data = event
-        if isinstance(data, bytes):
-            raw = data
-        elif isinstance(data, bytearray):
-            raw = bytes(data)
-        else:
-            raw = str(data).encode("utf-8")
-        if stream_type == "stdout":
-            self._stdout.extend(raw)
-        else:
-            self._stderr.extend(raw)
-
-    def peek_stdout(self) -> bool:
-        return bool(self._stdout)
-
-    def read_stdout(self) -> bytes:
-        data = bytes(self._stdout)
-        self._stdout.clear()
-        return data
-
-    def peek_stderr(self) -> bool:
-        return bool(self._stderr)
-
-    def read_stderr(self) -> bytes:
-        data = bytes(self._stderr)
-        self._stderr.clear()
-        return data
-
-    @property
-    def returncode(self) -> int:
-        return self._returncode
-
-    def close(self) -> None:
-        self._stop_event.set()
-        self._done = True
-        if self._async_events:
-            return
-        close = getattr(self._events, "close", None)
-        if callable(close):
-            try:
-                close()
-            except (RuntimeError, ValueError):
-                pass
 
 
 class PyromindSDK:
@@ -794,8 +651,13 @@ class PyromindSDK:
     ) -> dict[str, Any]:
         if not self.sandbox_id:
             raise RuntimeError("sandbox is not started")
-        if self.rift_ready and not _force_platform:
+        if not _force_platform:
+            if not self.rift_ready:
+                raise RiftUnavailable(
+                    "rift channel is not ready; refusing platform exec"
+                )
             return await self._execute_rift(action, cwd, timeout)
+        # _force_platform is only used by bootstrap itself (mkdir/uname/start).
         command = action.get("command", "")
         result = await self._client.exec_command(
             self.sandbox_id,
@@ -908,35 +770,6 @@ class PyromindSDK:
             except Exception:  # noqa: BLE001
                 self.logger.debug("closing rift client failed", exc_info=True)
 
-    def attach_exec(
-        self,
-        cmd: list[str],
-        *,
-        stdin: bool = True,
-        tty: bool = False,
-        cwd: str = "",
-    ) -> _SdkExecStreamWs:
-        # Stream output over the platform WebSocket so long-running commands are
-        # not subject to the one-shot HTTP request timeout or response buffering.
-        # Docker's -i/-it flags select this path, but stdin is intentionally not
-        # forwarded to the sandbox.
-        stop_event = threading.Event()
-        url = build_exec_stream_websocket_url(
-            self._client.base_url,
-            self.sandbox_id,
-            self._client.api_key,
-            self._client.cluster,
-        )
-        events = iter_exec_stream_async(
-            url=url,
-            command=list(cmd),
-            cwd=cwd or self.working_dir,
-            timeout=None,
-            tty=tty,
-            stop_event=stop_event,
-        )
-        return _SdkExecStreamWs(events, stop_event, async_events=True)
-
     async def iter_exec_stream(
         self,
         cmd: list[str],
@@ -946,64 +779,47 @@ class PyromindSDK:
         timeout: int | None = None,
         stdin_close: Any | None = None,
     ) -> AsyncIterator[SandboxExecStreamChunk]:
-        """Stream one exec command without leaving the running event loop.
-
-        Output-only: the exec-stream channel has no PTY and forwards no stdin.
-        Interactive work belongs on ``/sandboxes/{id}/terminal``.
-        """
+        """Stream one exec command through rift; no platform exec-stream fallback."""
         if not self.sandbox_id:
             raise RuntimeError("sandbox is not started")
-        if self.rift_ready:
-            if self._rift_client is None:
-                raise RiftUnavailable("rift client is not initialized")
-            argv = (
-                list(cmd)
-                if isinstance(cmd, (list, tuple))
-                else ["/bin/sh", "-c", str(cmd)]
+        if not self.rift_ready:
+            raise RiftUnavailable(
+                "rift channel is not ready; refusing platform exec-stream"
             )
-            session = await self._rift_client.open_exec(
-                argv,
-                cwd=cwd or self.working_dir,
-                tty=tty,
-            )
-            try:
-                async for frame in session.frames():
-                    body = frame.WhichOneof("body")
-                    if body == "stdout":
-                        yield SandboxExecStreamChunk(
-                            type="stdout", data=frame.stdout
-                        )
-                    elif body == "stderr":
-                        yield SandboxExecStreamChunk(
-                            type="stderr", data=frame.stderr
-                        )
-                    elif body == "exit":
-                        yield SandboxExecStreamChunk(
-                            type="exit",
-                            data="",
-                            returncode=int(frame.exit.code),
-                        )
-            finally:
-                try:
-                    await session.close_stdin()
-                except Exception:  # noqa: BLE001
-                    pass
-            return
-        url = build_exec_stream_websocket_url(
-            self._client.base_url,
-            self.sandbox_id,
-            self._client.api_key,
-            self._client.cluster,
+        if self._rift_client is None:
+            raise RiftUnavailable("rift client is not initialized")
+        argv = (
+            list(cmd)
+            if isinstance(cmd, (list, tuple))
+            else ["/bin/sh", "-c", str(cmd)]
         )
-        async for chunk in iter_exec_stream_async(
-            url=url,
-            command=list(cmd),
+        session = await self._rift_client.open_exec(
+            argv,
             cwd=cwd or self.working_dir,
-            timeout=timeout,
             tty=tty,
-            stdin_close=stdin_close,
-        ):
-            yield chunk
+        )
+        try:
+            async for frame in session.frames():
+                body = frame.WhichOneof("body")
+                if body == "stdout":
+                    yield SandboxExecStreamChunk(
+                        type="stdout", data=frame.stdout
+                    )
+                elif body == "stderr":
+                    yield SandboxExecStreamChunk(
+                        type="stderr", data=frame.stderr
+                    )
+                elif body == "exit":
+                    yield SandboxExecStreamChunk(
+                        type="exit",
+                        data="",
+                        returncode=int(frame.exit.code),
+                    )
+        finally:
+            try:
+                await session.close_stdin()
+            except Exception:  # noqa: BLE001
+                pass
 
     def attach_main(
         self,
@@ -1323,126 +1139,25 @@ class PyromindSDK:
 
     async def iter_archive_chunks(self, path: str):
         """Yield tar bytes for ``docker cp`` from a k8s-middleware sandbox."""
-        if self.rift_ready:
-            if self._rift_client is None:
-                raise RiftUnavailable("rift client is not initialized")
-            async for chunk in self._rift_client.get_archive(path):
-                yield chunk
-            return
-        target = path if path.startswith("/") else f"/{path}"
-        parent = target.rsplit("/", 1)[0] or "/"
-        base = target.rsplit("/", 1)[-1]
-        stat = await self.archive_path_stat(target)
-        if stat is None:
-            raise FileNotFoundError(target)
-
-        if stat["mode"] & 0o040000:
-            # 目录分支**不**直接 ``tar … | base64`` 走一次性 exec —— 实测（2026-10-14）：
-            # 命令退出瞬间会把管道里没送出的尾部丢掉（立刻退出 4/6 截断、末尾多活 1 秒
-            # 6/6 完好）。而固定等待不是修复。
-            # 改成：先把 tar 落到容器内临时文件，再用**带回执机制**的文件读取
-            # （read_file → middleware 读完 payload 才关 stdin，生产者不会在数据在途时退出）
-            # 把整包取回来，最后删掉临时文件。
-            tmp_name = f"/tmp/.docker-rt-cp-{uuid.uuid4().hex}.tar"
-            quoted_tmp = shlex.quote(tmp_name)
-            try:
-                result = await self.execute(
-                    {
-                        "command": (
-                            f"tar -C {shlex.quote(parent)} -cf {quoted_tmp} "
-                            f"-- {shlex.quote(base)}; rc=$?; "
-                            f"wc -c < {quoted_tmp} > /tmp/.docker-rt-cp-size; exit $rc"
-                        )
-                    },
-                    cwd="/",
-                )
-                code = int(result.get("returncode", 0) or 0)
-                if code != 0:
-                    raise RuntimeError(
-                        result.get("exception_info")
-                        or result.get("output")
-                        or f"tar failed for {target}"
-                    )
-                raw = await self._client.read_file(self.sandbox_id, tmp_name)
-                if not raw:
-                    raise RuntimeError(f"tar produced no data for {target}")
-                yield raw
-            finally:
-                try:
-                    await self.execute(
-                        {"command": f"rm -f {quoted_tmp} /tmp/.docker-rt-cp-size"},
-                        cwd="/",
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("temp tar cleanup failed for %s: %s", tmp_name, exc)
-            return
-
-        data = await self._client.read_file(self.sandbox_id, target)
-        # 对账：上面 archive_path_stat 已经拿到了文件的真实大小（容器里 wc -c），
-        # 而 tar 头若用 len(data) —— 即「实际收到的字节数」—— 来写，一旦上游
-        # 的流被截断，就会产出一个**自洽**的 tar：docker cp 解开它、安静地写出
-        # 一个缺尾的文件、退出码 0、两边日志都干净。所以先比大小再打包。
-        expected = int(stat.get("size") or 0)
-        if expected and len(data) < expected:
-            raise RuntimeError(
-                f"short read for {target}: got {len(data)} of {expected} bytes — "
-                "the file read stream was truncated; refusing to emit a "
-                "self-consistent truncated tar"
+        if not self.rift_ready:
+            raise RiftUnavailable(
+                "rift channel is not ready; refusing platform file API"
             )
-        buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w") as tar:
-            info = tarfile.TarInfo(name=base or "/")
-            info.size = len(data)
-            info.mode = stat["mode"] & 0o777
-            tar.addfile(info, io.BytesIO(data))
-        yield buf.getvalue()
-
+        if self._rift_client is None:
+            raise RiftUnavailable("rift client is not initialized")
+        async for chunk in self._rift_client.get_archive(path):
+            yield chunk
+        return
     async def put_archive(self, dest_path: str, tar_bytes: bytes) -> None:
         """Extract ``docker cp`` tar bytes into a k8s-middleware sandbox."""
-        if self.rift_ready:
-            if self._rift_client is None:
-                raise RiftUnavailable("rift client is not initialized")
-            with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as tar:
-                for member in tar.getmembers():
-                    name = member.name.lstrip("/")
-                    normalized = posixpath.normpath(name)
-                    if (
-                        normalized == ".."
-                        or normalized.startswith("../")
-                        or posixpath.isabs(normalized)
-                    ):
-                        raise ValueError(
-                            f"unsafe path in tar archive: {member.name!r}"
-                        )
-            await self._rift_client.put_archive(dest_path or "/", tar_bytes)
-            return
-        dest = dest_path or "/"
-        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r") as tar:
-            for member in tar.getmembers():
-                name = member.name.lstrip("/")
-                normalized = posixpath.normpath(name)
-                if (
-                    normalized == ".."
-                    or normalized.startswith("../")
-                    or posixpath.isabs(normalized)
-                ):
-                    raise ValueError(f"unsafe path in tar archive: {member.name!r}")
-                if member.isdir():
-                    target = posixpath.join(dest, name)
-                    await self.execute(
-                        {"command": f"mkdir -p {shlex.quote(target)}"},
-                        cwd="/",
-                    )
-                    continue
-                if not member.isfile():
-                    continue
-                content = tar.extractfile(member)
-                data = content.read() if content is not None else b""
-                target = posixpath.join(dest, name)
-                if not dest.endswith("/") and name == posixpath.basename(dest):
-                    target = dest
-                await self._client.write_file(self.sandbox_id, target, data)
-
+        if not self.rift_ready:
+            raise RiftUnavailable(
+                "rift channel is not ready; refusing platform file API"
+            )
+        if self._rift_client is None:
+            raise RiftUnavailable("rift client is not initialized")
+        validate_tar_members(tar_bytes)
+        await self._rift_client.put_archive(dest_path or "/", tar_bytes)
     def patch_pod_metadata(self, **kwargs: Any) -> None:
         return None
 

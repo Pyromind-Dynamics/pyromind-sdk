@@ -20,9 +20,9 @@ Pod，之后所有 `docker exec` / `docker cp` / 交互式 `-it` 都走
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `DOCKER_RT_RIFT_GATEWAY` | 空 | Gateway 地址。docker-rt 可运行在任何地方，默认按公网 `rift.example.com:443`。必填。 |
-| `DOCKER_RT_RIFT_GATEWAY_TLS` | `false` | 公网 TLS（系统信任链）时设 `true`；内网 h2c 保持 false。 |
-| `DOCKER_RT_RIFT_GATEWAY_CA` | 空 | 自签/私有 CA 路径；设置后使用 TLS，优先级高于 `_TLS`。 |
+| `DOCKER_RT_RIFT_GATEWAY` | 空 | **默认不用设**：从 `CLUSTER_RESOURCE[PYROMIND_CLUSTER]["rift"][env]` 解析（如 `rift.pyromind.ai:443`）。只用于本地/测试覆盖。 |
+| `DOCKER_RT_RIFT_GATEWAY_TLS` | 自动 | `:443` 或 `https://` 自动启用（系统信任链），一般不用设。 |
+| `DOCKER_RT_RIFT_GATEWAY_CA` | 空 | 私有 CA 路径；默认取集群 map 的 `rift_ca`，只有在本地覆盖时才设。 |
 | `DOCKER_RT_RIFT_BIN_DIR` | 本目录 `bin/` | 存放 `rift-client-linux-<arch>` 的目录。 |
 | `DOCKER_RT_RIFT_REMOTE_DIR` | `/opt/docker-rt/rift` | Pod 内专属注入目录。默认不用 `/tmp`（tmpfs，可能被镜像/平台清理）；rootfs 只读时再改 `/tmp/.rift`，放到持久卷（如 workspace）可跳过二进制重传。 |
 | `DOCKER_RT_RIFT_RETRY` | `3` | 启动失败重试次数（含首次）。 |
@@ -32,6 +32,10 @@ Pod，之后所有 `docker exec` / `docker cp` / 交互式 `-it` 都走
 | `DOCKER_RT_RIFT_PING_INTERVAL` | `0.3` | 探测间隔（秒）。 |
 | `DOCKER_RT_RIFT_HEALTH_INTERVAL` | `30` | 后台健康检查周期（秒），`0` 关闭。 |
 
+> 公网 gRPC 域名与 API 域名一起维护在 `pyromind_sdk/client/base.py` 的
+> `CLUSTER_RESOURCE[...]["rift"]`，必须与 Gateway Ingress 的 host/TLS 一致；
+> 代码里没有明文 h2c 的公网入口。
+>
 > `docker start` 会在 Pod Running 之后继续等待 rift-client 注入 + Ping；只有 Ping
 > 成功后才把容器标成 `Running`/`Up`。3 次仍失败则 start 返回 503、容器置为 `Dead`。
 > rift 是强制通道，**没有关闭开关**；缺少 `DOCKER_RT_RIFT_GATEWAY` 同样会让 start 失败。
@@ -78,8 +82,20 @@ k8s_middleware 的 pause 是把 StatefulSet 缩到 0，resume 会**新建 Pod**�
 ```bash
 cd pyromind_sdk/docker_rt/backend/rift/client
 make build-linux        # ../bin/rift-client-linux-{amd64,arm64} + ../bin/rift-client.sha256
-make test               # Go 单测（access key 常量时间比较）
+                        # + ../bin/rift-client.version (git describe, injected via -X main.version)
+make test               # Go 单测（access key 常量时间比较、exec 帧、tar 校验）
 ```
+
+`rift-client.version` 是 bootstrap 判断"Pod 里跑的是不是这份二进制"的依据：`Ping`
+返回的版本与它不一致时，bootstrap 会 kill 旧进程并重启一次，仍不一致就直接报
+`rift-client version mismatch after restart`。文件缺失时只告警、跳过校验（发布脚本
+会断言它存在）。
+
+`rift-client.source.sha256` 是**源码指纹**：`make build-linux` 对
+`client/*.go`（不含测试）、`pb/`、`go.mod/sum`、`Makefile` 和 `proto/rift.proto` 做哈希
+并写入。构建 wheel 时（`setup.py` 的 `bdist_wheel`）会重新计算：不一致就自动重建
+（有 Go 工具链时），没有 Go 就**直接失败**，避免把旧二进制打进发行包。`pytest` 里
+也有一条同名检查（没有二进制时跳过）。
 
 bootstrap 时若存在 `bin/rift-client.sha256`，会先校验本地二进制再上传。也可以
 把 `DOCKER_RT_RIFT_BIN_DIR` 指向任一包含这两个文件的目录。二进制是 release 产物，
@@ -107,6 +123,16 @@ Running/Up，`docker exec` / `docker cp` / `attach` 才允许进入：
 key 只在 Gateway **建流时**校验一次，会话期间不再检查；断线重连是新 stream，会重新
 校验。SDK 的 gRPC channel 带 30s keepalive，ingress/LB 的
 idle/read timeout 要相应调大，否则长时间无输出的 shell 会被中间设备切断。
+
+### `docker exec -d`
+
+`docker exec -d` 由一个后台 asyncio 任务读取 rift 流（`aio_server._run_detached`），
+**进程寿命绑定在这条流上**：daemon 退出/重启会断开流，进程可能继续运行但输出丢失
+（PTY 模式下会被 SIGHUP 终止）。所以：
+
+- `exec -d` 只适合“起了就不管”的短任务，不适合守护进程；
+- 需要跨 daemon 重启存活的长驻服务，请在命令里自行 `setsid nohup ... &`（输出重定向
+  到容器内文件），或等 `docker run -d` 的 workload 托管能力上线。
 
 平台 exec/文件接口只在 **bootstrap 自身**的调用里使用
 （`execute(..., _force_platform=True)`：`mkdir`、`uname -m`、启动脚本），它不是业务

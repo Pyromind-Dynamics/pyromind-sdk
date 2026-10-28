@@ -50,7 +50,14 @@ CLUSTER_RESOURCE = {
             "pre2": "https://pre2-api.pyromind.ai",
             "dev": "http://localhost:8001",
         },
-        "storage":"https://storage.pyromind.ai"
+        "storage":"https://storage.pyromind.ai",
+        # gRPC data plane (rift-gateway). Public CA; TLS is inferred from :443.
+        "rift": {
+            "prod": "rift.pyromind.ai:443",
+            "pre": "pre-rift.pyromind.ai:443",
+            "pre2": "pre2-rift.pyromind.ai:443",
+            "dev": "localhost:18080",
+        },
     },
     "us-west-2": {
         "http": {
@@ -59,7 +66,13 @@ CLUSTER_RESOURCE = {
             "pre2": "https://pre2-api-us-west-2.pyromind.ai",
             "dev": "http://localhost:8002",
         },
-        "storage":"https://storage-us-west-2.pyromind.ai"
+        "storage":"https://storage-us-west-2.pyromind.ai",
+        "rift": {
+            "prod": "rift-us-west-2.pyromind.ai:443",
+            "pre": "pre-rift-us-west-2.pyromind.ai:443",
+            "pre2": "pre2-rift-us-west-2.pyromind.ai:443",
+            "dev": "localhost:18080",
+        },
     },
     "cn-east-1": {
         "http": {
@@ -68,7 +81,13 @@ CLUSTER_RESOURCE = {
             "pre2": "https://pre2-api-cn-east-1.pyromind-asia.cn",
             "dev": "http://localhost:8002",
         },
-        "storage": "https://storage-cn-east-1.pyromind-asia.cn"
+        "storage": "https://storage-cn-east-1.pyromind-asia.cn",
+        "rift": {
+            "prod": "rift-cn-east-1.pyromind-asia.cn:443",
+            "pre": "pre-rift-cn-east-1.pyromind-asia.cn:443",
+            "pre2": "pre2-rift-cn-east-1.pyromind-asia.cn:443",
+            "dev": "localhost:18080",
+        },
     },
 }
 
@@ -116,6 +135,29 @@ def resolve_base_url_from_cluster(cluster: str) -> str:
     if not base:
         raise ValueError(f"Unknown env {env!r} for cluster {code!r}")
     return base.rstrip("/") + "/api/v1"
+
+
+
+
+def resolve_rift_target_from_cluster(cluster: str) -> tuple[str, bool, str | None]:
+    """Return ``(gateway, tls, ca)`` for the rift data plane.
+
+    The domain lives next to the API/storage entries in :data:`CLUSTER_RESOURCE`;
+    callers should not have to configure it. TLS is implied by an ``https://``
+    scheme or a ``:443`` port. A private CA, when needed, is a per-cluster
+    ``rift_ca`` path in the same table.
+    """
+    code, env = parse_cluster_code(cluster)
+    cfg = CLUSTER_RESOURCE.get(code)
+    if not cfg:
+        valid = ", ".join(available_clusters())
+        raise ValueError(f"Unknown cluster {code!r}. Valid clusters: {valid}")
+    gateway = (cfg.get("rift", {}) or {}).get(env)
+    if not gateway:
+        raise ValueError(f"Unknown rift env {env!r} for cluster {code!r}")
+    tls = gateway.startswith("https://") or gateway.endswith(":443")
+    ca = cfg.get("rift_ca")
+    return gateway, tls, str(ca) if ca else None
 
 
 def resolve_api_base_url(cluster: Optional[str] = None) -> str:

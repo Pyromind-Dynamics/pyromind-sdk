@@ -49,6 +49,10 @@ class RiftConfig:
     ping_attempts: int
     ping_interval: float
     health_interval: float
+    # Version baked into the shipped binary (`make build-linux` writes it next
+    # to the binaries). None when the file is missing, which only skips the
+    # stale-binary check.
+    expected_version: str | None
 
     def binary_for_arch(self, machine: str) -> Path:
         arch = _ARCH_ALIASES.get(machine.strip().lower())
@@ -66,15 +70,51 @@ class RiftConfig:
         return path
 
 
+def _resolve_gateway() -> tuple[str, bool, str | None]:
+    """Resolve the public gRPC endpoint.
+
+    Default source is the SDK cluster map (``CLUSTER_RESOURCE[cluster]["rift"]``),
+    so users do not configure the data-plane domain. ``DOCKER_RT_RIFT_GATEWAY``
+    remains an override for local/dev; TLS is inferred from ``:443``/``https``.
+    A private CA comes from the cluster's ``rift_ca`` entry or the CA env.
+    """
+    explicit = (os.getenv("DOCKER_RT_RIFT_GATEWAY") or "").strip()
+    ca_env = (os.getenv("DOCKER_RT_RIFT_GATEWAY_CA") or "").strip() or None
+    tls_raw = os.getenv("DOCKER_RT_RIFT_GATEWAY_TLS")
+    if explicit:
+        tls = _bool(tls_raw, explicit.startswith("https://") or explicit.endswith(":443"))
+        return explicit, tls, ca_env
+
+    cluster = (os.getenv("PYROMIND_CLUSTER") or "").strip()
+    if cluster:
+        try:
+            from pyromind_sdk.client.base import resolve_rift_target_from_cluster
+
+            gateway, tls, ca = resolve_rift_target_from_cluster(cluster)
+            if tls_raw is not None and tls_raw.strip():
+                tls = _bool(tls_raw, tls)
+            return gateway, tls, ca_env or ca
+        except Exception:  # noqa: BLE001 — fall through to "not configured"
+            pass
+    return "", _bool(tls_raw, False), ca_env
+
+
+def _expected_version(bin_dir: Path) -> str | None:
+    try:
+        text = (bin_dir / "rift-client.version").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text or None
+
+
 def load_rift_config() -> RiftConfig:
     default_bin = Path(__file__).resolve().parent / "bin"
     bin_dir = Path(os.getenv("DOCKER_RT_RIFT_BIN_DIR") or default_bin).expanduser()
+    gateway, gateway_tls, gateway_ca = _resolve_gateway()
     return RiftConfig(
-        gateway=(os.getenv("DOCKER_RT_RIFT_GATEWAY") or "").strip(),
-        # Public TLS (e.g. Higress with a public CA) needs this flag; a custom
-        # private CA is supplied via DOCKER_RT_RIFT_GATEWAY_CA and implies TLS.
-        gateway_tls=_bool(os.getenv("DOCKER_RT_RIFT_GATEWAY_TLS"), False),
-        gateway_ca=(os.getenv("DOCKER_RT_RIFT_GATEWAY_CA") or "").strip() or None,
+        gateway=gateway,
+        gateway_tls=gateway_tls,
+        gateway_ca=gateway_ca,
         bin_dir=bin_dir,
         remote_dir=(os.getenv("DOCKER_RT_RIFT_REMOTE_DIR") or "/opt/docker-rt/rift").strip(),
         retry=max(1, _int(os.getenv("DOCKER_RT_RIFT_RETRY"), 3)),
@@ -83,4 +123,5 @@ def load_rift_config() -> RiftConfig:
         ping_attempts=max(1, _int(os.getenv("DOCKER_RT_RIFT_PING_ATTEMPTS"), 20)),
         ping_interval=max(0.05, _float(os.getenv("DOCKER_RT_RIFT_PING_INTERVAL"), 0.3)),
         health_interval=max(0.0, _float(os.getenv("DOCKER_RT_RIFT_HEALTH_INTERVAL"), 30.0)),
+        expected_version=_expected_version(bin_dir),
     )
