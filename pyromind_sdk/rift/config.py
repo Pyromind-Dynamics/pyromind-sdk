@@ -64,7 +64,7 @@ class RiftConfig:
         if not path.is_file():
             raise RiftBinaryMissing(
                 f"rift-client binary not found: {path}. Build it with "
-                "`make build-linux` in pyromind_sdk/docker_rt/backend/rift/client, "
+                "`make build-linux` in pyromind_sdk/rift/client, "
                 "or set DOCKER_RT_RIFT_BIN_DIR."
             )
         return path

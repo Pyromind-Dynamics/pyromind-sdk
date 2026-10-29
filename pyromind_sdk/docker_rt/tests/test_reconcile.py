@@ -94,7 +94,7 @@ def test_adopted_sandbox_can_exec_and_copy(monkeypatch) -> None:
     import io
     import tarfile
 
-    from pyromind_sdk.docker_rt.backend.rift.pb import rift_pb2
+    from pyromind_sdk.rift.pb import rift_pb2
 
     store, _, name = _adopt_running(monkeypatch)
     record = store.get(name)

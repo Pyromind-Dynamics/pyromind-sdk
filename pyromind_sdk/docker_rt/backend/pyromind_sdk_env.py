@@ -34,9 +34,9 @@ from pyromind_sdk.client.models import (
 )
 from .archive import validate_tar_members
 from .portforward import parse_publish_spec
-from .rift.bootstrap import bootstrap_once
-from .rift.config import load_rift_config
-from .rift.errors import RiftError, RiftUnavailable
+from ...rift.bootstrap import bootstrap_once
+from ...rift.config import load_rift_config
+from ...rift.errors import RiftError, RiftUnavailable
 from .runtime import parse_binds
 
 logger = logging.getLogger("docker_rt.pyromind_sdk")

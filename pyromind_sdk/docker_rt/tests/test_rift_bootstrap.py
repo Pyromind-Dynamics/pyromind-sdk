@@ -5,16 +5,16 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-import pyromind_sdk.docker_rt.backend.rift.bootstrap as bootstrap_mod
-from pyromind_sdk.docker_rt.backend.rift.bootstrap import (
+import pyromind_sdk.rift.bootstrap as bootstrap_mod
+from pyromind_sdk.rift.bootstrap import (
     _force_restart,
     _kv,
     _local_binary_sha,
     _start_script,
     _wait_ping,
 )
-from pyromind_sdk.docker_rt.backend.rift.config import load_rift_config
-from pyromind_sdk.docker_rt.backend.rift.errors import RiftUnavailable
+from pyromind_sdk.rift.config import load_rift_config
+from pyromind_sdk.rift.errors import RiftUnavailable
 
 
 def test_kv_parses_last_matching_line():

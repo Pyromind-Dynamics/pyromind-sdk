@@ -13,17 +13,13 @@ try:  # setuptools >= 70 ships the command itself
 except ImportError:  # pragma: no cover - older setuptools
     from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
+from setuptools.command.sdist import sdist as _sdist
+
 # Read README
 readme_file = Path(__file__).parent / "README.md"
 long_description = readme_file.read_text(encoding="utf-8") if readme_file.exists() else ""
 
-_RIFT_DIR = (
-    Path(__file__).resolve().parent
-    / "pyromind_sdk"
-    / "docker_rt"
-    / "backend"
-    / "rift"
-)
+_RIFT_DIR = Path(__file__).resolve().parent / "pyromind_sdk" / "rift"
 
 
 def _rift_fingerprint():
@@ -36,50 +32,52 @@ def _rift_fingerprint():
     return module
 
 
-class bdist_wheel(_bdist_wheel):
-    """Refuse to package rift-client binaries that predate the Go sources.
+def _ensure_rift_binaries() -> None:
+    """Fail (or rebuild) unless ``bin/`` matches the Go sources.
 
-    ``bin/`` is gitignored and built by hand; without this guard a release made
-    after editing ``client/*.go`` would ship the previous build silently.
-    Rebuilds automatically when a Go toolchain is available.
+    ``bin/`` is gitignored and built by hand. Without this guard a release made
+    after editing ``client/*.go`` — or from a fresh clone that never ran
+    ``make build-linux`` — would ship stale or missing binaries silently.
     """
+    module = _rift_fingerprint()
+    issues = module.problems()
+    if issues:
+        print("rift-client binaries are stale; rebuilding...", file=sys.stderr)
+        client = _RIFT_DIR / "client"
+        if (
+            shutil.which("go")
+            and shutil.which("make")
+            and (client / "go.mod").is_file()
+        ):
+            subprocess.run(["make", "build-linux"], cwd=str(client), check=True)
+        issues = module.problems()
+    if issues:
+        raise SystemExit(
+            "rift-client is stale: "
+            + "; ".join(issues)
+            + f". Run `make build-linux` in {_RIFT_DIR / 'client'}."
+        )
+
+
+class bdist_wheel(_bdist_wheel):
+    """Package only binaries that match the Go sources."""
 
     def run(self):
-        module = _rift_fingerprint()
-        issues = module.problems()
-        if issues:
-            print(
-                "rift-client binaries are stale; rebuilding...", file=sys.stderr
-            )
-            client = _RIFT_DIR / "client"
-            if (
-                shutil.which("go")
-                and shutil.which("make")
-                and (client / "go.mod").is_file()
-            ):
-                subprocess.run(
-                    ["make", "build-linux"], cwd=str(client), check=True
-                )
-            issues = module.problems()
-        if issues:
-            raise SystemExit(
-                "rift-client is stale: "
-                + "; ".join(issues)
-                + f". Run `make build-linux` in {_RIFT_DIR / 'client'}."
-            )
+        _ensure_rift_binaries()
         # build/lib may hold binaries from an earlier build; drop them so the
         # packaged files are always the ones verified above.
         build_lib = Path(self.get_finalized_command("build").build_lib)
-        cached = (
-            build_lib
-            / "pyromind_sdk"
-            / "docker_rt"
-            / "backend"
-            / "rift"
-            / "bin"
-        )
+        cached = build_lib / "pyromind_sdk" / "rift" / "bin"
         if cached.is_dir():
             shutil.rmtree(cached)
+        super().run()
+
+
+class sdist(_sdist):
+    """An sdist without fresh binaries cannot be turned into a working wheel."""
+
+    def run(self):
+        _ensure_rift_binaries()
         super().run()
 
 
@@ -87,7 +85,7 @@ class bdist_wheel(_bdist_wheel):
 setup(
     name="pyromind-sdk",
     version = "0.1.12",
-    cmdclass={"bdist_wheel": bdist_wheel},
+    cmdclass={"bdist_wheel": bdist_wheel, "sdist": sdist},
     description="Lightweight SDK stub for local development and testing of third-party nodes without the full platform codebase",
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -138,8 +136,8 @@ setup(
     package_data={
         "pyromind_sdk": ["*.md"],
         "pyromind_sdk.docker_rt": ["*.md", "requirements.txt", "requirements-dev.txt"],
-        # Build these first: backend/rift/client -> `make build-linux`.
-        "pyromind_sdk.docker_rt.backend.rift": [
+        # Build these first: pyromind_sdk/rift/client -> `make build-linux`.
+        "pyromind_sdk.rift": [
             "README.md",
             "proto/*.proto",
             "bin/rift-client-linux-*",

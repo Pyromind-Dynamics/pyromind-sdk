@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=70", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -81,17 +81,17 @@ packages = [
     "pyromind_sdk.docker_rt.api",
     "pyromind_sdk.docker_rt.backend",
     "pyromind_sdk.docker_rt.backend.kube",
-    "pyromind_sdk.docker_rt.backend.rift",
-    "pyromind_sdk.docker_rt.backend.rift.pb",
     "pyromind_sdk.docker_rt.tests",
+    "pyromind_sdk.rift",
+    "pyromind_sdk.rift.pb",
 ]
 
 [tool.setuptools.package-data]
 pyromind_sdk = ["*.md"]
 "pyromind_sdk.docker_rt" = ["*.md", "requirements.txt", "requirements-dev.txt"]
 # rift-client is shipped as architecture-specific release binaries; build them
-# with `backend/rift/client/make build-linux` before building the wheel.
-"pyromind_sdk.docker_rt.backend.rift" = [
+# with `pyromind_sdk/rift/client/make build-linux` before building the wheel.
+"pyromind_sdk.rift" = [
     "README.md",
     "proto/*.proto",
     "bin/rift-client-linux-*",
@@ -99,6 +99,18 @@ pyromind_sdk = ["*.md"]
     "bin/rift-client.version",
 ]
 "pyromind_sdk.examples" = ["*.yaml", "utils/*.py"]
+
+# The wheel is runtime-only. Go sources and their tests build the binaries and
+# are kept in the sdist (release checks read them), but docker-rt never needs
+# them at run time.
+[tool.setuptools.exclude-package-data]
+"pyromind_sdk.rift" = [
+    "client/*.go",
+    "client/go.mod",
+    "client/go.sum",
+    "client/Makefile",
+    "client/pb/*.go",
+]
 
 [tool.pytest.ini_options]
 # Exclude test_yaml_nodes.py from pytest collection

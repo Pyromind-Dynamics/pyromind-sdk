@@ -27,7 +27,7 @@ import zipfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-RIFT = REPO / "pyromind_sdk" / "docker_rt" / "backend" / "rift"
+RIFT = REPO / "pyromind_sdk" / "rift"
 CLIENT = RIFT / "client"
 BIN = RIFT / "bin"
 ARCHES = ("amd64", "arm64")

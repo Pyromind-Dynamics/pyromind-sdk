@@ -13,7 +13,6 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 build:
 	@mkdir -p $(OUT)
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="$(LDFLAGS)" -o $(OUT)/rift-client .
-	@printf '%s\n' "$(VERSION)" > $(OUT)/rift-client.version
 
 build-linux:
 	@mkdir -p $(OUT)
