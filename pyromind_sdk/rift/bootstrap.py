@@ -23,7 +23,7 @@ import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .client import RiftGatewayClient
+from .rift_client import RiftGatewayClient
 from .config import load_rift_config
 from .errors import (
     RiftPermissionDenied,
@@ -32,7 +32,9 @@ from .errors import (
 )
 
 if TYPE_CHECKING:
-    from ..pyromind_sdk_env import PyromindSDK
+    # Import for type hints only: pyromind_sdk_env imports this module, so a
+    # runtime import here would be circular.
+    from ..docker_rt.backend.pyromind_sdk_env import PyromindSDK
 
 logger = logging.getLogger("docker_rt.rift.bootstrap")
 

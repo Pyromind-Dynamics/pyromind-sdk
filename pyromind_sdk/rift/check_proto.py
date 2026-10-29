@@ -27,7 +27,7 @@ _HERE = Path(__file__).resolve().parent
 _PROTO = _HERE / "proto" / "rift.proto"
 _GO_PB = _HERE / "client" / "pb" / "rift.pb.go"
 _GO_GRPC = _HERE / "client" / "pb" / "rift_grpc.pb.go"
-_REPO_ROOT = _HERE.parents[3]
+_REPO_ROOT = _HERE.parents[1]
 
 
 def _normalized_proto(text: str) -> list[str]:
@@ -122,7 +122,7 @@ def _descriptor_model(proto: Path):
 def _python_model():
     if str(_REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(_REPO_ROOT))
-    from pyromind_sdk.docker_rt.backend.rift.pb import rift_pb2
+    from pyromind_sdk.rift.pb import rift_pb2
 
     messages: dict[str, dict] = {}
     for name, message in rift_pb2.DESCRIPTOR.message_types_by_name.items():

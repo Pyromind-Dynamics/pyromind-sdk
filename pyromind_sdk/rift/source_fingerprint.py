@@ -61,6 +61,10 @@ def problems() -> list[str]:
         for binary in BINARIES
         if not binary.is_file()
     ]
+    if not CLIENT_DIR.is_dir():
+        # Installed wheel: Go sources are not shipped, so there is nothing to
+        # compare. The binaries themselves are still checked above.
+        return issues
     if not FINGERPRINT_FILE.is_file():
         issues.append(f"missing {FINGERPRINT_FILE.name}")
         return issues

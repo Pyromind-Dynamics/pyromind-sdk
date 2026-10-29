@@ -287,13 +287,14 @@ docker exec / cp -> docker-rt -> rift gateway（鉴权）-> Service:7500 -> rift
 - `docker stop` + `docker start` 会重建沙箱 Pod，docker-rt 会重新 bootstrap 并**重启
   进程**；10MB 二进制只有在注入目录位于持久卷且 sha 一致时才跳过重传
   （`DOCKER_RT_RIFT_REMOTE_DIR`，默认 `/opt/docker-rt/rift`）。
-- Gateway 每次 RPC 用 Ed25519 私钥签发短期 token，Pod 里只有公钥；所以 SDK 开源
-  仓库里的验签逻辑公开也无法伪造 token。
+- Gateway 用调用方的 access key 与沙箱 `Pipe` 里的值比对，并把同一个 key 作为
+  `x-rift-token` 转发；Pod 内以 `0400` 文件保存并做常量时间比较。不涉及公钥、KV
+  或签名。
 - `rift-client` 不可达的飞书告警由 **gateway** 发出（按 sandbox 统计连续失败），本机
   daemon 不发通知。
 
 完整环境变量表与 bootstrap 时序见
-[`pyromind_sdk/docker_rt/backend/rift/README.md`](pyromind_sdk/docker_rt/backend/rift/README.md)。
+[`pyromind_sdk/rift/README.md`](pyromind_sdk/rift/README.md)。
 
 ## 自定义工作流节点
 

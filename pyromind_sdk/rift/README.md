@@ -10,11 +10,15 @@ Pod，之后所有 `docker exec` / `docker cp` / 交互式 `-it` 都走
 | --- | --- |
 | `config.py` | 读取 `DOCKER_RT_RIFT_*` 环境变量，按架构解析本地二进制。 |
 | `errors.py` | `RiftUnavailable` / `RiftUnauthenticated` / `RiftPermissionDenied` / `RiftBinaryMissing`。 |
-| `client.py` | `grpc.aio` 客户端：`ping` / `exec_once` / `open_exec` / `get_archive` / `put_archive`。 |
+| `rift_client.py` | `grpc.aio` 客户端（daemon 侧）：`ping` / `exec_once` / `open_exec` / `get_archive` / `put_archive`。 |
 | `bootstrap.py` | 按 `uname -m` 选二进制、上传、写入 access key、detached 启动、Ping。 |
 | `pb/` | 由 `rift-gateway/proto/rift.proto` 生成的 Python stub。 |
+| `check_proto.py` | 构建期：两份 proto 与两端生成物一致性检查。 |
+| `source_fingerprint.py` | 构建期：Go 源码指纹，防止打包旧二进制。 |
 | `client/` | **rift-client 的 Go 源码**（module `rift-client`）与 `Makefile`，随 SDK 一起维护。 |
 | `bin/` | `rift-client-linux-{amd64,arm64}`（构建产物，不入库）。 |
+
+> Python 文件只运行在本机 daemon，不会进入 Pod；进 Pod 的只有 `bin/` 里的 Go 二进制。
 
 ## 环境变量
 
@@ -80,7 +84,7 @@ k8s_middleware 的 pause 是把 StatefulSet 缩到 0，resume 会**新建 Pod**�
 源码就在本目录旁边（`client/`），直接在 SDK 仓库内构建：
 
 ```bash
-cd pyromind_sdk/docker_rt/backend/rift/client
+cd pyromind_sdk/rift/client
 make build-linux        # ../bin/rift-client-linux-{amd64,arm64} + ../bin/rift-client.sha256
                         # + ../bin/rift-client.version (git describe, injected via -X main.version)
 make test               # Go 单测（access key 常量时间比较、exec 帧、tar 校验）
@@ -93,9 +97,9 @@ make test               # Go 单测（access key 常量时间比较、exec 帧�
 
 `rift-client.source.sha256` 是**源码指纹**：`make build-linux` 对
 `client/*.go`（不含测试）、`pb/`、`go.mod/sum`、`Makefile` 和 `proto/rift.proto` 做哈希
-并写入。构建 wheel 时（`setup.py` 的 `bdist_wheel`）会重新计算：不一致就自动重建
-（有 Go 工具链时），没有 Go 就**直接失败**，避免把旧二进制打进发行包。`pytest` 里
-也有一条同名检查（没有二进制时跳过）。
+并写入。构建 wheel **和 sdist** 时（`setup.py` 的 `bdist_wheel` / `sdist`）都会重新
+计算：不一致或缺失就自动重建（有 Go 工具链时），没有 Go 就**直接失败**，避免把旧/
+缺二进制的包发出去。`pytest` 里也有一条同名检查（没有二进制时跳过）。
 
 bootstrap 时若存在 `bin/rift-client.sha256`，会先校验本地二进制再上传。也可以
 把 `DOCKER_RT_RIFT_BIN_DIR` 指向任一包含这两个文件的目录。二进制是 release 产物，

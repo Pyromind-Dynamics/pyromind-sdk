@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from ..backend.rift import check_proto
+from ...rift import check_proto
 
 pytest.importorskip("grpc_tools")
 

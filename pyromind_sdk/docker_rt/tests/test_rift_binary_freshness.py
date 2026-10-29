@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from ..backend.rift import source_fingerprint
+from ...rift import source_fingerprint
 
 
 def test_rift_binaries_match_the_go_sources() -> None:

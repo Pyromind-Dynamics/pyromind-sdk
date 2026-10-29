@@ -295,12 +295,13 @@ Requirements and behaviour:
   the bootstrap and always restarts the process. The 10 MB binary is re-uploaded
   unless the injection directory survives on a persistent mount and its hash
   matches (`DOCKER_RT_RIFT_REMOTE_DIR`, default `/opt/docker-rt/rift`).
-- The gateway mints a short-lived Ed25519 token per RPC and the pod holds only
-  the public key, so the open-source verification code cannot forge tokens.
+- The gateway compares the caller's access key against the sandbox `Pipe` and
+  forwards the same key as `x-rift-token`; the pod holds it in a `0400` file and
+  compares it in constant time. No public key, KV or signing is involved.
 - Feishu alerts for an unreachable `rift-client` are emitted by the gateway
   (it counts consecutive failures per sandbox), not by the local daemon.
 
-See [`pyromind_sdk/docker_rt/backend/rift/README.md`](pyromind_sdk/docker_rt/backend/rift/README.md)
+See [`pyromind_sdk/rift/README.md`](pyromind_sdk/rift/README.md)
 for the full environment-variable table and the bootstrap sequence.
 
 ## Custom workflow nodes

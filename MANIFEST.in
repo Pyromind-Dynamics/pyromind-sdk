@@ -2,9 +2,9 @@ include README.md
 include LICENSE
 include pyproject.toml
 # rift data plane: in-repo Go client source (sdist) + release binaries (both)
-recursive-include pyromind_sdk/docker_rt/backend/rift/client *.go go.mod go.sum Makefile pb/*.go
-recursive-include pyromind_sdk/docker_rt/backend/rift/proto *.proto
-recursive-include pyromind_sdk/docker_rt/backend/rift/bin rift-client-linux-* rift-client.sha256 rift-client.version rift-client.source.sha256 README.md
+recursive-include pyromind_sdk/rift/client *.go go.mod go.sum Makefile pb/*.go
+recursive-include pyromind_sdk/rift/proto *.proto
+recursive-include pyromind_sdk/rift/bin rift-client-linux-* rift-client.sha256 rift-client.version rift-client.source.sha256 README.md
 recursive-exclude * __pycache__
 recursive-exclude * *.py[co]
 # Exclude build and development files

@@ -97,8 +97,8 @@ from .backend.pyromind_sdk_env import (  # noqa: E402
     close_sandbox_client,
     get_sandbox_client,
 )
-from .backend.rift.config import load_rift_config  # noqa: E402
-from .backend.rift.errors import RiftError, RiftUnavailable  # noqa: E402
+from ..rift.config import load_rift_config  # noqa: E402
+from ..rift.errors import RiftError, RiftUnavailable  # noqa: E402
 from .bootstrap import check_connection, print_connected  # noqa: E402
 from .register_context import (  # noqa: E402
     ensure_docker_rt_context,
