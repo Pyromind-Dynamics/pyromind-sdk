@@ -156,6 +156,26 @@ created before rift-gateway was deployed it has no route; run `docker stop` +
 rift-gateway 上线**之前**创建的沙箱没有 Pipe，无法自愈：`docker stop` + `docker start`
 （Pod 重建后由 k8s_middleware 重新写 Pipe，再 bootstrap），或直接重建沙箱。
 
+### `docker cp` 大文件：并行分片
+
+单条 rift 流的上传速度由**前门代理的 HTTP/2 流控窗口 × RTT** 决定：集群内 RTT 亚毫秒，
+500MB 只要 7s；公网 RTT 200–400ms 时单流只有 **0.1–0.3 MiB/s**（同一份 32MiB 文件
+实测 164s）。窗口是"每条流"的，所以多开几条流就能叠加（同条件下 4 条流 26.4s，**6.2x**）。
+
+因此 `PyromindSDK.put_archive` 对大文件走分片：
+
+- 条件：tar 里**恰好一个普通文件**且整体 ≥ `DOCKER_RT_CP_PARALLEL_MIN_BYTES`（默认 8 MiB）；
+- 做法：daemon 把 tar 落到临时文件并先做成员校验，再按 `DOCKER_RT_CP_PART_BYTES`
+  （默认 8 MiB）切片，每条切片包成单成员 tar（`part-00000`…）用
+  `DOCKER_RT_CP_STREAMS`（默认 4）条 `PutArchive` 并发写进 Pod 的
+  `/tmp/.drt-cp-<uuid>/`；
+- 组装：Pod 内 `cat part-* > payload && chmod/ touch && mv -f payload <dest>/<name>`，
+  `mv` 是重命名，不跟随目标符号链接；随后删除暂存目录；
+- 其余形态（目录、符号链接、小文件）仍走**单流 + rift-client 逐成员校验**，行为不变；
+- 失败（mkdir / 分片 / 组装任一步）都会清理暂存目录并报错，不会静默成功。
+
+下载方向不需要分片：窗口在客户端侧随 RTT 自适应，实测 20 MiB/11.2s（≈1.8 MiB/s）。
+
 ### 长连接 / 交互式会话
 
 `docker exec -it bash`、`docker attach` 走 bidi `Exec` 流，可以持续数小时。access

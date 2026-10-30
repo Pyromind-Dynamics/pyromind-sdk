@@ -10,9 +10,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import inspect
+import io
 import logging
 import os
+import posixpath
 import shlex
+import tarfile
+import tempfile
+import time
 import uuid
 import threading
 import weakref
@@ -32,7 +37,7 @@ from pyromind_sdk.client.models import (
     SandboxType,
     VolumeMount,
 )
-from .archive import validate_tar_members
+from .archive import validate_tar_file, validate_tar_members
 from .portforward import parse_publish_spec
 from ...rift.bootstrap import bootstrap_once
 from ...rift.config import load_rift_config
@@ -61,6 +66,27 @@ _CLEANUP_DELETE_RETRY_DELAY_S = 1.0
 _CLEANUP_PAUSE_TIMEOUT_S = 60.0
 _CLEANUP_PAUSE_POLL_INTERVAL_S = 1.0
 _CLEANUP_STATUS_TIMEOUT_S = 10.0
+#: 单条 rift 流的上传速度被前门代理的 HTTP/2 流控窗口限住（窗口 × RTT）。
+#: 公网 RTT 200–400ms 时单流约 0.1–0.3 MiB/s，4 条并发测得约 12 倍聚合带宽
+#: （2026-10-30，Mac → pre 网关）。大于阈值且是单个普通文件的 tar 走并行分片。
+def _cp_int(name: str, default: int, *, floor: int = 0) -> int:
+    raw = os.getenv(name)
+    try:
+        return max(floor, int(str(raw).strip())) if raw and raw.strip() else default
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using %d", name, raw, default)
+        return default
+
+
+_CP_PARALLEL_MIN_BYTES = _cp_int("DOCKER_RT_CP_PARALLEL_MIN_BYTES", 8 << 20)
+_CP_PART_BYTES = _cp_int("DOCKER_RT_CP_PART_BYTES", 8 << 20, floor=1 << 20)
+_CP_STREAMS = _cp_int("DOCKER_RT_CP_STREAMS", 4, floor=1)
+
+#: 刷 Pod 状态的硬上限（秒）。数据面请求（exec/cp/start）进来都会先强制刷新一次
+#: 状态，而客户端默认 600s 超时 —— 控制面（pre-api）抖一下就把数据面拖死：
+#: 2026-10-30 本地实测 1 MiB 的 `docker cp` 卡了 109.6s，一个字节都还没传。
+#: 超时就沿用缓存状态，让 exec/cp 自己用网关的结果说话。
+_PHASE_REFRESH_TIMEOUT_S = 5.0
 _CLEANUP_PAUSE_REQUEST_TIMEOUT_S = 30.0
 _CLEANUP_DELETE_TIMEOUT_S = 30.0
 DEFAULT_CLEANUP_CONCURRENCY = 4
@@ -175,6 +201,27 @@ def new_sandbox_client() -> AsyncSandboxClient:
         connector_limit=DEFAULT_CONNECTOR_LIMIT,
         connector_limit_per_host=DEFAULT_CONNECTOR_LIMIT,
     )
+
+
+def _member_tar(name: str, data: bytes, mode: int = 0o600) -> bytes:
+    """One-member tar: what a part stream ships to rift-client."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(name=name)
+        info.size = len(data)
+        info.mode = mode
+        info.mtime = int(time.time())
+        tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def _spool_reader(fileobj: Any, chunk: int = 1 << 20):
+    """Sync chunk reader over the spooled body (``put_archive`` wants iterables)."""
+    while True:
+        data = fileobj.read(chunk)
+        if not data:
+            return
+        yield data
 
 
 def get_sandbox_client() -> AsyncSandboxClient:
@@ -954,7 +1001,28 @@ class PyromindSDK:
                 if cached is not None:
                     return cached
             try:
-                sandbox = await self._client.get_sandbox(self.sandbox_id)
+                sandbox = await self._client.get_sandbox(
+                    self.sandbox_id,
+                    timeout=_PHASE_REFRESH_TIMEOUT_S,
+                    # A status probe with retries would multiply the bound.
+                    retry=False,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                # Control plane is slow, the data plane is what the caller is
+                # here for: keep the cached view and let exec/cp answer for
+                # itself instead of blocking on the client's 600s timeout.
+                logger.warning(
+                    "status refresh timed out after %.0fs sandbox=%s; "
+                    "keeping cached phase %r",
+                    _PHASE_REFRESH_TIMEOUT_S,
+                    self.sandbox_id,
+                    self.sandbox_status,
+                )
+                return (
+                    self._phase_from_status(str(self.sandbox_status or ""))
+                    if self.sandbox_status
+                    else "Unknown"
+                )
             except _SDK_API_ERRORS as exc:
                 self._phase_refreshed_at = loop.time()
                 if exc.status_code == 404:
@@ -1204,12 +1272,19 @@ class PyromindSDK:
     ) -> None:
         """Extract a ``docker cp`` tar into a k8s-middleware sandbox.
 
-        The daemon hands over the request body as a stream so a multi-GB image
-        tar is never buffered here; rift-client validates and repacks every
-        member on arrival, then checks the files really landed. This method
-        owns the second half of that contract: the bytes we sent must all be
-        accounted for, otherwise the copy must not look successful — that is
-        how a `docker cp` once reported success while nothing was written.
+        Two shapes:
+
+        * one regular file larger than ``_CP_PARALLEL_MIN_BYTES`` — split into
+          ``_CP_PART_BYTES`` parts sent over ``_CP_STREAMS`` concurrent
+          ``PutArchive`` streams, then assembled in the Pod. A single stream is
+          bounded by the front proxy's HTTP/2 flow-control window: from a
+          high-RTT client that is ~0.1–0.3 MiB/s, while four streams measured
+          ~12x the single-stream rate (2026-10-30);
+        * anything else (directories, symlinks, small files) — one validated
+          stream, exactly as before.
+
+        Either way the bytes we sent must be accounted for by rift-client;
+        otherwise the copy must not look successful.
         """
         if not self.rift_ready:
             raise RiftUnavailable(
@@ -1218,38 +1293,151 @@ class PyromindSDK:
         if self._rift_client is None:
             raise RiftUnavailable("rift client is not initialized")
         dest = dest_path or "/"
-        sent = 0
+
         if isinstance(tar, (bytes, bytearray, memoryview)):
             payload = bytes(tar)
             validate_tar_members(payload)
-            sent = len(payload)
-            data: Any = payload
-        else:
+            await self._put_archive_single(dest, payload, len(payload))
+            return
 
-            async def _counted(chunks: Any):
-                nonlocal sent
-                async for chunk in chunks:
-                    sent += len(chunk)
-                    yield chunk
+        # A live stream cannot be inspected (or replayed) in place: spool it so
+        # one code path can validate the archive, decide between the parallel
+        # and single-stream shapes, and still deliver every byte.
+        with tempfile.TemporaryFile(prefix="drt-cp-") as spool:
+            size = 0
+            async for chunk in tar:
+                if chunk:
+                    spool.write(chunk)
+                    size += len(chunk)
+            if size == 0:
+                raise RiftUnavailable(
+                    "docker cp: the upload body was empty, nothing to extract"
+                )
+            await self._put_archive_spooled(dest, spool, size)
 
-            data = _counted(tar)
+    async def _put_archive_spooled(self, dest: str, spool: Any, size: int) -> None:
+        spool.seek(0)
+        members = validate_tar_file(spool)
+        spool.seek(0)
+
+        if (
+            len(members) == 1
+            and members[0].isreg()
+            and members[0].size > 0
+            and size >= _CP_PARALLEL_MIN_BYTES
+            and _CP_STREAMS > 1
+        ):
+            if await self._put_archive_parallel(dest, spool, members[0]):
+                return
+            spool.seek(0)
+
+        await self._put_archive_single(dest, _spool_reader(spool), size)
+
+    async def _put_archive_single(
+        self, dest: str, data: Any, size: int
+    ) -> None:
         written = await self._rift_client.put_archive(dest, data)
-        if sent == 0:
+        if written != size:
             raise RiftUnavailable(
-                "docker cp: the upload body was empty, nothing to extract"
-            )
-        if written != sent:
-            raise RiftUnavailable(
-                f"docker cp: rift-client received {written} of {sent} bytes; "
+                f"docker cp: rift-client received {written} of {size} bytes; "
                 "refusing to report the copy as successful"
             )
         logger.info(
             "archive put done sandbox=%s dest=%s bytes=%d written=%d",
             self.sandbox_id,
             dest,
-            sent,
+            size,
             written,
         )
+
+    async def _put_archive_parallel(
+        self, dest: str, spool: Any, member: Any
+    ) -> bool:
+        """Send one big regular file as N concurrent parts; assemble in the Pod.
+
+        Returns False when the Pod cannot be prepared, so the caller can fall
+        back to the single validated stream instead of failing the copy.
+        """
+        staging = f"/tmp/.drt-cp-{uuid.uuid4().hex}"
+        prepared = await self.execute(
+            {"command": f"mkdir -p {shlex.quote(staging)}"}, cwd="/"
+        )
+        if int(prepared.get("returncode", 0) or 0) != 0:
+            logger.warning(
+                "docker cp: cannot create staging dir for %s; using one stream",
+                member.name,
+            )
+            return False
+
+        started = time.monotonic()
+        sem = asyncio.Semaphore(_CP_STREAMS)
+        parts: list[tuple[int, int]] = []
+        offset = int(member.offset_data)
+        for index, _ in enumerate(range(0, member.size, _CP_PART_BYTES)):
+            parts.append((index, offset + index * _CP_PART_BYTES))
+
+        async def send(index: int, start: int) -> None:
+            spool.seek(start)
+            data = spool.read(min(_CP_PART_BYTES, offset + member.size - start))
+            if not data:
+                return
+            frame = _member_tar(f"part-{index:05d}", data)
+            async with sem:
+                await self._rift_client.put_archive(staging, frame)
+
+        try:
+            await asyncio.gather(*(send(i, o) for i, o in parts))
+        except Exception:
+            await self._remove_staging(staging)
+            raise
+
+        target = posixpath.join(dest, member.name)
+        parent = posixpath.dirname(target) or "/"
+        assemble = (
+            f"set -e; cd {shlex.quote(staging)}; "
+            f"cat part-* > payload; "
+            f"chmod {member.mode & 0o777:o} payload; "
+            # docker cp preserves mtime; the single-stream path gets it from tar.
+            f"touch -d @{int(member.mtime)} payload 2>/dev/null || true; "
+            f"mkdir -p {shlex.quote(parent)}; "
+            f"mv -f payload {shlex.quote(target)}; "
+            f"cd /; rm -rf {shlex.quote(staging)}"
+        )
+        try:
+            result = await self.execute({"command": assemble}, cwd="/")
+            code = int(result.get("returncode", 0) or 0)
+        except Exception as exc:  # noqa: BLE001
+            await self._remove_staging(staging)
+            raise RiftUnavailable(
+                f"docker cp: assembling {member.name} failed: {exc}"
+            ) from exc
+        if code != 0:
+            await self._remove_staging(staging)
+            raise RiftUnavailable(
+                f"docker cp: assembling {member.name} failed: "
+                f"{result.get('stderr') or result.get('output') or f'exit {code}'}"
+            )
+        logger.info(
+            "archive put done sandbox=%s dest=%s name=%s bytes=%d parts=%d "
+            "streams=%d elapsed=%.1fs",
+            self.sandbox_id,
+            dest,
+            member.name,
+            member.size,
+            len(parts),
+            _CP_STREAMS,
+            time.monotonic() - started,
+        )
+        return True
+
+    async def _remove_staging(self, staging: str) -> None:
+        try:
+            await self.execute(
+                {"command": f"rm -rf {shlex.quote(staging)}"}, cwd="/"
+            )
+        except Exception:  # noqa: BLE001 - best effort
+            logger.debug("staging cleanup failed for %s", staging, exc_info=True)
+
     def patch_pod_metadata(self, **kwargs: Any) -> None:
         return None
 

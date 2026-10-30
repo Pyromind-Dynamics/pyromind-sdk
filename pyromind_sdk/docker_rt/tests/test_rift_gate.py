@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from ..backend.pyromind_sdk_env import PyromindSDK
@@ -25,9 +27,13 @@ def _legacy_record() -> ContainerRecord:
 
 
 @pytest.mark.asyncio
-async def test_exec_is_rejected_at_create_time(aiohttp_client) -> None:
+async def test_exec_is_rejected_at_create_time(aiohttp_client, monkeypatch) -> None:
+    from .. import aio_server as mod
     from ..aio_server import create_aio_app
 
+    monkeypatch.setattr(
+        mod, "load_rift_config", lambda: SimpleNamespace(gateway="gw.example:443")
+    )
     app = create_aio_app(run_reconcile=False)
     client = await aiohttp_client(app)
     store = app["store"]
@@ -47,9 +53,13 @@ async def test_exec_is_rejected_at_create_time(aiohttp_client) -> None:
 
 
 @pytest.mark.asyncio
-async def test_cp_is_rejected_while_rift_is_not_ready(aiohttp_client) -> None:
+async def test_cp_is_rejected_while_rift_is_not_ready(aiohttp_client, monkeypatch) -> None:
+    from .. import aio_server as mod
     from ..aio_server import create_aio_app
 
+    monkeypatch.setattr(
+        mod, "load_rift_config", lambda: SimpleNamespace(gateway="gw.example:443")
+    )
     app = create_aio_app(run_reconcile=False)
     client = await aiohttp_client(app)
     store = app["store"]
@@ -322,3 +332,33 @@ def test_put_archive_streams_and_rechunks_into_fixed_frames() -> None:
     sizes = [len(chunk) for chunk in call.chunks]
     assert sizes == [256 * 1024, 1000 + 300 * 1024 - 256 * 1024]
     assert b"".join(call.chunks) == b"a" * 1000 + b"b" * (300 * 1024)
+
+
+def test_not_ready_message_names_the_missing_cluster(monkeypatch):
+    """没配 gateway 时，409 必须指向配置，而不是让人去 stop/start 沙箱。
+
+    2026-10-30：本地 daemon 没设 PYROMIND_CLUSTER —— API 列表回落到 portal 仍能
+    列出沙箱，rift 却没有回落，于是所有容器恒为 Created，exec 报"沙箱没路由"，
+    完全误导。
+    """
+    from .. import aio_server as mod
+
+    class _Record:
+        id = "a" * 64
+
+    monkeypatch.setattr(
+        mod, "load_rift_config", lambda: SimpleNamespace(gateway="")
+    )
+    msg = (mod._rift_not_ready_error(_Record()).text or "")
+    assert "rift gateway is not configured" in msg
+    assert "PYROMIND_CLUSTER" in msg
+    assert "docker stop" not in msg
+
+    monkeypatch.setattr(
+        mod,
+        "load_rift_config",
+        lambda: SimpleNamespace(gateway="gw.example:443"),
+    )
+    msg = (mod._rift_not_ready_error(_Record()).text or "")
+    assert "rift-client is not ready" in msg
+    assert "docker stop" in msg
