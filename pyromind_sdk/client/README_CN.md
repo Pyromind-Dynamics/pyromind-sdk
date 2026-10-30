@@ -69,6 +69,33 @@ Portal 不会把用户 API Key 发给目标集群。权限或服务未开通时�
 请将 SDK 的 `base_url` 指向当前环境的 Portal。SDK 默认使用标准 Portal 地址；
 如果使用其他 Portal 环境，通过 `base_url` 或 `PYROMIND_BASE_URL` 配置即可。
 
+## 同集群文件共享
+
+通过 `client.storage.file_shares` 发起和管理文件共享。`cluster` 应设置为源文件所在的集群及环境，SDK 会随请求发送 `X-Cluster`；`base_url` 应指向对应环境的 Portal：
+
+```python
+from pyromind_sdk import PyroMindAPIClient
+
+client = PyroMindAPIClient(
+    api_key="your-api-key",
+    cluster="us-west-1#pre",
+)
+
+created = client.storage.file_shares.create(
+    source_path="/workspace/models",
+    target_user_input="user@example.com",  # 接收人的 UID 或邮箱
+)
+
+sent = client.storage.file_shares.list({"direction": "sent"})
+if created.task and created.task.can_cancel:
+    client.storage.file_shares.cancel(created.biz_no)
+
+# 仅从当前用户自己的列表中删除一个或多个终态任务
+client.storage.file_shares.delete(["terminal-share-biz-no"])
+```
+
+`list_page()` 查询单页，`list()` 自动翻页；`direction` 可选 `sent` 或 `received`，还可传入分页参数和可选的 `transfer_env`。`get()` 查询单条任务。服务端仅允许发起人取消待接受邀请，且仅允许删除终态任务；删除只隐藏当前用户一侧的记录，不会修改另一方的任务。通知投递待重试时可调用 `retry_notification(biz_no)`。异步客户端提供相同方法，调用时在 `client.storage.file_shares` 方法前加 `await`。
+
 ## 沙箱（Sandbox）⚠️已废弃不能创建
 
 ### 列出所有沙箱

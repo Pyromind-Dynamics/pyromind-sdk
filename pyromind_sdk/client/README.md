@@ -95,6 +95,43 @@ For a single file, `target_path` may be either the destination directory or the
 full destination file path without a trailing slash when its basename matches
 the source filename.
 
+## Same-cluster file sharing
+
+Create and manage file share invitations through `client.storage.file_shares`.
+Set `cluster` to the cluster and environment that owns the source path; the SDK
+sends it as `X-Cluster` with each request. Use the Portal base URL for the
+environment you are using.
+
+```python
+from pyromind_sdk import PyroMindAPIClient
+
+client = PyroMindAPIClient(
+    api_key="your-api-key",
+    cluster="us-west-1#pre",
+)
+
+created = client.storage.file_shares.create(
+    source_path="/workspace/models",
+    target_user_input="user@example.com",  # recipient UID or email
+)
+
+sent = client.storage.file_shares.list({"direction": "sent"})
+if created.task and created.task.can_cancel:
+    client.storage.file_shares.cancel(created.biz_no)
+
+# Delete one or more terminal tasks from this user's list only.
+client.storage.file_shares.delete(["terminal-share-biz-no"])
+```
+
+`list_page()` returns one page; `list()` automatically fetches all pages and
+accepts `direction="sent"` or `direction="received"`, pagination, and an
+optional `transfer_env`. `get()` fetches one task. The service permits canceling
+only a pending invitation created by the current user, and permits deleting
+only terminal tasks. Deletion hides the task from the current participant's
+list without changing the other participant's record. Use
+`retry_notification(biz_no)` to retry a notification whose delivery is pending.
+The async API exposes the same methods as `await client.storage.file_shares.*`.
+
 ## Sandboxes（⚠️desperate can not create）
 
 ### List all sandboxes

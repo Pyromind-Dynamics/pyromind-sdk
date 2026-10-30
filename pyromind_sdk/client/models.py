@@ -1363,6 +1363,121 @@ class TransferClearResponse(BaseModel):
     deleted: int = 0
 
 
+class FileShareRequest(BaseModel):
+    """Request model for sharing a workspace file or directory with a user."""
+
+    source_path: str = Field(
+        ...,
+        min_length=1,
+        max_length=1024,
+        description="File or directory path under /workspace on the selected cluster.",
+    )
+    target_user_input: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=320,
+        description="Recipient UID or email address.",
+    )
+    target_user_id: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description="Recipient user ID (alternative to target_user_input).",
+    )
+
+    @model_validator(mode="after")
+    def validate_recipient(self) -> "FileShareRequest":
+        if bool(self.target_user_input) == (self.target_user_id is not None):
+            raise ValueError(
+                "provide exactly one of target_user_input or target_user_id"
+            )
+        return self
+
+
+class FileShareLocation(BaseModel):
+    """Source or destination location for a same-cluster share."""
+
+    cluster: Optional[str] = None
+    path: Optional[str] = None
+
+
+class FileShareTask(BaseModel):
+    """Same-cluster file share task returned by the API."""
+
+    biz_no: Optional[str] = None
+    direction: Optional[Literal["sent", "received"]] = None
+    counterparty_user_id: Optional[int] = None
+    counterparty_uid: Optional[str] = None
+    counterparty_email: Optional[str] = None
+    source_kind: Optional[Literal["file", "directory"]] = None
+    source: Optional[FileShareLocation] = None
+    target: Optional[FileShareLocation] = None
+    status: Optional[str] = None
+    transfer_env: Optional[str] = None
+    result_code: Optional[str] = None
+    error_code: Optional[str] = None
+    target_user_input: Optional[str] = None
+    confirmation_required: bool = False
+    can_cancel: bool = False
+    file_count: Optional[int] = None
+    dir_count: Optional[int] = None
+    size_bytes: Optional[int] = None
+    error: Optional[str] = None
+    notification_pending: bool = False
+    created_at: Optional[str] = None
+    finished_at: Optional[str] = None
+
+
+class FileShareCreateResponse(BaseModel):
+    """Response returned after a share invitation is created."""
+
+    biz_no: str
+    status: str
+    notification_pending: bool = False
+    task: Optional[FileShareTask] = None
+
+
+class FileShareListQuery(BaseModel):
+    """Filters and pagination for sent or received share tasks."""
+
+    direction: Literal["sent", "received"] = "sent"
+    page_number: int = Field(default=1, ge=1)
+    page_size: int = Field(default=20, ge=1, le=100)
+    transfer_env: Optional[str] = None
+
+    def to_params(self) -> Dict[str, Any]:
+        params: Dict[str, Any] = {
+            "direction": self.direction,
+            "page_number": self.page_number,
+            "page_size": self.page_size,
+        }
+        if self.transfer_env:
+            params["transfer_env"] = self.transfer_env
+        return params
+
+
+class FileSharePage(BaseModel):
+    """One page of file share tasks."""
+
+    tasks: List[FileShareTask] = Field(default_factory=list)
+    total: int = 0
+    page_number: int = 1
+    page_size: int = 20
+
+
+class FileShareDeleteFailure(BaseModel):
+    """One share task that could not be hidden from the current user's list."""
+
+    biz_no: str
+    error_code: Optional[str] = None
+
+
+class FileShareDeleteResponse(BaseModel):
+    """Result of hiding terminal share tasks from the current user's list."""
+
+    deleted: int = 0
+    failed: List[FileShareDeleteFailure] = Field(default_factory=list)
+
+
 class TrainingTaskEventType(str, Enum):
     """Training task event type enumeration"""
     TRAINING_TASK_STATUS_CHANGED = "training_task_status_changed"
