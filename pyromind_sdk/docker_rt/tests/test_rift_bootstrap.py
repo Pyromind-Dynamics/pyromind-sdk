@@ -251,3 +251,23 @@ def test_ping_rift_version_reports_none_when_channel_is_down():
     env._rift_client = _Client()
     assert asyncio.run(env.ping_rift_version()) == "v9+abc"
     assert asyncio.run(env.ping_rift()) is True
+
+
+def test_a_timeout_says_which_step_and_how_long(monkeypatch):
+    """裸 TimeoutError 会让人以为是代码 bug；必须说清是哪一步、卡了多久。"""
+    import asyncio as _asyncio
+
+    from pyromind_sdk.rift.errors import RiftUnavailable
+
+    async def never():
+        await _asyncio.sleep(5)
+
+    try:
+        _asyncio.run(bootstrap_mod._step("writing token", "sb-x", never(), 0.01))
+    except RiftUnavailable as exc:
+        text = str(exc)
+        assert "writing token" in text
+        assert "sandbox=sb-x" in text
+        assert "platform API looks slow" in text
+    else:
+        raise AssertionError("expected RiftUnavailable")

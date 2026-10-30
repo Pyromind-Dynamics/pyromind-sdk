@@ -66,7 +66,25 @@ def main(argv: list[str] | None = None) -> int:
                 if inspect.isawaitable(result):
                     await result
 
-            asyncio.run(_check_connection())
+            try:
+                asyncio.run(_check_connection())
+            except Exception as exc:  # noqa: BLE001
+                # Credentials and 4xx are real errors; a slow/unreachable control
+                # plane is not. The daemon's own startup treats connectivity as a
+                # warning (see aio_server.on_startup) — the CLI gate used to
+                # disagree and refuse to start at all, so one slow `GET
+                # /sandboxes` (30s timeout) took the whole daemon down.
+                status = getattr(exc, "status_code", None)
+                transient = isinstance(
+                    exc, (asyncio.TimeoutError, TimeoutError, OSError)
+                ) or (status is not None and int(status) >= 500)
+                if not transient:
+                    raise
+                with trace_scope(getattr(exc, "trace_id", None)):
+                    logger.warning(
+                        "PyroMind API is slow or unreachable (%s); starting anyway",
+                        exc,
+                    )
             os.environ["PYROMIND_DOCKER_RT_BOOTSTRAPPED"] = "1"
         except KeyboardInterrupt:
             print("docker-rt setup cancelled.", file=sys.stderr)

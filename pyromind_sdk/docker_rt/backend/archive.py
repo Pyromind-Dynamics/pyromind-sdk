@@ -429,10 +429,68 @@ def _tar_parents(rel: str) -> Iterator[str]:
         yield "/".join(parts[:index])
 
 
+def _validate_tar(tar: tarfile.TarFile) -> list[tarfile.TarInfo]:
+    """Reject escaping members; return the members that would be extracted."""
+    symlinks: set[str] = set()
+    members: list[tarfile.TarInfo] = []
+    for member in tar:
+        name = member.name
+        rel = _tar_member_rel(name)
+        if rel in {"", "."}:
+            continue
+        members.append(member)
+        if rel == ".." or rel.startswith("../"):
+            raise ValueError(f"unsafe path in tar archive: {name!r}")
+        if member.ischr() or member.isblk():
+            raise ValueError(f"device node in tar archive: {name!r}")
+        for parent in _tar_parents(rel):
+            if parent in symlinks:
+                raise ValueError(
+                    f"tar member {name!r} writes through symlink {parent!r}"
+                )
+        if member.issym():
+            target = member.linkname
+            resolved = posixpath.normpath(
+                posixpath.join(posixpath.dirname(rel), target)
+            )
+            if (
+                posixpath.isabs(target)
+                or resolved == ".."
+                or resolved.startswith("../")
+            ):
+                raise ValueError(
+                    f"tar symlink {name!r} escapes the destination: "
+                    f"{target!r}"
+                )
+            symlinks.add(rel)
+        elif member.islnk():
+            target = member.linkname
+            resolved = _tar_member_rel(target)
+            if (
+                posixpath.isabs(target)
+                or resolved == ".."
+                or resolved.startswith("../")
+            ):
+                raise ValueError(
+                    f"tar hardlink {name!r} escapes the destination: "
+                    f"{target!r}"
+                )
+    return members
+
+
+def validate_tar_file(fileobj) -> list[tarfile.TarInfo]:
+    """Validate an on-disk tar and return its members (no data buffered)."""
+    try:
+        with tarfile.open(fileobj=fileobj, mode="r:") as tar:
+            return _validate_tar(tar)
+    except tarfile.TarError as exc:
+        raise ValueError(f"invalid tar archive: {exc}") from exc
+
+
 def validate_tar_members(data: bytes) -> None:
     """Reject archive members that could escape ``dest_path``.
 
-    ``docker cp`` ends up as ``tar -xf -`` inside the container. tar itself
+    ``docker cp`` ends up as ``tar -xf`` inside the container. tar itself
     rejects ``..`` and absolute names, but it *does* follow a symlink that was
     created earlier in the same archive, so ``link -> /etc`` followed by
     ``link/passwd`` would write outside the destination. Device nodes are
@@ -441,48 +499,7 @@ def validate_tar_members(data: bytes) -> None:
     """
     try:
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tar:
-            symlinks: set[str] = set()
-            for member in tar:
-                name = member.name
-                rel = _tar_member_rel(name)
-                if rel in {"", "."}:
-                    continue
-                if rel == ".." or rel.startswith("../"):
-                    raise ValueError(f"unsafe path in tar archive: {name!r}")
-                if member.ischr() or member.isblk():
-                    raise ValueError(f"device node in tar archive: {name!r}")
-                for parent in _tar_parents(rel):
-                    if parent in symlinks:
-                        raise ValueError(
-                            f"tar member {name!r} writes through symlink {parent!r}"
-                        )
-                if member.issym():
-                    target = member.linkname
-                    resolved = posixpath.normpath(
-                        posixpath.join(posixpath.dirname(rel), target)
-                    )
-                    if (
-                        posixpath.isabs(target)
-                        or resolved == ".."
-                        or resolved.startswith("../")
-                    ):
-                        raise ValueError(
-                            f"tar symlink {name!r} escapes the destination: "
-                            f"{target!r}"
-                        )
-                    symlinks.add(rel)
-                elif member.islnk():
-                    target = member.linkname
-                    resolved = _tar_member_rel(target)
-                    if (
-                        posixpath.isabs(target)
-                        or resolved == ".."
-                        or resolved.startswith("../")
-                    ):
-                        raise ValueError(
-                            f"tar hardlink {name!r} escapes the destination: "
-                            f"{target!r}"
-                        )
+            _validate_tar(tar)
     except tarfile.TarError as exc:
         raise ValueError(f"invalid tar archive: {exc}") from exc
 

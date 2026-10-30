@@ -1325,7 +1325,29 @@ def _rift_not_ready(c: Any) -> bool:
     )
 
 
+def _rift_gateway_missing() -> bool:
+    """The data plane has no endpoint at all — a configuration error, not a Pod.
+
+    ``PYROMIND_CLUSTER`` (or ``DOCKER_RT_RIFT_GATEWAY``) is what maps to the
+    gateway domain. Without it every sandbox stays ``Created`` forever while the
+    API still lists them (the list falls back to the portal), which reads like
+    "the sandbox is broken" instead of "the daemon is misconfigured".
+    """
+    try:
+        return not load_rift_config().gateway
+    except Exception:  # noqa: BLE001 - configuration must never break the API
+        return False
+
+
 def _rift_not_ready_error(c: Any) -> web.Response:
+    if _rift_gateway_missing():
+        return _err(
+            409,
+            f"Container {c.id[:12]} is not running: the rift gateway is not "
+            "configured. Export PYROMIND_CLUSTER=<cluster>[#<env>] (or set "
+            "DOCKER_RT_RIFT_GATEWAY) and restart docker-rt; every sandbox stays "
+            "Created until then.",
+        )
     return _err(
         409,
         f"Container {c.id[:12]} is not running: rift-client is not ready. "
@@ -2298,6 +2320,7 @@ async def _rift_health_loop(app: web.Application) -> None:
     store: ContainerStore = app["store"]
     locks: dict[str, asyncio.Lock] = {}
     failures: dict[str, int] = {}
+    ping_misses: dict[str, int] = {}
     retry_at: dict[str, float] = {}
     loop = asyncio.get_running_loop()
     while True:
@@ -2321,6 +2344,7 @@ async def _rift_health_loop(app: web.Application) -> None:
                     if env.rift_ready:
                         running = await env.ping_rift_version()
                         if running and not _rift_version_is_stale(running):
+                            ping_misses.pop(record.id, None)
                             failures.pop(record.id, None)
                             retry_at.pop(record.id, None)
                             continue
@@ -2332,16 +2356,34 @@ async def _rift_health_loop(app: web.Application) -> None:
                                 running,
                                 load_rift_config().expected_version,
                             )
-                    env.rift_ready = False
+                        else:
+                            # One missed ping is usually a network blip; a
+                            # re-inject restarts rift-client and kills every
+                            # open exec session, so require two in a row.
+                            misses = ping_misses.get(record.id, 0) + 1
+                            ping_misses[record.id] = misses
+                            if misses < 2:
+                                logger.warning(
+                                    "rift ping failed id=%s (%s/2); checking again "
+                                    "before re-injecting",
+                                    record.id[:12],
+                                    misses,
+                                )
+                                continue
                     # A pause/resume transition leaves the Pod Pending for a
                     # while. Injecting then fails ("Sandbox is not running") and
                     # competes with the `docker start` that is waiting for the
                     # same Pod, so only bootstrap once the platform says Running.
                     phase = str(await env.refresh_phase(force=True) or "").strip().lower()
                     if phase not in {"running", "up", "ready"}:
+                        # "unknown" means the control plane did not answer (the
+                        # refresh is bounded). Keep the last readiness instead of
+                        # flipping to "not ready": a control-plane blink must not
+                        # turn every exec/cp into a 409.
                         raise RiftError(
                             f"sandbox is not running yet (phase={phase or 'unknown'})"
                         )
+                    env.rift_ready = False
                     logger.warning(
                         "rift channel unhealthy id=%s; re-bootstrapping",
                         record.id[:12],
@@ -5932,6 +5974,18 @@ async def on_startup(app: web.Application) -> None:
                 pass
 
         task.add_done_callback(_keeper_done)
+
+    # The data plane needs an explicit cluster: rift maps it to the gateway
+    # domain, while the API list falls back to the portal — so a daemon started
+    # without PYROMIND_CLUSTER still lists sandboxes, and every one of them sits
+    # at "Created" with exec/cp refused. Say it once, loudly, at startup.
+    if _rift_gateway_missing():
+        logger.warning(
+            "rift gateway is not configured (PYROMIND_CLUSTER unset and no "
+            "DOCKER_RT_RIFT_GATEWAY): sandboxes will stay Created and exec/cp "
+            "will be refused. Export PYROMIND_CLUSTER=<cluster>[#<env>] and "
+            "restart docker-rt."
+        )
 
     store: ContainerStore = app["store"]
     # Connectivity is a warning at startup, not a hard gate: the platform API is

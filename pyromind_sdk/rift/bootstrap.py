@@ -46,6 +46,24 @@ _UPLOAD_TIMEOUT_S = 180.0
 _SMALL_WRITE_TIMEOUT_S = 30.0
 _BOOTSTRAP_EXEC_TIMEOUT_S = 60.0
 
+
+async def _step(step: str, sandbox_id: str, awaitable: Any, timeout: float) -> Any:
+    """Await one bootstrap step, naming it when the platform API is too slow.
+
+    A bare ``TimeoutError`` from `wait_for` says nothing about which call hung;
+    2026-10-30 a slow pre-API produced four of them in a row and the log read
+    like a code bug. The message must carry the step, the limit and the hint.
+    """
+    started = time.monotonic()
+    try:
+        return await asyncio.wait_for(awaitable, timeout=timeout)
+    except (asyncio.TimeoutError, TimeoutError) as exc:
+        raise RiftUnavailable(
+            f"rift bootstrap timed out at {step} after "
+            f"{time.monotonic() - started:.1f}s (limit {timeout:.0f}s, "
+            f"sandbox={sandbox_id}); the platform API looks slow or unreachable"
+        ) from exc
+
 _START_SCRIPT = """#!/bin/sh
 set -eu
 BIN="__REMOTE_DIR__/rift-client"
@@ -258,7 +276,12 @@ async def bootstrap_once(env: "PyromindSDK") -> dict[str, Any]:
     log_path = posixpath.join(remote_dir, "rift.log")
     pid_path = posixpath.join(remote_dir, "rift.pid")
 
-    arch, remote_sha = await _prepare_remote(env, remote_dir, bin_path)
+    arch, remote_sha = await _step(
+        "probing the sandbox (mkdir/uname/sha)",
+        env.sandbox_id,
+        _prepare_remote(env, remote_dir, bin_path),
+        _BOOTSTRAP_EXEC_TIMEOUT_S + 5.0,
+    )
     binary = cfg.binary_for_arch(arch)
     local_sha = _local_binary_sha(binary)
 
@@ -285,9 +308,11 @@ async def bootstrap_once(env: "PyromindSDK") -> dict[str, Any]:
             bin_path,
         )
         upload_started = time.monotonic()
-        result = await asyncio.wait_for(
+        result = await _step(
+            "uploading rift-client",
+            env.sandbox_id,
             env._client.write_file(env.sandbox_id, bin_path, data),
-            timeout=_UPLOAD_TIMEOUT_S,
+            _UPLOAD_TIMEOUT_S,
         )
         elapsed = max(time.monotonic() - upload_started, 0.001)
         logger.info(
@@ -307,19 +332,23 @@ async def bootstrap_once(env: "PyromindSDK") -> dict[str, Any]:
     # access key or script wins even on a persistent volume.
     logger.info("writing token/start script sandbox=%s", env.sandbox_id)
     writes_started = time.monotonic()
-    await asyncio.wait_for(
+    await _step(
+        "writing token",
+        env.sandbox_id,
         env._client.write_file(
             env.sandbox_id, token_path, access_key.encode("utf-8")
         ),
-        timeout=_SMALL_WRITE_TIMEOUT_S,
+        _SMALL_WRITE_TIMEOUT_S,
     )
-    await asyncio.wait_for(
+    await _step(
+        "writing start script",
+        env.sandbox_id,
         env._client.write_file(
             env.sandbox_id,
             script_path,
             _start_script(remote_dir, env.sandbox_id).encode("utf-8"),
         ),
-        timeout=_SMALL_WRITE_TIMEOUT_S,
+        _SMALL_WRITE_TIMEOUT_S,
     )
     logger.info(
         "token/start script written sandbox=%s in %.1fs",
@@ -339,11 +368,16 @@ async def bootstrap_once(env: "PyromindSDK") -> dict[str, Any]:
     )
     logger.info("starting rift-client sandbox=%s", env.sandbox_id)
     start_started = time.monotonic()
-    result = await env.execute(
-        {"command": start},
-        cwd="/",
-        _force_platform=True,
-        timeout=int(_BOOTSTRAP_EXEC_TIMEOUT_S),
+    result = await _step(
+        "starting rift-client",
+        env.sandbox_id,
+        env.execute(
+            {"command": start},
+            cwd="/",
+            _force_platform=True,
+            timeout=int(_BOOTSTRAP_EXEC_TIMEOUT_S),
+        ),
+        _BOOTSTRAP_EXEC_TIMEOUT_S + 5.0,
     )
     logger.info(
         "start command returned rc=%s in %.1fs sandbox=%s",

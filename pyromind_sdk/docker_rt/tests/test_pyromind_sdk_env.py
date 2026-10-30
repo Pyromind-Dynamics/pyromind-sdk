@@ -6,7 +6,7 @@ import json
 import tarfile
 import weakref
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 from pyromind_sdk.client.models import (
@@ -289,7 +289,7 @@ def test_refresh_phase_does_not_refetch_after_not_found():
     assert asyncio.run(adapter.refresh_phase()) == "NotFound"
     assert asyncio.run(adapter.refresh_phase(force=True)) == "NotFound"
 
-    client.get_sandbox.assert_called_once_with("sb-test-1")
+    client.get_sandbox.assert_called_once_with("sb-test-1", timeout=ANY, retry=False)
 
 
 def test_refresh_phase_singleflights_status_requests():
@@ -305,7 +305,7 @@ def test_refresh_phase_singleflights_status_requests():
 
     asyncio.run(run())
 
-    client.get_sandbox.assert_called_once_with("sb-test-1")
+    client.get_sandbox.assert_called_once_with("sb-test-1", timeout=ANY, retry=False)
     assert adapter.sandbox_status == "stopped"
 
 
@@ -471,7 +471,7 @@ def test_refresh_record_state_queries_backend_before_lifecycle() -> None:
     )
     asyncio.run(_refresh_record_state(record))
 
-    client.get_sandbox.assert_called_once_with("sb-pending")
+    client.get_sandbox.assert_called_once_with("sb-pending", timeout=ANY, retry=False)
     assert record.state == ContainerState.CREATED
 
 
@@ -549,8 +549,12 @@ def test_put_archive_streams_and_counts_bytes() -> None:
 
     async def fake_put(dest, chunks):
         total = 0
-        async for chunk in chunks:
-            total += len(chunk)
+        if hasattr(chunks, "__aiter__"):
+            async for chunk in chunks:
+                total += len(chunk)
+        else:
+            for chunk in chunks:
+                total += len(chunk)
         seen["dest"] = dest
         seen["total"] = total
         return total
@@ -637,7 +641,7 @@ def test_wait_until_running_returns_when_up() -> None:
     asyncio.run(adapter.wait_until_running())
 
     assert adapter.sandbox_status == "running"
-    client.get_sandbox.assert_called_once_with("sb-wait")
+    client.get_sandbox.assert_called_once_with("sb-wait", timeout=ANY, retry=False)
 
 
 def test_wait_until_running_raises_on_failed_status() -> None:
@@ -1272,3 +1276,160 @@ def test_inspect_without_a_resolved_ip_keeps_the_field_empty(
     result = _to_inspect(record, pod_ip="")
 
     assert result["NetworkSettings"]["IPAddress"] == ""
+
+
+def test_refresh_phase_is_bounded_when_the_control_plane_stalls(monkeypatch):
+    """控制面卡住不能把 exec/cp 一起拖死（客户端默认超时是 600s）。
+
+    2026-10-30 本地实测：`pre-api` 抖动时，1 MiB 的 `docker cp` 先卡了 109.6s
+    才进入传输。刷新必须有自己的上限，超时就沿用缓存状态。
+    """
+    import time as _time
+
+    from ..backend import pyromind_sdk_env as envmod
+
+    adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.sandbox_id = "sb-slow"
+    adapter.sandbox_status = "running"
+    adapter._terminal_phase = None
+    adapter._phase_refreshed_at = 0.0
+
+    class _SlowClient:
+        # Enforce the per-request timeout like aiohttp does.
+        async def get_sandbox(self, *args, **kwargs):
+            timeout = kwargs.get("timeout")
+            if timeout:
+                await asyncio.sleep(timeout)
+                raise asyncio.TimeoutError()
+            await asyncio.sleep(10)
+
+    adapter._client = _SlowClient()
+    monkeypatch.setattr(envmod, "_PHASE_REFRESH_TIMEOUT_S", 0.05)
+
+    started = _time.monotonic()
+    phase = asyncio.run(adapter.refresh_phase(force=True))
+    elapsed = _time.monotonic() - started
+
+    assert elapsed < 2, f"refresh took {elapsed:.1f}s; it must be bounded"
+    assert phase == "Running", "超时后应沿用缓存状态，而不是 Unknown/失败"
+
+
+def _parallel_adapter(monkeypatch, *, execute_rc=0):
+    """PyromindSDK 替身：记录每条 rift put_archive 与每次 exec。"""
+    from ..backend import pyromind_sdk_env as envmod
+
+    calls = {"puts": [], "execs": []}
+
+    class _Rift:
+        async def put_archive(self, dest, data):
+            if isinstance(data, (bytes, bytearray, memoryview)):
+                payload = bytes(data)
+            elif hasattr(data, "__aiter__"):
+                payload = b"".join([chunk async for chunk in data])
+            else:
+                payload = b"".join(list(data))
+            calls["puts"].append((dest, payload))
+            return len(payload)
+
+    adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.sandbox_id = "sb-par"
+    adapter.rift_ready = True
+    adapter._rift_client = _Rift()
+
+    async def _execute(action, cwd="", **kwargs):
+        command = action["command"]
+        calls["execs"].append(command)
+        # mkdir 总是成功，只有"组装"那一步受 execute_rc 控制
+        rc = 0 if command.startswith("mkdir") else execute_rc
+        return {"output": "", "stderr": "", "returncode": rc}
+
+    adapter.execute = _execute  # type: ignore[method-assign]
+    monkeypatch.setattr(envmod, "_CP_PARALLEL_MIN_BYTES", 1)
+    monkeypatch.setattr(envmod, "_CP_PART_BYTES", 1 << 20)
+    monkeypatch.setattr(envmod, "_CP_STREAMS", 2)
+    return adapter, calls
+
+
+def _one_file_tar(name: str, body: bytes) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(name=name)
+        info.size = len(body)
+        info.mode = 0o640
+        tar.addfile(info, io.BytesIO(body))
+    return buf.getvalue()
+
+
+def test_big_single_file_is_split_into_parallel_parts(monkeypatch):
+    import asyncio as _asyncio
+
+    body = b"x" * (3 * 1024 * 1024 + 7)  # 1 MiB parts -> 4 parts
+    frame = _one_file_tar("big.bin", body)
+    adapter, calls = _parallel_adapter(monkeypatch)
+
+    async def source():
+        yield frame
+
+    _asyncio.run(adapter.put_archive("/var", source()))
+
+    staging = [dest for dest, _ in calls["puts"]]
+    assert staging and all(d.startswith("/tmp/.drt-cp-") for d in staging), staging
+    assert len(staging) == 4, "3MiB+7 with 1MiB parts is four part streams"
+
+    # 每个分片都是单成员 tar，名字按序号；拼起来必须等于原文件
+    joined = b""
+    for index, (_dest, payload) in enumerate(calls["puts"]):
+        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as tar:
+            member = tar.next()
+            assert member.name == f"part-{index:05d}"
+            joined += tar.extractfile(member).read()
+    assert joined == body
+
+    assert calls["execs"][0].startswith("mkdir -p /tmp/.drt-cp-")
+    assemble = calls["execs"][-1]
+    assert "cat part-*" in assemble
+    assert "mv -f payload /var/big.bin" in assemble
+    assert "chmod 640 payload" in assemble
+
+
+def test_directory_archive_stays_one_stream(monkeypatch):
+    import asyncio as _asyncio
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for name, body in (("d/a.txt", b"a"), ("d/b.txt", b"bb")):
+            info = tarfile.TarInfo(name)
+            info.size = len(body)
+            tar.addfile(info, io.BytesIO(body))
+    frame = buf.getvalue()
+    adapter, calls = _parallel_adapter(monkeypatch)
+
+    async def source():
+        yield frame
+
+    _asyncio.run(adapter.put_archive("/var", source()))
+
+    assert [dest for dest, _ in calls["puts"]] == ["/var"]
+    assert calls["puts"][0][1] == frame
+    assert calls["execs"] == [], "多成员归档不能走分片/组装"
+
+
+def test_assembly_failure_is_loud_and_cleans_up(monkeypatch):
+    import asyncio as _asyncio
+
+    from pyromind_sdk.rift.errors import RiftUnavailable
+
+    body = b"y" * (2 * 1024 * 1024)
+    frame = _one_file_tar("big.bin", body)
+    adapter, calls = _parallel_adapter(monkeypatch, execute_rc=2)
+
+    async def source():
+        yield frame
+
+    try:
+        _asyncio.run(adapter.put_archive("/var", source()))
+    except RiftUnavailable as exc:
+        assert "assembling big.bin failed" in str(exc)
+    else:
+        raise AssertionError("组装失败必须报错，不能当成功")
+    assert any(script.startswith("rm -rf /tmp/.drt-cp-") for script in calls["execs"])
