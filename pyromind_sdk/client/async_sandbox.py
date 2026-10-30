@@ -833,7 +833,7 @@ class AsyncSandboxClient(PyroMindAsyncClient):
                     )
                 return self._extract_data(await complete_resp.json())
 
-        except Exception:
+        except Exception as exc:
             # Best-effort abort on failure（清掉残片）。
             # 沙箱已经没了就**跳过** —— 残片随沙箱消失，再去 abort 只会又打一个
             # 404/500 到服务端日志。

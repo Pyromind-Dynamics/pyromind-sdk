@@ -84,7 +84,7 @@ class sdist(_sdist):
 ## todo update_version
 setup(
     name="pyromind-sdk",
-    version = "0.1.12",
+    version = "0.1.30.dev",
     cmdclass={"bdist_wheel": bdist_wheel, "sdist": sdist},
     description="Lightweight SDK stub for local development and testing of third-party nodes without the full platform codebase",
     long_description=long_description,

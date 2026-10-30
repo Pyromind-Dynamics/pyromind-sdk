@@ -21,7 +21,8 @@ def test_build_exec_stream_url_resolves_portal_to_direct_cluster() -> None:
         "https://pre-api-portal.pyromind.ai/api/v1",
         "sb-demo",
         "key-123",
-        "us-west-1",
+        # Bare `us-west-1` means prod; the env suffix selects pre.
+        "us-west-1#pre",
     )
 
     assert url == (
@@ -117,7 +118,7 @@ def _install_fake_ws(monkeypatch: pytest.MonkeyPatch, ws: _FakeWS) -> None:
         async def __aexit__(self, *exc) -> bool:
             return False
 
-        async def _connect(self, url, heartbeat=None):
+        async def _connect(self, url, heartbeat=None, headers=None):
             return ws
 
     fake = types.SimpleNamespace(
@@ -379,3 +380,20 @@ def test_loss_context_reports_elapsed_time_and_bytes(
     assert "connection lost" in message
     assert "received 7 stdout / 0 stderr bytes" in message
     assert "after " in message
+
+
+def test_exec_stream_keepalive_is_well_under_common_idle_timeouts():
+    """The app-level ping must beat intermediaries' ~30s WebSocket idle kill.
+
+    The middleware itself allows 300s and closes with an explicit
+    EXEC_IDLE_TIMEOUT frame; a silent "connection lost" at ~31s comes from a
+    proxy/LB in front of it. 60s was too slow (bootstrap probes died mid-way).
+    """
+    import inspect
+
+    from pyromind_sdk.exec_stream import _iter_exec_stream_events
+
+    default = inspect.signature(
+        _iter_exec_stream_events
+    ).parameters["ping_interval_s"].default
+    assert default <= 15.0

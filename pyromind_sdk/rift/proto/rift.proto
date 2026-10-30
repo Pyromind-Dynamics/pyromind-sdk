@@ -47,6 +47,12 @@ message ExecFrame {
     ExecResize resize = 5;
     ExecExit exit = 6;
     bool stdin_close = 7;
+    // Liveness only. HTTP/2 proxies reset their per-stream read/send idle
+    // timers on DATA frames, not on gRPC PING frames, so a silent
+    // `exec -it bash` gets reset after ~60s (nginx default) unless somebody
+    // keeps writing. Both ends send one while the stream is idle; receivers
+    // must ignore it.
+    bool ping = 8;
   }
 }
 

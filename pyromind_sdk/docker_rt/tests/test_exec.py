@@ -392,16 +392,17 @@ async def test_pyromind_exec_transport_routing(monkeypatch, stdin, tty, expected
         )
         assert calls["rift"]["cwd"] == ""
     else:
-        outer = calls["oneshot"]["cmd"]
-        assert outer[:2] == ["sh", "-c"], outer
-        assert "__DRT_END_" in outer[2] and '"$@"' in outer[2]
-        assert calls["oneshot"]["cmd"][4:] == argv_with_exec_cwd(
+        # PyromindSDK oneshot rides rift's bidi stream: the command is passed
+        # through with only the cwd wrapper — no platform-exec end-marker.
+        cmd = calls["oneshot"]["cmd"]
+        assert cmd == argv_with_exec_cwd(
             ["cat"], "/workspace", create_missing=True
         )
+        assert "__DRT_END_" not in " ".join(cmd)
         assert calls["oneshot"]["cwd"] == ""
-        assert calls["oneshot"]["marker"].startswith("__DRT_END_")
+        assert calls["oneshot"]["marker"] == ""
         assert calls["oneshot"]["ack_path"] == ""
-        assert calls["oneshot"]["stdin_close"] is not None
+        assert calls["oneshot"]["stdin_close"] is None
 
 
 @pytest.mark.asyncio
@@ -2437,6 +2438,142 @@ async def test_interactive_without_rift_fails_without_platform_fallback(monkeypa
     assert any(
         b"RIFT_UNAVAILABLE" in chunk for chunk in resp.written
     ), "必须明确告诉客户端 rift 不可用"
+
+
+class _RiftTerminalHarness:
+    """最小替身：一条永远安静的 rift exec 流 + 被劫持的 docker 连接。"""
+
+    def __init__(self):
+        self.exit_code = None
+        self.pings = 0
+        self.canceled = asyncio.Event()
+        self.writes: list[bytes] = []
+
+    async def frames(self):
+        await self.canceled.wait()
+        return
+        yield  # pragma: no cover — 让它成为 async generator
+
+    async def write_stdin(self, data):
+        self.writes.append(data)
+
+    async def close_stdin(self):
+        return None
+
+    async def resize(self, rows, cols):
+        return None
+
+    async def ping(self):
+        self.pings += 1
+
+    async def cancel(self):
+        self.canceled.set()
+
+
+def _rift_terminal_calls(monkeypatch, *, tty: bool, sandbox_id: str = "sb-test"):
+    from .. import aio_server as mod
+
+    stream = _RiftTerminalHarness()
+
+    class _Protocol:
+        _message_tail = b""
+
+        def force_close(self):
+            return None
+
+    class _Resp:
+        def __init__(self):
+            self.written: list[bytes] = []
+
+        async def write(self, chunk):
+            self.written.append(chunk)
+
+        async def drain(self):
+            return None
+
+        def force_close(self):
+            return None
+
+    class _Request:
+        def __init__(self, protocol):
+            self.protocol = protocol
+            self.transport = None
+            self.content = None
+
+    class _Rift:
+        async def open_exec(self, argv, **kwargs):
+            return stream
+
+    kube_env = SimpleNamespace(
+        sandbox_id=sandbox_id,
+        working_dir="/",
+        _rift_client=_Rift(),
+    )
+    protocol = _Protocol()
+    resp = _Resp()
+    session = SimpleNamespace(
+        id="exec-rift-1", running=False, exit_code=None, tty_cols=80, tty_rows=24
+    )
+    request = _Request(protocol)
+
+    async def run():
+        return await mod._hijack_rift_terminal(
+            request, resp, protocol, session, kube_env, tty
+        )
+
+    return mod, stream, resp, session, run
+
+
+@pytest.mark.asyncio
+async def test_rift_terminal_pings_while_idle(monkeypatch):
+    """静置的 `exec -it bash` 必须自己发应用层心跳。
+
+    nginx 的 grpc_read_timeout / grpc_send_timeout / client_body_timeout 默认
+    60s，而且只被 DATA 帧重置；gRPC keepalive 是 PING 帧，代理自己就回 ACK。
+    没有这条心跳，终端在 60s 后会被 RST_STREAM 掐掉。
+    """
+    mod, stream, _resp, _session, run = _rift_terminal_calls(monkeypatch, tty=True)
+    monkeypatch.setattr(mod, "_RIFT_KEEPALIVE_S", 0.01)
+    monkeypatch.setattr(mod, "_RIFT_IDLE_TIMEOUT_S", 60.0)
+    monkeypatch.setattr(mod, "_RIFT_IDLE_POLL_S", 60.0)
+
+    task = asyncio.create_task(run())
+    await asyncio.sleep(0.1)
+    assert stream.pings >= 2, f"心跳次数={stream.pings}，静置流必须持续发 ping"
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_rift_terminal_closes_after_30m_idle_with_a_reason(monkeypatch):
+    """30 分钟没有真实流量才收；心跳帧不算真实流量，且收尾要说明原因。"""
+    mod, stream, resp, session, run = _rift_terminal_calls(monkeypatch, tty=True)
+    monkeypatch.setattr(mod, "_RIFT_KEEPALIVE_S", 0.01)
+    monkeypatch.setattr(mod, "_RIFT_IDLE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(mod, "_RIFT_IDLE_POLL_S", 0.01)
+
+    await asyncio.wait_for(run(), timeout=2)
+
+    body = b"".join(resp.written)
+    assert b"session closed after 30m idle" in body, body
+    assert b"RIFT_UNAVAILABLE" not in body, "自己关的会话不许报不可用"
+    assert stream.canceled.is_set()
+    assert stream.pings >= 1, "空闲期间仍要保活，直到我们自己收掉"
+    assert session.running is False
+
+
+@pytest.mark.asyncio
+async def test_rift_terminal_idle_notice_is_tty_only(monkeypatch):
+    """非 tty 的 stdout 被管道消费，不能掺人话。"""
+    mod, _stream, resp, _session, run = _rift_terminal_calls(monkeypatch, tty=False)
+    monkeypatch.setattr(mod, "_RIFT_IDLE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(mod, "_RIFT_IDLE_POLL_S", 0.01)
+
+    await asyncio.wait_for(run(), timeout=2)
+
+    assert b"".join(resp.written) == b""
 
 
 @pytest.mark.asyncio

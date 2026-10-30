@@ -656,3 +656,27 @@ def test_generated_wrapper_drops_the_cli_legacy_builder_banner(
     assert "still-visible-stderr" in proc.stderr
     assert "step 1/2 : FROM scratch" in proc.stdout
     assert "DEPRECATED" not in proc.stdout
+
+
+def test_cp_never_runs_the_cli_through_script(
+    monkeypatch: MonkeyPatch,
+    tmp_path,
+) -> None:
+    """`script <file> <cmd>` 在 util-linux 上会**忽略命令**、起一个交互 shell。
+
+    2026-10-30 线上：`docker cp` 在交互 shell 里打印 "Successfully copied" 但文件
+    根本不存在 —— wrapper 用 `script -q -e /dev/null docker cp …` 包了 CLI，
+    util-linux 只认 `-c`，于是 docker cp 从未执行。回归点：cp 分支不得出现
+    `script` 调用，且必须直接执行 REAL_DOCKER。
+    """
+    path = tmp_path / "docker"
+    monkeypatch.setattr(mod, "WRAPPER_PATH", path)
+    monkeypatch.setattr(mod, "find_real_docker", lambda: "/usr/local/bin/docker")
+    monkeypatch.setattr(mod, "_shell_rc_path", lambda: tmp_path / "rc")
+
+    text = mod.install_wrapper().read_text(encoding="utf-8")
+    assert 'script -q -e /dev/null "$REAL_DOCKER"' not in text
+    assert 'script -q /dev/null "$REAL_DOCKER"' not in text
+    assert '"$REAL_DOCKER" "${args[@]}" >"$_cp_out" 2>"$_cp_err"' in text
+    # 失败行必须压过 CLI 先打印的 "Successfully copied"。
+    assert "grep -av 'Successfully copied'" in text

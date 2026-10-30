@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
-from typing import AsyncIterator, Iterable, Optional, Sequence
+from typing import Any, AsyncIterator, Iterable, Optional, Sequence
 
 import grpc
 import grpc.aio
+
+from pyromind_sdk.client.trace import ensure_trace_id
 
 from .config import RiftConfig
 from .errors import (
@@ -30,12 +33,93 @@ def _map_rpc_error(exc: grpc.aio.AioRpcError) -> Exception:
         return RiftUnauthenticated(details)
     if code == grpc.StatusCode.PERMISSION_DENIED:
         return RiftPermissionDenied(details)
+    if _is_ingress_413(details):
+        return RiftUnavailable(
+            "rift gateway ingress rejected the request body with HTTP 413 "
+            "(nginx client_max_body_size); set "
+            "nginx.ingress.kubernetes.io/proxy-body-size=0 on the gateway "
+            f"Ingress. {details}"
+        )
     return RiftUnavailable(details)
+
+
+def _is_ingress_413(details: str) -> bool:
+    return "status: 413" in details
+
+
+async def _terminal_call_error(
+    call: grpc.aio.StreamUnaryCall, fallback: BaseException
+) -> Exception:
+    """Recover the real RPC status after a failed write.
+
+    A write dies with "Internal error from Core" (grpc core's ExecuteBatchError)
+    when the stream is torn down mid-send, which hides the reason — typically the
+    ingress answering 413. Awaiting the call yields the terminal status.
+    """
+    terminal: grpc.aio.AioRpcError | None = None
+    try:
+        await asyncio.wait_for(call, timeout=5)
+    except grpc.aio.AioRpcError as exc:
+        terminal = exc
+    except Exception:  # noqa: BLE001 - fall through to the generic error
+        pass
+    if terminal is not None and _is_ingress_413(terminal.details() or ""):
+        return _map_rpc_error(terminal)
+    if isinstance(fallback, grpc.aio.AioRpcError):
+        return _with_upload_hint(_map_rpc_error(fallback))
+    if terminal is not None:
+        return _with_upload_hint(_map_rpc_error(terminal))
+    return RiftUnavailable(f"rift put archive failed: {fallback}")
+
+
+def _with_upload_hint(error: Exception) -> Exception:
+    """Name the most common reason a PutArchive stream dies mid-transfer.
+
+    When the peer answers 413 before the response is read, grpc core reports the
+    write as INTERNAL "Internal error from Core" and the 413 never reaches this
+    layer, so the caller would otherwise only see "Internal error from Core".
+    """
+    if "Internal error from Core" not in str(error):
+        return error
+    return RiftUnavailable(
+        f"{error} — the upload stream was cut mid-transfer. Check the gateway "
+        "Ingress: nginx rejects request bodies above its client_max_body_size "
+        "(default 1 MiB) with HTTP 413, which gRPC surfaces as a broken stream. "
+        "Set nginx.ingress.kubernetes.io/proxy-body-size=0 on that Ingress."
+    )
 
 
 def _chunked(data: bytes) -> Iterable[bytes]:
     for offset in range(0, len(data), _STREAM_CHUNK):
         yield data[offset: offset + _STREAM_CHUNK]
+
+
+async def _sync_as_async(iterable: Iterable[bytes]) -> AsyncIterator[bytes]:
+    for item in iterable:
+        yield item
+
+
+async def _archive_chunks(data: Any) -> AsyncIterator[bytes]:
+    """Normalise bytes / sync iterable / async iterable into 256 KiB frames.
+
+    Streaming matters: an image tar is routinely >1 GiB, and the daemon must not
+    hold it in memory just to hand it to gRPC.
+    """
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        for chunk in _chunked(bytes(data)):
+            yield chunk
+        return
+    source = data if hasattr(data, "__aiter__") else _sync_as_async(data)
+    buf = bytearray()
+    async for piece in source:
+        if not piece:
+            continue
+        buf.extend(piece)
+        while len(buf) >= _STREAM_CHUNK:
+            yield bytes(buf[:_STREAM_CHUNK])
+            del buf[:_STREAM_CHUNK]
+    if buf:
+        yield bytes(buf)
 
 
 class RiftExecSession:
@@ -50,6 +134,15 @@ class RiftExecSession:
 
     async def close_stdin(self) -> None:
         await self._call.write(rift_pb2.ExecFrame(stdin_close=True))
+
+    async def ping(self) -> None:
+        """Liveness frame, ignored by the receiver.
+
+        HTTP/2 proxies reset their per-stream idle timers on DATA frames only,
+        so an idle interactive shell needs a byte every few seconds or the
+        stream gets RST after the proxy's ~60s timeout.
+        """
+        await self._call.write(rift_pb2.ExecFrame(ping=True))
 
     async def resize(self, rows: int, cols: int) -> None:
         await self._call.write(
@@ -86,6 +179,17 @@ class RiftGatewayClient:
         self._channel: Optional[grpc.aio.Channel] = None
         self._stub: Optional[rift_pb2_grpc.RiftStub] = None
 
+    def _call_metadata(self) -> tuple[tuple[str, str], ...]:
+        """Per-call metadata: auth plus the daemon's trace id when there is one.
+
+        The gateway logs the same id, so one ``docker exec`` can be grepped
+        across docker-rt, ingress and the gateway.
+        """
+        trace = ensure_trace_id()
+        if not trace:
+            return self._metadata
+        return self._metadata + (("x-trace-id", trace),)
+
     async def _ensure_stub(self) -> rift_pb2_grpc.RiftStub:
         if self._stub is not None:
             return self._stub
@@ -104,8 +208,8 @@ class RiftGatewayClient:
                 self.cfg.gateway, credentials, options=options
             )
         elif self.cfg.gateway_tls:
-            # Public CA (for example a Higress-managed certificate): use the
-            # system trust store. A private CA goes through gateway_ca above.
+            # CA already trusted by the system store (public or company CA
+            # installed on the machine); a private CA goes through gateway_ca.
             self._channel = grpc.aio.secure_channel(
                 self.cfg.gateway, grpc.ssl_channel_credentials(), options=options
             )
@@ -121,7 +225,7 @@ class RiftGatewayClient:
         try:
             reply = await stub.Ping(
                 rift_pb2.PingRequest(),
-                metadata=self._metadata,
+                metadata=self._call_metadata(),
                 timeout=timeout or self.cfg.ping_timeout,
             )
             return reply.version
@@ -141,7 +245,7 @@ class RiftGatewayClient:
         timeout: float | None = None,
     ) -> tuple[bytes, bytes, int]:
         stub = await self._ensure_stub()
-        call = stub.Exec(metadata=self._metadata, timeout=timeout)
+        call = stub.Exec(metadata=self._call_metadata(), timeout=timeout)
         await call.write(
             rift_pb2.ExecFrame(
                 open=rift_pb2.ExecOpen(
@@ -184,9 +288,10 @@ class RiftGatewayClient:
         tty: bool = False,
         rows: int = 0,
         cols: int = 0,
+        stdin: bool = True,
     ) -> RiftExecSession:
         stub = await self._ensure_stub()
-        call = stub.Exec(metadata=self._metadata)
+        call = stub.Exec(metadata=self._call_metadata())
         await call.write(
             rift_pb2.ExecFrame(
                 open=rift_pb2.ExecOpen(
@@ -194,7 +299,7 @@ class RiftGatewayClient:
                     cwd=cwd or "",
                     env=dict(env or {}),
                     tty=tty,
-                    stdin=True,
+                    stdin=stdin,
                     rows=rows,
                     cols=cols,
                 )
@@ -206,7 +311,7 @@ class RiftGatewayClient:
         stub = await self._ensure_stub()
         call = stub.GetArchive(
             rift_pb2.GetArchiveRequest(path=path),
-            metadata=self._metadata,
+            metadata=self._call_metadata(),
         )
         try:
             async for chunk in call:
@@ -214,20 +319,33 @@ class RiftGatewayClient:
         except grpc.aio.AioRpcError as exc:
             raise _map_rpc_error(exc) from exc
 
-    async def put_archive(self, dest_path: str, data: bytes) -> int:
+    async def put_archive(self, dest_path: str, data: Any) -> int:
+        """Send a tar to the sandbox.
+
+        ``data`` may be ``bytes``, a sync iterable of chunks, or an async
+        iterable; the daemon passes the request body through as one so a large
+        ``docker cp`` never sits fully in memory.
+        """
         stub = await self._ensure_stub()
-        call = stub.PutArchive(metadata=self._metadata)
-        await call.write(
-            rift_pb2.PutArchiveFrame(
-                start=rift_pb2.PutArchiveStart(dest_path=dest_path or "/")
-            )
-        )
-        for chunk in _chunked(data):
-            await call.write(rift_pb2.PutArchiveFrame(chunk=chunk))
+        call = stub.PutArchive(metadata=self._call_metadata())
         try:
-            reply = await call.done_writing()
-        except grpc.aio.AioRpcError as exc:
-            raise _map_rpc_error(exc) from exc
+            await call.write(
+                rift_pb2.PutArchiveFrame(
+                    start=rift_pb2.PutArchiveStart(dest_path=dest_path or "/")
+                )
+            )
+            async for chunk in _archive_chunks(data):
+                await call.write(rift_pb2.PutArchiveFrame(chunk=chunk))
+            # grpc.aio: done_writing() only half-closes the send side and returns
+            # None; the reply comes from awaiting the call itself.
+            await call.done_writing()
+            reply = await call
+        except (ConnectionError, ConnectionResetError):
+            # The request body source died (client went away); let the daemon
+            # answer 499 instead of dressing it up as a rift failure.
+            raise
+        except Exception as exc:  # noqa: BLE001 - re-raised after mapping
+            raise await _terminal_call_error(call, exc) from exc
         return int(reply.bytes_written)
 
     async def close(self) -> None:

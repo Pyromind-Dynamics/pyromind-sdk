@@ -24,8 +24,8 @@ Pod，之后所有 `docker exec` / `docker cp` / 交互式 `-it` 都走
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `DOCKER_RT_RIFT_GATEWAY` | 空 | **默认不用设**：从 `CLUSTER_RESOURCE[PYROMIND_CLUSTER]["rift"][env]` 解析（如 `rift.pyromind.ai:443`）。只用于本地/测试覆盖。 |
-| `DOCKER_RT_RIFT_GATEWAY_TLS` | 自动 | `:443` 或 `https://` 自动启用（系统信任链），一般不用设。 |
+| `DOCKER_RT_RIFT_GATEWAY` | 空 | **默认不用设**：从 `CLUSTER_RESOURCE[PYROMIND_CLUSTER]["rift"][env]` 解析（如 `rift-gateway-us-west-1.pyromind.ai:443`）。只用于本地/测试覆盖。 |
+| `DOCKER_RT_RIFT_GATEWAY_TLS` | 自动 | `:443` 或 `https://` 自动启用（用系统信任链；公司 CA 未装入系统信任库时改用 `DOCKER_RT_RIFT_GATEWAY_CA`），一般不用设。 |
 | `DOCKER_RT_RIFT_GATEWAY_CA` | 空 | 私有 CA 路径；默认取集群 map 的 `rift_ca`，只有在本地覆盖时才设。 |
 | `DOCKER_RT_RIFT_BIN_DIR` | 本目录 `bin/` | 存放 `rift-client-linux-<arch>` 的目录。 |
 | `DOCKER_RT_RIFT_REMOTE_DIR` | `/opt/docker-rt/rift` | Pod 内专属注入目录。默认不用 `/tmp`（tmpfs，可能被镜像/平台清理）；rootfs 只读时再改 `/tmp/.rift`，放到持久卷（如 workspace）可跳过二进制重传。 |
@@ -90,10 +90,30 @@ make build-linux        # ../bin/rift-client-linux-{amd64,arm64} + ../bin/rift-c
 make test               # Go 单测（access key 常量时间比较、exec 帧、tar 校验）
 ```
 
-`rift-client.version` 是 bootstrap 判断"Pod 里跑的是不是这份二进制"的依据：`Ping`
-返回的版本与它不一致时，bootstrap 会 kill 旧进程并重启一次，仍不一致就直接报
-`rift-client version mismatch after restart`。文件缺失时只告警、跳过校验（发布脚本
-会断言它存在）。
+`rift-client.version` 是 bootstrap 判断"Pod 里跑的是不是这份二进制"的依据。版本串是
+**`<git describe>+<源码指纹前 12 位>`**（`make build-linux` 用
+`source_fingerprint.py --print` 注入）：`git describe` 对同一 commit 的不同构建是同一个
+串，只有指纹后缀会变 —— 这正是"新改动到底进没进 Pod"的判据。
+
+`Ping` 返回的版本与它不一致时：
+
+1. `bootstrap_once` 先 **kill 旧进程再上传**（Linux 不允许覆盖正在运行的可执行文件，
+   会 `ETXTBSY`），然后重启、重新 Ping；仍不一致就报
+   `rift-client version mismatch after restart`；
+2. daemon 的后台健康检查每 `DOCKER_RT_RIFT_HEALTH_INTERVAL`（默认 30s）比对一次版本，
+   不一致就自动重新注入 —— **升级 SDK 后，已经 Running 的沙箱会在一个健康周期内自动
+   换上新二进制**，不需要 `docker stop/start`。
+
+确认 Pod 里跑的是哪一版（`<远程目录>` 默认 `/opt/docker-rt/rift`）：
+
+```bash
+# 期望版本（安装包里）
+cat $(python -c 'import pyromind_sdk.rift.config as c; print(c.load_rift_config().bin_dir)')/rift-client.version
+# 实际在跑的版本（Ping 里就是它；daemon 日志 "rift-client ready … version=…" 同源）
+docker exec <cid> sha256sum /opt/docker-rt/rift/rift-client
+```
+
+`rift-client.version` 缺失时只告警、跳过校验（发布脚本会断言它存在）。
 
 `rift-client.source.sha256` 是**源码指纹**：`make build-linux` 对
 `client/*.go`（不含测试）、`pb/`、`go.mod/sum`、`Makefile` 和 `proto/rift.proto` 做哈希
@@ -121,12 +141,43 @@ Running/Up，`docker exec` / `docker cp` / `attach` 才允许进入：
 | `put_archive` / `iter_archive_chunks` | 走 `PutArchive` / `GetArchive` 的 tar 流（先校验 tar 成员路径）。 |
 | 交互式 `exec -it` / `attach` | aio_server `_hijack_rift_terminal`：PTY + resize + stdin。 |
 
+### 未就绪时的行为
+
+`docker ps` 只有在 rift-client Ping 通之后才显示 `Up`；在此之前容器是 `Created`
+（列表/检查里的 `State` 也是 `created`，不是 `running`）。这时 **exec / cp 一律
+不可用**，直接返回 409：
+
+```
+Container <id> is not running: rift-client is not ready. If this sandbox was
+created before rift-gateway was deployed it has no route; run `docker stop` +
+`docker start` (or recreate it) so k8s_middleware writes the Pipe.
+```
+
+rift-gateway 上线**之前**创建的沙箱没有 Pipe，无法自愈：`docker stop` + `docker start`
+（Pod 重建后由 k8s_middleware 重新写 Pipe，再 bootstrap），或直接重建沙箱。
+
 ### 长连接 / 交互式会话
 
 `docker exec -it bash`、`docker attach` 走 bidi `Exec` 流，可以持续数小时。access
 key 只在 Gateway **建流时**校验一次，会话期间不再检查；断线重连是新 stream，会重新
-校验。SDK 的 gRPC channel 带 30s keepalive，ingress/LB 的
-idle/read timeout 要相应调大，否则长时间无输出的 shell 会被中间设备切断。
+校验。
+
+**应用层心跳**：gRPC 的 30s keepalive 是 HTTP/2 PING 帧，中间的 nginx/ALB 自己就回
+ACK，**不会**重置它们的 per-stream 空闲计时（`grpc_read_timeout` /
+`grpc_send_timeout` / `client_body_timeout` 默认 60s），所以一条安静的 shell 会在
+60s 后被 RST_STREAM 掐掉（gateway 日志是 `rift request canceled … context canceled`）。
+两端因此各自在流上静置 20s 后补一帧 `ExecFrame.ping`（真 DATA 帧）：
+
+| 方向 | 发送方 | 位置 |
+| --- | --- | --- |
+| 上游 → 下游（响应） | `rift-client` | `client/server.go` 的 `execWriter`（tty / pipe 两条路径都覆盖） |
+| 下游 → 上游（请求） | daemon | `aio_server._hijack_rift_terminal`（仅 stdin 空闲时发） |
+
+`ExecFrame.ping` 只是心跳，接收方**必须忽略**；它不是数据，也不重置空闲计时。
+
+**空闲回收**：交互式会话由 daemon 自己按 **30 分钟无真实流量**（stdin / PTY 输出 /
+resize；心跳不算）收掉，与平台终端 `WS_IDLE_TIMEOUT_S` 一致。tty 会话会先写一句
+`docker-rt: session closed after 30m idle (no keystrokes)` 再关流。
 
 ### `docker exec -d`
 
@@ -167,3 +218,5 @@ fallback。若 `rift_ready` 为假（启动中、恢复中、已挂），`start_
 | `RiftUnavailable` + `sandbox is not running` | Pod 未运行或 rift-client 未启动；Gateway 通过 `7500` 连接结果判定，不查 middleware 状态。 |
 | 注入失败但 Pod 正常 | `/tmp` 可能 noexec，改用 `DOCKER_RT_RIFT_REMOTE_DIR=/workspace/.rift`。 |
 | 网络不通 | 确认 Gateway 可达、Service 有 `rift:7500`。 |
+| `docker cp` 报 "Successfully copied" 但容器里没有文件 | 这句是 docker CLI 无条件先打的，**不能当结果**（见 `aio_server.put_container_archive` 注释）。现在抽取后 `rift-client` 会逐个成员校验存在性与 size、daemon 会比对 sent/written，任一不符就返回 5xx 并在 daemon 日志留 `archive put done/dst …` 行；老 daemon（2026-10-30 之前）存在"异步 put_archive 被同步调用 → 没写却回 200"的静默失败，需升级。 |
+| `exec -it` 静置约 60s 被断（`RST_STREAM`） | 心跳没生效：确认 Pod 里的 `rift-client` 是本版本（`Ping` 返回版本），以及 daemon 的 `_RIFT_KEEPALIVE_S` 没被调到 ≥ 60s；再看 ingress/LB 的 per-stream 空闲阈值。 |

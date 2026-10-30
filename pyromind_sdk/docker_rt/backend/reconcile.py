@@ -117,7 +117,14 @@ async def reconcile_pyromind_sandboxes(
 
     try:
         client = sandbox_client or get_sandbox_client()
-        sandboxes = await client.list()
+        # Bound the list call: the platform client allows 600s per request, and
+        # a startup reconcile hanging for ten minutes looks like a dead daemon.
+        sandboxes = await asyncio.wait_for(client.list(), timeout=60)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "PyromindSDK reconcile list timed out after 60s; keeping the local view"
+        )
+        return {"adopted": 0, "reaped": 0}
     except Exception as exc:
         logger.warning("PyromindSDK reconcile list failed: %s", exc)
         return {"adopted": 0, "reaped": 0}
@@ -160,9 +167,36 @@ async def reconcile_pyromind_sandboxes(
             )
             existing = store.get(name) or store.get(sandbox_id)
             if existing is not None:
-                existing.kube_env = kube_env
+                # Keep the live adapter: it holds rift_ready and the gateway
+                # channel. Replacing it on every reconcile pass (list/ps) reset
+                # those flags, so a just-bootstrapped sandbox looked "not ready"
+                # again and the health loop restarted it in a loop.
+                current = getattr(existing, "kube_env", None)
+                if current is None:
+                    existing.kube_env = kube_env
+                else:
+                    for attr in (
+                        "sandbox_status",
+                        "resources",
+                        "configuration",
+                        "volume_mounts",
+                        "port_mappings",
+                        "created_at",
+                        "updated_at",
+                        "endpoint_url",
+                        "web_vnc_url",
+                        "usage",
+                        "uid",
+                        "system_image_path",
+                        "screen_size",
+                    ):
+                        value = getattr(kube_env, attr, None)
+                        if value is not None:
+                            setattr(current, attr, value)
                 existing.pod_name = sandbox_id
                 existing.image = image
+                existing.sandbox_id = sandbox_id
+                existing.sandbox_status = sandbox.status
                 await store.set_state(existing, state)
                 existing.published_ports = _published_ports(sandbox)
             else:

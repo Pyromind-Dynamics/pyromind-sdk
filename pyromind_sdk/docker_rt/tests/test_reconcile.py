@@ -138,3 +138,41 @@ def test_adopted_sandbox_can_exec_and_copy(monkeypatch) -> None:
         tar.addfile(info, io.BytesIO(b"hi"))
     asyncio.run(adapter.put_archive("/tmp", buf.getvalue()))
     assert rift.archive_calls == [("/tmp", len(buf.getvalue()))]
+
+
+def test_reconcile_keeps_the_live_adapter_and_its_rift_state(monkeypatch) -> None:
+    """A list/ps reconcile must not reset rift_ready (it killed healthy sandboxes)."""
+    from pyromind_sdk.client.models import SandboxResponse
+
+    import pyromind_sdk.docker_rt.backend.pyromind_sdk_env as env_mod
+
+    sandbox = SandboxResponse(
+        id="sb-live",
+        name="live",
+        type=SandboxType.CUSTOM,
+        status="Running",
+        image="busybox:1.36",
+    )
+    client = MagicMock()
+    client.list = AsyncMock(return_value=[sandbox])
+    monkeypatch.setattr(env_mod, "get_sandbox_client", lambda: client)
+
+    store = ContainerStore()
+    live_env = MagicMock()
+    live_env.sandbox_id = "sb-live"
+    live_env.rift_ready = True
+    record = ContainerRecord(
+        id="b" * 64,
+        name="live",
+        image="busybox:1.36",
+        state=ContainerState.RUNNING,
+        sandbox_id="sb-live",
+        kube_env=live_env,
+    )
+    store._containers[record.id] = record
+    store._names[record.name] = record.id
+
+    asyncio.run(reconcile_pyromind_sandboxes(store, force=True))
+
+    assert store.get(record.id).kube_env is live_env
+    assert live_env.rift_ready is True

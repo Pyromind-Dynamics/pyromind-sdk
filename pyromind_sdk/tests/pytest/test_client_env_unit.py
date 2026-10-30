@@ -236,7 +236,7 @@ class TestResolveApiBaseUrl:
         from pyromind_sdk.client.base import resolve_api_base_url
 
         monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
-        monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-1")
+        monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-1#pre")
 
         assert resolve_api_base_url() == "https://pre-api.pyromind.ai/api/v1"
 
@@ -303,6 +303,6 @@ def test_rift_gateway_resolves_from_cluster_map(monkeypatch):
     from pyromind_sdk.rift.config import load_rift_config
 
     cfg = load_rift_config()
-    assert cfg.gateway == "pre-rift.pyromind.ai:443"
+    assert cfg.gateway == "pre-rift-gateway-us-west-1.pyromind.ai:443"
     assert cfg.gateway_tls is True
     assert cfg.gateway_ca is None

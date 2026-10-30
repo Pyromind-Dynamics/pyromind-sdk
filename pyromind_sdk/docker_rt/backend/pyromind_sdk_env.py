@@ -37,6 +37,7 @@ from .portforward import parse_publish_spec
 from ...rift.bootstrap import bootstrap_once
 from ...rift.config import load_rift_config
 from ...rift.errors import RiftError, RiftUnavailable
+from ...rift.rift_client import RiftGatewayClient
 from .runtime import parse_binds
 
 logger = logging.getLogger("docker_rt.pyromind_sdk")
@@ -701,14 +702,21 @@ class PyromindSDK:
             "exception_info": "",
         }
 
-    async def ping_rift(self) -> bool:
+    async def ping_rift_version(self) -> str | None:
+        """Build string reported by the injected rift-client (None when down).
+
+        ``<git describe>+<source sha12>`` — two builds of the same commit differ
+        here, which is the only way to tell a stale Pod apart.
+        """
         if self._rift_client is None:
-            return False
+            return None
         try:
-            await self._rift_client.ping()
-            return True
+            return await self._rift_client.ping()
         except Exception:  # noqa: BLE001
-            return False
+            return None
+
+    async def ping_rift(self) -> bool:
+        return bool(await self.ping_rift_version())
 
     async def bootstrap_rift(self, *, force: bool = False) -> None:
         """Upload/start rift-client and wait until the gateway can Ping it.
@@ -718,23 +726,51 @@ class PyromindSDK:
         must not fall back to the platform exec WebSocket.
         """
         cfg = load_rift_config()
-        if self.rift_ready and not force:
-            if await self.ping_rift():
-                return
-            self.rift_ready = False
+        # Ping first, with a client that costs nothing (no platform API call).
+        # After a daemon restart the Pod usually still runs the previous
+        # rift-client, so this avoids re-uploading/re-writing anything while the
+        # platform API is slow or unreachable.
+        if self._rift_client is None and self.sandbox_id and cfg.gateway:
+            access_key = str(getattr(self._client, "api_key", "") or "").strip()
+            if access_key:
+                self._rift_client = RiftGatewayClient(
+                    cfg, access_key, self.sandbox_id
+                )
+        running = await self.ping_rift_version()
+        # "Reachable" is not "current": a Pod keeps serving the previous build
+        # until something replaces it. Only a matching build may short-circuit,
+        # otherwise a new SDK would never reach sandboxes that are already up.
+        if running and (not cfg.expected_version or running == cfg.expected_version):
+            self.rift_ready = True
+            self.rift_degraded = False
+            self.rift_last_error = ""
+            self.logger.info(
+                "rift already reachable sandbox=%s; skipping bootstrap",
+                self.sandbox_id,
+            )
+            return
+        if running:
+            self.logger.warning(
+                "rift-client is stale sandbox=%s running=%s expected=%s; re-injecting",
+                self.sandbox_id,
+                running,
+                cfg.expected_version,
+            )
+        self.rift_ready = False
 
         last_error: BaseException | None = None
         for attempt in range(1, cfg.retry + 1):
             self.rift_attempts = attempt
             try:
-                await bootstrap_once(self)
+                info = await bootstrap_once(self)
                 self.rift_ready = True
                 self.rift_degraded = False
                 self.rift_last_error = ""
                 self.logger.info(
-                    "rift ready sandbox=%s attempt=%s",
+                    "rift ready sandbox=%s attempt=%s version=%s",
                     self.sandbox_id,
                     attempt,
+                    (info or {}).get("version", "?"),
                 )
                 return
             except RiftError as exc:
@@ -797,7 +833,14 @@ class PyromindSDK:
             argv,
             cwd=cwd or self.working_dir,
             tty=tty,
+            # Non-tty exec is output-only: Opening with stdin=True made
+            # rift-client wait for `stdin_close` before sending the exit frame,
+            # while this path only closes stdin *after* the frames loop ends —
+            # a 60s deadlock that ended in RST_STREAM. The PTY path
+            # (_hijack_rift_terminal) keeps stdin=True.
+            stdin=bool(tty),
         )
+        saw_exit = False
         try:
             async for frame in session.frames():
                 body = frame.WhichOneof("body")
@@ -810,11 +853,19 @@ class PyromindSDK:
                         type="stderr", data=frame.stderr
                     )
                 elif body == "exit":
+                    saw_exit = True
                     yield SandboxExecStreamChunk(
                         type="exit",
                         data="",
                         returncode=int(frame.exit.code),
                     )
+                    break
+        except Exception:
+            # Once the exit frame is in, a following RST_STREAM is just the
+            # gateway tearing down a bidi stream the client is no longer
+            # sending on. Report success, not RIFT_UNAVAILABLE.
+            if not saw_exit:
+                raise
         finally:
             try:
                 await session.close_stdin()
@@ -1148,16 +1199,57 @@ class PyromindSDK:
         async for chunk in self._rift_client.get_archive(path):
             yield chunk
         return
-    async def put_archive(self, dest_path: str, tar_bytes: bytes) -> None:
-        """Extract ``docker cp`` tar bytes into a k8s-middleware sandbox."""
+    async def put_archive(
+        self, dest_path: str, tar: bytes | AsyncIterator[bytes]
+    ) -> None:
+        """Extract a ``docker cp`` tar into a k8s-middleware sandbox.
+
+        The daemon hands over the request body as a stream so a multi-GB image
+        tar is never buffered here; rift-client validates and repacks every
+        member on arrival, then checks the files really landed. This method
+        owns the second half of that contract: the bytes we sent must all be
+        accounted for, otherwise the copy must not look successful — that is
+        how a `docker cp` once reported success while nothing was written.
+        """
         if not self.rift_ready:
             raise RiftUnavailable(
                 "rift channel is not ready; refusing platform file API"
             )
         if self._rift_client is None:
             raise RiftUnavailable("rift client is not initialized")
-        validate_tar_members(tar_bytes)
-        await self._rift_client.put_archive(dest_path or "/", tar_bytes)
+        dest = dest_path or "/"
+        sent = 0
+        if isinstance(tar, (bytes, bytearray, memoryview)):
+            payload = bytes(tar)
+            validate_tar_members(payload)
+            sent = len(payload)
+            data: Any = payload
+        else:
+
+            async def _counted(chunks: Any):
+                nonlocal sent
+                async for chunk in chunks:
+                    sent += len(chunk)
+                    yield chunk
+
+            data = _counted(tar)
+        written = await self._rift_client.put_archive(dest, data)
+        if sent == 0:
+            raise RiftUnavailable(
+                "docker cp: the upload body was empty, nothing to extract"
+            )
+        if written != sent:
+            raise RiftUnavailable(
+                f"docker cp: rift-client received {written} of {sent} bytes; "
+                "refusing to report the copy as successful"
+            )
+        logger.info(
+            "archive put done sandbox=%s dest=%s bytes=%d written=%d",
+            self.sandbox_id,
+            dest,
+            sent,
+            written,
+        )
     def patch_pod_metadata(self, **kwargs: Any) -> None:
         return None
 

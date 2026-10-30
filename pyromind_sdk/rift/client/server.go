@@ -82,6 +82,77 @@ func (r *riftServer) Exec(stream pb.Rift_ExecServer) error {
 	return execPipe(stream, cmd, open)
 }
 
+// keepaliveInterval is how long an Exec stream may stay silent in either
+// direction before this side writes a liveness frame. It has to stay well
+// below the HTTP/2 idle timers of whatever sits between the SDK and the
+// gateway (nginx's grpc_read_timeout / grpc_send_timeout / client_body_timeout
+// all default to 60s): those timers are reset by DATA frames only, and gRPC's
+// own keepalive PINGs are answered by the proxy itself, so they do not count.
+// A variable so tests can run the same code in milliseconds.
+var keepaliveInterval = 20 * time.Second
+
+// execWriter owns the only goroutine allowed to call Send on an Exec stream
+// (gRPC requires a single sender) and injects keepalive frames while the
+// stream is idle. Producers hand frames to send() and never touch the stream.
+type execWriter struct {
+	frames chan *pb.ExecFrame
+	done   chan struct{}
+	err    error // valid once done is closed
+}
+
+func newExecWriter(stream pb.Rift_ExecServer) *execWriter {
+	w := &execWriter{
+		frames: make(chan *pb.ExecFrame, 64),
+		done:   make(chan struct{}),
+	}
+	go w.run(stream)
+	return w
+}
+
+func (w *execWriter) run(stream pb.Rift_ExecServer) {
+	defer close(w.done)
+	ticker := time.NewTicker(keepaliveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case frame, ok := <-w.frames:
+			if !ok {
+				return
+			}
+			if err := stream.Send(frame); err != nil {
+				w.err = err
+				return
+			}
+			// Real data already reset the proxies' timers: push the ping out.
+			ticker.Reset(keepaliveInterval)
+		case <-ticker.C:
+			frame := &pb.ExecFrame{Body: &pb.ExecFrame_Ping{Ping: true}}
+			if err := stream.Send(frame); err != nil {
+				w.err = err
+				return
+			}
+		}
+	}
+}
+
+// send reports false once the stream is gone; producers must stop then.
+func (w *execWriter) send(frame *pb.ExecFrame) bool {
+	select {
+	case w.frames <- frame:
+		return true
+	case <-w.done:
+		return false
+	}
+}
+
+// close flushes buffered frames (including the exit frame) and returns the
+// first write error, which is what the gateway/client must see.
+func (w *execWriter) close() error {
+	close(w.frames)
+	<-w.done
+	return w.err
+}
+
 func execPipe(stream pb.Rift_ExecServer, cmd *exec.Cmd, open *pb.ExecOpen) error {
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -98,11 +169,12 @@ func execPipe(stream pb.Rift_ExecServer, cmd *exec.Cmd, open *pb.ExecOpen) error
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+	w := newExecWriter(stream)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go copyOut(stream, stdout, false, &wg)
-	go copyOut(stream, stderr, true, &wg)
+	go copyOut(w, stdout, false, &wg)
+	go copyOut(w, stderr, true, &wg)
 
 	recvDone := make(chan struct{})
 	go func() {
@@ -129,10 +201,11 @@ func execPipe(stream pb.Rift_ExecServer, cmd *exec.Cmd, open *pb.ExecOpen) error
 
 	wg.Wait()
 	<-recvDone
-	return stream.Send(&pb.ExecFrame{Body: &pb.ExecFrame_Exit{Exit: &pb.ExecExit{Code: int32(exitCode(cmd.Wait()))}}})
+	w.send(&pb.ExecFrame{Body: &pb.ExecFrame_Exit{Exit: &pb.ExecExit{Code: int32(exitCode(cmd.Wait()))}}})
+	return w.close()
 }
 
-func copyOut(stream pb.Rift_ExecServer, r io.Reader, isErr bool, wg *sync.WaitGroup) {
+func copyOut(w *execWriter, r io.Reader, isErr bool, wg *sync.WaitGroup) {
 	defer wg.Done()
 	buf := make([]byte, 32*1024)
 	for {
@@ -145,7 +218,9 @@ func copyOut(stream pb.Rift_ExecServer, r io.Reader, isErr bool, wg *sync.WaitGr
 			} else {
 				fr = &pb.ExecFrame{Body: &pb.ExecFrame_Stdout{Stdout: chunk}}
 			}
-			_ = stream.Send(fr)
+			if !w.send(fr) {
+				return
+			}
 		}
 		if err != nil {
 			return
@@ -166,6 +241,7 @@ func execTTY(stream pb.Rift_ExecServer, cmd *exec.Cmd, open *pb.ExecOpen) error 
 		return err
 	}
 	defer func() { _ = ptmx.Close() }()
+	w := newExecWriter(stream)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -175,7 +251,10 @@ func execTTY(stream pb.Rift_ExecServer, cmd *exec.Cmd, open *pb.ExecOpen) error 
 		for {
 			n, err := ptmx.Read(buf)
 			if n > 0 {
-				_ = stream.Send(&pb.ExecFrame{Body: &pb.ExecFrame_Stdout{Stdout: append([]byte(nil), buf[:n]...)}})
+				frame := &pb.ExecFrame{Body: &pb.ExecFrame_Stdout{Stdout: append([]byte(nil), buf[:n]...)}}
+				if !w.send(frame) {
+					return
+				}
 			}
 			if err != nil {
 				return
@@ -207,7 +286,8 @@ func execTTY(stream pb.Rift_ExecServer, cmd *exec.Cmd, open *pb.ExecOpen) error 
 	}()
 
 	wg.Wait()
-	return stream.Send(&pb.ExecFrame{Body: &pb.ExecFrame_Exit{Exit: &pb.ExecExit{Code: int32(exitCode(cmd.Wait()))}}})
+	w.send(&pb.ExecFrame{Body: &pb.ExecFrame_Exit{Exit: &pb.ExecExit{Code: int32(exitCode(cmd.Wait()))}}})
+	return w.close()
 }
 
 func (r *riftServer) GetArchive(req *pb.GetArchiveRequest, stream pb.Rift_GetArchiveServer) error {
@@ -342,7 +422,7 @@ func (r *riftServer) PutArchive(stream pb.Rift_PutArchiveServer) error {
 		_, _ = io.Copy(&errBuf, stderr)
 	}()
 
-	validateErr := copyValidatedTar(pr, stdin, dest)
+	members, validateErr := copyValidatedTar(pr, stdin, dest)
 	_ = stdin.Close()
 	// No reader is left, so a writer stuck after the end-of-archive marker gets
 	// ErrClosedPipe instead of blocking the handler.
@@ -369,6 +449,20 @@ func (r *riftServer) PutArchive(stream pb.Rift_PutArchiveServer) error {
 	}
 	if waitErr != nil {
 		return fmt.Errorf("tar extract: %v: %s", waitErr, errBuf.String())
+	}
+	// `tar -xf -` exits 0 on an empty or silently-skipped input, and the daemon
+	// turns any success status into HTTP 200 — which is how a `docker cp` used
+	// to "succeed" without leaving a file behind. Verify what actually landed.
+	if total := atomic.LoadInt64(&received); total == 0 {
+		return fmt.Errorf("tar extract: empty archive stream (0 bytes received)")
+	}
+	if len(members) == 0 {
+		// `docker cp` always ships at least one member; an end-of-archive-only
+		// payload means the caller got nothing while tar still exited 0.
+		return fmt.Errorf("tar extract: archive contained no members")
+	}
+	if err := verifyExtracted(dest, members); err != nil {
+		return err
 	}
 	return stream.SendAndClose(&pb.PutArchiveReply{
 		BytesWritten: atomic.LoadInt64(&received),
@@ -444,36 +538,75 @@ func validateTarHeader(hdr *tar.Header, dest string, symlinks map[string]struct{
 
 // copyValidatedTar streams members from src to dst, dropping the ones that
 // fail validation instead of handing them to tar.
-func copyValidatedTar(src io.Reader, dst io.Writer, dest string) error {
+// extractedMember is what we expect to find on disk after `tar -xf -`.
+type extractedMember struct {
+	name string
+	size int64
+	typ  byte
+}
+
+func copyValidatedTar(
+	src io.Reader, dst io.Writer, dest string,
+) ([]extractedMember, error) {
 	tr := tar.NewReader(src)
 	tw := tar.NewWriter(dst)
 	symlinks := make(map[string]struct{})
+	members := make([]extractedMember, 0, 8)
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("tar: %v", err)
+			return nil, fmt.Errorf("tar: %v", err)
 		}
 		if hdr.Typeflag == tar.TypeXGlobalHeader {
 			continue
 		}
 		if err := validateTarHeader(hdr, dest, symlinks); err != nil {
-			return err
+			return nil, err
 		}
 		if hdr.Typeflag == tar.TypeSymlink {
 			symlinks[tarMemberPath(hdr.Name)] = struct{}{}
 		}
 		if err := tw.WriteHeader(hdr); err != nil {
-			return fmt.Errorf("tar: %v", err)
+			return nil, fmt.Errorf("tar: %v", err)
 		}
 		if _, err := io.Copy(tw, tr); err != nil {
-			return fmt.Errorf("tar: %v", err)
+			return nil, fmt.Errorf("tar: %v", err)
 		}
+		members = append(members, extractedMember{name: hdr.Name, size: hdr.Size, typ: hdr.Typeflag})
 	}
 	if err := tw.Close(); err != nil {
-		return fmt.Errorf("tar: %v", err)
+		return nil, fmt.Errorf("tar: %v", err)
+	}
+	return members, nil
+}
+
+// verifyExtracted checks the repacked members really landed under dest. It is
+// the difference between "tar exited 0" and "the file the caller asked for
+// exists with the right size" — the daemon may only report success on the
+// latter.
+func verifyExtracted(dest string, members []extractedMember) error {
+	for _, member := range members {
+		rel := tarMemberPath(member.name)
+		if rel == "" || rel == "." {
+			continue
+		}
+		target := filepath.Join(dest, filepath.FromSlash(rel))
+		info, err := os.Lstat(target)
+		if err != nil {
+			return fmt.Errorf(
+				"tar extract: %q is missing under %s: %v",
+				member.name, dest, err,
+			)
+		}
+		if member.typ == tar.TypeReg && info.Mode().IsRegular() && info.Size() != member.size {
+			return fmt.Errorf(
+				"tar extract: %q is %d bytes on disk, want %d",
+				member.name, info.Size(), member.size,
+			)
+		}
 	}
 	return nil
 }

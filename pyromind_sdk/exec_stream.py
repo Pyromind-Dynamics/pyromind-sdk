@@ -135,7 +135,7 @@ async def _iter_exec_stream_events(
     timeout: Optional[int] = None,
     tty: bool = False,
     stop_event: Optional[threading.Event] = None,
-    ping_interval_s: float = 60.0,
+    ping_interval_s: float = 10.0,
     stdin_close: Optional[threading.Event] = None,
 ) -> AsyncIterator[Dict[str, Any]]:
     # Output-only channel: the server refused stdin support here (see the
@@ -222,6 +222,13 @@ async def _iter_exec_stream_events(
                         stdin_close.clear()
                         await ws.send_str('{"type":"stdin_close"}')
                     if loop.time() - last_ping >= ping_interval_s:
+                        # Application-level keepalive. Must be well under any
+                        # intermediary idle timeout: the middleware itself allows
+                        # 300s (and closes with an explicit EXEC_IDLE_TIMEOUT
+                        # frame), but ingress/LB/NAT in front of it commonly cut
+                        # idle WebSockets at ~30s with no close frame — which the
+                        # client can only report as "connection lost". 60s was too
+                        # slow and produced exactly that failure during bootstrap.
                         await ws.send_str('{"type":"ping"}')
                         last_ping = loop.time()
                     continue
