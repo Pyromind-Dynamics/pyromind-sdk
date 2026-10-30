@@ -414,3 +414,25 @@ def test_stream_framing_roundtrip():
     err = frame_stderr(b"e")
     assert err[0] == 2
     assert frame_stdout(b"") == b""
+
+
+def test_sync_put_archive_refuses_an_async_adapter():
+    """同步助手遇到异步 ``put_archive`` 必须报错，不能静默空转。
+
+    2026-10-30：旧的 daemon 走到 ``archive.put_archive`` 时，``PyromindSDK``
+    的异步实现被当同步调用 —— 协程从未 await，字节一个没发，HTTP 却回 200，
+    ``docker cp`` 打印 "Successfully copied" 而文件不存在。
+    """
+    from ..backend.archive import make_single_file_tar, put_archive
+
+    class AsyncEnv:
+        async def put_archive(self, dest_path, tar_bytes):
+            raise AssertionError("must never be awaited from the sync helper")
+
+    data = make_single_file_tar("hello.txt", b"hello")
+    try:
+        put_archive(AsyncEnv(), "/var", data)
+    except TypeError as exc:
+        assert "is async" in str(exc)
+    else:
+        raise AssertionError("expected TypeError for an async put_archive")

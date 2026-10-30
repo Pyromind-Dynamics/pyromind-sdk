@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import inspect
 import io
 import logging
 import posixpath
@@ -580,7 +581,17 @@ def put_archive(kube_env: Any, dest_path: str, tar_bytes: bytes) -> None:
     if hasattr(kube_env, "put_archive"):
         # The adapter validates too; keeping this branch free of a second scan
         # avoids walking a multi-GB tar twice.
-        kube_env.put_archive(dest_path, tar_bytes)
+        result = kube_env.put_archive(dest_path, tar_bytes)
+        if inspect.isawaitable(result):
+            # This helper is sync (callers run it in a thread), so an async
+            # adapter would turn into "coroutine never awaited": the copy writes
+            # nothing while the HTTP layer still answers 200. Say so instead of
+            # pretending the upload happened.
+            result.close() if inspect.iscoroutine(result) else None
+            raise TypeError(
+                f"{type(kube_env).__name__}.put_archive() is async; "
+                "await it instead of calling this sync helper"
+            )
         return
     validate_tar_members(tar_bytes)
     if len(tar_bytes) <= _EMBED_MAX and callable(getattr(kube_env, "execute", None)):

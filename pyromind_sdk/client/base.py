@@ -51,11 +51,10 @@ CLUSTER_RESOURCE = {
             "dev": "http://localhost:8001",
         },
         "storage":"https://storage.pyromind.ai",
-        # gRPC data plane (rift-gateway). Public CA; TLS is inferred from :443.
         "rift": {
-            "prod": "rift.pyromind.ai:443",
-            "pre": "pre-rift.pyromind.ai:443",
-            "pre2": "pre2-rift.pyromind.ai:443",
+            "prod": "rift-gateway-us-west-1.pyromind.ai:443",
+            "pre": "pre-rift-gateway-us-west-1.pyromind.ai:443",
+            "pre2": "pre-rift-gateway-us-west-1.pyromind.ai:443",
             "dev": "localhost:18080",
         },
     },

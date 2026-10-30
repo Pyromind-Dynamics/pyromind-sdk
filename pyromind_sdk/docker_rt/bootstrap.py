@@ -8,6 +8,7 @@ active parameters with ANSI colors after a successful connection.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 try:
@@ -15,6 +16,8 @@ try:
 except ImportError:
     pass
 from typing import Any
+
+logger = logging.getLogger("docker_rt.bootstrap")
 
 DOCKER_LINUX_INSTALL_HINT = """\
 Docker CLI is required but was not found.
@@ -89,9 +92,10 @@ def _ask_cluster(
     from ..client.base import DEFAULT_CLUSTER, resolve_base_url_from_cluster
 
     choices = ", ".join(_cluster_choices())
-    prompt = f"PYROMIND_CLUSTER ({choices}): "
+    hint = f"{choices}; 可选 #pre / #pre2，默认 prod"
+    prompt = f"PYROMIND_CLUSTER ({hint}): "
     if color:
-        prompt = f"{_BOLD}{_CYAN}PYROMIND_CLUSTER ({choices}):{_RESET} "
+        prompt = f"{_BOLD}{_CYAN}PYROMIND_CLUSTER ({hint}):{_RESET} "
     while True:
         candidate = _prompt(prompt, stdin=stdin, stdout=stdout) or DEFAULT_CLUSTER
         try:
@@ -204,8 +208,13 @@ async def check_connection(
         # Data plane: check the cluster the daemon will actually talk to,
         # not the portal.
         base_url=resolve_api_base_url(cluster),
+        # Startup must not hang for the client's 600s default when the API is
+        # unreachable; fail fast with a clear error instead.
+        timeout=30,
+        max_retries=2,
     )
     try:
+        logger.info("checking PyroMind API connectivity...")
         return len(await client.list())
     finally:
         if owns_client:

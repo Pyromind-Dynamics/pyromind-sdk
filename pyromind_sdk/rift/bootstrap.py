@@ -20,6 +20,7 @@ import hashlib
 import logging
 import posixpath
 import shlex
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -38,6 +39,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("docker_rt.rift.bootstrap")
 
+#: The platform HTTP client allows 600s per request (DEFAULT_TIMEOUT), so one
+#: stalled connection can look like a hang for ten minutes. Bootstrap stages get
+#: explicit caps and are retried by ``bootstrap_rift`` instead.
+_UPLOAD_TIMEOUT_S = 180.0
+_SMALL_WRITE_TIMEOUT_S = 30.0
+_BOOTSTRAP_EXEC_TIMEOUT_S = 60.0
+
 _START_SCRIPT = """#!/bin/sh
 set -eu
 BIN="__REMOTE_DIR__/rift-client"
@@ -52,8 +60,12 @@ if [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; then
   exit 0
 fi
 rm -f "$PID"
+# `-x` (exact process name), never `-f "$BIN"`: the platform exec wrapper's own
+# command line contains $BIN (the chmod above), so `pkill -f` would kill the
+# shell running this script and report a spurious "start failed" even though the
+# client started.
 if command -v pkill >/dev/null 2>&1; then
-  pkill -f "$BIN" 2>/dev/null || true
+  pkill -x rift-client 2>/dev/null || true
 fi
 if command -v setsid >/dev/null 2>&1; then
   setsid "$BIN" --port "$PORT" --bind "$BIND" --sandbox-id "$SANDBOX_ID" \
@@ -118,6 +130,30 @@ def _local_binary_sha(path: Path) -> str:
     return actual
 
 
+async def _stop_remote(env: "PyromindSDK", pid_path: str) -> None:
+    """Best-effort stop of the previous rift-client before replacing it.
+
+    Failures are ignored: a stopped sandbox has no process to kill, and the
+    start step below reports the real problem.
+    """
+    qpid = shlex.quote(pid_path)
+    command = (
+        f"if [ -f {qpid} ]; then kill $(cat {qpid}) 2>/dev/null || true; fi; "
+        f"sleep 1; true"
+    )
+    try:
+        await env.execute(
+            {"command": command},
+            cwd="/",
+            _force_platform=True,
+            timeout=int(_BOOTSTRAP_EXEC_TIMEOUT_S),
+        )
+    except Exception as exc:  # noqa: BLE001 - best effort
+        logger.debug(
+            "stop before upload failed sandbox=%s: %s", env.sandbox_id, exc
+        )
+
+
 async def _prepare_remote(
     env: "PyromindSDK", remote_dir: str, bin_path: str
 ) -> tuple[str, str]:
@@ -139,7 +175,10 @@ async def _prepare_remote(
         f"fi; fi"
     )
     result = await env.execute(
-        {"command": command}, cwd="/", _force_platform=True
+        {"command": command},
+        cwd="/",
+        _force_platform=True,
+        timeout=int(_BOOTSTRAP_EXEC_TIMEOUT_S),
     )
     if int(result.get("returncode", 0) or 0) != 0:
         raise RiftUnavailable(
@@ -163,7 +202,14 @@ async def _wait_ping(client: RiftGatewayClient, *, attempts: int, interval: floa
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             await asyncio.sleep(interval)
-    raise RiftUnavailable(f"rift-client did not answer Ping: {last_error}")
+    detail = str(last_error)
+    if "sandbox not found" in detail.lower():
+        detail += (
+            "; the gateway has no route for this sandbox (no Pipe). Sandboxes "
+            "created before rift-gateway was deployed need `docker stop` + "
+            "`docker start` (or a recreate) so k8s_middleware writes the Pipe"
+        )
+    raise RiftUnavailable(f"rift-client did not answer Ping: {detail}")
 
 
 async def _force_restart(
@@ -183,11 +229,14 @@ async def _force_restart(
         f"kill $(cat {shlex.quote(pid_path)}) 2>/dev/null || true; "
         f"rm -f {shlex.quote(pid_path)}; fi; "
         f"if command -v pkill >/dev/null 2>&1; then "
-        f"pkill -f {shlex.quote(bin_path)} 2>/dev/null || true; fi; "
+        f"pkill -x rift-client 2>/dev/null || true; fi; "
         f"sleep 0.3; sh {shlex.quote(script_path)}"
     )
     result = await env.execute(
-        {"command": command}, cwd="/", _force_platform=True
+        {"command": command},
+        cwd="/",
+        _force_platform=True,
+        timeout=int(_BOOTSTRAP_EXEC_TIMEOUT_S),
     )
     if int(result.get("returncode", 0) or 0) != 0:
         raise RiftUnavailable(
@@ -213,6 +262,13 @@ async def bootstrap_once(env: "PyromindSDK") -> dict[str, Any]:
     binary = cfg.binary_for_arch(arch)
     local_sha = _local_binary_sha(binary)
 
+    if remote_sha and remote_sha != local_sha:
+        # Linux refuses to write to a running executable (ETXTBSY) and the
+        # upload goes straight to ``bin_path``, so a different build must stop
+        # the old process *before* the upload. It is started again below; this
+        # is the only ordering that lets a running sandbox pick up a new build.
+        await _stop_remote(env, pid_path)
+
     if remote_sha and remote_sha == local_sha:
         logger.info(
             "reusing existing rift-client binary sandbox=%s path=%s",
@@ -220,8 +276,27 @@ async def bootstrap_once(env: "PyromindSDK") -> dict[str, Any]:
             bin_path,
         )
     else:
-        await env._client.write_file(
-            env.sandbox_id, bin_path, binary.read_bytes()
+        data = binary.read_bytes()
+        logger.info(
+            "uploading rift-client sandbox=%s arch=%s size=%dB path=%s",
+            env.sandbox_id,
+            arch,
+            len(data),
+            bin_path,
+        )
+        upload_started = time.monotonic()
+        result = await asyncio.wait_for(
+            env._client.write_file(env.sandbox_id, bin_path, data),
+            timeout=_UPLOAD_TIMEOUT_S,
+        )
+        elapsed = max(time.monotonic() - upload_started, 0.001)
+        logger.info(
+            "uploaded rift-client sandbox=%s size=%dB in %.1fs (%.2f MiB/s) server_path=%s",
+            env.sandbox_id,
+            len(data),
+            elapsed,
+            len(data) / 1048576 / elapsed,
+            (result or {}).get("path", "?"),
         )
 
     access_key = str(getattr(env._client, "api_key", "") or "").strip()
@@ -230,13 +305,26 @@ async def bootstrap_once(env: "PyromindSDK") -> dict[str, Any]:
 
     # The token and start script are tiny; always rewrite them so an updated
     # access key or script wins even on a persistent volume.
-    await env._client.write_file(
-        env.sandbox_id, token_path, access_key.encode("utf-8")
+    logger.info("writing token/start script sandbox=%s", env.sandbox_id)
+    writes_started = time.monotonic()
+    await asyncio.wait_for(
+        env._client.write_file(
+            env.sandbox_id, token_path, access_key.encode("utf-8")
+        ),
+        timeout=_SMALL_WRITE_TIMEOUT_S,
     )
-    await env._client.write_file(
+    await asyncio.wait_for(
+        env._client.write_file(
+            env.sandbox_id,
+            script_path,
+            _start_script(remote_dir, env.sandbox_id).encode("utf-8"),
+        ),
+        timeout=_SMALL_WRITE_TIMEOUT_S,
+    )
+    logger.info(
+        "token/start script written sandbox=%s in %.1fs",
         env.sandbox_id,
-        script_path,
-        _start_script(remote_dir, env.sandbox_id).encode("utf-8"),
+        time.monotonic() - writes_started,
     )
 
     # One exec: secure files, stop the previous process (pause/resume may leave
@@ -249,8 +337,19 @@ async def bootstrap_once(env: "PyromindSDK") -> dict[str, Any]:
         f"rm -f {shlex.quote(pid_path)}; fi; "
         f"sh {shlex.quote(script_path)}"
     )
+    logger.info("starting rift-client sandbox=%s", env.sandbox_id)
+    start_started = time.monotonic()
     result = await env.execute(
-        {"command": start}, cwd="/", _force_platform=True
+        {"command": start},
+        cwd="/",
+        _force_platform=True,
+        timeout=int(_BOOTSTRAP_EXEC_TIMEOUT_S),
+    )
+    logger.info(
+        "start command returned rc=%s in %.1fs sandbox=%s",
+        result.get("returncode", "?"),
+        time.monotonic() - start_started,
+        env.sandbox_id,
     )
     if int(result.get("returncode", 0) or 0) != 0:
         tail = await _log_tail(env, log_path)
@@ -312,11 +411,12 @@ async def bootstrap_once(env: "PyromindSDK") -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             pass
     logger.info(
-        "rift-client ready sandbox=%s arch=%s gateway=%s path=%s reused=%s",
+        "rift-client ready sandbox=%s arch=%s version=%s gateway=%s path=%s reused=%s",
         env.sandbox_id,
         arch,
+        running_version,
         cfg.gateway,
         remote_dir,
         bool(remote_sha and remote_sha == local_sha),
     )
-    return {}
+    return {"version": running_version}

@@ -80,6 +80,11 @@ def problems() -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    if "--print" in args:
+        # Build identity for the Makefile: `git describe` alone cannot tell two
+        # builds of the same commit apart, and Ping returns this string.
+        print(fingerprint())
+        return 0
     if "--write" in args:
         print(write())
         return 0

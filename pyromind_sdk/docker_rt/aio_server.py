@@ -11,7 +11,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, AsyncIterator
 
 from aiohttp import WSMsgType, web
 from aiohttp.client_exceptions import ClientConnectionResetError
@@ -1265,11 +1265,15 @@ def _status_text(state: ContainerState) -> str:
 def _display_status(c: Any) -> str:
     """Map a record to one of: running / stopped / pending / failed."""
     kube_env = getattr(c, "kube_env", None)
-    if isinstance(kube_env, PyromindSDK) and not getattr(
-        kube_env, "rift_ready", False
+    if (
+        isinstance(kube_env, PyromindSDK)
+        and c.state == ContainerState.RUNNING
+        and not getattr(kube_env, "rift_ready", False)
     ):
         # The Pod may be Running, but the container is not exec-ready until
         # rift-client answers Ping. Docker should not show it as Up yet.
+        # Only RUNNING records are gated: a stopped/dead container keeps
+        # showing Exited/Dead even though rift-client is gone with the Pod.
         return "pending"
     _, sandbox_status = _sandbox_identity(c)
     s = (sandbox_status or "").strip().lower()
@@ -1300,6 +1304,35 @@ def _display_status_text(c: Any) -> str:
     if state == "failed":
         return "Dead"
     return "Created"
+
+
+def _docker_state(c: Any) -> str:
+    """``State`` for the list API, derived from the same view as ``Status``."""
+    return {
+        "running": "running",
+        "stopped": "exited",
+        "failed": "dead",
+    }.get(_display_status(c), "created")
+
+
+def _rift_not_ready(c: Any) -> bool:
+    """True when the sandbox exists but exec/cp cannot reach rift-client yet."""
+    kube_env = getattr(c, "kube_env", None)
+    return (
+        isinstance(kube_env, PyromindSDK)
+        and c.state == ContainerState.RUNNING
+        and not getattr(kube_env, "rift_ready", False)
+    )
+
+
+def _rift_not_ready_error(c: Any) -> web.Response:
+    return _err(
+        409,
+        f"Container {c.id[:12]} is not running: rift-client is not ready. "
+        "If this sandbox was created before rift-gateway was deployed it has no "
+        "route; run `docker stop` + `docker start` (or recreate it) so "
+        "k8s_middleware writes the Pipe.",
+    )
 
 
 def _parse_epoch(value: Any) -> int | None:
@@ -1411,6 +1444,7 @@ async def _wait_container_ready(record: Any, *, timeout: float) -> str:
         return "running"
 
     deadline = time.monotonic() + max(float(timeout), 0.01)
+    started = time.monotonic()
     short = (getattr(record, "id", "") or "")[:12]
     # `docker run -d` / `start` 的 HTTP 响应没有 body，CLI 在 waiting 期间也不读
     # stdout ⇒ 这行提示只能进 daemon 日志（前台 run 的终端提示在 attach 里单独写）。
@@ -1418,6 +1452,7 @@ async def _wait_container_ready(record: Any, *, timeout: float) -> str:
         "waiting for the sandbox to be running... id=%s timeout=%ss", short, timeout
     )
     last_phase: Any = "Unknown"
+    last_note = 0.0
     while True:
         try:
             kwargs = {"force": True} if isinstance(kube_env, PyromindSDK) else {}
@@ -1431,6 +1466,19 @@ async def _wait_container_ready(record: Any, *, timeout: float) -> str:
         if status_word in {"running", "stopped", "failed"}:
             logger.info("sandbox %s is %s", short, status_word)
             return status_word
+
+        # Progress beats a silent multi-minute wait: `docker start` can sit here
+        # while the platform schedules the Pod, and the API poll itself is slow.
+        elapsed = time.monotonic() - started
+        if elapsed - last_note >= 15.0:
+            logger.info(
+                "sandbox %s is still %s (%.0fs elapsed, timeout=%ss)",
+                short,
+                str(last_phase),
+                elapsed,
+                timeout,
+            )
+            last_note = elapsed
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -1526,7 +1574,9 @@ def _to_list_item(c: Any) -> dict[str, Any]:
         "Created": _created_epoch(c),
         "Ports": ports_list,
         "Labels": labels,
-        "State": (sandbox_status or c.state.value).lower(),
+        # Keep State consistent with Status: a sandbox whose rift-client is not
+        # ready yet must not be reported as running (filters use State).
+        "State": _docker_state(c),
         "Status": _display_status_text(c),
         "HostConfig": {"NetworkMode": "default"},
         "NetworkSettings": {"Networks": {}},
@@ -1576,8 +1626,9 @@ def _has_type_filter(filters: dict[str, list[str]]) -> bool:
 def _matches_filters(c: Any, filters: dict[str, list[str]]) -> bool:
     if not filters:
         return True
-    sandbox_id, sandbox_status = _sandbox_identity(c)
-    state = (sandbox_status or c.state.value).lower()
+    # Same view as the list payload: a not-ready sandbox is "created", not
+    # "running", so `docker ps --filter status=running` stays honest.
+    state = _docker_state(c)
     labels = _to_list_item(c).get("Labels", {})
 
     def type_matches(values: list[str]) -> bool:
@@ -1667,8 +1718,11 @@ def _to_inspect(c: Any, *, pod_ip: str | None = None) -> dict[str, Any]:
     backend keeps resolving it inline, as it always did.
     """
     sandbox_id, sandbox_status = _sandbox_identity(c)
-    state_status = sandbox_status or c.state.value
-    running = state_status.lower() in {"running", "up"}
+    platform_status = sandbox_status or c.state.value
+    # Docker's State follows the same view as `docker ps`: until rift-client is
+    # ready the container is "created", not "running".
+    state_status = _docker_state(c)
+    running = state_status == "running"
     mode = os.getenv("DOCKER_RT_INSPECT_MODE", "standard").lower()
     if mode == "sandbox":
         display_id = sandbox_id or c.id
@@ -1679,7 +1733,7 @@ def _to_inspect(c: Any, *, pod_ip: str | None = None) -> dict[str, Any]:
             "id": display_id,
             "name": c.name,
             "type": "custom",
-            "status": state_status,
+            "status": platform_status,
             "configuration": (
                 getattr(kube_env, "configuration", None) or {}
                 if kube_env is not None
@@ -1834,8 +1888,7 @@ def _to_inspect(c: Any, *, pod_ip: str | None = None) -> dict[str, Any]:
             "Paused": False,
             "Restarting": False,
             "OOMKilled": False,
-            "Dead": c.state == ContainerState.DEAD
-            or state_status.lower() in {"failed", "error"},
+            "Dead": c.state == ContainerState.DEAD or state_status == "dead",
             "Pid": 0,
             "ExitCode": 0 if running else getattr(c, "exit_code", 0),
             "Error": c.error or "",
@@ -1903,9 +1956,31 @@ def _to_inspect(c: Any, *, pod_ip: str | None = None) -> dict[str, Any]:
     return result
 
 
+def _schedule_reconcile(app: web.Application, store: ContainerStore) -> None:
+    """Refresh the sandbox list in the background.
+
+    ``client.list()`` is a platform API call that can take tens of seconds when
+    that API is slow or unreachable; doing it inline made every ``docker ps``
+    block for the same amount of time. Local records (create/rm) are already
+    authoritative, so the list can be served immediately and refreshed behind
+    the request; ``reconcile_pyromind_sandboxes`` keeps its own TTL.
+    """
+    task = app.get("reconcile_task")
+    if task is not None and not task.done():
+        return
+
+    async def _run() -> None:
+        try:
+            await reconcile_pyromind_sandboxes(store)
+        except Exception:  # noqa: BLE001
+            logger.debug("background reconcile failed", exc_info=True)
+
+    app["reconcile_task"] = asyncio.get_running_loop().create_task(_run())
+
+
 async def list_containers(request: web.Request) -> web.Response:
     store: ContainerStore = request.app["store"]
-    await reconcile_pyromind_sandboxes(store)
+    _schedule_reconcile(request.app, store)
     all_flag = request.rel_url.query.get("all", "0") in {"1", "true", "True"}
     records = store.list(all_containers=all_flag)
     filters = _parse_filters(request.rel_url.query.get("filters"))
@@ -2196,13 +2271,35 @@ async def _bootstrap_rift_for_record(record: Any) -> web.Response | None:
         return _err(503, record.error)
 
 
+def _rift_version_is_stale(running: str) -> bool:
+    """True when the Pod runs a different build than the one shipped here.
+
+    ``Ping`` returns ``<git describe>+<source sha12>`` (see
+    ``rift/client/Makefile``): the git part alone cannot tell two builds of the
+    same commit apart, the sha suffix can. An empty expected version (package
+    without ``rift-client.version``) keeps the old "any version is fine"
+    behaviour instead of re-injecting on every pass.
+    """
+    expected = load_rift_config().expected_version
+    return bool(expected) and running != expected
+
+
 async def _rift_health_loop(app: web.Application) -> None:
-    """Keep the rift channel alive: ping, then re-bootstrap (3 attempts inside)."""
+    """Keep the rift channel alive: ping, then re-bootstrap (3 attempts inside).
+
+    Repeated failures back off per sandbox (up to 5 minutes). A legacy sandbox
+    without a Pipe can never recover on its own, and retrying it every 30s
+    hammers the same platform API that ``docker run`` needs to start a new
+    sandbox (upload + status polling), which used to stall fresh starts.
+    """
     interval = load_rift_config().health_interval
     if interval <= 0:
         return
     store: ContainerStore = app["store"]
     locks: dict[str, asyncio.Lock] = {}
+    failures: dict[str, int] = {}
+    retry_at: dict[str, float] = {}
+    loop = asyncio.get_running_loop()
     while True:
         # Check once immediately: adopted sandboxes are not usable until this
         # pass injects and starts their rift-client.
@@ -2212,6 +2309,8 @@ async def _rift_health_loop(app: web.Application) -> None:
             env = getattr(record, "kube_env", None)
             if not isinstance(env, PyromindSDK):
                 continue
+            if retry_at.get(record.id, 0.0) > loop.time():
+                continue
             lock = locks.setdefault(record.id, asyncio.Lock())
             if lock.locked():
                 continue
@@ -2219,21 +2318,59 @@ async def _rift_health_loop(app: web.Application) -> None:
                 if record.state != ContainerState.RUNNING:
                     continue
                 try:
-                    if env.rift_ready and await env.ping_rift():
-                        continue
+                    if env.rift_ready:
+                        running = await env.ping_rift_version()
+                        if running and not _rift_version_is_stale(running):
+                            failures.pop(record.id, None)
+                            retry_at.pop(record.id, None)
+                            continue
+                        if running:
+                            logger.warning(
+                                "rift-client is stale id=%s running=%s expected=%s; "
+                                "re-injecting",
+                                record.id[:12],
+                                running,
+                                load_rift_config().expected_version,
+                            )
                     env.rift_ready = False
+                    # A pause/resume transition leaves the Pod Pending for a
+                    # while. Injecting then fails ("Sandbox is not running") and
+                    # competes with the `docker start` that is waiting for the
+                    # same Pod, so only bootstrap once the platform says Running.
+                    phase = str(await env.refresh_phase(force=True) or "").strip().lower()
+                    if phase not in {"running", "up", "ready"}:
+                        raise RiftError(
+                            f"sandbox is not running yet (phase={phase or 'unknown'})"
+                        )
                     logger.warning(
                         "rift channel unhealthy id=%s; re-bootstrapping",
                         record.id[:12],
                     )
                     await env.bootstrap_rift(force=True)
+                    failures.pop(record.id, None)
+                    retry_at.pop(record.id, None)
                 except RiftError as exc:
+                    count = failures.get(record.id, 0) + 1
+                    failures[record.id] = count
+                    delay = min(interval * (2 ** min(count - 1, 5)), 300.0)
+                    retry_at[record.id] = loop.time() + delay
                     logger.warning(
-                        "rift recovery failed id=%s: %s", record.id[:12], exc
+                        "rift recovery failed id=%s (%s in a row, next try in %.0fs): %s",
+                        record.id[:12],
+                        count,
+                        delay,
+                        exc,
                     )
                 except Exception:  # noqa: BLE001
+                    count = failures.get(record.id, 0) + 1
+                    failures[record.id] = count
+                    delay = min(interval * (2 ** min(count - 1, 5)), 300.0)
+                    retry_at[record.id] = loop.time() + delay
                     logger.exception(
-                        "rift health check failed id=%s", record.id[:12]
+                        "rift health check failed id=%s (%s in a row, next try in %.0fs)",
+                        record.id[:12],
+                        count,
+                        delay,
                     )
         await asyncio.sleep(interval)
 
@@ -3315,6 +3452,8 @@ async def get_container_archive(request: web.Request) -> web.StreamResponse | we
     await _refresh_record_state(record, store)
     if record.kube_env is None or record.state != ContainerState.RUNNING:
         return _err(409, "Container is not running")
+    if _rift_not_ready(record):
+        return _rift_not_ready_error(record)
 
     stat, error = await _archive_path_stat(record, path)
     if error is not None:
@@ -3420,6 +3559,8 @@ async def head_container_archive(request: web.Request) -> web.Response:
         return _err(404, f"No such container: {cid}")
     if record.kube_env is None or record.state != ContainerState.RUNNING:
         return _err(409, "Container is not running")
+    if _rift_not_ready(record):
+        return _rift_not_ready_error(record)
 
     stat, error = await _archive_path_stat(record, path)
     if error is not None:
@@ -3479,6 +3620,14 @@ def _human_bytes(n: float) -> str:
     return f"{value:.1f}TiB"
 
 
+async def _chained_chunks(prefix: bytes, content: Any) -> AsyncIterator[bytes]:
+    """Replay the bytes already read for the tar-head precheck, then stream."""
+    if prefix:
+        yield prefix
+    async for chunk in content.iter_chunked(_CP_HEAD_READ):
+        yield chunk
+
+
 async def _discard_body(content: Any) -> None:
     """把请求体剩余部分读掉**但不保存**。
 
@@ -3514,6 +3663,8 @@ async def put_container_archive(request: web.Request) -> web.Response:
     await _refresh_record_state(record, store)
     if record.kube_env is None or record.state != ContainerState.RUNNING:
         return _err(409, "Container is not running")
+    if _rift_not_ready(record):
+        return _rift_not_ready_error(record)
 
     # ---- 1) 先从 tar 头把大小读出来（最多几十 KiB，不进内存攒着）----
     content = request.content
@@ -3556,14 +3707,17 @@ async def put_container_archive(request: web.Request) -> web.Response:
         )
 
     # ---- 3) 未超限：老路径原样走（把先读掉的那段原样补回去，不丢字节）----
-    chunks: list[bytes] = [bytes(prefix)] if prefix else []
     try:
-        async for chunk in content.iter_chunked(_CP_HEAD_READ):
-            chunks.append(chunk)
-        data = b"".join(chunks)
         if isinstance(record.kube_env, PyromindSDK):
-            await record.kube_env.put_archive(path, data)
+            # 流式转发：镜像 tar 常有 GB 级，攒进内存再上传会翻倍占用。
+            await record.kube_env.put_archive(
+                path, _chained_chunks(bytes(prefix), content)
+            )
         else:
+            chunks: list[bytes] = [bytes(prefix)] if prefix else []
+            async for chunk in content.iter_chunked(_CP_HEAD_READ):
+                chunks.append(chunk)
+            data = b"".join(chunks)
             await asyncio.to_thread(put_archive, record.kube_env, path, data)
     except (ConnectionResetError, ConnectionError, ClientConnectionResetError):
         logger.debug("archive put client disconnected id=%s", cid[:12])
@@ -3601,6 +3755,11 @@ async def create_exec(request: web.Request) -> web.Response:
         await _refresh_record_state(record, store)
         if record.state != ContainerState.RUNNING or record.kube_env is None:
             return _err(409, "Container is not running")
+
+    # exec needs rift-client; refuse at create time so `docker exec` prints a
+    # daemon error instead of failing later inside the hijack with a bare 503.
+    if _rift_not_ready(record):
+        return _rift_not_ready_error(record)
 
     cmd = body.get("Cmd") or []
     if isinstance(cmd, str):
@@ -4478,12 +4637,10 @@ async def _hijack_session(
         ack_path = ""
         stdin_close = None
         if isinstance(kube_env, PyromindSDK):
-            token = uuid.uuid4().hex
-            marker = f"__DRT_END_{token}__"
-            # exec-stream 这条路**有 stdin 通道**（平台接口已支持 stdin/stdin_close 帧）
-            # ⇒ 读完 payload 就半关闭 stdin 当回执，不需要再额外跑一次 exec 去落文件。
-            cmd = argv_with_exec_handshake(cmd, marker=marker)
-            stdin_close = asyncio.Event()
+            # rift's bidi stream delivers a real exit frame, so the platform-exec
+            # end-marker handshake is unnecessary — and its marker lands in
+            # stderr (46 bytes) where it pollutes the gateway's output preview.
+            marker = ""
         try:
             session.exit_code = await _stream_ws_oneshot(
                 resp=resp,
@@ -4552,12 +4709,12 @@ async def _hijack_session(
                 code = await _stream_pyromind_exec(
                     resp=resp,
                     kube_env=kube_env,
-                    cmd=argv_with_exec_handshake(foreground_cmd, marker=marker),
+                    cmd=list(foreground_cmd),
                     tty=False,
                     session_id=getattr(session, "id", "") or "",
                     cwd=cwd,
-                    marker=marker,
-                    stdin_close=asyncio.Event(),
+                    marker="",
+                    stdin_close=None,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("foreground run exec failed: %s", exc)
@@ -4800,6 +4957,24 @@ def _pty_output_for_client(data: bytes, *, tty: bool) -> bytes:
     return frame_stdout(data.replace(b"\r\n", b"\n"))
 
 
+#: exec 流上的应用层心跳间隔（秒）。必须远小于中间 HTTP/2 代理的空闲阈值：nginx 的
+#: grpc_read_timeout / grpc_send_timeout / client_body_timeout 默认都是 60s，而且
+#: **只被 DATA 帧重置** —— gRPC keepalive 是 PING 帧，代理自己就回了 ACK，救不了这条流。
+#: 2026-10-29 实测：`docker exec -it bash` 静置 60s 后被 RST_STREAM(1) 掐掉，
+#: gateway 侧看到的是 `context canceled`。
+_RIFT_KEEPALIVE_S = 20.0
+
+#: 交互式会话的空闲回收，对齐平台终端（WS_IDLE_TIMEOUT_S=1800）：只有真实流量
+#: （stdin / PTY 输出 / resize）才重置，心跳帧不算。轮询粒度也照抄平台。
+_RIFT_IDLE_TIMEOUT_S = 1800.0
+_RIFT_IDLE_POLL_S = 30.0
+
+
+def _rift_idle_notice_text() -> str:
+    """空闲回收是**我们**关的：tty 会话必须说一句，否则 CLI 侧只看到干净的 EOF。"""
+    return "\r\ndocker-rt: session closed after 30m idle (no keystrokes)\r\n"
+
+
 async def _hijack_rift_terminal(
     request: web.Request,
     resp: web.StreamResponse,
@@ -4852,10 +5027,16 @@ async def _hijack_rift_terminal(
 
     session_over = asyncio.Event()
     exit_code = [0]
+    #: 真实流量（stdin / PTY 输出 / resize）的时间戳；心跳帧不算 —— 空闲判据和平台
+    #: 终端一致，否则 20s 一次的心跳会让 30 分钟永远不到期。
+    last_activity = [time.monotonic()]
+    #: 30 分钟空闲是我们自己收的，pump_out 不能再把 cancel 翻译成 RIFT_UNAVAILABLE。
+    idle_expired = asyncio.Event()
 
     async def push_resize(width: int, height: int) -> None:
         try:
             await exec_session.resize(height, width)
+            last_activity[0] = time.monotonic()
         except Exception:  # noqa: BLE001 — resize is best-effort
             logger.debug("rift resize failed", exc_info=True)
 
@@ -4866,30 +5047,39 @@ async def _hijack_rift_terminal(
             async for frame in exec_session.frames():
                 body = frame.WhichOneof("body")
                 if body == "stdout":
+                    last_activity[0] = time.monotonic()
                     await resp.write(
                         _pty_output_for_client(frame.stdout, tty=tty)
                     )
                     await resp.drain()
                 elif body == "stderr":
+                    last_activity[0] = time.monotonic()
                     await resp.write(frame_stderr(frame.stderr))
                     await resp.drain()
                 elif body == "exit":
                     exit_code[0] = int(frame.exit.code)
                     return
+                # "ping": 网关/rift-client 的心跳，不是给用户的数据。
         except (ConnectionResetError, ConnectionError):
             logger.debug(
                 "rift terminal client disconnected id=%s",
                 getattr(session, "id", "")[:12],
             )
         except RiftError as exc:
-            await _write_exec_error(resp, f"[RIFT_UNAVAILABLE] {exc}", tty=tty)
+            if not idle_expired.is_set():
+                await _write_exec_error(
+                    resp, f"[RIFT_UNAVAILABLE] {exc}", tty=tty
+                )
         finally:
             session_over.set()
 
     async def pump_in() -> None:
+        last_ping = time.monotonic()
         while not session_over.is_set():
             data = _take_client_stdin(protocol)
             if data:
+                last_activity[0] = time.monotonic()
+                last_ping = last_activity[0]
                 await exec_session.write_stdin(data)
                 continue
             if _client_stdin_eof(protocol):
@@ -4898,13 +5088,45 @@ async def _hijack_rift_terminal(
                 except Exception:  # noqa: BLE001
                     pass
                 return
+            now = time.monotonic()
+            if now - last_ping >= _RIFT_KEEPALIVE_S:
+                last_ping = now
+                try:
+                    await exec_session.ping()
+                except Exception:  # noqa: BLE001 — 断流由 pump_out 报
+                    return
             await asyncio.sleep(0.02)
 
+    async def idle_watchdog() -> None:
+        while not session_over.is_set():
+            await asyncio.sleep(_RIFT_IDLE_POLL_S)
+            if time.monotonic() - last_activity[0] < _RIFT_IDLE_TIMEOUT_S:
+                continue
+            idle_expired.set()
+            logger.info(
+                "rift terminal idle timeout id=%s sandbox=%s idle=%.0fs",
+                getattr(session, "id", "")[:12],
+                kube_env.sandbox_id,
+                time.monotonic() - last_activity[0],
+            )
+            await exec_session.cancel()
+            return
+
     try:
-        await asyncio.gather(pump_out(), pump_in())
+        await asyncio.gather(pump_out(), pump_in(), idle_watchdog())
+    except Exception:  # noqa: BLE001
+        if not idle_expired.is_set():
+            raise
     finally:
         session.running = False
         session.exit_code = exit_code[0]
+        if idle_expired.is_set() and tty:
+            # 非 tty 的 stdout 会被管道消费，掺一句人话等于污染数据。
+            try:
+                await resp.write(_rift_idle_notice_text().encode("utf-8"))
+                await resp.drain()
+            except (ConnectionResetError, ConnectionError, RuntimeError):
+                pass
         await exec_session.cancel()
         _force_close_hijack(request, resp)
     return resp
@@ -5712,11 +5934,27 @@ async def on_startup(app: web.Application) -> None:
         task.add_done_callback(_keeper_done)
 
     store: ContainerStore = app["store"]
-    await check_connection(
-        api_key=os.getenv("PYROMIND_API_KEY"),
-        cluster=os.getenv("PYROMIND_CLUSTER"),
-        client=get_sandbox_client(),
-    )
+    # Connectivity is a warning at startup, not a hard gate: the platform API is
+    # sometimes unreachable for a minute, and exiting here takes the whole daemon
+    # (and every adopted sandbox) down with it. Reconcile below is bounded and
+    # retried in the background, and `docker run` surfaces API errors itself.
+    try:
+        await asyncio.wait_for(
+            check_connection(
+                api_key=os.getenv("PYROMIND_API_KEY"),
+                cluster=os.getenv("PYROMIND_CLUSTER"),
+                client=get_sandbox_client(),
+            ),
+            timeout=60,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "PyroMind API connectivity check timed out after 60s; starting anyway"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "PyroMind API connectivity check failed (%s); starting anyway", exc
+        )
     try:
         stats = await reconcile_pyromind_sandboxes(store, force=True)
         logger.info(

@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\nrift.proto\x12\x04rift\"\r\n\x0bPingRequest\"\x1c\n\tPingReply\x12\x0f\n\x07version\x18\x01 \x01(\t\"\xbd\x01\n\x08\x45xecOpen\x12\x0c\n\x04\x61rgv\x18\x01 \x03(\t\x12\x0b\n\x03\x63wd\x18\x02 \x01(\t\x12$\n\x03\x65nv\x18\x03 \x03(\x0b\x32\x17.rift.ExecOpen.EnvEntry\x12\x0b\n\x03tty\x18\x04 \x01(\x08\x12\r\n\x05stdin\x18\x05 \x01(\x08\x12\x0c\n\x04rows\x18\x06 \x01(\r\x12\x0c\n\x04\x63ols\x18\x07 \x01(\r\x12\x0c\n\x04user\x18\x08 \x01(\t\x1a*\n\x08\x45nvEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"(\n\nExecResize\x12\x0c\n\x04rows\x18\x01 \x01(\r\x12\x0c\n\x04\x63ols\x18\x02 \x01(\r\"\x18\n\x08\x45xecExit\x12\x0c\n\x04\x63ode\x18\x01 \x01(\x05\"\xc3\x01\n\tExecFrame\x12\x1e\n\x04open\x18\x01 \x01(\x0b\x32\x0e.rift.ExecOpenH\x00\x12\x0f\n\x05stdin\x18\x02 \x01(\x0cH\x00\x12\x10\n\x06stdout\x18\x03 \x01(\x0cH\x00\x12\x10\n\x06stderr\x18\x04 \x01(\x0cH\x00\x12\"\n\x06resize\x18\x05 \x01(\x0b\x32\x10.rift.ExecResizeH\x00\x12\x1e\n\x04\x65xit\x18\x06 \x01(\x0b\x32\x0e.rift.ExecExitH\x00\x12\x15\n\x0bstdin_close\x18\x07 \x01(\x08H\x00\x42\x06\n\x04\x62ody\"!\n\x11GetArchiveRequest\x12\x0c\n\x04path\x18\x01 \x01(\t\"F\n\x0c\x41rchiveChunk\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12\x0c\n\x04name\x18\x02 \x01(\t\x12\x0c\n\x04size\x18\x03 \x01(\x03\x12\x0c\n\x04mode\x18\x04 \x01(\x03\"$\n\x0fPutArchiveStart\x12\x11\n\tdest_path\x18\x01 \x01(\t\"R\n\x0fPutArchiveFrame\x12&\n\x05start\x18\x01 \x01(\x0b\x32\x15.rift.PutArchiveStartH\x00\x12\x0f\n\x05\x63hunk\x18\x02 \x01(\x0cH\x00\x42\x06\n\x04\x62ody\"(\n\x0fPutArchiveReply\x12\x15\n\rbytes_written\x18\x01 \x01(\x03\x32\xdb\x01\n\x04Rift\x12*\n\x04Ping\x12\x11.rift.PingRequest\x1a\x0f.rift.PingReply\x12,\n\x04\x45xec\x12\x0f.rift.ExecFrame\x1a\x0f.rift.ExecFrame(\x01\x30\x01\x12;\n\nGetArchive\x12\x17.rift.GetArchiveRequest\x1a\x12.rift.ArchiveChunk0\x01\x12<\n\nPutArchive\x12\x15.rift.PutArchiveFrame\x1a\x15.rift.PutArchiveReply(\x01\x42\x13Z\x11rift-client/pb;pbb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\nrift.proto\x12\x04rift\"\r\n\x0bPingRequest\"\x1c\n\tPingReply\x12\x0f\n\x07version\x18\x01 \x01(\t\"\xbd\x01\n\x08\x45xecOpen\x12\x0c\n\x04\x61rgv\x18\x01 \x03(\t\x12\x0b\n\x03\x63wd\x18\x02 \x01(\t\x12$\n\x03\x65nv\x18\x03 \x03(\x0b\x32\x17.rift.ExecOpen.EnvEntry\x12\x0b\n\x03tty\x18\x04 \x01(\x08\x12\r\n\x05stdin\x18\x05 \x01(\x08\x12\x0c\n\x04rows\x18\x06 \x01(\r\x12\x0c\n\x04\x63ols\x18\x07 \x01(\r\x12\x0c\n\x04user\x18\x08 \x01(\t\x1a*\n\x08\x45nvEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"(\n\nExecResize\x12\x0c\n\x04rows\x18\x01 \x01(\r\x12\x0c\n\x04\x63ols\x18\x02 \x01(\r\"\x18\n\x08\x45xecExit\x12\x0c\n\x04\x63ode\x18\x01 \x01(\x05\"\xd3\x01\n\tExecFrame\x12\x1e\n\x04open\x18\x01 \x01(\x0b\x32\x0e.rift.ExecOpenH\x00\x12\x0f\n\x05stdin\x18\x02 \x01(\x0cH\x00\x12\x10\n\x06stdout\x18\x03 \x01(\x0cH\x00\x12\x10\n\x06stderr\x18\x04 \x01(\x0cH\x00\x12\"\n\x06resize\x18\x05 \x01(\x0b\x32\x10.rift.ExecResizeH\x00\x12\x1e\n\x04\x65xit\x18\x06 \x01(\x0b\x32\x0e.rift.ExecExitH\x00\x12\x15\n\x0bstdin_close\x18\x07 \x01(\x08H\x00\x12\x0e\n\x04ping\x18\x08 \x01(\x08H\x00\x42\x06\n\x04\x62ody\"!\n\x11GetArchiveRequest\x12\x0c\n\x04path\x18\x01 \x01(\t\"F\n\x0c\x41rchiveChunk\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12\x0c\n\x04name\x18\x02 \x01(\t\x12\x0c\n\x04size\x18\x03 \x01(\x03\x12\x0c\n\x04mode\x18\x04 \x01(\x03\"$\n\x0fPutArchiveStart\x12\x11\n\tdest_path\x18\x01 \x01(\t\"R\n\x0fPutArchiveFrame\x12&\n\x05start\x18\x01 \x01(\x0b\x32\x15.rift.PutArchiveStartH\x00\x12\x0f\n\x05\x63hunk\x18\x02 \x01(\x0cH\x00\x42\x06\n\x04\x62ody\"(\n\x0fPutArchiveReply\x12\x15\n\rbytes_written\x18\x01 \x01(\x03\x32\xdb\x01\n\x04Rift\x12*\n\x04Ping\x12\x11.rift.PingRequest\x1a\x0f.rift.PingReply\x12,\n\x04\x45xec\x12\x0f.rift.ExecFrame\x1a\x0f.rift.ExecFrame(\x01\x30\x01\x12;\n\nGetArchive\x12\x17.rift.GetArchiveRequest\x1a\x12.rift.ArchiveChunk0\x01\x12<\n\nPutArchive\x12\x15.rift.PutArchiveFrame\x1a\x15.rift.PutArchiveReply(\x01\x42\x13Z\x11rift-client/pb;pbb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -47,17 +47,17 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_EXECEXIT']._serialized_start=299
   _globals['_EXECEXIT']._serialized_end=323
   _globals['_EXECFRAME']._serialized_start=326
-  _globals['_EXECFRAME']._serialized_end=521
-  _globals['_GETARCHIVEREQUEST']._serialized_start=523
-  _globals['_GETARCHIVEREQUEST']._serialized_end=556
-  _globals['_ARCHIVECHUNK']._serialized_start=558
-  _globals['_ARCHIVECHUNK']._serialized_end=628
-  _globals['_PUTARCHIVESTART']._serialized_start=630
-  _globals['_PUTARCHIVESTART']._serialized_end=666
-  _globals['_PUTARCHIVEFRAME']._serialized_start=668
-  _globals['_PUTARCHIVEFRAME']._serialized_end=750
-  _globals['_PUTARCHIVEREPLY']._serialized_start=752
-  _globals['_PUTARCHIVEREPLY']._serialized_end=792
-  _globals['_RIFT']._serialized_start=795
-  _globals['_RIFT']._serialized_end=1014
+  _globals['_EXECFRAME']._serialized_end=537
+  _globals['_GETARCHIVEREQUEST']._serialized_start=539
+  _globals['_GETARCHIVEREQUEST']._serialized_end=572
+  _globals['_ARCHIVECHUNK']._serialized_start=574
+  _globals['_ARCHIVECHUNK']._serialized_end=644
+  _globals['_PUTARCHIVESTART']._serialized_start=646
+  _globals['_PUTARCHIVESTART']._serialized_end=682
+  _globals['_PUTARCHIVEFRAME']._serialized_start=684
+  _globals['_PUTARCHIVEFRAME']._serialized_end=766
+  _globals['_PUTARCHIVEREPLY']._serialized_start=768
+  _globals['_PUTARCHIVEREPLY']._serialized_end=808
+  _globals['_RIFT']._serialized_start=811
+  _globals['_RIFT']._serialized_end=1030
 # @@protoc_insertion_point(module_scope)

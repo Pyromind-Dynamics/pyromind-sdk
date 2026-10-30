@@ -122,9 +122,11 @@ def test_cluster_prompt_lists_every_configured_cluster(monkeypatch: MonkeyPatch)
     prompt_line = next(
         line for line in stdout.getvalue().splitlines() if "PYROMIND_CLUSTER (" in line
     )
-    # 只列最外层的 key，顺序跟配置一致；不出现 us-west-1 这类变体
-    assert prompt_line == f"PYROMIND_CLUSTER ({', '.join(available_clusters())}): "
-    assert "#" not in prompt_line
+    # 只列最外层的 key，顺序跟配置一致；环境用 #pre / #pre2 后缀表达
+    assert prompt_line == (
+        f"PYROMIND_CLUSTER ({', '.join(available_clusters())}; "
+        "可选 #pre / #pre2，默认 prod): "
+    )
 
 
 def test_cluster_prompt_rejects_unknown_code_and_asks_again(monkeypatch: MonkeyPatch) -> None:

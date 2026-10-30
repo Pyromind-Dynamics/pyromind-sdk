@@ -100,12 +100,12 @@ def test_shared_async_client_targets_the_cluster_directly(
     """``docker cp`` and friends are data plane: never through the portal."""
     monkeypatch.setenv("PYROMIND_API_KEY", "test-key")
     monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
-    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-1")
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-1#pre")
 
     client = env_mod.new_sandbox_client()
 
     assert client.base_url == "https://pre-api.pyromind.ai/api/v1"
-    assert client.cluster == "us-west-1"
+    assert client.cluster == "us-west-1#pre"
 
 
 def test_shared_async_client_keeps_an_explicit_base_url(
@@ -423,6 +423,26 @@ def test_archive_path_stat_uses_shell_exec(monkeypatch: MonkeyPatch) -> None:
     assert stat["size"] == 123
 
 
+def test_running_container_is_pending_until_rift_is_ready() -> None:
+    record = _record("custom")
+    record.state = ContainerState.RUNNING
+    record.kube_env.sandbox_status = "Running"
+
+    record.kube_env.rift_ready = False
+    assert _display_status(record) == "pending"
+    assert _display_status_text(record) == "Created"
+
+    record.kube_env.rift_ready = True
+    assert _display_status(record) == "running"
+    assert _display_status_text(record) == "Up"
+
+    # A stopped container is not gated by rift readiness.
+    record.kube_env.rift_ready = False
+    record.state = ContainerState.EXITED
+    record.kube_env.sandbox_status = "Stopped"
+    assert _display_status(record) == "stopped"
+
+
 def test_container_state_from_status_hides_pending_from_running_ps() -> None:
     assert _container_state_from_status("Pending") == ContainerState.CREATED
     assert _container_state_from_status("running") == ContainerState.RUNNING
@@ -458,18 +478,92 @@ def test_refresh_record_state_queries_backend_before_lifecycle() -> None:
 def test_put_archive_writes_files_into_sandbox() -> None:
     adapter, client = _adapter_with_fake_client()
     adapter.rift_ready = True
-    rift = SimpleNamespace(put_archive=AsyncMock())
-    adapter._rift_client = rift
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
         info = tarfile.TarInfo(name="hello.txt")
         info.size = 5
         tar.addfile(info, io.BytesIO(b"hello"))
+    payload = buf.getvalue()
+    rift = SimpleNamespace(put_archive=AsyncMock(return_value=len(payload)))
+    adapter._rift_client = rift
 
-    asyncio.run(adapter.put_archive("/var", buf.getvalue()))
+    asyncio.run(adapter.put_archive("/var", payload))
 
-    rift.put_archive.assert_awaited_once_with("/var", buf.getvalue())
+    rift.put_archive.assert_awaited_once_with("/var", payload)
     client.write_file.assert_not_called()
+
+
+def _tar_with_hello() -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(name="hello.txt")
+        info.size = 5
+        tar.addfile(info, io.BytesIO(b"hello"))
+    return buf.getvalue()
+
+
+def test_put_archive_refuses_success_when_nothing_was_written() -> None:
+    """rift 回 0 字节时 `docker cp` 不能报成功。
+
+    2026-10-30 现场：旧的 daemon 把异步 ``put_archive`` 当同步调用（没 await），
+    结果什么都没发、HTTP 却回 200，CLI 打印 "Successfully copied" 而文件不存在。
+    """
+    from ...rift.errors import RiftUnavailable
+
+    adapter, _client = _adapter_with_fake_client()
+    adapter.rift_ready = True
+    rift = SimpleNamespace(put_archive=AsyncMock(return_value=0))
+    adapter._rift_client = rift
+
+    try:
+        asyncio.run(adapter.put_archive("/var", _tar_with_hello()))
+    except RiftUnavailable as exc:
+        assert "0 of" in str(exc)
+    else:
+        raise AssertionError("expected RiftUnavailable when 0 bytes were written")
+
+
+def test_put_archive_refuses_partial_transfer() -> None:
+    from ...rift.errors import RiftUnavailable
+
+    adapter, _client = _adapter_with_fake_client()
+    adapter.rift_ready = True
+    payload = _tar_with_hello()
+    rift = SimpleNamespace(put_archive=AsyncMock(return_value=len(payload) - 1))
+    adapter._rift_client = rift
+
+    try:
+        asyncio.run(adapter.put_archive("/var", payload))
+    except RiftUnavailable as exc:
+        assert "of" in str(exc)
+    else:
+        raise AssertionError("expected RiftUnavailable on a truncated transfer")
+
+
+def test_put_archive_streams_and_counts_bytes() -> None:
+    """流式入口也要能算出准确字节数（大 tar 不进内存）。"""
+    adapter, _client = _adapter_with_fake_client()
+    adapter.rift_ready = True
+    payload = _tar_with_hello()
+    seen: dict[str, object] = {}
+
+    async def fake_put(dest, chunks):
+        total = 0
+        async for chunk in chunks:
+            total += len(chunk)
+        seen["dest"] = dest
+        seen["total"] = total
+        return total
+
+    adapter._rift_client = SimpleNamespace(put_archive=fake_put)
+
+    async def source():
+        yield payload[:7]
+        yield payload[7:]
+
+    asyncio.run(adapter.put_archive("/var/", source()))
+
+    assert seen == {"dest": "/var/", "total": len(payload)}
 
 
 def test_put_archive_rejects_path_traversal() -> None:
@@ -641,6 +735,10 @@ def _record(type_: str) -> ContainerRecord:
     adapter.resources = {}
     adapter.volume_mounts = []
     adapter.port_mappings = []
+    # Most tests are about lifecycle/list output, not the rift gate; a fixture
+    # that is exec-ready keeps `docker ps` semantics unchanged. The gate itself
+    # is covered by test_running_container_is_pending_until_rift_is_ready.
+    adapter.rift_ready = True
 
     return ContainerRecord(
         id=f"sb-{type_}",
@@ -809,6 +907,7 @@ def test_standard_filters_match_record() -> None:
     adapter.sandbox_id = "sb-demo"
     adapter.sandbox_status = "Running"
     adapter.sandbox_type = "custom"
+    adapter.rift_ready = True
     adapter.resources = {}
     adapter.volume_mounts = []
     adapter.port_mappings = []

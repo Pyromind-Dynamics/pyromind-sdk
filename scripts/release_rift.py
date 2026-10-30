@@ -23,6 +23,7 @@ import argparse
 import hashlib
 import subprocess
 import sys
+import tarfile
 import zipfile
 from pathlib import Path
 
@@ -85,13 +86,14 @@ def _check_proto(skip_gateway: bool) -> None:
     _run(cmd, REPO)
 
 
-def _build_wheel(dist: Path) -> Path:
+def _build_artifacts(dist: Path) -> tuple[Path, Path]:
     dist.mkdir(parents=True, exist_ok=True)
     _run(
         [
             sys.executable,
             "-m",
             "build",
+            "--sdist",
             "--wheel",
             "--no-isolation",
             "--outdir",
@@ -100,9 +102,10 @@ def _build_wheel(dist: Path) -> Path:
         REPO,
     )
     wheels = sorted(dist.glob("*.whl"), key=lambda path: path.stat().st_mtime)
-    if not wheels:
-        raise SystemExit(f"no wheel produced in {dist}")
-    return wheels[-1]
+    sdists = sorted(dist.glob("*.tar.gz"), key=lambda path: path.stat().st_mtime)
+    if not wheels or not sdists:
+        raise SystemExit(f"expected a wheel and an sdist in {dist}")
+    return sdists[-1], wheels[-1]
 
 
 def _verify_wheel(wheel: Path, version: str) -> None:
@@ -122,6 +125,48 @@ def _verify_wheel(wheel: Path, version: str) -> None:
         if packaged != version:
             raise SystemExit(
                 f"{wheel.name}: packaged version {packaged!r} != {version!r}"
+            )
+        # Runtime package: Go sources must not be shipped.
+        leaked = [name for name in names if name.endswith((".go", "go.mod", "go.sum"))]
+        if leaked:
+            raise SystemExit(
+                f"{wheel.name}: Go sources leaked into the wheel: {leaked[:3]}"
+            )
+
+
+def _verify_sdist(sdist: Path, version: str) -> None:
+    """The sdist must still carry the binaries and the Go sources."""
+    with tarfile.open(sdist) as archive:
+        names = archive.getnames()
+        for arch in ARCHES:
+            tail = f"bin/rift-client-linux-{arch}"
+            if not any(name.endswith(tail) for name in names):
+                raise SystemExit(f"{sdist.name} is missing {tail}")
+        go_files = [name for name in names if name.endswith(".go")]
+        if len(go_files) < 6:
+            raise SystemExit(
+                f"{sdist.name}: expected the Go sources for rebuilds, found "
+                f"{len(go_files)} .go files"
+            )
+        for tail in (
+            "rift/client/main.go",
+            "rift/client/server.go",
+            "rift/client/go.mod",
+            "rift/client/Makefile",
+            "rift/proto/rift.proto",
+        ):
+            if not any(name.endswith(tail) for name in names):
+                raise SystemExit(f"{sdist.name} is missing {tail}")
+        version_name = next(
+            (name for name in names if name.endswith("bin/rift-client.version")),
+            None,
+        )
+        if version_name is None:
+            raise SystemExit(f"{sdist.name} is missing bin/rift-client.version")
+        packaged = archive.extractfile(version_name).read().decode("utf-8").strip()
+        if packaged != version:
+            raise SystemExit(
+                f"{sdist.name}: packaged version {packaged!r} != {version!r}"
             )
 
 
@@ -145,13 +190,15 @@ def main(argv: list[str] | None = None) -> int:
     if not args.skip_proto:
         _check_proto(skip_gateway=args.skip_gateway_check)
 
-    wheel = _build_wheel(Path(args.dist))
+    sdist, wheel = _build_artifacts(Path(args.dist))
+    _verify_sdist(sdist, version)
     _verify_wheel(wheel, version)
 
     print()
     print(f"record:   {version}")
     for name, digest in checks:
         print(f"binary:   {digest}  {name}")
+    print(f"sdist:    {_sha256(sdist)}  {sdist.name}")
     print(f"wheel:    {_sha256(wheel)}  {wheel.name}")
     print("release artifacts OK")
     return 0

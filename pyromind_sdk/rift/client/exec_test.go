@@ -246,6 +246,56 @@ func TestExecTTYUsesPTY(t *testing.T) {
 	}
 }
 
+func TestExecTTYSendsKeepaliveWhileIdle(t *testing.T) {
+	// A silent `exec -it bash` is reset by HTTP/2 proxies (nginx's 60s
+	// read/send timers) unless the stream keeps carrying DATA frames; gRPC
+	// PINGs do not count. The PTY here stays silent and must still be kept
+	// alive, and the exit frame must still be the last thing sent.
+	old := keepaliveInterval
+	keepaliveInterval = 25 * time.Millisecond
+	defer func() { keepaliveInterval = old }()
+
+	recv := make(chan *pb.ExecFrame, 1)
+	recv <- openFrame([]string{"/bin/sh", "-c", "sleep 0.5"}, func(o *pb.ExecOpen) {
+		o.Tty = true
+	})
+	stream := &chanExecStream{recv: recv}
+	done := make(chan error, 1)
+	go func() { done <- (&riftServer{}).Exec(stream) }()
+
+	time.Sleep(150 * time.Millisecond)
+	close(recv)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("exec: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("tty exec timed out")
+	}
+
+	stream.mu.Lock()
+	frames := append([]*pb.ExecFrame(nil), stream.out...)
+	stream.mu.Unlock()
+
+	pings := 0
+	for i, fr := range frames {
+		if fr.GetPing() {
+			pings++
+			continue
+		}
+		if _, ok := fr.Body.(*pb.ExecFrame_Exit); ok && i != len(frames)-1 {
+			t.Fatalf("exit frame at %d of %d: keepalives must stop at exit", i, len(frames))
+		}
+	}
+	if pings < 2 {
+		t.Fatalf("pings = %d, want >= 2 (an idle stream must stay alive)", pings)
+	}
+	if _, _, _, sawExit := collect(frames); !sawExit {
+		t.Fatal("no exit frame")
+	}
+}
+
 // ---- Ping / helpers ------------------------------------------------------
 
 func TestPingReturnsVersion(t *testing.T) {

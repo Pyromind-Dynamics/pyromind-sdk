@@ -53,8 +53,81 @@ func makeTar(t *testing.T, entries ...tarEntry) []byte {
 func repack(t *testing.T, data []byte, dest string) ([]byte, error) {
 	t.Helper()
 	var out bytes.Buffer
-	err := copyValidatedTar(bytes.NewReader(data), &out, dest)
+	_, err := copyValidatedTar(bytes.NewReader(data), &out, dest)
 	return out.Bytes(), err
+}
+
+func TestVerifyExtractedCatchesSilentLoss(t *testing.T) {
+	dest := t.TempDir()
+	members := []extractedMember{
+		{name: "ok.bin", size: 3, typ: tar.TypeReg},
+		{name: "missing.bin", size: 3, typ: tar.TypeReg},
+	}
+	if err := os.WriteFile(filepath.Join(dest, "ok.bin"), []byte("abc"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := verifyExtracted(dest, members)
+	if err == nil {
+		t.Fatal("a member that never landed must fail the copy")
+	}
+	if !strings.Contains(err.Error(), "missing.bin") {
+		t.Errorf("error = %v, want it to name missing.bin", err)
+	}
+
+	// Present but truncated is just as bad: `docker cp` success must mean the
+	// bytes are all there.
+	if err := os.WriteFile(filepath.Join(dest, "missing.bin"), []byte("ab"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyExtracted(dest, members); err == nil ||
+		!strings.Contains(err.Error(), "2 bytes") {
+		t.Errorf("truncated member: err = %v, want a size mismatch", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dest, "missing.bin"), []byte("abc"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyExtracted(dest, members); err != nil {
+		t.Errorf("complete extraction must pass, got %v", err)
+	}
+}
+
+func TestEmptyArchiveHasNoMembers(t *testing.T) {
+	// `docker cp` never sends an end-of-archive-only payload; PutArchive must
+	// reject it instead of letting `tar -xf -` exit 0 and the daemon answer 200.
+	var buf bytes.Buffer
+	if err := tar.NewWriter(&buf).Close(); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	members, err := copyValidatedTar(bytes.NewReader(buf.Bytes()), &out, t.TempDir())
+	if err != nil {
+		t.Fatalf("repack: %v", err)
+	}
+	if len(members) != 0 {
+		t.Fatalf("members = %d, want 0", len(members))
+	}
+	if buf.Len() == 0 {
+		t.Fatal("an empty tar still carries an end-of-archive marker")
+	}
+}
+
+func TestRepackReturnsMembers(t *testing.T) {
+	data := makeTar(t,
+		tarEntry{name: "a.tar", typeflag: tar.TypeReg, body: "hello"},
+		tarEntry{name: "d", typeflag: tar.TypeDir},
+	)
+	var out bytes.Buffer
+	members, err := copyValidatedTar(bytes.NewReader(data), &out, t.TempDir())
+	if err != nil {
+		t.Fatalf("repack: %v", err)
+	}
+	if len(members) != 2 {
+		t.Fatalf("members = %d, want 2", len(members))
+	}
+	if members[0].name != "a.tar" || members[0].size != 5 || members[0].typ != tar.TypeReg {
+		t.Errorf("member[0] = %+v", members[0])
+	}
 }
 
 func readNames(t *testing.T, data []byte) []string {

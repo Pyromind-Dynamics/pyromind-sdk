@@ -24,7 +24,7 @@ def test_kv_parses_last_matching_line():
     assert _kv(output, "MISSING") == ""
 
 
-def test_start_script_uses_remote_dir():
+def test_start_script_uses_the_remote_dir():
     script = _start_script("/opt/docker-rt/rift", "sb_1")
     assert '/opt/docker-rt/rift/rift-client' in script
     assert '/opt/docker-rt/rift/token' in script
@@ -33,6 +33,11 @@ def test_start_script_uses_remote_dir():
     assert '--sandbox-id "$SANDBOX_ID"' in script
     assert '--token-file "$TOKEN_FILE"' in script
     assert '--public-key-file' not in script
+    # `pkill -f "$BIN"` matches the platform exec wrapper's own command line
+    # (it contains the chmod path) and kills the shell before it can report
+    # success. Only the exact process name is safe.
+    assert 'pkill -x rift-client' in script
+    assert 'pkill -f "$BIN"' not in script
 
 
 def test_local_binary_sha_without_sums_file(tmp_path):
@@ -112,7 +117,7 @@ def test_force_restart_kills_pid_and_previous_process():
     )
     command = commands[0]
     assert "kill $(cat /opt/docker-rt/rift/rift.pid)" in command
-    assert "pkill -f /opt/docker-rt/rift/rift-client" in command
+    assert "pkill -x rift-client" in command
     assert "sh /opt/docker-rt/rift/start.sh" in command
 
 
@@ -183,3 +188,66 @@ def test_bootstrap_fails_when_the_version_stays_stale(monkeypatch, tmp_path):
     with pytest.raises(RiftUnavailable, match="version mismatch after restart"):
         asyncio.run(bootstrap_mod.bootstrap_once(env))
     assert any("pkill" in command for command in env.commands)
+
+
+def test_rift_calls_carry_the_trace_id(monkeypatch):
+    from pyromind_sdk.rift import rift_client as mod
+
+    monkeypatch.setattr(mod, "ensure_trace_id", lambda: "trace-1")
+    client = mod.RiftGatewayClient.__new__(mod.RiftGatewayClient)
+    client._metadata = (("authorization", "Bearer k"), ("x-sandbox-id", "sb-1"))
+
+    assert client._call_metadata() == (
+        ("authorization", "Bearer k"),
+        ("x-sandbox-id", "sb-1"),
+        ("x-trace-id", "trace-1"),
+    )
+
+
+def test_rift_calls_omit_trace_when_there_is_none(monkeypatch):
+    from pyromind_sdk.rift import rift_client as mod
+
+    monkeypatch.setattr(mod, "ensure_trace_id", lambda: "")
+    client = mod.RiftGatewayClient.__new__(mod.RiftGatewayClient)
+    client._metadata = (("authorization", "Bearer k"),)
+
+    assert client._call_metadata() == (("authorization", "Bearer k"),)
+
+
+def test_stale_version_detection_uses_the_build_suffix(monkeypatch):
+    """同一 commit 重新编译也要能被认出来。
+
+    `git describe` 对同一 commit 的不同构建是同一个串，只有 `+<source sha>`
+    后缀会变；健康检查靠它决定要不要重新注入。
+    """
+    from .. import aio_server as mod
+
+    monkeypatch.setattr(
+        mod,
+        "load_rift_config",
+        lambda: SimpleNamespace(expected_version="v1.2.3+aaaa11112222"),
+    )
+    assert mod._rift_version_is_stale("v1.2.3+bbbb33334444") is True
+    assert mod._rift_version_is_stale("v1.2.3") is True
+    assert mod._rift_version_is_stale("v1.2.3+aaaa11112222") is False
+
+    # 老包没有 rift-client.version：不能每轮都判定过期、把 Pod 反复重启。
+    monkeypatch.setattr(mod, "load_rift_config", lambda: SimpleNamespace(expected_version=None))
+    assert mod._rift_version_is_stale("v1.2.3") is False
+
+
+def test_ping_rift_version_reports_none_when_channel_is_down():
+    from ..backend.pyromind_sdk_env import PyromindSDK
+
+    env = PyromindSDK.__new__(PyromindSDK)
+    env._rift_client = None
+    assert asyncio.run(env.ping_rift_version()) is None
+    assert asyncio.run(env.ping_rift()) is False
+
+    class _Client:
+        async def ping(self):
+            return "v9+abc"
+
+    env._rift_client = _Client()
+    assert asyncio.run(env.ping_rift_version()) == "v9+abc"
+    assert asyncio.run(env.ping_rift()) is True
