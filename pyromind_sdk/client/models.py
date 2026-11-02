@@ -1422,7 +1422,6 @@ class FileShareTask(BaseModel):
     dir_count: Optional[int] = None
     size_bytes: Optional[int] = None
     error: Optional[str] = None
-    notification_pending: bool = False
     created_at: Optional[str] = None
     finished_at: Optional[str] = None
 
@@ -1432,7 +1431,7 @@ class FileShareCreateResponse(BaseModel):
 
     biz_no: str
     status: str
-    notification_pending: bool = False
+    notification_sent: Optional[bool] = None
     task: Optional[FileShareTask] = None
 
 

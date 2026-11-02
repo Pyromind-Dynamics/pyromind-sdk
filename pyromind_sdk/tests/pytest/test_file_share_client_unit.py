@@ -18,7 +18,7 @@ def mock_networking(monkeypatch):
     )
 
 
-def test_file_share_create_list_get_cancel_delete_and_notification_retry():
+def test_file_share_create_list_get_cancel_and_delete():
     client = StorageAPIClient(
         api_key="test-key",
         base_url="https://api-portal.pyromind.ai/api/v1",
@@ -42,6 +42,7 @@ def test_file_share_create_list_get_cancel_delete_and_notification_retry():
                 "data": {
                     "biz_no": "share-1",
                     "status": "pending_confirmation",
+                    "notification_sent": True,
                     "task": task,
                 },
             }
@@ -66,13 +67,12 @@ def test_file_share_create_list_get_cancel_delete_and_notification_retry():
     fetched = client.file_shares.get("share-1")
     cancelled = client.file_shares.cancel("share-1")
     deleted = client.file_shares.delete(["share-1"])
-    retried = client.file_shares.retry_notification("share-1")
-
     assert created.biz_no == "share-1"
+    assert created.notification_sent is True
     assert created.task.can_cancel is True
     assert page.total == 1
     assert page.tasks[0].source.path == "Qwen"
-    assert fetched.biz_no == cancelled.biz_no == retried.biz_no == "share-1"
+    assert fetched.biz_no == cancelled.biz_no == "share-1"
     assert deleted.deleted == 1
     assert posts == [
         (
@@ -85,7 +85,6 @@ def test_file_share_create_list_get_cancel_delete_and_notification_retry():
         ),
         ("/storage/file_share/share-1/cancel", None, {}),
         ("/storage/file_share/delete", {"biz_nos": ["share-1"]}, {}),
-        ("/storage/file_share/share-1/notification/retry", None, {}),
     ]
     assert gets == [
         (

@@ -94,7 +94,7 @@ if created.task and created.task.can_cancel:
 client.storage.file_shares.delete(["terminal-share-biz-no"])
 ```
 
-`list_page()` 查询单页，`list()` 自动翻页；`direction` 可选 `sent` 或 `received`，还可传入分页参数和可选的 `transfer_env`。`get()` 查询单条任务。服务端仅允许发起人取消待接受邀请，且仅允许删除终态任务；删除只隐藏当前用户一侧的记录，不会修改另一方的任务。通知投递待重试时可调用 `retry_notification(biz_no)`。异步客户端提供相同方法，调用时在 `client.storage.file_shares` 方法前加 `await`。
+`list_page()` 查询单页，`list()` 自动翻页；`direction` 可选 `sent` 或 `received`，还可传入分页参数和可选的 `transfer_env`。`get()` 查询单条任务。服务端仅允许发起人取消待接受邀请，且仅允许删除终态任务；删除只隐藏当前用户一侧的记录，不会修改另一方的任务。创建响应中的 `notification_sent` 表示站内信是否已成功发送。异步客户端提供相同方法，调用时在 `client.storage.file_shares` 方法前加 `await`。
 
 ## 沙箱（Sandbox）⚠️已废弃不能创建
 

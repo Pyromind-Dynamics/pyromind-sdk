@@ -128,8 +128,8 @@ accepts `direction="sent"` or `direction="received"`, pagination, and an
 optional `transfer_env`. `get()` fetches one task. The service permits canceling
 only a pending invitation created by the current user, and permits deleting
 only terminal tasks. Deletion hides the task from the current participant's
-list without changing the other participant's record. Use
-`retry_notification(biz_no)` to retry a notification whose delivery is pending.
+list without changing the other participant's record. The create response's
+`notification_sent` field indicates whether the inbox notification was sent.
 The async API exposes the same methods as `await client.storage.file_shares.*`.
 
 ## Sandboxes（⚠️desperate can not create）

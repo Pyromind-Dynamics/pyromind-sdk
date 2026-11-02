@@ -142,15 +142,6 @@ class AsyncFileShareResource:
             **self._storage._extract_file_share_data(response)
         )
 
-    async def retry_notification(self, biz_no: str) -> FileShareTask:
-        """Retry delivery of a pending invitation or result notification."""
-
-        response = await self._storage.post(
-            f"{self._PREFIX}/{biz_no}/notification/retry"
-        )
-        return FileShareTask(**self._storage._extract_file_share_data(response))
-
-
 class AsyncStorageAPIClient(PyroMindAsyncClient):
     """Async client for storage APIs, transfers, and same-cluster file sharing."""
 
