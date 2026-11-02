@@ -1400,8 +1400,22 @@ class FileShareLocation(BaseModel):
     path: Optional[str] = None
 
 
+class FileShareStatus(str, Enum):
+    """Raw lifecycle status returned by the file-share API."""
+
+    PENDING_CONFIRMATION = "pending_confirmation"
+    QUEUED = "queued"
+    ACCEPTED = "accepted"
+    CLONING = "cloning"
+    SUCCESS = "success"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
 class FileShareTask(BaseModel):
-    """Same-cluster file share task returned by the API."""
+    """Same-cluster file-share task; status is the raw backend lifecycle value."""
 
     biz_no: Optional[str] = None
     direction: Optional[Literal["sent", "received"]] = None
@@ -1418,6 +1432,7 @@ class FileShareTask(BaseModel):
     target_user_input: Optional[str] = None
     confirmation_required: bool = False
     can_cancel: bool = False
+    accepted_at: Optional[str] = None
     file_count: Optional[int] = None
     dir_count: Optional[int] = None
     size_bytes: Optional[int] = None

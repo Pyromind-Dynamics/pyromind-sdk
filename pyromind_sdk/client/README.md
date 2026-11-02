@@ -116,6 +116,7 @@ created = client.storage.file_shares.create(
 )
 
 sent = client.storage.file_shares.list({"direction": "sent"})
+received = client.storage.file_shares.list({"direction": "received"})
 if created.task and created.task.can_cancel:
     client.storage.file_shares.cancel(created.biz_no)
 
@@ -131,6 +132,10 @@ only terminal tasks. Deletion hides the task from the current participant's
 list without changing the other participant's record. The create response's
 `notification_sent` field indicates whether the inbox notification was sent.
 The async API exposes the same methods as `await client.storage.file_shares.*`.
+
+`FileShareTask.status` is the raw backend status and can be compared with
+`FileShareStatus` constants. Set `direction="received"` to query recipient-side
+tasks. The `accepted_at` field records when the recipient accepted the request.
 
 ## Sandboxes（⚠️desperate can not create）
 
