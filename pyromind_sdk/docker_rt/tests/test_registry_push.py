@@ -306,6 +306,29 @@ def test_docker_config_b64_empty_when_unconfigured(monkeypatch: pytest.MonkeyPat
         registry_push.docker_config_b64("docker.io/my-user")
 
 
+def test_a_mounted_dockerconfig_is_not_an_implicit_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``.dockerconfigjson`` that merely exists on the host must not be adopted."""
+    from ..backend import registry_push
+
+    _clear(monkeypatch)
+    monkeypatch.setattr(registry_push.os.path, "exists", lambda _path: True)
+    assert registry_push.credential_source() == ""
+    assert registry_push.docker_config_b64("docker.io/my-user") == ""
+
+
+def test_read_docker_config_secret_needs_an_explicit_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ..backend import registry_push
+
+    _clear(monkeypatch)
+    monkeypatch.setattr(registry_push.os.path, "exists", lambda _path: True)
+    with pytest.raises(registry_push.RegistryConfigError):
+        registry_push.read_docker_config_secret()
+
+
 # --------------------------------------------------------------------------
 # Aliyun POP signing
 # --------------------------------------------------------------------------

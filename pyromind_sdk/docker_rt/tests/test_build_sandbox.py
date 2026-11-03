@@ -78,12 +78,10 @@ def _clear(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _set_push_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Satisfy the push-credential precondition.
+    """Configure push credentials explicitly.
 
-    ``build_executor()`` has a default and the credential check is a hard
-    pre-sandbox error, so any test that wants to reach the sandbox at all must
-    call this — otherwise it aborts on "No push credentials configured" before
-    the code under test ever runs.
+    Credentials are never picked up implicitly: without these env vars the
+    build still runs and only warns, and the sandbox receives no credential.
     """
     monkeypatch.setenv("DOCKER_RT_REGISTRY_USERNAME", "my-user")
     monkeypatch.setenv("DOCKER_RT_REGISTRY_PASSWORD", PUSH_PASSWORD)
@@ -837,6 +835,35 @@ async def test_build_in_sandbox_fully_qualified_tag_without_a_prefix(
 
 
 @pytest.mark.asyncio
+async def test_build_in_sandbox_without_push_never_injects_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--no-push`` builds must not carry registry credentials into the sandbox."""
+    from ..backend import build_sandbox
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
+    monkeypatch.setenv("DOCKER_RT_BUILD_PUSH", "false")
+    _set_push_credentials(monkeypatch)
+
+    sandbox = _FakeBuildSandbox(stdout=f"INFO building\ndocker-rt-digest: {GOOD_DIGEST}\n")
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(tar_bytes=_context_tar(), tags=["myapp"], namespace="ns")
+    )
+
+    assert not [event for event in events if event.get("error")], events
+    script = _worker_script(sandbox)
+    assert "--no-push" in script
+    # Nothing credential-shaped: no config file, no DOCKER_CONFIG export.
+    assert "base64 -d" not in script
+    assert "DOCKER_CONFIG" not in script
+    assert PUSH_PASSWORD not in script
+
+
+@pytest.mark.asyncio
 async def test_a_failed_push_still_reports_the_archive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1071,33 +1098,33 @@ async def test_build_in_sandbox_fails_fast_when_configured_credentials_are_unrea
 
 
 @pytest.mark.asyncio
-async def test_build_in_sandbox_fails_before_the_sandbox_when_no_credentials_are_configured(
+async def test_build_in_sandbox_warns_when_no_credentials_are_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No push credentials is a hard pre-sandbox error, not a warning.
+    """No push credentials is a warning, and nothing is injected.
 
-    Pushing without credentials cannot succeed against either Docker Hub or ACR,
-    so failing before the sandbox costs the user nothing instead of several
-    minutes plus a 401.
+    The build still runs: some registries accept anonymous pushes, and the
+    sandbox must not receive credentials that were never configured.
     """
     from ..backend import build_sandbox
-    from ..backend import runtime
 
     _clear(monkeypatch)
     monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
     monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
 
-    async def boom(**kwargs: Any):  # pragma: no cover - must not run
-        raise AssertionError("must not create a sandbox")
-
-    monkeypatch.setattr(runtime, "start_kube_environment", boom)
+    sandbox = _FakeBuildSandbox(stdout=f"INFO building\ndocker-rt-digest: {GOOD_DIGEST}\n")
+    _install_fake(monkeypatch, sandbox)
 
     events = await _collect(
         build_sandbox.build_in_sandbox(tar_bytes=_context_tar(), tags=["myapp"], namespace="ns")
     )
-    assert events[0]["error"]
-    assert "credentials" in events[0]["error"]
-    assert not any(e.get("stream") for e in events)
+
+    warnings = "".join(event.get("stream") or "" for event in events)
+    assert "no push credentials configured" in warnings
+    assert not [event for event in events if event.get("error")], events
+    script = _worker_script(sandbox)
+    assert "base64 -d" not in script
+    assert "DOCKER_CONFIG" not in script
 
 
 def test_build_event_payload_is_json_serialisable(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1746,8 +1773,8 @@ def test_push_fix_hints_mark_the_dockerconfig_as_optional(
     """``DOCKER_RT_REGISTRY_DOCKERCONFIG`` 是**二选一**的备选，不是必填项。
 
     2026-10-09 用户把三行读成了"都得配"，原话："这个是可选的吧，，，不用必须配置这个吧"。
-    代码里的优先级是 ``USERNAME+PASSWORD`` > 显式 dockerconfig > 默认的
-    ``/etc/docker-image/.dockerconfigjson``（存在就用），所以三种情况都不需要全设。
+    代码里的优先级是 ``USERNAME+PASSWORD`` > 显式 dockerconfig；两者都没有就是没有，
+    **不会**再去读机器上碰巧存在的 ``.dockerconfigjson``。
     """
     from ..backend.build_sandbox import push_fix_hints
 
@@ -1761,7 +1788,7 @@ def test_push_fix_hints_mark_the_dockerconfig_as_optional(
     assert "DOCKER_RT_REGISTRY_DOCKERCONFIG" in text
     assert "only one of the two is needed" in text
     assert "Neither is mandatory" in text
-    assert "/etc/docker-image/.dockerconfigjson" in text
+    assert "/etc/docker-image/.dockerconfigjson" not in text
 
 
 def test_push_fix_hints_always_offer_the_escape_hatches(

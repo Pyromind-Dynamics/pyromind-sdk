@@ -41,7 +41,6 @@ logger = logging.getLogger("docker_rt.registry_push")
 
 UTC = _dt.timezone.utc
 
-DEFAULT_DOCKER_CONFIG_SECRET = "/etc/docker-image/.dockerconfigjson"
 ACR_API_ENDPOINT = "https://cr.{region_id}.aliyuncs.com/"
 ACR_API_VERSION = "2018-12-01"
 
@@ -313,12 +312,21 @@ def read_docker_config_file(path: str) -> dict[str, Any]:
 
 
 def read_docker_config_secret(path: str | None = None) -> dict[str, Any]:
-    """Read the kubelet-mounted ``kubernetes.io/dockerconfigjson`` secret.
+    """Read an **explicitly configured** docker config file.
 
-    The mounted file holds the **base64** of the ``config.json`` (that is how the
+    The file holds the **base64** of the ``config.json`` (that is how the
     platform publishes it), but a plain JSON file is accepted too.
+
+    There is deliberately no implicit path: a daemon that happens to run on a
+    host with a mounted registry secret must not silently adopt it. Callers
+    without an explicit path or ``DOCKER_RT_REGISTRY_DOCKERCONFIG`` get an
+    error instead.
     """
-    target = (path or _env("DOCKER_RT_REGISTRY_DOCKERCONFIG") or DEFAULT_DOCKER_CONFIG_SECRET)
+    target = (path or _env("DOCKER_RT_REGISTRY_DOCKERCONFIG") or "").strip()
+    if not target:
+        raise RegistryConfigError(
+            "no docker config configured: set DOCKER_RT_REGISTRY_DOCKERCONFIG"
+        )
     try:
         with open(target, "r", encoding="utf-8") as handle:
             text = handle.read().strip()
@@ -350,13 +358,16 @@ def _credentials_from_env() -> tuple[str, str]:
 
 
 def credential_source() -> str:
-    """``"username_password"``, ``"dockerconfig"`` or ``""`` when unconfigured."""
+    """``"username_password"``, ``"dockerconfig"`` or ``""`` when unconfigured.
+
+    Only explicitly configured sources count. A mounted
+    ``.dockerconfigjson`` is **not** an implicit fallback: the daemon must not
+    pick up credentials that merely happen to exist on the machine it runs on.
+    """
     username, password = _credentials_from_env()
     if username and password:
         return "username_password"
     if _env("DOCKER_RT_REGISTRY_DOCKERCONFIG"):
-        return "dockerconfig"
-    if os.path.exists(DEFAULT_DOCKER_CONFIG_SECRET):
         return "dockerconfig"
     return ""
 

@@ -539,12 +539,6 @@ def build_prerequisites_error(
                     if prefix_error:
                         problems.append(prefix_error)
 
-    # Check credentials when push is enabled and a prefix was resolved.
-    if push and registry:
-        cred_error = _check_push_credentials(registry)
-        if cred_error:
-            problems.append(cred_error)
-
     return "; ".join(problems) if problems else None
 
 
@@ -557,26 +551,6 @@ def _build_registry_hint(tag: str) -> str:
         "Set DOCKER_RT_BUILD_REGISTRY to your registry prefix, e.g. "
         "'docker.io/your-namespace' for Docker Hub."
     )
-
-
-def _check_push_credentials(registry: str) -> str | None:
-    """Check if push credentials are configured, return hint if missing."""
-    username = _env("DOCKER_RT_REGISTRY_USERNAME")
-    password = _env("DOCKER_RT_REGISTRY_PASSWORD")
-    dockerconfig = _env("DOCKER_RT_REGISTRY_DOCKERCONFIG")
-
-    has_creds = (username and password) or dockerconfig
-
-    if not has_creds:
-        return (
-            "No push credentials configured. Set one of: "
-            "DOCKER_RT_REGISTRY_USERNAME + DOCKER_RT_REGISTRY_PASSWORD "
-            "(registry username and password/API token), or "
-            "DOCKER_RT_REGISTRY_DOCKERCONFIG (path to dockerconfig.json or base64-encoded content). "
-            "For Docker Hub, use your username and an Access Token from "
-            "https://hub.docker.com/settings/security"
-        )
-    return None
 
 
 # --------------------------------------------------------------------------
@@ -1143,8 +1117,9 @@ def push_fix_hints() -> list[str]:
             "logged in to it>"
         )
         hints.append(
-            "    Neither is mandatory: with neither set, the default "
-            f"{registry_push.DEFAULT_DOCKER_CONFIG_SECRET} is used if it exists."
+            "    Neither is mandatory: with neither set the build runs without "
+            "registry credentials and only logs a warning — no local docker "
+            "config is read implicitly."
         )
     elif reachable:
         hints.append(
@@ -1385,15 +1360,6 @@ async def build_in_sandbox(
 
     destinations = list(dict.fromkeys(aliases.values()))
 
-    # Credentials are keyed by registry **host**, so this needs a prefix even when
-    # the push prefix itself is unresolved: a fully-qualified ``-t`` carries its
-    # own host. Passing ``""`` would make ``docker_config_b64`` re-resolve the
-    # prefix internally and raise on a cluster whose profile has a host but no
-    # namespace — killing a build that never needed the prefix.
-    credential_prefix = registry or (
-        destinations[0].rsplit("/", 1)[0] if destinations and "/" in destinations[0] else ""
-    )
-
     # 先做环境变量体检：拼错的变量常常就是下面那些"缺失 / 跳过"告警的真正原因，
     # 所以它必须排在它们**前面**（2026-10-09 用户 `DOCKER_RT_ACR_SECRET` → 建仓被跳过）。
     for warning in registry_push.unknown_env_warnings():
@@ -1415,20 +1381,36 @@ async def build_in_sandbox(
     for warning in plan.warnings:
         yield {"stream": f"warning: {warning}\n"}
 
-    try:
-        docker_config_b64 = registry_push.docker_config_b64(credential_prefix)
-    except RegistryConfigError as exc:
-        # Configured-but-unreadable is a deployment error: fail before spending a
-        # sandbox rather than after a five-minute build that ends in a 401.
-        yield buildkit.error_event(str(exc))
-        return
-    if push and not docker_config_b64:
-        yield {
-            "stream": (
-                "warning: no push credentials resolved; assuming the registry "
-                "accepts anonymous pushes\n"
-            )
-        }
+    # Registry credentials exist only to push, so a build that does not push
+    # never resolves them — and never carries them into the sandbox.
+    docker_config_b64 = ""
+    if push:
+        # Credentials are keyed by registry **host**, so this needs a prefix even
+        # when the push prefix itself is unresolved: a fully-qualified ``-t``
+        # carries its own host. Passing ``""`` would make ``docker_config_b64``
+        # re-resolve the prefix internally and raise on a cluster whose profile
+        # has a host but no namespace.
+        credential_prefix = registry or (
+            destinations[0].rsplit("/", 1)[0]
+            if destinations and "/" in destinations[0]
+            else ""
+        )
+        try:
+            docker_config_b64 = registry_push.docker_config_b64(credential_prefix)
+        except RegistryConfigError as exc:
+            # Configured-but-unreadable is a deployment error: fail before spending
+            # a sandbox rather than after a five-minute build that ends in a 401.
+            yield buildkit.error_event(str(exc))
+            return
+        if not docker_config_b64:
+            yield {
+                "stream": (
+                    "warning: no push credentials configured; pushing without "
+                    "registry credentials (anonymous push). Set "
+                    "DOCKER_RT_REGISTRY_USERNAME + DOCKER_RT_REGISTRY_PASSWORD, "
+                    "or DOCKER_RT_REGISTRY_DOCKERCONFIG.\n"
+                )
+            }
 
     script = start_script(
         destinations=destinations,
