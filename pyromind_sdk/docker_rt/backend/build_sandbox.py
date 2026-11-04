@@ -113,11 +113,22 @@ def build_executor() -> str:
 
 
 def sandbox_cpu_limit() -> str:
-    return _env("DOCKER_RT_BUILD_SANDBOX_CPU", "2")
+    # The platform rejects a custom sandbox whose CPU:memory is not 1:2
+    # ("Sandbox CPU:memory must be 1:2") unless the account is admin, so this
+    # default must stay paired with sandbox_memory_limit() (8 cpu / 16Gi).
+    return _env("DOCKER_RT_BUILD_SANDBOX_CPU", "8")
+
+
+def rift_port() -> int:
+    """Port rift-client listens on inside the sandbox (bootstrap's default)."""
+    try:
+        return int(os.getenv("RIFT_PORT") or 7500)
+    except ValueError:
+        return 7500
 
 
 def sandbox_memory_limit() -> str:
-    return _env("DOCKER_RT_BUILD_SANDBOX_MEMORY", "4Gi")
+    return _env("DOCKER_RT_BUILD_SANDBOX_MEMORY", "16Gi")
 
 
 def sandbox_ready_timeout() -> int:
@@ -178,8 +189,14 @@ def poll_interval() -> float:
 
 
 def keep_sandbox() -> bool:
-    """Keep the sandbox alive after the build (troubleshooting only)."""
-    return _env("DOCKER_RT_BUILD_SANDBOX_KEEP", "false").lower() in {
+    """Keep the sandbox alive when a build **fails** (default: on).
+
+    A failed build is exactly when the sandbox is worth inspecting (OOMKilled,
+    evicted, disk full). Successful builds are always cleaned up: keeping every
+    sandbox would leak a 16Gi/4cpu pod per build. Set the env to ``false`` to
+    clean up failures too.
+    """
+    return _env("DOCKER_RT_BUILD_SANDBOX_KEEP", "true").lower() in {
         "1",
         "true",
         "yes",
@@ -350,12 +367,6 @@ async def sweep_stale_build_sandboxes(*, client: Any | None = None) -> list[str]
             "build sandboxes are left alone; remove them yourself with "
             "`docker ps | grep %s` + `docker rm -f <id>`",
             BUILD_SANDBOX_NAME_STEM,
-        )
-        return []
-    if keep_sandbox():
-        logger.warning(
-            "DOCKER_RT_BUILD_SANDBOX_KEEP=true — leaving leftover build sandboxes "
-            "alone"
         )
         return []
 
@@ -1433,6 +1444,69 @@ async def _check_push_targets(
     yield {"stream": f"warning: {message}\n"}
 
 
+#: 自动升配的上限；超了就停，不再猜（配额/成本）。
+MAX_BUILD_MEMORY_GIB = 64
+
+
+_MEMORY_UNITS = (
+    ("gib", 1),
+    ("gi", 1),
+    ("gb", 1),
+    ("g", 1),
+    ("mib", 1024),
+    ("mi", 1024),
+    ("mb", 1024),
+    ("m", 1024),
+)
+
+
+def _build_memory_gib(value: str) -> int | None:
+    """Parse the k8s quantity forms the platform accepts (``16Gi``, ``16G``,
+    ``16384Mi``) into whole GiB, rounding up."""
+    text = (value or "").strip().lower()
+    for suffix, per_gib in _MEMORY_UNITS:
+        if not text.endswith(suffix):
+            continue
+        try:
+            amount = float(text[: -len(suffix)])
+        except ValueError:
+            return None
+        gib = amount / per_gib
+        return int(gib) if gib.is_integer() else int(gib) + 1
+    return None
+
+
+def _double_memory(value: str) -> str | None:
+    """``16Gi`` -> ``32Gi``; ``None`` when it cannot be doubled safely."""
+    gib = _build_memory_gib(value)
+    if gib is None or gib <= 0:
+        return None
+    doubled = gib * 2
+    if doubled > MAX_BUILD_MEMORY_GIB:
+        return None
+    return f"{doubled}Gi"
+
+
+def _double_cpu(value: str) -> str | None:
+    """``8`` -> ``16``; ``None`` for fractional or non-numeric limits."""
+    try:
+        cores = int((value or "").strip())
+    except ValueError:
+        return None
+    return str(cores * 2) if cores > 0 else None
+
+
+def _died(signal: dict[str, Any], detail: str) -> None:
+    """The sandbox vanished before kaniko reported an exit code.
+
+    Kept out of the user-facing stream: `build_in_sandbox` decides whether to
+    retry with more resources or to report it once.
+    """
+    signal["died_without_exit"] = True
+    signal["detail"] = detail
+    logger.warning("build sandbox died without an exit code: %s", detail)
+
+
 async def build_in_sandbox(
     *,
     tar_bytes: bytes,
@@ -1444,6 +1518,70 @@ async def build_in_sandbox(
     namespace: str,
     sandbox_client: Any | None = None,
     platform: str | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """Build and push; a sandbox that dies without an exit code is retried once
+    with doubled resources (users cannot be expected to tune MAX_JOBS or the
+    limit). CPU doubles with memory because the platform enforces 1:2.
+    """
+    memory = sandbox_memory_limit()
+    cpu = sandbox_cpu_limit()
+    for attempt in (1, 2):
+        signal: dict[str, Any] = {}
+        async for event in _build_once(
+            tar_bytes=tar_bytes,
+            tags=tags,
+            dockerfile=dockerfile,
+            buildargs=buildargs,
+            labels=labels,
+            target=target,
+            namespace=namespace,
+            sandbox_client=sandbox_client,
+            platform=platform,
+            memory_limit=memory,
+            cpu_limit=cpu,
+            signal=signal,
+        ):
+            yield event
+        if not signal.get("died_without_exit"):
+            return
+        next_memory = _double_memory(memory) if attempt == 1 else None
+        next_cpu = _double_cpu(cpu) if attempt == 1 else None
+        if next_memory is None or next_cpu is None:
+            yield buildkit.error_event(
+                "build sandbox died before reporting an exit code "
+                f"(likely OOM-killed; limit {memory})"
+            )
+            return
+        dead = signal.get("sandbox")
+        if dead is not None:
+            try:
+                await dead.cleanup()
+            except Exception:  # noqa: BLE001 - best effort
+                logger.debug("dead build sandbox cleanup failed", exc_info=True)
+        yield {
+            "stream": (
+                "build sandbox died before reporting an exit code "
+                f"(likely OOM-killed; limit {memory}).\n"
+                f"Retried with {next_memory}.\n"
+            )
+        }
+        memory, cpu = next_memory, next_cpu
+
+
+async def _build_once(
+    *,
+    tar_bytes: bytes,
+    tags: list[str],
+    dockerfile: str = "Dockerfile",
+    buildargs: dict[str, str] | None = None,
+    labels: dict[str, str] | None = None,
+    target: str | None = None,
+    namespace: str,
+    sandbox_client: Any | None = None,
+    platform: str | None = None,
+    memory_limit: str = "",
+    cpu_limit: str = "",
+    signal: dict[str, Any] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Build and push, yielding Docker-style progress events.
 
@@ -1671,12 +1809,15 @@ async def build_in_sandbox(
                     f"{time.monotonic() - upload_started:.1f}s"
                 )
 
+    signal = signal if signal is not None else {}
     sandbox = None
     digest = ""
+    succeeded = False
     try:
         yield stage(
             f"Creating the build sandbox ({build_executor()}, "
-            f"{sandbox_memory_limit()} / {sandbox_cpu_limit()} cpu)…"
+            f"{memory_limit or sandbox_memory_limit()} / "
+            f"{cpu_limit or sandbox_cpu_limit()} cpu)…"
         )
 
         async def _create_sandbox_with(
@@ -1693,10 +1834,14 @@ async def build_in_sandbox(
                 working_dir="/",
                 container_name=new_build_sandbox_name(),
                 ready_timeout=sandbox_ready_timeout(),
-                memory_limit=sandbox_memory_limit(),
-                cpu_limit=sandbox_cpu_limit(),
+                memory_limit=memory_limit or sandbox_memory_limit(),
+                cpu_limit=cpu_limit or sandbox_cpu_limit(),
                 sandbox_client=sandbox_client,
                 mounts=mounts,
+                # The gateway dials <service>:<rift port> for every sandbox; a
+                # custom sandbox only gets the port when it is asked for (the
+                # middleware adds it on resume/edit, not on create).
+                port_bindings={f"{rift_port()}/tcp": [{"HostPort": str(rift_port())}]},
             )
 
         def _mounts_for(plan: context_staging.StagingPlan | None) -> list[dict[str, Any]]:
@@ -1742,6 +1887,7 @@ async def build_in_sandbox(
                     f"cannot create build sandbox ({build_executor()}): {_error_text(exc2)}"
                 )
                 return
+        signal["sandbox"] = sandbox
         yield stage(
             f"Build sandbox {getattr(sandbox, 'sandbox_id', '?')} created; "
             "waiting for it to run…"
@@ -1759,6 +1905,21 @@ async def build_in_sandbox(
         yield stage(
             f"Build sandbox ready after {time.monotonic() - ready_started:.1f}s"
         )
+
+        # rift is the only exec/data channel into a sandbox, and a freshly
+        # created build sandbox has no rift-client yet: without this the push
+        # probe, the staged-context copy and the final upload all fail with
+        # "rift channel is not ready" after several wasted minutes. Stop here
+        # with the injection error instead of running a build that cannot work.
+        yield stage("Preparing the sandbox exec channel…")
+        try:
+            await sandbox.bootstrap_rift()
+        except Exception as exc:  # noqa: BLE001
+            yield buildkit.error_event(
+                "cannot open the exec channel into the build sandbox: "
+                f"{_error_text(exc)}"
+            )
+            return
 
         # Ask the sandbox — not this host — whether the push can ever work, and
         # do it before the context copy and the build. See _check_push_targets.
@@ -2061,12 +2222,13 @@ async def build_in_sandbox(
                             f"reported state={last_state or 'unknown'}"
                         )
                     target = destinations[0] if destinations else "the image tag"
-                    yield buildkit.error_event(
+                    _died(
+                        signal,
                         f"lost contact with the build sandbox: {poll_failures} polls "
-                        f"in a row failed ({_error_text(exc, timeout=_exec_deadline(POLL_TIMEOUT_S))}); "
-                        f"{contact}, {offset} log bytes seen. "
-                        "kaniko runs detached, so the image may have been pushed "
-                        f"anyway — check {target} before rebuilding"
+                        f"in a row failed "
+                        f"({_error_text(exc, timeout=_exec_deadline(POLL_TIMEOUT_S))}); "
+                        f"{contact}, {offset} log bytes seen; kaniko runs detached, "
+                        f"so check {target} before rebuilding",
                     )
                     return
                 await asyncio.sleep(poll_interval())
@@ -2153,13 +2315,7 @@ async def build_in_sandbox(
                 # means the container changed underneath the build — never that
                 # the launcher failed. See kaniko.status_script for the ordering
                 # rule that keeps these two apart.
-                yield buildkit.error_event(
-                    "the build sandbox lost its working directory "
-                    f"({kaniko.build_workdir()}) while the build was running: the "
-                    "container was recreated (most often OOM-killed). Raise "
-                    f"DOCKER_RT_BUILD_SANDBOX_MEMORY (currently "
-                    f"{sandbox_memory_limit()}) or reduce the build's peak memory"
-                )
+                _died(signal, "the build sandbox lost its working directory")
                 return
             if state == "not-launched":
                 yield buildkit.error_event(
@@ -2170,10 +2326,7 @@ async def build_in_sandbox(
             if state == "gone":
                 gone_strikes += 1
                 if gone_strikes >= GONE_STRIKES:
-                    yield buildkit.error_event(
-                        "the build process disappeared without reporting an exit "
-                        "code — most likely killed (OOM) or reaped by the sandbox"
-                    )
+                    _died(signal, "the build process disappeared")
                     return
             else:
                 gone_strikes = 0
@@ -2226,6 +2379,7 @@ async def build_in_sandbox(
             yield {"aux": {"ID": digest}}
         yield {"stream": "Successfully built\n"}
         yield {"docker_rt": {"aliases": aliases, "digest": digest}}
+        succeeded = True
     finally:
         # Stage-2 cleanup. The sandbox already deleted its own staged directory
         # right after the copy; this is for the paths where it never got that
@@ -2241,9 +2395,11 @@ async def build_in_sandbox(
                     stager.describe(),
                 )
         if sandbox is not None:
-            if keep_sandbox():
+            keep = keep_sandbox() and not succeeded
+            if keep:
                 logger.warning(
-                    "DOCKER_RT_BUILD_SANDBOX_KEEP=true — leaving build sandbox %s",
+                    "build failed — leaving sandbox %s for inspection "
+                    "(DOCKER_RT_BUILD_SANDBOX_KEEP; `docker rm -f <id>` when done)",
                     getattr(sandbox, "sandbox_id", "?"),
                 )
             else:

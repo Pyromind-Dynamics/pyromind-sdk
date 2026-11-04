@@ -138,7 +138,7 @@ docker build -t myapp:dev .
 | 现象 | 检查项 |
 | --- | --- |
 | Sandbox 无法拉取镜像 | 确认目标集群可访问镜像仓库，且平台有权限读取该镜像。 |
-| 构建无法启动 | 检查构建器镜像是否可拉取、是否包含 shell 和 `sleep`；若 Sandbox 因 OOM 被终止，可提高内存（`DOCKER_RT_BUILD_SANDBOX_MEMORY`）。 |
+| 构建无法启动 | 检查构建器镜像是否可拉取、是否包含 shell 和 `sleep`；构建沙箱默认 16Gi/8cpu（`DOCKER_RT_BUILD_SANDBOX_MEMORY` / `_CPU`，平台要求 CPU:memory = 1:2），若它在报出退出码之前死亡，会自动把资源翻倍重试一次（`build sandbox died before reporting an exit code … Retried with 32Gi`）。**失败**的构建默认保留沙箱便于排查（`DOCKER_RT_BUILD_SANDBOX_KEEP=true`），成功的构建始终清理。 |
 | 构建卡在拉取依赖、域名解析失败 | 构建使用集群网络，Dockerfile 中的联网地址必须集群可达，见「中国区集群使用差异」。 |
 | 构建完成但推送失败 | 检查仓库连通性与凭据，并确认前缀包含命名空间（见「中国区集群使用差异」）。镜像归档可能仍保存在 `/workspace/docker_images/`。 |
 | `docker exec` 报 `[EXEC_STREAM_LOST]` / `[EXEC_STREAM_RELAY_FAILED]` | 平台已给出原因：exec 流在命令给出退出码之前中断。消息中包含诊断信息与已投递字节数：`0 stdout / 0 stderr` 基本说明命令未启动；已有字节输出说明命令已执行、仅丢失尾部——**不要盲目重试**，仅对幂等命令重试。 |

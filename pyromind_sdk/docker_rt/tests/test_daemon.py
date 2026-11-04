@@ -279,3 +279,38 @@ def test_cluster_help_lists_every_configured_cluster() -> None:
     assert "--cluster" in help_text
     for code in CLUSTER_RESOURCE:
         assert code in help_text, (code, help_text)
+
+
+def test_foreground_daemon_records_its_pid(monkeypatch: MonkeyPatch, tmp_path) -> None:
+    """前台启动也要写 pid 文件，否则 `--stop` 永远说 not running。"""
+    from .. import daemon as daemon_mod
+
+    sock = str(tmp_path / "docker-rt.sock")
+    monkeypatch.setenv("DOCKER_RT_PID_FILE", str(tmp_path / "daemon.pid"))
+
+    path = daemon_mod.write_pid_file(sock)
+    assert path.read_text(encoding="utf-8").strip() == str(os.getpid())
+
+    # `--stop` 读的就是这个文件
+    calls = []
+
+    def fake_kill(pid, sig):
+        calls.append((pid, sig))
+        if sig == 0:
+            raise ProcessLookupError()
+
+    monkeypatch.setattr(daemon_mod.os, "kill", fake_kill)
+    assert daemon_mod.stop_daemon(sock=sock) == 0
+    assert (os.getpid(), daemon_mod.signal.SIGTERM) in calls
+    assert not path.exists()
+
+
+def test_clear_pid_file_leaves_another_process_alone(tmp_path) -> None:
+    from .. import daemon as daemon_mod
+
+    path = tmp_path / "other.pid"
+    path.write_text("999999", encoding="utf-8")
+    daemon_mod.clear_pid_file(path)
+    assert path.exists(), "别的进程的 pid 文件不能被删"
+
+    daemon_mod.clear_pid_file(None)  # 没写过也不该炸

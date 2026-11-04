@@ -17,7 +17,12 @@ def main(argv: list[str] | None = None) -> int:
 
     from .aio_server import configure_daemon_logging
     from ..client.trace import trace_scope
-    from .bootstrap import check_connection, check_docker_cli, prepare_env
+    from .bootstrap import (
+        check_connection,
+        check_docker_cli,
+        load_registry_env,
+        prepare_env,
+    )
     from .daemon import prepare_server_parser, start_daemon
     from .install_wrapper import ensure_wrapper_installed
     from .register_context import (
@@ -30,6 +35,8 @@ def main(argv: list[str] | None = None) -> int:
     # 先装日志：setup 阶段失败也要有 时间/级别/trace 前缀，而不是裸 print
     configure_daemon_logging()
     logger = logging.getLogger("docker_rt")
+    # 必须在任何 build/push 逻辑之前：环境里有就落盘，没有就从 ~/.pyromind 读回。
+    load_registry_env()
 
     args = prepare_server_parser().parse_args(argv)
     if args.ready_timeout is not None:

@@ -680,3 +680,116 @@ def test_cp_never_runs_the_cli_through_script(
     assert '"$REAL_DOCKER" "${args[@]}" >"$_cp_out" 2>"$_cp_err"' in text
     # 失败行必须压过 CLI 先打印的 "Successfully copied"。
     assert "grep -av 'Successfully copied'" in text
+
+
+def test_rm_does_not_claim_success_when_the_cli_prints_an_error(
+    monkeypatch: MonkeyPatch,
+    tmp_path,
+) -> None:
+    """`docker rm` 会"退出码 0 + stderr 报错"，wrapper 不能因此打印 deleted。
+
+    2026-10-30：`docker rm /var/xxx.tar` 先打 "<path> deleted" 再打 `404: Not Found`，
+    用户以为文件被删了。docker 27 在只有 404 时退出码是 0，所以成功判定必须看
+    stderr，而不是只看退出码。
+    """
+    if shutil.which("bash") is None:
+        pytest.skip("bash is not available")
+
+    wrapper = tmp_path / "docker"
+    fake_docker = tmp_path / "fake-docker"
+    fake_docker.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo 'Error response from daemon: 404: Not Found' >&2\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(fake_docker.stat().st_mode | stat.S_IXUSR)
+
+    monkeypatch.setattr(mod, "WRAPPER_PATH", wrapper)
+    monkeypatch.setattr(mod, "WRAPPER_DIR", tmp_path)
+    monkeypatch.setattr(mod, "find_real_docker", lambda: str(fake_docker))
+    monkeypatch.setattr(mod, "_shell_rc_path", lambda: tmp_path / "rc")
+    mod.install_wrapper()
+
+    result = subprocess.run(
+        ["bash", str(wrapper), "rm", "busybox"],
+        env={"PATH": "/usr/bin:/bin", "DOCKER_HOST": "unix:///tmp/docker-rt.sock"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1, result
+    assert "deleted" not in result.stdout, result.stdout
+    assert "404" in (result.stdout + result.stderr)
+
+
+def test_rm_treats_any_stderr_as_failure(
+    monkeypatch: MonkeyPatch,
+    tmp_path,
+) -> None:
+    """CLI 退出码 0 但 stderr 有内容（例如 daemon 不在）也不能报 deleted。"""
+    if shutil.which("bash") is None:
+        pytest.skip("bash is not available")
+
+    wrapper = tmp_path / "docker"
+    fake_docker = tmp_path / "fake-docker"
+    fake_docker.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo 'Cannot connect to the Docker daemon' >&2\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(fake_docker.stat().st_mode | stat.S_IXUSR)
+
+    monkeypatch.setattr(mod, "WRAPPER_PATH", wrapper)
+    monkeypatch.setattr(mod, "WRAPPER_DIR", tmp_path)
+    monkeypatch.setattr(mod, "find_real_docker", lambda: str(fake_docker))
+    monkeypatch.setattr(mod, "_shell_rc_path", lambda: tmp_path / "rc")
+    mod.install_wrapper()
+
+    result = subprocess.run(
+        ["bash", str(wrapper), "rm", "busybox"],
+        env={"PATH": "/usr/bin:/bin", "DOCKER_HOST": "unix:///tmp/docker-rt.sock"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1, result
+    assert "deleted" not in result.stdout
+
+
+def test_rm_rejects_a_file_path_with_a_hint(
+    monkeypatch: MonkeyPatch,
+    tmp_path,
+) -> None:
+    """`docker rm <路径>` 直接给用法，不再甩裸 404。"""
+    if shutil.which("bash") is None:
+        pytest.skip("bash is not available")
+
+    wrapper = tmp_path / "docker"
+    fake_docker = tmp_path / "fake-docker"
+    log = tmp_path / "calls.log"
+    fake_docker.write_text(
+        f"#!/usr/bin/env bash\necho called >> {log}\n", encoding="utf-8"
+    )
+    fake_docker.chmod(fake_docker.stat().st_mode | stat.S_IXUSR)
+
+    monkeypatch.setattr(mod, "WRAPPER_PATH", wrapper)
+    monkeypatch.setattr(mod, "WRAPPER_DIR", tmp_path)
+    monkeypatch.setattr(mod, "find_real_docker", lambda: str(fake_docker))
+    monkeypatch.setattr(mod, "_shell_rc_path", lambda: tmp_path / "rc")
+    mod.install_wrapper()
+
+    result = subprocess.run(
+        ["bash", str(wrapper), "rm", "/var/some.tar"],
+        env={"PATH": "/usr/bin:/bin", "DOCKER_HOST": "unix:///tmp/docker-rt.sock"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1, result
+    assert "looks like a path" in result.stderr, result.stderr
+    assert "docker exec <container> rm /var/some.tar" in result.stderr
+    assert not log.exists(), "路径参数不应传给真正的 docker CLI"

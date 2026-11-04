@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from pathlib import Path
 try:
     import readline  # noqa: F401 - enables line editing for input()
 except ImportError:
@@ -107,6 +108,84 @@ def _ask_cluster(
             stdout.flush()
             continue
         return candidate
+
+
+#: Registry settings that survive a restart. The daemon reads env at start, so
+#: an `export` made after it started is invisible — and a new shell loses it.
+#: These are the only keys persisted (API key/cluster stay where the user put
+#: them); the password is written 0600 under ~/.pyromind.
+REGISTRY_ENV_KEYS = (
+    "DOCKER_RT_BUILD_REGISTRY",
+    "DOCKER_RT_REGISTRY_NAMESPACE",
+    "DOCKER_RT_REGISTRY_USERNAME",
+    "DOCKER_RT_REGISTRY_PASSWORD",
+)
+
+
+def registry_env_file() -> Path:
+    return Path(
+        os.getenv("DOCKER_RT_REGISTRY_ENV_FILE")
+        or (Path.home() / ".pyromind" / "registry.env")
+    )
+
+
+def _read_registry_env(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            if key.strip() in REGISTRY_ENV_KEYS:
+                values[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return values
+
+
+def _write_registry_env(path: Path, values: dict[str, str]) -> None:
+    merged = _read_registry_env(path)
+    merged.update({k: v for k, v in values.items() if v})
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(
+            "".join(f"{k}={merged[k]}\n" for k in REGISTRY_ENV_KEYS if merged.get(k)),
+            encoding="utf-8",
+        )
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError as exc:  # noqa: BLE001 - persistence is best effort
+        logger.warning("cannot persist registry settings to %s: %s", path, exc)
+
+
+def load_registry_env() -> dict[str, str]:
+    """Persist registry settings from env, or load them when env has none.
+
+    Resolution: values in the environment win (and are saved for next time);
+    otherwise ``~/.pyromind/registry.env`` supplies the missing keys. This is
+    what makes "export once, restart any time" work — a daemon started from a
+    fresh shell no longer loses the registry configuration.
+    """
+    path = registry_env_file()
+    provided = {
+        key: os.environ[key].strip()
+        for key in REGISTRY_ENV_KEYS
+        if (os.environ.get(key) or "").strip()
+    }
+    if provided:
+        _write_registry_env(path, provided)
+        logger.info(
+            "registry settings updated from environment (%s)", ", ".join(sorted(provided))
+        )
+        return provided
+    loaded = _read_registry_env(path)
+    for key, value in loaded.items():
+        os.environ.setdefault(key, value)
+    if loaded:
+        logger.info("registry settings loaded from %s", path)
+    return loaded
 
 
 def prepare_env(

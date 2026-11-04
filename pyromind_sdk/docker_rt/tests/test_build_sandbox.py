@@ -151,11 +151,13 @@ class _FakeBuildSandbox:
         staged_bytes: int | None = None,
         stage_in_error: str = "",
         raise_on_stage_in: Exception | None = None,
+        raise_on_bootstrap: Exception | None = None,
     ) -> None:
         self.sandbox_id = "sb-build-1"
         self.staged_bytes = staged_bytes
         self.stage_in_error = stage_in_error
         self.raise_on_stage_in = raise_on_stage_in
+        self.raise_on_bootstrap = raise_on_bootstrap
         self.stdout = stdout
         self.returncode = returncode
         self.raise_on_exec = raise_on_exec
@@ -169,6 +171,10 @@ class _FakeBuildSandbox:
         self.responses = list(responses) if responses is not None else None
         self.waited = False
         self.cleaned = False
+        #: kwargs of the create call, filled by ``_install_fake_factory``.
+        self.created_with: dict[str, Any] = {}
+        #: rift-client injection is part of "sandbox is usable" now.
+        self.bootstrap_called = False
         self.archives: list[tuple[str, bytes]] = []
         self.argv: list[str] | None = None
         self.exec_timeout: int | None = None
@@ -182,6 +188,11 @@ class _FakeBuildSandbox:
 
     async def wait_until_running(self) -> None:
         self.waited = True
+
+    async def bootstrap_rift(self) -> None:
+        if self.raise_on_bootstrap is not None:
+            raise self.raise_on_bootstrap
+        self.bootstrap_called = True
 
     async def put_archive(self, dest_path: str, tar_bytes: bytes) -> None:
         if self.raise_on_put is not None:
@@ -289,6 +300,28 @@ def _install_fake(
 
     monkeypatch.setattr(runtime, "start_kube_environment", fake_start)
     return captured
+
+
+def _install_fake_factory(
+    monkeypatch: pytest.MonkeyPatch, factory: Any
+) -> list[_FakeBuildSandbox]:
+    """重试会重建沙箱：每次 ``start_kube_environment`` 都拿一个新的替身。
+
+    每次尝试都从干净状态开始（calls 计数、响应脚本、hang 阈值），否则第二次
+    尝试会撞上第一次耗尽/卡死的替身，测到的就不是重试本身了。
+    """
+    from ..backend import runtime
+
+    created: list[_FakeBuildSandbox] = []
+
+    async def fake_start(**kwargs: Any) -> _FakeBuildSandbox:
+        sandbox = factory()
+        sandbox.created_with = kwargs
+        created.append(sandbox)
+        return sandbox
+
+    monkeypatch.setattr(runtime, "start_kube_environment", fake_start)
+    return created
 
 
 class _FakeStager:
@@ -796,6 +829,8 @@ async def test_build_in_sandbox_reports_failure_and_still_cleans_up(
     monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
     monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
     _set_push_credentials(monkeypatch)
+    # 本测试断言"失败也会清理"，显式关掉默认的失败保留
+    monkeypatch.setenv("DOCKER_RT_BUILD_SANDBOX_KEEP", "false")
 
     sandbox = _FakeBuildSandbox(stdout="error: no space left on device\n", returncode=1)
     _install_fake(monkeypatch, sandbox)
@@ -975,7 +1010,8 @@ async def test_build_in_sandbox_short_tag_without_registry_is_rejected(
 
 
 @pytest.mark.asyncio
-async def test_build_in_sandbox_keep_flag_skips_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_a_successful_build_always_cleans_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    """KEEP 现在只管"失败后保留现场"，成功构建永远清理（否则每次构建漏一个 16Gi 沙箱）。"""
     from ..backend import build_sandbox
 
     _clear(monkeypatch)
@@ -992,7 +1028,39 @@ async def test_build_in_sandbox_keep_flag_skips_cleanup(monkeypatch: pytest.Monk
             tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
         )
     )
-    assert not sandbox.cleaned
+    assert sandbox.cleaned, "成功构建必须删沙箱"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_build_keeps_the_sandbox_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """失败时默认保留沙箱，方便 describe 看 OOMKilled / 事件；显式 false 才清。"""
+    from ..backend import build_sandbox
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
+    _set_push_credentials(monkeypatch)
+
+    sandbox = _FakeBuildSandbox(raise_on_put=RuntimeError("kaboom"))
+    _install_fake(monkeypatch, sandbox)
+    await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
+    )
+    assert not sandbox.cleaned, "默认 KEEP=true：失败后留现场"
+
+    sandbox2 = _FakeBuildSandbox(raise_on_put=RuntimeError("kaboom"))
+    _install_fake(monkeypatch, sandbox2)
+    monkeypatch.setenv("DOCKER_RT_BUILD_SANDBOX_KEEP", "false")
+    await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
+    )
+    assert sandbox2.cleaned, "KEEP=false 时失败也要清理"
 
 
 @pytest.mark.asyncio
@@ -1003,6 +1071,8 @@ async def test_build_in_sandbox_reports_upload_failure(monkeypatch: pytest.Monke
     monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
     monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
     _set_push_credentials(monkeypatch)
+    # 本测试断言"失败也会清理"，显式关掉默认的失败保留
+    monkeypatch.setenv("DOCKER_RT_BUILD_SANDBOX_KEEP", "false")
 
     sandbox = _FakeBuildSandbox(raise_on_put=RuntimeError("kaboom"))
     _install_fake(monkeypatch, sandbox)
@@ -1023,6 +1093,8 @@ async def test_build_in_sandbox_reports_exec_failure(monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
     monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
     _set_push_credentials(monkeypatch)
+    # 本测试断言"失败也会清理"，显式关掉默认的失败保留
+    monkeypatch.setenv("DOCKER_RT_BUILD_SANDBOX_KEEP", "false")
 
     sandbox = _FakeBuildSandbox(raise_on_exec=RuntimeError("stream died"))
     _install_fake(monkeypatch, sandbox)
@@ -1250,10 +1322,10 @@ async def test_build_in_sandbox_reports_a_vanished_worker(
     monkeypatch.setenv("DOCKER_RT_BUILD_POLL_INTERVAL_S", "0.01")
     _set_push_credentials(monkeypatch)
 
-    sandbox = _FakeBuildSandbox(
-        responses=[_launch()] + [_poll(state="gone")] * build_sandbox.GONE_STRIKES
+    script = [_launch()] + [_poll(state="gone")] * build_sandbox.GONE_STRIKES
+    made = _install_fake_factory(
+        monkeypatch, lambda: _FakeBuildSandbox(responses=script)
     )
-    _install_fake(monkeypatch, sandbox)
 
     events = await _collect(
         build_sandbox.build_in_sandbox(tar_bytes=_context_tar(), tags=["myapp"], namespace="ns")
@@ -1261,9 +1333,43 @@ async def test_build_in_sandbox_reports_a_vanished_worker(
 
     errors = [event for event in events if event.get("error")]
     assert errors, events
-    assert "disappeared" in errors[0]["error"]
+    assert "died before reporting an exit code" in errors[0]["error"]
+    assert "limit 32Gi" in errors[0]["error"]
+    assert "Retried with 32Gi" in "".join(e.get("stream", "") for e in events)
     # One strike is not enough: the exit-code file lands a moment after the PID goes.
-    assert len(sandbox.calls) == build_sandbox.GONE_STRIKES + 1
+    assert len(made) == 2, "死亡后应升到 32Gi 重试一次"
+    assert len(made[0].calls) == build_sandbox.GONE_STRIKES + 1
+    assert len(made[1].calls) == build_sandbox.GONE_STRIKES + 1
+    assert made[0].cleaned, "重试前要清掉死掉的沙箱"
+    # 平台强制 CPU:memory = 1:2，升内存必须同时升 CPU，否则 create 直接 PARAM_ERROR。
+    assert made[0].created_with["memory_limit"] == "16Gi"
+    assert made[0].created_with["cpu_limit"] == "8"
+    assert made[1].created_with["memory_limit"] == "32Gi"
+    assert made[1].created_with["cpu_limit"] == "16"
+
+
+def test_build_sandbox_defaults_keep_the_platform_one_to_two_ratio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """平台对非管理员强制 CPU:memory = 1:2，默认值必须成对。
+
+    2026-11-02 真机：默认 4cpu/16Gi 在 create 时被
+    `PARAM_ERROR: Sandbox CPU:memory must be 1:2` 拒掉，构建根本起不来。
+    """
+    from ..backend import build_sandbox
+
+    _clear(monkeypatch)
+    cpu = int(build_sandbox.sandbox_cpu_limit())
+    memory = build_sandbox._build_memory_gib(build_sandbox.sandbox_memory_limit())
+    assert memory == 2 * cpu
+    assert build_sandbox._double_cpu(build_sandbox.sandbox_cpu_limit()) == str(2 * cpu)
+    assert build_sandbox._double_cpu("2.5") is None
+    assert build_sandbox._double_cpu("abc") is None
+    # 用户可能用 k8s 的其它写法；不能因此静默失去重试。
+    assert build_sandbox._double_memory("16Gi") == "32Gi"
+    assert build_sandbox._double_memory("16G") == "32Gi"
+    assert build_sandbox._double_memory("16384Mi") == "32Gi"
+    assert build_sandbox._double_memory("64Gi") is None  # 到上限不再翻倍
 
 
 @pytest.mark.asyncio
@@ -1974,14 +2080,14 @@ async def test_build_in_sandbox_reports_a_wiped_workdir(
     _set_push_credentials(monkeypatch)
 
     # The launcher succeeds and output flows, then the filesystem disappears.
-    sandbox = _FakeBuildSandbox(
-        responses=[
-            _launch(),
-            _poll("INFO[0004] Deleting filesystem...\n"),
-            _poll(state="wiped"),
-        ]
+    script = [
+        _launch(),
+        _poll("INFO[0004] Deleting filesystem...\n"),
+        _poll(state="wiped"),
+    ]
+    made = _install_fake_factory(
+        monkeypatch, lambda: _FakeBuildSandbox(responses=script)
     )
-    _install_fake(monkeypatch, sandbox)
 
     events = await _collect(
         build_sandbox.build_in_sandbox(
@@ -1991,9 +2097,10 @@ async def test_build_in_sandbox_reports_a_wiped_workdir(
 
     errors = [event for event in events if event.get("error")]
     assert errors, events
-    assert "lost its working directory" in errors[0]["error"]
-    assert "DOCKER_RT_BUILD_SANDBOX_MEMORY" in errors[0]["error"]
+    assert "died before reporting an exit code" in errors[0]["error"]
     assert "did not reach the fork" not in errors[0]["error"]
+    assert len(made) == 2
+    assert made[0].cleaned
 
 
 @pytest.mark.asyncio
@@ -2767,18 +2874,20 @@ async def test_sweep_is_disabled_by_the_knob(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.asyncio
-async def test_sweep_honours_keep_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``KEEP`` leaves a sandbox behind on purpose — even after a crash.
+async def test_sweep_still_runs_when_failed_builds_are_kept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """KEEP 只影响"失败后是否保留本次沙箱"，不能再把清扫关掉。
 
-    It is also the escape hatch for the account-wide reach of the prefix rule: a
-    machine that must not touch anyone else's builds sets it.
+    否则默认 KEEP=true 会让崩溃留下的沙箱永远堆着。
     """
     _clear(monkeypatch)
     monkeypatch.setenv("DOCKER_RT_BUILD_SANDBOX_KEEP", "true")
     client = _FakeSandboxListing([_sandbox(_build_name())])
 
-    assert await build_sandbox.sweep_stale_build_sandboxes(client=client) == []
-    assert client.deleted == []
+    removed = await build_sandbox.sweep_stale_build_sandboxes(client=client)
+    assert removed, "清扫必须照常执行"
+    assert client.deleted
 
 
 @pytest.mark.asyncio
@@ -3716,8 +3825,10 @@ async def test_a_hung_poll_fails_the_build_instead_of_hanging_it(
     monkeypatch.setattr(build_sandbox, "_exec_deadline", lambda timeout: 0.05)
     monkeypatch.setattr(build_sandbox, "poll_interval", lambda: 0.01)
     # The launch answers; every poll after it stalls without closing.
-    sandbox = _FakeBuildSandbox(stdout=_STAGED_STDOUT, hang_after_calls=1)
-    _install_fake(monkeypatch, sandbox)
+    made = _install_fake_factory(
+        monkeypatch,
+        lambda: _FakeBuildSandbox(stdout=_STAGED_STDOUT, hang_after_calls=1),
+    )
 
     events = await asyncio.wait_for(
         _collect(
@@ -3730,8 +3841,11 @@ async def test_a_hung_poll_fails_the_build_instead_of_hanging_it(
 
     errors = [event for event in events if event.get("error")]
     assert len(errors) == 1
-    assert "in a row" in errors[0]["error"]
-    assert len(sandbox.calls) == 1 + build_sandbox.MAX_POLL_FAILURES
+    assert "died before reporting an exit code" in errors[0]["error"]
+    assert "Retried with 32Gi" in "".join(e.get("stream", "") for e in events)
+    assert len(made) == 2
+    for sandbox in made:
+        assert len(sandbox.calls) == 1 + build_sandbox.MAX_POLL_FAILURES
 
 
 @pytest.mark.asyncio
@@ -3790,11 +3904,13 @@ def test_the_exec_deadline_leaves_room_for_the_servers_own_timeout() -> None:
 @pytest.mark.asyncio
 async def test_losing_the_sandbox_reports_where_the_build_got_to(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """连续失败时必须回答：上次答话是什么时候、当时到哪一步、镜像可能已推。
 
     这就是 2026-10-23 那条"卡在 still building…"的收尾文案——那次 kaniko 其实
-    早就推完镜像了，日志却什么都没说，用户只能等着。
+    早就推完镜像了，日志却什么都没说，用户只能等着。现在这两行给用户，细节
+    （到达哪一步、可能已推）进 daemon 日志。
     """
     from ..backend import build_sandbox
 
@@ -3804,15 +3920,19 @@ async def test_losing_the_sandbox_reports_where_the_build_got_to(
     _set_push_credentials(monkeypatch)
     monkeypatch.setattr(build_sandbox, "_exec_deadline", lambda timeout: 0.05)
     monkeypatch.setattr(build_sandbox, "poll_interval", lambda: 0.01)
-    sandbox = _FakeBuildSandbox(
-        stdout=_STAGED_STDOUT,
-        responses=[
-            {"stderr": "docker-rt-status: launched\n"},          # launch
-            {"stderr": "docker-rt-status: running\n"},           # one good poll
-        ],
-        hang_after_calls=2,                                      # then it stalls
-    )
-    _install_fake(monkeypatch, sandbox)
+    caplog.set_level(logging.WARNING)
+
+    def fake() -> _FakeBuildSandbox:
+        return _FakeBuildSandbox(
+            stdout=_STAGED_STDOUT,
+            responses=[
+                {"stderr": "docker-rt-status: launched\n"},          # launch
+                {"stderr": "docker-rt-status: running\n"},           # one good poll
+            ],
+            hang_after_calls=2,                                      # then it stalls
+        )
+
+    made = _install_fake_factory(monkeypatch, fake)
 
     events = await asyncio.wait_for(
         _collect(
@@ -3825,11 +3945,15 @@ async def test_losing_the_sandbox_reports_where_the_build_got_to(
     errors = [event for event in events if event.get("error")]
 
     assert len(errors) == 1
-    message = errors[0]["error"]
-    assert "lost contact with the build sandbox" in message
-    assert "in a row failed" in message
-    assert "reported state=running" in message      # where it got to
-    assert "check reg.example.com/rt/myapp:latest" in message  # what to verify
+    assert "died before reporting an exit code" in errors[0]["error"]
+    assert "Retried with 32Gi" in "".join(e.get("stream", "") for e in events)
+    assert len(made) == 2
+
+    log = caplog.text
+    assert "lost contact with the build sandbox" in log
+    assert "in a row failed" in log
+    assert "reported state=running" in log      # where it got to
+    assert "check reg.example.com/rt/myapp:latest" in log  # what to verify
 
 
 def test_the_ready_heartbeat_ramps_up_as_the_wait_drags_on() -> None:
@@ -3862,3 +3986,80 @@ async def test_the_ready_heartbeat_reports_until_the_task_finishes(
     assert messages
     assert "still waiting for the build sandbox to start" in messages[0]["stream"]
     assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_build_sandbox_gets_rift_and_the_service_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """构建沙箱必须先注入 rift-client，创建时也要带 7500 端口。
+
+    2026-10-30：af45184 删掉"rift 未就绪回落平台"之后，构建沙箱第一次 exec 就
+    报 `refusing platform exec-stream`；同时 create 只按 port_mappings 建 Service
+    端口（7500 只在 resume/edit 补），所以两件缺一不可。
+    """
+    from ..backend import build_sandbox
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1.24.0-debug")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_USERNAME", "my-user")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_PASSWORD", PUSH_PASSWORD)
+
+    sandbox = _FakeBuildSandbox(stdout=f"docker-rt-digest: {GOOD_DIGEST}\n")
+    captured = _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="custom-user-1"
+        )
+    )
+
+    assert not any("error" in event for event in events), events
+    assert sandbox.bootstrap_called, "构建沙箱必须先注入 rift-client"
+    assert captured["port_bindings"] == {"7500/tcp": [{"HostPort": "7500"}]}
+    # 真机上 kaniko 看到的是这段脚本里的 argv：忽略目录必须真的下发。
+    assert "--ignore-path=/opt/docker-rt/rift" in _worker_script(sandbox)
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_failure_stops_the_build_before_it_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """注入失败要立刻判构建失败，而不是跑满几分钟再挂在第一次 exec 上。"""
+    from ..backend import build_sandbox
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1.24.0-debug")
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_USERNAME", "my-user")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_PASSWORD", PUSH_PASSWORD)
+
+    sandbox = _FakeBuildSandbox(
+        raise_on_bootstrap=RuntimeError("rift gateway is not configured")
+    )
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="custom-user-1"
+        )
+    )
+
+    errors = [str(event.get("error", "")) for event in events if "error" in event]
+    assert any("exec channel" in text for text in errors), events
+    assert sandbox.calls == [], "注入失败后不应再向沙箱发任何 exec"
+
+
+def test_kaniko_ignores_the_rift_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    """rift-client 所在目录必须交给 kaniko 忽略（不删、不进镜像）。"""
+    from ..backend import kaniko
+
+    assert "--ignore-path=/opt/docker-rt/rift" in kaniko.kaniko_args(
+        destinations=["myapp:1"], push=False
+    )
+
+    monkeypatch.setenv("DOCKER_RT_RIFT_REMOTE_DIR", "/workspace/.rift")
+    assert "--ignore-path=/workspace/.rift" in kaniko.kaniko_args(
+        destinations=["myapp:1"], push=False
+    )

@@ -6196,9 +6196,15 @@ def main() -> None:
     port = int(os.getenv("DOCKER_RT_PORT", os.getenv("PORT", "2375")))
     app = create_aio_app()
 
+    # `--stop` 先读这个文件。前台启动以前不写，于是停一个前台 daemon 永远得到
+    # "docker-rt is not running"。
+    from .daemon import clear_pid_file, write_pid_file
+
+    pid_file = None
     try:
         if host:
             logger.info("Listening on TCP %s:%s", host, port)
+            pid_file = write_pid_file(sock)
             web.run_app(app, host=host, port=port, print=lambda *a, **k: None)
         else:
             try:
@@ -6208,6 +6214,7 @@ def main() -> None:
                 # 一行说清楚就够，不必甩 20 行 traceback。
                 logger.error("%s", exc)
                 raise SystemExit(1) from None
+            pid_file = write_pid_file(sock)
             logger.info("Listening on unix://%s", sock)
             web.run_app(app, path=sock, print=lambda *a, **k: None)
     except SystemExit:
@@ -6216,6 +6223,7 @@ def main() -> None:
         logger.exception("docker-rt server crashed")
         raise
     finally:
+        clear_pid_file(pid_file)
         logger.info("docker-rt server stopped")
 
 

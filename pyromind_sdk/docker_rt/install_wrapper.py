@@ -12,7 +12,7 @@ from pathlib import Path
 WRAPPER_DIR = Path.home() / ".pyromind" / "bin"
 WRAPPER_PATH = WRAPPER_DIR / "docker"
 PATH_LINE = 'export PATH="$HOME/.pyromind/bin:$PATH"'
-WRAPPER_VERSION = "21"
+WRAPPER_VERSION = "22"
 
 
 def _wrapper_version() -> str | None:
@@ -229,6 +229,14 @@ if [[ "${{args[0]:-}}" == "rm" ]]; then
         rm_opts+=("$arg")
         ;;
       *)
+        # `docker rm` removes containers. A path here can only be a mistake:
+        # say so, instead of letting the CLI turn it into a bare
+        # `404: Not Found` (the slashes do not even match the API route).
+        if [[ "$arg" == */* ]]; then
+          printf 'docker-rt: %s looks like a path; docker rm removes containers.\\n' "$arg" >&2
+          printf 'Delete files with: docker exec <container> rm %s\\n' "$arg" >&2
+          exit 1
+        fi
         rm_targets+=("$arg")
         ;;
     esac
@@ -264,10 +272,19 @@ if [[ "${{args[0]:-}}" == "rm" ]]; then
         _rm_err="$(mktemp)"
         "$REAL_DOCKER" rm "${{rm_opts[@]}}" "$target" >"$_rm_out" 2>"$_rm_err"
         rc=$?
-        if [[ $rc -eq 0 ]]; then
+        # The CLI can exit 0 while printing "Error response from daemon"
+        # (a 404 for an unknown container does exactly that), so the exit
+        # code alone is not evidence: an error line must win, or we claim
+        # a deletion that never happened.
+        # `rm` prints nothing to stderr on a real success, so ANY stderr means
+        # the container was not removed (a 404, "Cannot connect to the Docker
+        # daemon", …). Reporting a false success is the one outcome we cannot
+        # have; a false failure at least shows the message.
+        if [[ $rc -eq 0 && ! -s "$_rm_err" ]]; then
           printf '%s deleted\\n' "$target"
           cat "$_rm_err" >&2
         else
+          [[ $rc -eq 0 ]] && rc=1
           cat "$_rm_out" >&2
           cat "$_rm_err" >&2
         fi

@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -271,3 +272,60 @@ def test_a_timeout_says_which_step_and_how_long(monkeypatch):
         assert "platform API looks slow" in text
     else:
         raise AssertionError("expected RiftUnavailable")
+
+
+def test_registry_env_persists_and_reloads(monkeypatch, tmp_path):
+    """export 一次就够：daemon 在全新 shell 里重启也能拿到 registry 配置。
+
+    2026-11-02 反复踩到：`export` 只影响新进程，daemon 却早于它启动；换个
+    shell 重启又丢。这里把白名单键写到 ~/.pyromind/registry.env（0600）。
+    """
+    from .. import bootstrap as boot_mod
+
+    path = tmp_path / "registry.env"
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_ENV_FILE", str(path))
+    for key in boot_mod.REGISTRY_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "docker.io/jiangwc3439")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_USERNAME", "jiangwc3439")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_PASSWORD", "secret")
+    monkeypatch.setenv("SOME_OTHER", "not-persisted")
+
+    saved = boot_mod.load_registry_env()
+    assert saved["DOCKER_RT_BUILD_REGISTRY"] == "docker.io/jiangwc3439"
+    assert path.exists()
+    assert (path.stat().st_mode & 0o777) == 0o600
+    assert "SOME_OTHER" not in path.read_text(encoding="utf-8")
+
+    # 新 shell：环境里没有这些变量，但文件在
+    for key in boot_mod.REGISTRY_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    loaded = boot_mod.load_registry_env()
+    assert loaded["DOCKER_RT_REGISTRY_PASSWORD"] == "secret"
+    assert os.environ["DOCKER_RT_BUILD_REGISTRY"] == "docker.io/jiangwc3439"
+
+
+def test_registry_env_merges_a_partial_export(monkeypatch, tmp_path):
+    from .. import bootstrap as boot_mod
+
+    path = tmp_path / "registry.env"
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_ENV_FILE", str(path))
+    for key in boot_mod.REGISTRY_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+    path.write_text(
+        "DOCKER_RT_REGISTRY_USERNAME=old\nDOCKER_RT_REGISTRY_PASSWORD=oldpass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "docker.io/newuser")
+
+    boot_mod.load_registry_env()
+    text = path.read_text(encoding="utf-8")
+    assert "DOCKER_RT_BUILD_REGISTRY=docker.io/newuser" in text
+    assert "DOCKER_RT_REGISTRY_PASSWORD=oldpass" in text, "没提供的键要保留"
+
+    # 环境优先：导出的会被写到文件里
+    for key in boot_mod.REGISTRY_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    assert boot_mod.load_registry_env()["DOCKER_RT_BUILD_REGISTRY"] == "docker.io/newuser"
