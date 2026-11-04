@@ -13,6 +13,8 @@ import os
 import json
 import importlib.util
 import argparse
+import re
+import stat
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Any, List, Optional
@@ -27,35 +29,41 @@ except ImportError:
     from pyromind_sdk.nodes.type_converter import convert_string_to_python_type, convert_inputs, validate_output_type
 
 
-def _read_tmp_file_if_exists(value: Any) -> Any:
-    """
-    If `value` is a string pointing to an existing `/tmp/*` file,
-    read the file content and return it. Otherwise return the original value.
-
-    This supports passing large strings (e.g. system prompts) through heredoc files,
-    avoiding shell quoting/escaping issues.
-    """
-    if not isinstance(value, str):
-        return value
-
-    if not value.startswith("/tmp/"):
-        return value
-
-    path = Path(value)
-    if not path.is_file():
-        return value
-
-    # Remove only heredoc-added trailing newline(s), preserve other whitespace.
-    return path.read_text(encoding="utf-8").rstrip("\n")
-
-
-def _resolve_inputs_from_tmp_files(obj: Any) -> Any:
-    """Recursively resolve `/tmp/*` string values into their file contents."""
+def _resolve_inputs_from_tmp_files(obj: Any, input_dir: Optional[str] = None) -> Any:
+    """Read only explicit references in this invocation's private directory."""
     if isinstance(obj, dict):
-        return {k: _resolve_inputs_from_tmp_files(v) for k, v in obj.items()}
+        if set(obj) == {"__pyromind_input_file__"}:
+            name = obj["__pyromind_input_file__"]
+            if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", name):
+                raise ValueError("Invalid input file reference")
+            if not input_dir:
+                raise ValueError("Input file reference requires --input-dir")
+            directory_fd = os.open(input_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                directory_stat = os.fstat(directory_fd)
+                if (not stat.S_ISDIR(directory_stat.st_mode)
+                        or directory_stat.st_uid != os.geteuid()
+                        or directory_stat.st_mode & 0o077):
+                    raise ValueError("Input directory is not private")
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+                try:
+                    file_stat = os.fstat(fd)
+                    if (not stat.S_ISREG(file_stat.st_mode)
+                            or file_stat.st_uid != os.geteuid()
+                            or file_stat.st_mode & 0o077):
+                        raise ValueError("Input file is not private")
+                    with os.fdopen(fd, "r", encoding="utf-8") as file:
+                        fd = -1
+                        return file.read()
+                finally:
+                    if fd >= 0:
+                        os.close(fd)
+            finally:
+                os.close(directory_fd)
+        return {k: _resolve_inputs_from_tmp_files(v, input_dir) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_resolve_inputs_from_tmp_files(v) for v in obj]
-    return _read_tmp_file_if_exists(obj)
+        return [_resolve_inputs_from_tmp_files(v, input_dir) for v in obj]
+    return obj
 
 
 @contextmanager
@@ -132,7 +140,8 @@ def function_call_wrapper(
     input_types: Dict[str, Any],
     output_paths: Dict[str, str],
     return_types: Optional[List[str]] = None,
-    return_names: Optional[List[str]] = None
+    return_names: Optional[List[str]] = None,
+    input_dir: Optional[str] = None,
 ) -> None:
     """
     Python function call wrapper
@@ -167,8 +176,8 @@ def function_call_wrapper(
     func = get_function_from_module(module, function_name)
     
     # 3. Type conversion
-    # Resolve /tmp/* file indirections back into real string content.
-    inputs = _resolve_inputs_from_tmp_files(inputs)
+    # Resolve only explicit references from this invocation's private directory.
+    inputs = _resolve_inputs_from_tmp_files(inputs, input_dir)
     converted_inputs = convert_inputs(inputs, input_types)
     
     # 4. Call function
@@ -303,6 +312,7 @@ def main():
     parser.add_argument('--input-types', required=True, help='Input types JSON string')
     parser.add_argument('--output-paths', required=True, help='Output paths JSON string (dict: {output_name: file_path})')
     parser.add_argument('--inputs', required=True, help='Input values JSON string (dict: {input_name: value})')
+    parser.add_argument('--input-dir', help='Private directory for explicit input file references')
     parser.add_argument('--return-types', help='Return types JSON string (list of type names)')
     parser.add_argument('--return-names', help='Return names JSON string (list of output names)')
     
@@ -354,7 +364,8 @@ def main():
             input_types=input_types,
             output_paths=output_paths,
             return_types=return_types,
-            return_names=return_names
+            return_names=return_names,
+            input_dir=args.input_dir,
         )
     except Exception as e:
         logger.error(f"Error executing function: {e}")

@@ -26,6 +26,36 @@ logger = logging.getLogger(__name__)
 SPECIAL_NODE_TYPES = frozenset(["PrimitiveNode"])
 
 
+def _standard_node_type(node: Dict[str, Any]) -> Optional[str]:
+    """Return the business node type from the current Xyflow node format."""
+    data = node.get("data")
+    if not isinstance(data, dict):
+        return None
+    node_type = data.get("nodeType")
+    return node_type if isinstance(node_type, str) and node_type else None
+
+
+def _resolve_standard_node_info(
+    nodes: List[Dict[str, Any]], node_info: Optional[Dict], client: Any
+) -> Tuple[Optional[Dict], Optional[str]]:
+    """Require definitions for executable nodes, optionally fetching for this user."""
+    executable = any(
+        isinstance(node, dict) and _standard_node_type(node) != "PrimitiveNode"
+        for node in nodes
+    )
+    if not executable:
+        return node_info, None
+    if not node_info and client is not None:
+        try:
+            studio = getattr(client, "studio", client)
+            node_info = studio.get_node_info()
+        except Exception:
+            logger.warning("Failed to fetch node_info for workflow validation", exc_info=True)
+    if not isinstance(node_info, dict) or not node_info:
+        return None, "Node definitions are unavailable; executable node types cannot be validated"
+    return node_info, None
+
+
 class ValidationError(Exception):
     """Base exception for validation errors."""
     pass
@@ -87,6 +117,12 @@ def validate_workflow(
     nodes = workflow.get("nodes", [])
     edges = workflow.get("edges", [])
     links = workflow.get("links", [])
+    if isinstance(nodes, list):
+        node_info, node_info_error = _resolve_standard_node_info(nodes, node_info, client)
+        if node_info_error:
+            errors.append(node_info_error)
+            if strict:
+                raise SchemaValidationError(node_info_error)
 
     # Step 2: Build mappings
     try:
@@ -280,7 +316,8 @@ def validate_standard_format(
     data: Dict[str, Any],
     node_info: Optional[Dict] = None,
     strict: bool = False,
-    exclude_string_types: bool = False
+    exclude_string_types: bool = False,
+    client: Any = None,
 ) -> Tuple[bool, List[str]]:
     """
     Validate workflow in standard format.
@@ -311,6 +348,12 @@ def validate_standard_format(
         raise SchemaValidationError(f"Schema validation failed: {errors[0]}")
 
     nodes = data.get("nodes", [])
+    if isinstance(nodes, list):
+        node_info, node_info_error = _resolve_standard_node_info(nodes, node_info, client)
+        if node_info_error:
+            errors.append(node_info_error)
+            if strict:
+                raise SchemaValidationError(node_info_error)
 
     # Step 2: Build mappings
     try:
@@ -343,7 +386,8 @@ def validate_standard_format(
         
         # Validate config/widgets_values against node_info
         for node in nodes:
-            if node.get("data", {}).get("config", {}):
+            node_data = node.get("data")
+            if isinstance(node_data, dict) and node_data.get("config"):
                 config_errors = _validate_xyflow_config(node, node_info)
                 errors.extend(config_errors)
             if node.get("widgets_values"):
@@ -445,20 +489,29 @@ def _validate_nodes(nodes: List[Dict], node_map: Dict[str, Dict], node_info: Opt
             errors.append("Found node without 'id' field")
             continue
 
-        # Xyflow stores the business node type in data.nodeType.  Its top-level
-        # ``type`` is a frontend renderer hint (commonly "default"), so it is
-        # optional for backend validation.
-        node_type = node.get("type")
+        # `data.nodeType` is authoritative. Current workflows may use the
+        # generic renderer name `default`; named types must agree with it.
+        renderer_type = node.get("type")
         data = node.get("data", {})
+        if not isinstance(data, dict):
+            errors.append(f"Node {node_id} 'data' must be a dict")
+            data = {}
         xyflow_node_type = data.get("nodeType") if isinstance(data, dict) else None
-        if xyflow_node_type:
-            pass
-        elif node_type == "default":
-            errors.append(f"Node {node_id} type is 'default' but 'data.nodeType' is missing")
-        elif not node_type:
-            errors.append(f"Node {node_id} is missing 'type' field")
-        elif not isinstance(node_type, str):
-            errors.append(f"Node {node_id} 'type' must be a string, got {type(node_type).__name__}")
+        if renderer_type is not None and (
+            not isinstance(renderer_type, str) or not renderer_type
+        ):
+            errors.append(f"Node {node_id} 'type' must be a non-empty string when provided")
+        if not isinstance(xyflow_node_type, str) or not xyflow_node_type:
+            errors.append(f"Node {node_id} 'data.nodeType' must be a non-empty string")
+        elif (
+            isinstance(renderer_type, str)
+            and renderer_type != "default"
+            and renderer_type != xyflow_node_type
+        ):
+            errors.append(
+                f"Node {node_id} type mismatch: type '{renderer_type}' != "
+                f"data.nodeType '{xyflow_node_type}'"
+            )
 
         # Validate data.config (xyflow format)
         if data and "config" in data:
@@ -513,7 +566,7 @@ def _validate_nodes(nodes: List[Dict], node_map: Dict[str, Dict], node_info: Opt
                 errors.append(f"Node {node_id} 'widgets_values' must be a list, got {type(widgets_values).__name__}")
         
         # Validate node definition against node_info (if available)
-        if node_info and node_type:
+        if node_info and _standard_node_type(node):
             definition_errors = _validate_standard_node_definition(node_id, node, node_info)
             errors.extend(definition_errors)
 
@@ -645,7 +698,7 @@ def _validate_widgets_values_order(
         # Cannot validate without node_info
         return errors
     
-    node_type = node.get("type")
+    node_type = _standard_node_type(node)
     if not node_type or node_type not in node_info:
         return errors
     
@@ -737,14 +790,17 @@ def _validate_xyflow_config(
     if not node_info:
         return errors
 
-    node_type = node.get("type", "")
+    node_type = _standard_node_type(node)
     data = node.get("data", {})
-    if node_type == "default":
-        node_type = data.get("nodeType", "")
+    if not isinstance(data, dict):
+        return errors
     if not node_type or node_type not in node_info:
         return errors
 
     config = data.get("config", {})
+    if not isinstance(config, dict):
+        # Structural errors are collected by _validate_nodes.
+        return errors
     if not config:
         # Also try legacy widgets_values
         if "widgets_values" in node:
@@ -950,7 +1006,7 @@ def _validate_standard_node_definition(
         List of error messages
     """
     errors = []
-    node_type = node.get("type")
+    node_type = _standard_node_type(node)
 
     if not node_type:
         return errors
@@ -974,8 +1030,16 @@ def _validate_standard_node_definition(
 
     # Get params from xyflow config
     data = node.get("data", {})
+    if not isinstance(data, dict):
+        return errors
     config = data.get("config", {})
+    if not isinstance(config, dict):
+        return errors
     config_params = set(config.keys())
+    for param_name in config_params - set(all_params):
+        errors.append(
+            f"Node {node_id} (type '{node_type}') has unknown config parameter '{param_name}'"
+        )
 
     # Get node inputs (from inputs array)
     inputs_array = node.get("inputs", [])
@@ -1240,12 +1304,8 @@ def _validate_type_compatibility(
 
             source_node = node_map[source_id]
             target_node = node_map[target_id]
-            source_node_type = source_node.get("type", "")
-            target_node_type = target_node.get("type", "")
-            if source_node_type == "default":
-                source_node_type = source_node.get("data", {}).get("nodeType", "")
-            if target_node_type == "default":
-                target_node_type = target_node.get("data", {}).get("nodeType", "")
+            source_node_type = _standard_node_type(source_node)
+            target_node_type = _standard_node_type(target_node)
 
             if source_node_type not in node_info or target_node_type not in node_info:
                 continue
