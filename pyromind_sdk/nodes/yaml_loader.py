@@ -12,6 +12,13 @@ import re
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple, Set, Callable
 
+from .command_executor import (
+    _bind_shell_inputs,
+    _is_command_source,
+    _require_posix_source,
+    extract_placeholders,
+)
+
 logger = logging.getLogger(__name__)
 
 # Import constants from common module
@@ -342,6 +349,27 @@ def validate_command_template(command_template: List[str]) -> None:
         raise ValueError(
             f"command_template has too many parts: {len(command_template)} > {MAX_COMMAND_TEMPLATE_PARTS}"
         )
+
+
+def _bind_yaml_shell_template(parts: List[str], output_names: List[str]) -> List[str]:
+    """Keep YAML input placeholders out of shell source before platform rendering."""
+    secured = list(parts)
+    for index, part in enumerate(parts):
+        if not isinstance(part, str) or not _is_command_source(parts, index):
+            continue
+        names = sorted(extract_placeholders([part]) - set(output_names))
+        unresolved = set(re.findall(r"\{\{([^{}]+)\}\}", part)) - set(output_names) - set(names)
+        if unresolved:
+            raise ValueError(f"Unsupported shell template placeholders: {sorted(unresolved)}")
+        if not names:
+            continue
+        _require_posix_source(parts, index)
+        first_arg = max(1, len(parts) - index - 1)
+        secured[index] = _bind_shell_inputs(part, names, first_arg)
+        if len(parts) == index + 1:
+            secured.append("pyromind-node")
+        secured.extend(f"{{{{{name}}}}}" for name in names)
+    return secured
 
 
 def parse_input_type(input_config: Any) -> Tuple[Any, Dict[str, Any]]:
@@ -692,6 +720,14 @@ def create_node_class_from_yaml(
     # Validate class name
     validate_class_name(class_name)
 
+    environment = yaml_config.get("environment")
+    if environment is not None:
+        if not isinstance(environment, dict):
+            raise ValueError("environment must be an object")
+        for key in environment:
+            if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                raise ValueError(f"Invalid shell identifier in environment: {key!r}")
+
     # Validate description and category length
     if "description" in yaml_config:
         desc = yaml_config["description"]
@@ -945,8 +981,24 @@ def create_node_class_from_yaml(
 
         # Argument template (optional)
         args_template = yaml_config.get("args_template", [])
+        if isinstance(args_template, str):
+            args_template = [args_template]
+        elif not isinstance(args_template, list):
+            raise ValueError("args_template must be a list or string")
         if args_template:
             class_dict["ARGS_TEMPLATE"] = args_template
+
+        command_parts = list(class_dict.get("COMMAND_TEMPLATE", []))
+        argument_parts = list(class_dict.get("ARGS_TEMPLATE", []))
+        secured_parts = _bind_yaml_shell_template(command_parts + argument_parts, return_names)
+        if secured_parts != command_parts + argument_parts:
+            validate_command_template(secured_parts)
+            class_dict["COMMAND_TEMPLATE"] = secured_parts
+            class_dict["ARGS_TEMPLATE"] = []
+        if "TEST_COMMAND" in class_dict:
+            class_dict["TEST_COMMAND"] = _bind_yaml_shell_template(
+                list(class_dict["TEST_COMMAND"]), return_names
+            )
 
         # Resource limits
         resources = yaml_config.get("resources", {})

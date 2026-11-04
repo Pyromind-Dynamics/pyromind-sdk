@@ -1262,7 +1262,8 @@ class TestValidationFunctions:
             "edges": []
         }
 
-        is_valid, errors = validate_standard_format(standard)
+        node_info = {"NodeA": {"input": {"required": {}, "optional": {}}, "output": []}}
+        is_valid, errors = validate_standard_format(standard, node_info=node_info)
         error_list = [e for e in errors if not e.startswith("Warning:")]
         assert len(error_list) == 0
 
@@ -1279,7 +1280,8 @@ class TestValidationFunctions:
             "edges": [],
         }
 
-        is_valid, errors = validate_standard_format(standard)
+        node_info = {"NodeA": {"input": {"required": {}, "optional": {}}, "output": []}}
+        is_valid, errors = validate_standard_format(standard, node_info=node_info)
 
         assert is_valid is True
         assert not errors
@@ -1299,7 +1301,8 @@ class TestValidationFunctions:
             "edges": []
         }
 
-        is_valid, errors = validate_standard_format(standard)
+        node_info = {"NodeA": {"input": {"required": {}, "optional": {}}, "output": []}}
+        is_valid, errors = validate_standard_format(standard, node_info=node_info)
         error_list = [e for e in errors if not e.startswith("Warning:")]
         assert len(error_list) == 0
 
