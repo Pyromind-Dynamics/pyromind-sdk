@@ -1233,7 +1233,6 @@ class ProfileStorageInfoResponse(BaseModel):
     bucket_name: Optional[str] = None
     credentials_masked: bool = True
     has_credentials: bool = False
-    cleanup_pending_clusters: List[str] = Field(default_factory=list)
 
 
 class ProfileUserClustersResponse(BaseModel):

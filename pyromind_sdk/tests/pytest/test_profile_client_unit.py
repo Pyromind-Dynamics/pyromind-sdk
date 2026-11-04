@@ -37,7 +37,6 @@ def test_reset_storage_credentials_returns_the_pair_once():
                 "bucket_name": "10000042",
                 "credentials_masked": False,
                 "has_credentials": True,
-                "cleanup_pending_clusters": ["cn-east-1"],
             },
         }
     )
@@ -49,6 +48,5 @@ def test_reset_storage_credentials_returns_the_pair_once():
         assert credentials.access_key == "NEW_STORAGE_ACCESS_KEY"
         assert credentials.secret_key == "new-storage-secret"
         assert credentials.credentials_masked is False
-        assert credentials.cleanup_pending_clusters == ["cn-east-1"]
     finally:
         client.close()
