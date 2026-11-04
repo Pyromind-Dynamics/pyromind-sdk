@@ -264,7 +264,7 @@ def test_username_password_beats_dockerconfig(monkeypatch: pytest.MonkeyPatch, t
 
     _clear(monkeypatch)
     path = tmp_path / "config.json"
-    path.write_text(json.dumps({"auths": {"docker.io": {"auth": "ZnJvbS1maWxl"}}}), encoding="utf-8")
+    path.write_text(json.dumps({"auths": {"docker.io": {"auth": "not-a-real-auth"}}}), encoding="utf-8")
     monkeypatch.setenv("DOCKER_RT_REGISTRY_CLUSTER", "us-west-2")
     monkeypatch.setenv("DOCKER_RT_REGISTRY_DOCKERCONFIG", str(path))
     monkeypatch.setenv("DOCKER_RT_REGISTRY_USERNAME", "my-user")
@@ -272,7 +272,7 @@ def test_username_password_beats_dockerconfig(monkeypatch: pytest.MonkeyPatch, t
     assert registry_push.credential_source() == "username_password"
     decoded = json.loads(base64.b64decode(registry_push.docker_config_b64("docker.io/my-user")))
     assert decoded["auths"]["docker.io"]["auth"] == base64.b64encode(b"my-user:pat").decode()
-    assert "ZnJvbS1maWxl" not in json.dumps(decoded)
+    assert "not-a-real-auth" not in json.dumps(decoded)
 
 
 def test_docker_config_auths_are_objects_not_strings(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -22,6 +22,10 @@ ENV/
 .DS_Store
 # Ignore all hidden files
 .*
+# ...except repository automation/config that must be committed
+!.gitleaks.toml
+!.github/
+!.github/**
 
 # Testing
 .pytest_cache/
