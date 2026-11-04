@@ -8,6 +8,7 @@ import asyncio
 import logging
 from typing import List, Dict, Any, Optional
 from .async_base import PyroMindAsyncClient
+from ._node_logs import build_node_logs_request, extract_node_logs
 from .models import (
     TrainingTaskCreateRequest,
     TrainingTaskCreateResponse,
@@ -135,6 +136,41 @@ class AsyncStudioClient(PyroMindAsyncClient):
             return None
 
         return data if isinstance(data, dict) else None
+
+    async def get_node_logs(self, task_id: str, node_id: str) -> List[str]:
+        """Get the log lines for a node in a studio task (async).
+
+        Args:
+            task_id: ID of the studio task.
+            node_id: Database ID or node code of the node.
+
+        Returns:
+            Log lines for the node, or an empty list when no logs are available.
+        """
+        endpoint, _ = build_node_logs_request(task_id, node_id)
+        response = await self.get(endpoint)
+        return extract_node_logs(self._extract_data(response))
+
+    async def scroll_node_logs(
+        self,
+        task_id: str,
+        node_id: str,
+        timestamp: Optional[str] = None,
+        expect_count: int = 500,
+    ) -> List[str]:
+        """Read the next bounded chunk of node logs (async).
+
+        The backend supports forward scrolling only. ``expect_count`` must be
+        between 1 and 5,000 (default 500).
+        """
+        endpoint, params = build_node_logs_request(
+            task_id,
+            node_id,
+            timestamp=timestamp,
+            expect_count=expect_count,
+        )
+        response = await self.get(endpoint, params=params)
+        return extract_node_logs(self._extract_data(response))
 
     async def get_node_info(self, names: Optional[str] = None) -> Dict[str, Any]:
         """

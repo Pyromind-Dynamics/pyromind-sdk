@@ -83,6 +83,17 @@ client.storage.transfers.cancel(created.id)
 Use `client.storage.transfers.list_page()`, `delete()`, and `clear_finished()`
 to manage and monitor tasks. `client.storage.transfer` is the singular alias.
 The async client exposes the same resource as `client.storage.transfers`.
+`submit()` sends one request to Portal. Portal authenticates the API key,
+checks access to both clusters and activation of `cluster`, `studio`, and
+`storage`, then forwards the task creation to the source cluster. The user's
+key is not sent to the target cluster for these checks. If access or a required
+service is missing, Portal rejects the request before creating a transfer task.
+Use the Portal API base URL for the environment you are using. The SDK defaults
+to the standard Portal endpoint; set `base_url` or `PYROMIND_BASE_URL` when
+using a different Portal environment.
+For a single file, `target_path` may be either the destination directory or the
+full destination file path without a trailing slash when its basename matches
+the source filename.
 
 ## Sandboxes（⚠️desperate can not create）
 
@@ -485,6 +496,36 @@ The output format is:
 }
 ```
 
+### Get node logs
+
+```python
+# Fetch the available log lines for a node (node ID or node code)
+logs = client.studio.get_node_logs(task_id="task-id", node_id="node-id")
+for line in logs:
+    print(line)
+```
+
+`get_node_logs()` returns currently available logs, capped at 62,000 lines by
+the server. For smaller responses or repeated reads, use the bounded scroll
+method below.
+
+To use the existing Studio scroll behavior directly, call `scroll_node_logs()`:
+
+```python
+logs = client.studio.scroll_node_logs(
+    task_id="task-id",
+    node_id="node-id",
+    timestamp="2026-10-22T00:00:00Z",
+    expect_count=500,
+)
+```
+
+This method reads forward from the supplied timestamp and returns raw log lines.
+The server accepts 1 to 5,000 lines per request (default 500); it advances a
+supplied timestamp by one second before querying. This is the existing
+timestamp-based scroll behavior, not a lossless pagination cursor; logs in the
+skipped second may be missed.
+
 ### Get node info
 
 ```python
@@ -764,6 +805,13 @@ print(f"UID: {user_info.user.uid}")
 user_info_with_credit = profile_client.get_user_info(credit_info=True)
 print(f"Credit Amount: {user_info_with_credit.user.credit_amount}")
 print(f"Cash Balance: {user_info_with_credit.user.cash_balance}")
+```
+
+### Get enabled clusters
+
+```python
+clusters = profile_client.get_user_clusters()
+print(clusters)  # e.g. ["us-west-1", "us-west-3"]
 ```
 
 ### Get access key

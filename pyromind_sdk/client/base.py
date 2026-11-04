@@ -73,6 +73,15 @@ CLUSTER_RESOURCE = {
             "dev": "localhost:18080",
         },
     },
+    "us-west-3": {
+        "http": {
+            "prod": "https://api-us-west-3.pyromind.ai",
+            "pre": "https://pre-api-us-west-3.pyromind.ai",
+            "pre2": "https://pre2-api-us-west-3.pyromind.ai",
+            "dev": "http://localhost:8003",
+        },
+        "storage": "https://storage-us-west-3.pyromind.ai",
+    },
     "cn-east-1": {
         "http": {
             "prod": "https://api-cn-east-1.pyromind-asia.cn",
