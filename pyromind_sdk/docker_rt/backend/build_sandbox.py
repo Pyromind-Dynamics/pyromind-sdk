@@ -1365,6 +1365,11 @@ async def build_in_sandbox(
     for warning in registry_push.unknown_env_warnings():
         yield {"stream": f"warning: {warning}\n"}
 
+    # 先做环境变量体检：拼错的变量常常就是下面那些"缺失 / 跳过"告警的真正原因，
+    # 所以它必须排在它们**前面**（2026-10-09 用户 `DOCKER_RT_ACR_SECRET` → 建仓被跳过）。
+    for warning in registry_push.unknown_env_warnings():
+        yield {"stream": f"warning: {warning}\n"}
+
     # Create any ACR repository *before* spending a sandbox.
     try:
         ensured = registry_push.ensure_repositories(destinations)
