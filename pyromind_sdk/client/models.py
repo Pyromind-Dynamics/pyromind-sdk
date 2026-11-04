@@ -1241,6 +1241,12 @@ class ProfileUserClustersResponse(BaseModel):
     clusters: List[str] = Field(default_factory=list)
 
 
+class ProfileUserClustersResponse(BaseModel):
+    """Cluster codes enabled for the authenticated user."""
+
+    clusters: List[str] = Field(default_factory=list)
+
+
 class UserPubKeyRequest(BaseModel):
     """User public key request model"""
     name: Optional[str] = None

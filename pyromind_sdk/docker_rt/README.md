@@ -19,15 +19,6 @@ export PYROMIND_CLUSTER="<your enabled cluster>"
 
 Selectable clusters are the ones already enabled for your account — refer to the platform for the exact list. The API key and cluster can also be entered interactively on first start.
 
-`docker build` stages its build context through Storage. For build-context staging, also configure the Storage credentials separately:
-
-```bash
-export PYROMIND_STORAGE_ACCESS_KEY="your-storage-access-key"
-export PYROMIND_STORAGE_SECRET_KEY="your-storage-secret-key"
-```
-
-Retrieve a new pair with `ProfileClient.reset_storage_credentials()` and store it securely. `get_storage_info()` returns masked credentials; the API key remains only for PyroMind API authentication.
-
 ```bash
 docker-rt              # foreground
 docker-rt --daemon     # background
@@ -163,8 +154,6 @@ Only the PyroMind-specific variables you **must** know to use builds and pushes 
 | `PYROMIND_API_KEY` | Prompted if missing | PyroMind API credential. |
 | `PYROMIND_CLUSTER` | Prompted if missing | Target cluster (one enabled for your account). |
 | `PYROMIND_BASE_URL` | Resolved from cluster | Explicit API endpoint override. |
-| `PYROMIND_STORAGE_ACCESS_KEY` | Required for build-context staging | Storage/S3 Access Key; obtain it from the one-time reset response. |
-| `PYROMIND_STORAGE_SECRET_KEY` | Required for build-context staging | Storage/S3 Secret Key; save it with the corresponding Access Key. |
 
 ### Build and push
 

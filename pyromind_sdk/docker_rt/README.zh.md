@@ -19,15 +19,6 @@ export PYROMIND_CLUSTER="<已开通的集群>"
 
 可选集群为你账号下已开通的集群，具体以平台侧为准；首次启动时也可以交互输入 API Key 与集群。
 
-`docker build` 会通过 Storage 中转构建上下文。使用构建上下文中转时，还需单独配置 Storage 凭证：
-
-```bash
-export PYROMIND_STORAGE_ACCESS_KEY="your-storage-access-key"
-export PYROMIND_STORAGE_SECRET_KEY="your-storage-secret-key"
-```
-
-可通过 `ProfileClient.reset_storage_credentials()` 获取一组新凭证并安全保存。`get_storage_info()` 返回脱敏凭证；API Key 仅用于 PyroMind API 鉴权。
-
 ```bash
 docker-rt              # 前台运行
 docker-rt --daemon     # 后台运行
@@ -163,8 +154,6 @@ docker build -t myapp:dev .
 | `PYROMIND_API_KEY` | 未设置时提示输入 | PyroMind API 凭据。 |
 | `PYROMIND_CLUSTER` | 未设置时提示输入 | 目标集群（你账号下已开通的集群）。 |
 | `PYROMIND_BASE_URL` | 根据集群解析 | 显式指定 API 地址。 |
-| `PYROMIND_STORAGE_ACCESS_KEY` | 构建上下文中转时必需 | Storage/S3 Access Key；从仅返回一次的重置响应获取。 |
-| `PYROMIND_STORAGE_SECRET_KEY` | 构建上下文中转时必需 | 对应的 Storage/S3 Secret Key；与 Access Key 一同安全保存。 |
 
 ### 构建与推送
 
