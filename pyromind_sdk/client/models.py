@@ -1225,11 +1225,15 @@ class ProfileAccessKeyResponse(BaseModel):
 
 
 class ProfileStorageInfoResponse(BaseModel):
-    """Profile storage info response model"""
-    access_key: str
+    """Storage credentials; ordinary info reads return masked values."""
+    access_key: Optional[str] = None
     secret_key: Optional[str] = None
     url: Optional[str] = None
     uid: Optional[str] = None
+    bucket_name: Optional[str] = None
+    credentials_masked: bool = True
+    has_credentials: bool = False
+    cleanup_pending_clusters: List[str] = Field(default_factory=list)
 
 
 class ProfileUserClustersResponse(BaseModel):

@@ -372,6 +372,10 @@ def connect_storage(cluster: str | None = None) -> tuple[Any, str]:
 
     Raises :class:`StagingError` when the client or the credentials are
     unavailable, or when the bucket cannot be determined.
+
+    The Storage client reads ``PYROMIND_STORAGE_ACCESS_KEY`` and
+    ``PYROMIND_STORAGE_SECRET_KEY`` from the environment. ``/storage_info``
+    supplies bucket metadata only; its credential fields are masked.
     """
     try:
         from ...client.profile import ProfileClient
@@ -382,8 +386,6 @@ def connect_storage(cluster: str | None = None) -> tuple[Any, str]:
         info = ProfileClient(cluster=cluster).get_storage_info()
         storage = StorageClient(
             endpoint=getattr(info, "url", None),
-            access_key=info.access_key,
-            secret_key=info.secret_key,
             cluster=cluster,
         )
     except Exception as exc:  # noqa: BLE001

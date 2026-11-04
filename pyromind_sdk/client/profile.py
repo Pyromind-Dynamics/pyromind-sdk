@@ -60,12 +60,22 @@ class ProfileClient(PyroMindClient):
 
     def get_storage_info(self) -> ProfileStorageInfoResponse:
         """
-        Get the authenticated user's storage credentials
+        Get the authenticated user's masked storage credentials.
 
         Returns:
-            ProfileStorageInfoResponse object
+            ProfileStorageInfoResponse with masked Access Key and Secret Key.
         """
         response = self.post("/storage_info")
+        data = self._extract_data(response)
+        return ProfileStorageInfoResponse(**data)
+
+    def reset_storage_credentials(self) -> ProfileStorageInfoResponse:
+        """Rotate both Storage keys and return the new pair once.
+
+        Save the returned credentials securely. Ordinary ``get_storage_info``
+        calls remain masked and cannot retrieve this pair again.
+        """
+        response = self.post("/storage_credentials/reset")
         data = self._extract_data(response)
         return ProfileStorageInfoResponse(**data)
 
