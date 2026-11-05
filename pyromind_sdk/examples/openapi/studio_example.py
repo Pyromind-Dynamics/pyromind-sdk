@@ -515,8 +515,8 @@ def parse_workflow_graph(workflow: dict) -> Tuple[Dict, Dict]:
         if not node_id:
             continue
 
-        node_type = node.get("type", "Unknown")
         data = node.get("data", {})
+        node_type = data.get("nodeType", "Unknown")
         node_def = data.get("nodeDefinition") or {}
 
         name = data.get("label", node_type)
@@ -586,9 +586,7 @@ def print_node_io(node_info: dict) -> None:
         for out in outputs:
             out_name = out.get("name", "unnamed")
             out_type = out.get("type", "unknown")
-            links = out.get("links")
-            link_count = len(links) if links else 0
-            print(f"      - {out_name} ({out_type}) [connected to {link_count} node(s)]")
+            print(f"      - {out_name} ({out_type})")
     else:
         print("    Outputs: None")
 

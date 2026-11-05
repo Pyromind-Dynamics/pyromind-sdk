@@ -194,10 +194,32 @@ def test_incompatible_connected_types_are_rejected(validator: Callable) -> None:
     assert any("Type mismatch" in error for error in errors)
 
 
+def test_distinct_model_types_are_not_interchangeable(validator: Callable) -> None:
+    node_info = {
+        "VaeSource": {"input": {}, "output": ["VAE"], "output_name": ["vae"]},
+        "ModelSink": {"input": {"required": {"model": ["MODEL"]}}, "output": []},
+    }
+    workflow = {
+        "id": "workflow",
+        "nodes": [
+            {"id": "one", "data": {"nodeType": "VaeSource", "config": {}}},
+            {"id": "two", "data": {"nodeType": "ModelSink", "config": {}}},
+        ],
+        "edges": [{
+            "source": "one", "sourceHandle": "vae",
+            "target": "two", "targetHandle": "model",
+        }],
+    }
+
+    valid, errors = validator(workflow, node_info=node_info)
+
+    assert not valid
+    assert any("Type mismatch" in error for error in errors)
+
+
 def test_client_output_metadata_cannot_authorize_a_forged_port(validator: Callable) -> None:
     workflow = _connected_workflow()
     source = workflow["nodes"][0]
-    source["outputs"] = [{"name": "forged_handle", "type": "STRING", "links": []}]
     source["data"]["nodeDefinition"] = {"output_name": ["forged_handle"], "output": ["STRING"]}
     workflow["edges"][0]["sourceHandle"] = "forged_handle"
 
@@ -320,17 +342,31 @@ def test_primitive_falsey_values_are_valid(validator: Callable, value: int | boo
     assert valid, errors
 
 
-@pytest.mark.parametrize("inputs", [None, 1, "invalid"])
-def test_malformed_optional_input_metadata_returns_errors(
-    validator: Callable, inputs: Any,
+@pytest.mark.parametrize("field,value", [
+    ("inputs", [{"name": "anything", "type": "*"}]),
+    ("outputs", [{"name": "string", "type": "STRING"}]),
+    ("inputs", None),
+])
+def test_old_node_level_port_fields_are_rejected(
+    validator: Callable, field: str, value: Any,
 ) -> None:
     workflow = _from_dsl('first = AnythingToString(id="one", anything="sdk-readonly-check")')
-    workflow["nodes"][0]["inputs"] = inputs
+    workflow["nodes"][0][field] = value
 
     valid, errors = validator(workflow, node_info=NODE_INFO)
 
     assert not valid
-    assert any("'inputs' must be a list" in error for error in errors)
+    assert any(f"'{field}' is not supported in Xyflow" in error for error in errors)
+
+
+def test_old_workflow_links_are_rejected(validator: Callable) -> None:
+    workflow = _from_dsl('first = AnythingToString(id="one", anything="value")')
+    workflow["links"] = []
+
+    valid, errors = validator(workflow, node_info=NODE_INFO)
+
+    assert not valid
+    assert any("'links' is not supported in Xyflow" in error for error in errors)
 
 
 def test_dynamic_string_edge_overrides_stale_enum_config(validator: Callable) -> None:
