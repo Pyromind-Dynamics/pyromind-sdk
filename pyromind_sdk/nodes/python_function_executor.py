@@ -325,9 +325,11 @@ def build_command_template(
         "-i https://test.pypi.org/simple/ pyromind-sdk==0.1.15.dev10 -q"
     )
     bash_commands.append(
-        f"{python_exec} -m pip install --ignore-installed --no-cache-dir "
-        '--target "$input_dir/.pyromind-sdk-runtime" '
-        '-i https://pypi.org/simple/ "$input_dir/.pyromind-sdk-wheel/"*.whl -q'
+        f"{python_exec} -c \"import pyromind_sdk\" 2>/dev/null || "
+        f"{python_exec} -m pip install pyromind-sdk -q"
+        # f"{python_exec} -m pip install --ignore-installed --no-cache-dir "
+        # '--target "$input_dir/.pyromind-sdk-runtime" '
+        # '-i https://pypi.org/simple/ "$input_dir/.pyromind-sdk-wheel/"*.whl -q'
     )
     bash_commands.append(
         'export PYTHONPATH="$input_dir/.pyromind-sdk-runtime${PYTHONPATH:+:$PYTHONPATH}"'
