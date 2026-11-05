@@ -97,9 +97,19 @@ def test_parallel_commands_install_sdk_into_separate_private_directories(tmp_pat
         "from pathlib import Path\n"
         "args = sys.argv[1:]\n"
         "def value(flag): return args[args.index(flag) + 1]\n"
-        "if args[:2] == ['-m', 'pip']:\n"
+        "if args[:3] == ['-m', 'pip', 'download']:\n"
         "    assert '--no-deps' in args\n"
+        "    assert value('-i') == 'https://test.pypi.org/simple/'\n"
+        "    destination = Path(value('--dest'))\n"
+        "    destination.mkdir(parents=True)\n"
+        "    (destination / 'pyromind_sdk-0.1.15.dev10-py3-none-any.whl').touch()\n"
+        "elif args[:3] == ['-m', 'pip', 'install']:\n"
+        "    assert '--no-deps' not in args\n"
+        "    assert value('-i') == 'https://pypi.org/simple/'\n"
         "    target = Path(value('--target'))\n"
+        "    wheels = [Path(arg) for arg in args if arg.endswith('.whl')]\n"
+        "    assert len(wheels) == 1 and wheels[0].is_file()\n"
+        "    assert wheels[0].parent.parent == target.parent\n"
         "    target.mkdir(parents=True)\n"
         "    (target / 'installed').touch()\n"
         "else:\n"
@@ -253,7 +263,8 @@ def test_build_command_template_accelerate_mode_uses_accelerate_config_input(tmp
     )
 
     script = command_template[2]
-    assert "python3 -m pip install --no-deps" in script
+    assert "python3 -m pip download --no-deps" in script
+    assert "python3 -m pip install --ignore-installed" in script
     assert script.index("pip install") < script.index("accelerate launch")
     assert 'accelerate launch --config_file "$input_dir/accelerate_config"' in script
     assert 'printf "%s" "${2}" > "$input_dir/accelerate_config"' in script

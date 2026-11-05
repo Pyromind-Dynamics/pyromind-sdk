@@ -18,12 +18,13 @@ Usage Examples:
     # Convert lite to Xyflow format (without auto layout, preserves [0,0] positions)
     python workflow_cli.py convert --to-standard --no-auto-layout workflow.lite.json output.json
 
-    # Validate a workflow (auto-detects format)
+    # Validate a workflow (Xyflow executable nodes fetch definitions automatically)
+    # Configure PYROMIND_API_KEY and PYROMIND_CLUSTER for API access.
     python workflow_cli.py validate workflow.json
     python workflow_cli.py validate workflow.lite.json
 
-    # Validate with node_info for enhanced checks (validates node definitions)
-    python workflow_cli.py validate --with-node-info workflow.json
+    # Fetch node definitions for additional lite validation
+    python workflow_cli.py validate --with-node-info workflow.lite.json
 
     # Convert with node info from API (better parameter mapping)
     python workflow_cli.py convert --with-node-info workflow.json output.lite.json
@@ -55,14 +56,14 @@ def fetch_node_info() -> Dict[str, Any]:
     """
     try:
         print("Fetching node info from API...")
-        client = PyroMindAPIClient()
-        node_info = client.studio.get_node_info()
+        with PyroMindAPIClient() as client:
+            node_info = client.studio.get_node_info()
+        if not isinstance(node_info, dict):
+            raise ValueError("Node definitions must be a dictionary")
         print(f"✓ Loaded {len(node_info)} node definitions")
-        client.close()
         return node_info
     except Exception as e:
         print(f"⚠ Warning: Failed to fetch node info: {e}")
-        print("Continuing with generic parameter extraction...")
         return {}
 
 
@@ -81,11 +82,11 @@ Examples:
   # Convert to Xyflow format without auto layout
   python workflow_cli.py convert --to-standard --no-auto-layout workflow.lite.json output.json
 
-  # Validate workflow (auto-detects format)
+  # Validate Xyflow (fetches definitions using PYROMIND_API_KEY/PYROMIND_CLUSTER)
   python workflow_cli.py validate workflow.json
 
-  # Validate workflow with node_info for enhanced checks
-  python workflow_cli.py validate --with-node-info workflow.json
+  # Validate lite workflow with node definitions for enhanced checks
+  python workflow_cli.py validate --with-node-info workflow.lite.json
 
   # Convert with accurate parameter mapping using API
   python workflow_cli.py convert --with-node-info workflow.json output.lite.json
@@ -114,7 +115,7 @@ Examples:
     parser.add_argument(
         "--with-node-info",
         action="store_true",
-        help="Fetch node info from API for accurate parameter mapping and enhanced validation"
+        help="Fetch node info for conversion or lite validation (automatic for executable Xyflow nodes)"
     )
     parser.add_argument(
         "--auto-layout",
@@ -148,17 +149,30 @@ Examples:
         print(f"✗ Error: Failed to read input file: {e}")
         sys.exit(1)
 
+    if not isinstance(data, dict):
+        print("✗ Error: Workflow must be a JSON object")
+        sys.exit(1)
+
     # Handle validate command
     if args.command == "validate":
         nodes = data.get("nodes", [])
         is_lite_format = isinstance(nodes, dict)
 
-        # Fetch node_info if requested
+        # Executable Xyflow nodes require authoritative definitions.
+        requires_node_info = isinstance(nodes, list) and any(
+            isinstance(node, dict)
+            and isinstance(node.get("data"), dict)
+            and isinstance(node["data"].get("nodeType"), str)
+            and node["data"]["nodeType"] not in ("", "PrimitiveNode")
+            for node in nodes
+        )
         node_info = None
-        if args.with_node_info:
+        if args.with_node_info or requires_node_info:
             node_info = fetch_node_info()
-            if node_info:
-                print(f"✓ Using node_info for enhanced validation ({len(node_info)} node types)")
+            if not node_info:
+                print("✗ Error: Node definitions are required for this validation and could not be loaded")
+                sys.exit(1)
+            print(f"✓ Using node_info for validation ({len(node_info)} node types)")
 
         if is_lite_format:
             is_valid, errors = validate_lite_format(data, node_info=node_info)
@@ -188,20 +202,20 @@ Examples:
                 print("\n✓ Validation passed")
 
                 # Suggest using --with-node-info for enhanced validation
-                if not node_info:
+                if is_lite_format and not node_info:
                     print("\n💡 Tip: Use --with-node-info for enhanced validation")
                     print("   This will check parameter values against node definitions")
-                    print("   Example: python workflow_cli.py validate --with-node-info workflow.json")
+                    print("   Example: python workflow_cli.py validate --with-node-info workflow.lite.json")
 
             elif not error_list:
                 # Has warnings but no errors - validation passed with warnings
                 print(f"\n✓ Validation passed (with {len(warning_list)} warning(s))")
 
                 # Suggest using --with-node-info for enhanced validation
-                if not node_info:
+                if is_lite_format and not node_info:
                     print("\n💡 Tip: Use --with-node-info for enhanced validation")
                     print("   This will check parameter values against node definitions")
-                    print("   Example: python workflow_cli.py validate --with-node-info workflow.json")
+                    print("   Example: python workflow_cli.py validate --with-node-info workflow.lite.json")
 
             else:
                 # Has errors - validation failed
@@ -221,6 +235,8 @@ Examples:
         node_info = None
         if args.with_node_info:
             node_info = fetch_node_info()
+            if not node_info:
+                print("Continuing with generic parameter extraction...")
 
         # Create converter with auto_layout setting
         converter = WorkflowLiteConverter(
