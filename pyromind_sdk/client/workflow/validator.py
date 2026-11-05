@@ -12,7 +12,7 @@ Validation includes:
 
 import logging
 import uuid
-from typing import Dict, List, Any, Tuple, Optional
+from typing import Dict, List, Any, Tuple, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +91,10 @@ def validate_workflow(
     3. Link validation
     4. Type compatibility validation
 
+    Current Xyflow nodes supply values through data.config and edges. Input
+    and output port arrays do not need to be repeated in the workflow;
+    node_info supplies the authoritative port definitions.
+
     Args:
         workflow: Workflow JSON dictionary in standard format
         client: PyroMindAPIClient instance (optional, for fetching node_info)
@@ -138,7 +142,8 @@ def validate_workflow(
         return False, errors
 
     # Step 3: Node validation
-    node_errors = _validate_nodes(nodes, node_map, node_info)
+    input_bindings = _xyflow_input_bindings(edges, node_map, node_info or {})
+    node_errors = _validate_nodes(nodes, node_map, node_info, input_bindings=input_bindings)
     errors.extend(node_errors)
 
     # Step 4: Edge/link validation
@@ -154,15 +159,10 @@ def validate_workflow(
         type_errors = _validate_type_compatibility(workflow, node_map, link_map, node_info)
         errors.extend(type_errors)
         
-        # Validate config/widgets_values against node_info
-        if edges:
-            for node in nodes:
-                order_errors = _validate_xyflow_config(node, node_info)
-                errors.extend(order_errors)
-        else:
-            for node in nodes:
-                order_errors = _validate_widgets_values_order(node, node_info)
-                errors.extend(order_errors)
+        for node in nodes:
+            errors.extend(_validate_xyflow_config(
+                node, node_info, input_bindings.get(str(node.get("id")), {}), node_map
+            ))
 
     # Step 6: Business logic validation
     business_errors = _validate_business_logic(workflow, node_map, link_map)
@@ -188,7 +188,7 @@ def validate_lite_format(
 
     Args:
         data: Workflow dictionary in lite format
-        node_info: Optional node information for type validation
+        node_info: Authoritative node definitions, or fetched using client
         strict: If True, raise exception on first error
 
     Returns:
@@ -334,6 +334,7 @@ def validate_standard_format(
         strict: If True, raise exception on first error
         exclude_string_types: If True, ignore STRING when a type union has
             more specific non-STRING members.
+        client: Optional SDK client for fetching node definitions
 
     Returns:
         Tuple of (is_valid, error_messages)
@@ -366,7 +367,8 @@ def validate_standard_format(
         return False, errors
 
     # Step 3: Node validation
-    node_errors = _validate_nodes(nodes, node_map, node_info)
+    input_bindings = _xyflow_input_bindings(data.get("edges", []), node_map, node_info or {})
+    node_errors = _validate_nodes(nodes, node_map, node_info, input_bindings=input_bindings)
     errors.extend(node_errors)
 
     # Step 4: Edge validation
@@ -384,15 +386,10 @@ def validate_standard_format(
         )
         errors.extend(type_errors)
         
-        # Validate config/widgets_values against node_info
         for node in nodes:
-            node_data = node.get("data")
-            if isinstance(node_data, dict) and node_data.get("config"):
-                config_errors = _validate_xyflow_config(node, node_info)
-                errors.extend(config_errors)
-            if node.get("widgets_values"):
-                order_errors = _validate_widgets_values_order(node, node_info)
-                errors.extend(order_errors)
+            errors.extend(_validate_xyflow_config(
+                node, node_info, input_bindings.get(str(node.get("id")), {}), node_map
+            ))
 
     # Step 6: Business logic validation
     business_errors = _validate_business_logic(data, node_map, link_map)
@@ -479,9 +476,40 @@ def _validate_standard_schema(data: Dict[str, Any]) -> List[str]:
 # Node Validation
 # ============================================================================
 
-def _validate_nodes(nodes: List[Dict], node_map: Dict[str, Dict], node_info: Optional[Dict] = None) -> List[str]:
-    """Validate nodes structure and content (supports xyflow and legacy formats)."""
+def _xyflow_input_bindings(
+    edges: List[Dict], node_map: Dict[str, Dict], node_info: Dict
+) -> Dict[str, Dict[str, Dict]]:
+    """Collect bindings only from edges whose endpoints and ports exist."""
+    connected: Dict[str, Dict[str, Dict]] = {}
+    if not isinstance(edges, list):
+        return connected  # Schema validation reports the malformed field.
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        source_id = str(edge.get("source", ""))
+        target_id = str(edge.get("target", ""))
+        if source_id not in node_map or target_id not in node_map:
+            continue
+        source_type = _standard_node_type(node_map[source_id])
+        target_type = _standard_node_type(node_map[target_id])
+        source_handle = edge.get("sourceHandle", "0")
+        target_handle = edge.get("targetHandle")
+        if (
+            isinstance(target_handle, str)
+            and _get_node_input_type(target_type, target_handle, node_info) is not None
+            and _get_node_output_type_by_name(source_type, source_handle, node_info) is not None
+        ):
+            connected.setdefault(target_id, {})[target_handle] = edge
+    return connected
+
+
+def _validate_nodes(
+    nodes: List[Dict], node_map: Dict[str, Dict], node_info: Optional[Dict] = None,
+    input_bindings: Optional[Dict[str, Dict[str, Dict]]] = None,
+) -> List[str]:
+    """Validate current Xyflow nodes against authoritative definitions."""
     errors = []
+    input_bindings = input_bindings or {}
 
     for node in nodes:
         node_id = node.get("id")
@@ -518,6 +546,10 @@ def _validate_nodes(nodes: List[Dict], node_map: Dict[str, Dict], node_info: Opt
             config = data["config"]
             if not isinstance(config, dict):
                 errors.append(f"Node {node_id} 'data.config' must be a dict, got {type(config).__name__}")
+        if xyflow_node_type == "PrimitiveNode" and isinstance(data.get("config", {}), dict):
+            value = data.get("config", {}).get("value")
+            if value is None or value == "":
+                errors.append(f"PrimitiveNode {node_id}: value is required and cannot be empty")
 
         # Validate inputs (legacy format)
         if "inputs" in node:
@@ -567,7 +599,9 @@ def _validate_nodes(nodes: List[Dict], node_map: Dict[str, Dict], node_info: Opt
         
         # Validate node definition against node_info (if available)
         if node_info and _standard_node_type(node):
-            definition_errors = _validate_standard_node_definition(node_id, node, node_info)
+            definition_errors = _validate_standard_node_definition(
+                node_id, node, node_info, set(input_bindings.get(str(node_id), {}))
+            )
             errors.extend(definition_errors)
 
     return errors
@@ -771,7 +805,9 @@ def _validate_widgets_values_order(
 
 def _validate_xyflow_config(
     node: Dict,
-    node_info: Optional[Dict] = None
+    node_info: Optional[Dict] = None,
+    input_bindings: Optional[Dict[str, Dict]] = None,
+    node_map: Optional[Dict[str, Dict]] = None,
 ) -> List[str]:
     """
     Validate xyflow node data.config against node_info.
@@ -801,11 +837,17 @@ def _validate_xyflow_config(
     if not isinstance(config, dict):
         # Structural errors are collected by _validate_nodes.
         return errors
-    if not config:
-        # Also try legacy widgets_values
-        if "widgets_values" in node:
-            return _validate_widgets_values_order(node, node_info)
-        return errors
+    config = dict(config)
+    # Match execution: edges override config; primitive edges inline a static
+    # value, while other edges provide a dynamic value checked by edge types.
+    for param_name, edge in (input_bindings or {}).items():
+        source = (node_map or {}).get(str(edge.get("source")), {})
+        if _standard_node_type(source) == "PrimitiveNode":
+            source_config = source.get("data", {}).get("config", {})
+            if isinstance(source_config, dict):
+                config[param_name] = source_config.get("value")
+        else:
+            config.pop(param_name, None)
 
     node_def = node_info[node_type]
     input_defs = node_def.get("input", {})
@@ -816,16 +858,14 @@ def _validate_xyflow_config(
     for param_name, param_value in config.items():
         if param_name in all_params:
             param_def = all_params[param_name]
-            param_type, min_val, max_val, allowed_vals = _get_param_type_info(param_def)
+            errors.extend(_validate_parameter_constraints(
+                param_value, param_def, str(node.get("id")), node_type, param_name
+            ))
 
-            if allowed_vals and isinstance(param_value, str):
-                if param_value not in allowed_vals:
-                    errors.append(
-                        f"Node {node.get('id')} config param '{param_name}' value '{param_value}' "
-                        f"not in allowed values: {allowed_vals}"
-                    )
+    return errors
 
-    return errors# ============================================================================
+
+# ============================================================================
 # Link Validation
 # ============================================================================
 
@@ -986,14 +1026,15 @@ def _validate_lite_node_definition(
 def _validate_standard_node_definition(
     node_id: int,
     node: Dict,
-    node_info: Dict
+    node_info: Dict,
+    connected_inputs: Optional[Set[str]] = None,
 ) -> List[str]:
     """
     Validate node definition against node_info for standard format.
 
     Checks:
     1. Node type exists in node_info
-    2. Required parameters are present (in inputs array or widgets_values)
+    2. Required parameters are supplied by config or valid Xyflow edges
     3. Input parameters exist in node_info
     4. Output names match node_info (if defined)
 
@@ -1001,6 +1042,7 @@ def _validate_standard_node_definition(
         node_id: Node ID
         node: Node dictionary
         node_info: Node information dictionary
+        connected_inputs: Input names supplied by valid incoming Xyflow edges
 
     Returns:
         List of error messages
@@ -1043,28 +1085,17 @@ def _validate_standard_node_definition(
 
     # Get node inputs (from inputs array)
     inputs_array = node.get("inputs", [])
-    node_input_names = set()
-    for inp in inputs_array:
-        if isinstance(inp, dict) and "name" in inp:
-            node_input_names.add(inp["name"])
+    if not isinstance(inputs_array, list):
+        inputs_array = []  # Structural errors were collected by _validate_nodes.
 
-    # Get parameters from legacy widgets_values
-    widgets_values_params = set()
-    if node.get("widgets_values"):
-        widgets_values_params = set(_get_widgets_values_param_order(node_type, node, node_info))
-
-    # Check required parameters are present
-    # A required parameter is present if it's either:
-    # 1. In the inputs array (has connection), OR
-    # 2. In xyflow config (no connection, direct value), OR
-    # 3. In widgets_values (legacy format)
+    # Current Xyflow supplies values through config and edges. Display metadata
+    # in legacy inputs/widgets_values does not supply an executable binding.
+    supplied_params = config_params | (connected_inputs or set())
     for param_name in required_params.keys():
-        if param_name in config_params:
-            continue
-        if param_name not in node_input_names and param_name not in widgets_values_params:
+        if param_name not in supplied_params:
             errors.append(
                 f"Node {node_id} (type '{node_type}') is missing required parameter '{param_name}' "
-                f"(not found in inputs array, widgets_values, or config)"
+                f"(not found in config or incoming edges)"
             )
 
     # Check that all input parameters exist in node_info and validate types
@@ -1090,25 +1121,31 @@ def _validate_standard_node_definition(
                         f"but node_info expects type '{expected_type}' (types are not compatible)"
                     )
 
-            # Validate parameter value constraints
-            param_def = all_params[input_name]
-            value_errors = _validate_parameter_value(
-                node_id, node_type, input_name, param_def, node, node_info
-            )
-            errors.extend(value_errors)
 
-    # Validate output names (xyflow: nodeDefinition; legacy: outputs array)
+    # Output ports come from node_info. Optional client metadata may be checked
+    # for consistency, but is never required or used to authorize an edge.
     node_definition = data.get("nodeDefinition", {})
+    if not isinstance(node_definition, dict):
+        errors.append(f"Node {node_id} 'data.nodeDefinition' must be a dict")
+        node_definition = {}
     outputs_array = node.get("outputs", [])
-    if node_definition:
-        node_output_names = node_definition.get("output_name", [])
-    else:
+    if "output_name" in node_definition:
+        node_output_names = node_definition["output_name"]
+    elif "outputs" in node and isinstance(outputs_array, list):
         node_output_names = [out.get("name") for out in outputs_array if isinstance(out, dict) and "name" in out]
+    else:
+        node_output_names = node_def.get("output_name", [])
+    if not isinstance(node_output_names, (list, tuple)):
+        errors.append(f"Node {node_id} 'data.nodeDefinition.output_name' must be a list")
+        node_output_names = node_def.get("output_name", [])
     errors.extend(_validate_node_outputs(str(node_id), node_type, node_output_names, node_info))
 
     # Check output type compatibility
     expected_output_types = node_def.get("output", [])
     actual_output_types = node_definition.get("output", expected_output_types) if node_definition else expected_output_types
+    if not isinstance(actual_output_types, (list, tuple)):
+        errors.append(f"Node {node_id} 'data.nodeDefinition.output' must be a list")
+        actual_output_types = expected_output_types
     if expected_output_types and actual_output_types:
         for i, output_name in enumerate(node_output_names):
             if i < len(expected_output_types) and i < len(actual_output_types):
@@ -1296,7 +1333,7 @@ def _validate_type_compatibility(
         for edge in edges:
             source_id = str(edge.get("source", ""))
             target_id = str(edge.get("target", ""))
-            source_handle = edge.get("sourceHandle", "")
+            source_handle = edge.get("sourceHandle", "0")
             target_handle = edge.get("targetHandle", "")
 
             if source_id not in node_map or target_id not in node_map:
@@ -1483,8 +1520,11 @@ def _validate_business_logic(
             if source_id == target_id:
                 errors.append(f"Warning: Link {link_id} is a self-loop (node {source_id} connects to itself)")
 
-    # Check for cycles (detect circular dependencies) - only for legacy links
-    if link_map and not edges:
+    if edges:
+        cycles = _detect_cycles(node_map, link_map, edges)
+        if cycles:
+            errors.append(f"Circular dependencies detected: {cycles}")
+    elif link_map:
         cycles = _detect_cycles(node_map, link_map, edges)
         if cycles:
             errors.append(f"Warning: Circular dependencies detected: {cycles}")
@@ -1498,41 +1538,37 @@ def _detect_cycles(
     edges: List[Dict] = None
 ) -> List[List]:
     """Detect circular dependencies using DFS (supports xyflow edges and legacy links)."""
-    """Detect circular dependencies using DFS."""
-    cycles = []
     visited = set()
-    rec_stack = set()
+    adjacency = {str(node_id): [] for node_id in node_map}
+    if edges:
+        connections = ((str(edge.get("source", "")), str(edge.get("target", ""))) for edge in edges)
+    else:
+        connections = ((str(link[1]), str(link[3])) for link in link_map.values() if len(link) >= 6)
+    for source_id, target_id in connections:
+        if source_id in adjacency and target_id in adjacency:
+            adjacency[source_id].append(target_id)
 
-    def dfs(node_id: int, path: List[int]) -> bool:
-        """DFS to detect cycles."""
+    # Iterative DFS avoids recursion limits on otherwise valid long chains.
+    for node_id in adjacency:
+        if node_id in visited:
+            continue
         visited.add(node_id)
-        rec_stack.add(node_id)
-        path.append(node_id)
-
-        # Check all outgoing links from this node
-        for link in link_map.values():
-            _, source_id, _, target_id, _, _ = link
-            if source_id == node_id:
-                if target_id not in visited:
-                    if dfs(target_id, path):
-                        return True
-                elif target_id in rec_stack:
-                    # Found a cycle
-                    cycle_start = path.index(target_id)
-                    cycle = path[cycle_start:] + [target_id]
-                    cycles.append(cycle)
-                    return True
-
-        path.pop()
-        rec_stack.remove(node_id)
-        return False
-
-    for node_id in node_map.keys():
-        if node_id not in visited:
-            if dfs(node_id, []):
-                break
-
-    return cycles
+        path = [node_id]
+        active = {node_id: 0}
+        stack = [iter(adjacency[node_id])]
+        while stack:
+            target_id = next(stack[-1], None)
+            if target_id is None:
+                stack.pop()
+                active.pop(path.pop())
+            elif target_id in active:
+                return [path[active[target_id]:] + [target_id]]
+            elif target_id not in visited:
+                visited.add(target_id)
+                active[target_id] = len(path)
+                path.append(target_id)
+                stack.append(iter(adjacency[target_id]))
+    return []
 
 
 # ============================================================================
@@ -1597,6 +1633,24 @@ def _validate_edges(
         if not target_id:
             errors.append(f"Edge '{edge_id}': missing 'target' field")
 
+        source_handle = edge.get("sourceHandle", "0")
+        target_handle = edge.get("targetHandle")
+        if not isinstance(target_handle, str) or not target_handle:
+            errors.append(f"Edge '{edge_id}': missing or invalid 'targetHandle' field")
+        if node_info:
+            if source_id in node_map:
+                source_type = _standard_node_type(node_map[source_id])
+                if _get_node_output_type_by_name(source_type, source_handle, node_info) is None:
+                    errors.append(
+                        f"Edge '{edge_id}': unknown source output '{source_handle}' on node '{source_id}'"
+                    )
+            if target_id in node_map and isinstance(target_handle, str) and target_handle:
+                target_type = _standard_node_type(node_map[target_id])
+                if _get_node_input_type(target_type, target_handle, node_info) is None:
+                    errors.append(
+                        f"Edge '{edge_id}': unknown target input '{target_handle}' on node '{target_id}'"
+                    )
+
     return errors
 
 
@@ -1619,7 +1673,7 @@ def _get_param_type_info(param_def: Any) -> Tuple[Optional[str], Optional[float]
     Returns:
         Tuple of (param_type, min_val, max_val, combo_options)
     """
-    if not isinstance(param_def, list) or len(param_def) == 0:
+    if not isinstance(param_def, (list, tuple)) or len(param_def) == 0:
         return None, None, None, None
 
     first_elem = param_def[0]
@@ -1806,7 +1860,7 @@ def _get_node_input_type(node_type: str, input_name: str, node_info: Dict) -> Op
     for category in ["required", "optional"]:
         if category in input_defs and input_name in input_defs[category]:
             param_def = input_defs[category][input_name]
-            if isinstance(param_def, list) and len(param_def) > 0:
+            if isinstance(param_def, (list, tuple)) and len(param_def) > 0:
                 first_elem = param_def[0]
                 if isinstance(first_elem, str):
                     return first_elem
@@ -1839,7 +1893,7 @@ def _get_node_output_type(node_type: str, output_idx: int, node_info: Dict) -> O
     return None
 
 
-def _get_node_output_type_by_name(node_type: str, output_name: str, node_info: Dict) -> Optional[str]:
+def _get_node_output_type_by_name(node_type: str, output_name: Any, node_info: Dict) -> Optional[str]:
     """
     Get the expected output type for a named node output from node_info.
 
@@ -1851,19 +1905,23 @@ def _get_node_output_type_by_name(node_type: str, output_name: str, node_info: D
     Returns:
         Expected type string, or None if not found
     """
-    if node_type not in node_info:
+    if node_type == "PrimitiveNode":
+        return "AUTO" if output_name in ("value", "0", 0) and not isinstance(output_name, bool) else None
+    if node_type not in node_info or isinstance(output_name, bool):
         return None
 
     output_types = node_info[node_type].get("output", [])
     output_names = node_info[node_type].get("output_name", [])
 
-    if output_name in output_names:
+    if isinstance(output_name, int) or (
+        isinstance(output_name, str) and output_name.isascii() and output_name.isdigit()
+    ):
+        index = int(output_name)
+        return output_types[index] if 0 <= index < len(output_types) else None
+    if isinstance(output_name, str) and output_name in output_names:
         name_idx = output_names.index(output_name)
         if name_idx < len(output_types):
             return output_types[name_idx]
-    elif len(output_types) > 0:
-        return output_types[0]  # Use first output as fallback
-
     return None
 
 
