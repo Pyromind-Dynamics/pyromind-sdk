@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import shlex
 from pathlib import Path
 
 import pytest
@@ -59,6 +60,63 @@ def test_yaml_binds_inputs_before_platform_rendering(tmp_path: Path, shell: str)
     assert not marker.exists()
     assert result["success"], result
     assert result["stdout"] == value
+
+
+@pytest.mark.parametrize("script", [
+    '''printf "%s" "$(printf '%s' '{{text}}')"''',
+    '''printf "%s" "$(printf '%s' "$(printf '%s' '{{text}}')")"''',
+    '''printf "%s" "`printf '%s' '{{text}}'`"''',
+])
+def test_command_substitution_inputs_are_rejected_before_execution(tmp_path: Path, script: str) -> None:
+    marker = tmp_path / "executed"
+    command = ["sh", "-c", f"touch {shlex.quote(str(marker))}; {script}"]
+    result = execute_command_template(command, inputs={"text": "expected input"})
+    assert not result["success"]
+    assert any("command substitutions" in error for error in result["errors"])
+    assert not marker.exists()
+    with pytest.raises(ValueError, match="command substitutions"):
+        _yaml_node(command)
+
+
+@pytest.mark.parametrize("shell", ["sh", "bash"])
+@pytest.mark.parametrize("via_yaml", [False, True])
+def test_input_outside_command_substitution_keeps_its_quote_context(
+    tmp_path: Path, shell: str, via_yaml: bool,
+) -> None:
+    script = '''printf "%s" "$(printf '%s' 'child"quote')"; printf '%s' '{{text}}' '''
+    command = [shell, "-c", script]
+    if via_yaml:
+        command = _yaml_node(command).COMMAND_TEMPLATE
+    marker = tmp_path / "executed"
+    value = f'$(touch {marker}); "quoted"\n\'single quoted\''
+    result = execute_command_template(command, inputs={"text": value})
+    assert result["success"], result
+    assert result["stdout"] == 'child"quote' + value
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("block", [
+    '$(printf "%s" "${VALUE:-text}")',
+    '$(case x in x) printf ok;; esac)',
+    '$((1 + 2))',
+    '$(printf ok # ignored )\n)',
+    "$(printf '%s' $'escaped\\\'quote')",
+])
+def test_complex_substitutions_fail_before_binding_inputs(block: str) -> None:
+    command = ["sh", "-c", f'''printf "%s" "{block}"; printf '%s' '{{{{text}}}}' ''']
+    with pytest.raises(ValueError, match="command substitutions"):
+        _yaml_node(command)
+    result = execute_command_template(command, inputs={"text": "expected"})
+    assert not result["success"]
+    assert any("command substitutions" in error for error in result["errors"])
+
+
+def test_single_quoted_substitution_text_remains_literal() -> None:
+    command = ["sh", "-c", "printf '%s' '{{text}} literal $(printf wrong)'"]
+    node = _yaml_node(command)
+    result = execute_command_template(node.COMMAND_TEMPLATE, inputs={"text": "expected"})
+    assert result["success"], result
+    assert result["stdout"] == "expected literal $(printf wrong)"
 
 
 @pytest.mark.parametrize("shell", ["fish", "csh", "tcsh", "custom-shell", "python3"])

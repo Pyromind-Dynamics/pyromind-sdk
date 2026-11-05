@@ -7,7 +7,7 @@ specific node types, making it work with any node definitions.
 
 Xyflow Workflow Format:
   - Nodes with data.nodeType and data.config
-  - Edges with sourceHandle and targetHandle names
+  - Edges with a sourceHandle name or output index and a targetHandle name
 
 Workflow Lite Format:
   - Simplified structure focusing on execution logic
@@ -370,15 +370,12 @@ class LinkBuilder:
 
             # Build output name → index mapping
             output_map: Dict[str, str] = {}
-            if node_def:
-                output_names = node_def.get("output_name", [])
-                for idx, name in enumerate(output_names):
-                    output_map[name] = str(idx)
-            elif node_type in self.type_resolver.node_info:
+            output_names = node_def.get("output_name") if node_def else None
+            if not output_names and node_type in self.type_resolver.node_info:
                 ni_data = self.type_resolver.node_info[node_type]
                 output_names = ni_data.get("output_name", [])
-                for idx, name in enumerate(output_names):
-                    output_map[name] = str(idx)
+            for idx, name in enumerate(output_names or []):
+                output_map[name] = str(idx)
             output_mappings[node_id] = output_map
 
         return input_mappings, output_mappings
@@ -413,18 +410,33 @@ class LinkBuilder:
             target = edge.get("target")
             source_id = str(source) if source is not None else ""
             target_id = str(target) if target is not None else ""
-            source_handle = edge.get("sourceHandle", "")
+            source_handle = edge.get("sourceHandle", 0)
             target_handle = edge.get("targetHandle", "")
 
             if (
                 not source_id or not target_id
-                or not isinstance(source_handle, str) or not source_handle
+                or not isinstance(source_handle, (str, int))
+                or isinstance(source_handle, bool) or source_handle == ""
                 or not isinstance(target_handle, str) or not target_handle
             ):
-                raise ValueError("Xyflow edges require named sourceHandle and targetHandle")
+                raise ValueError("Xyflow edges require a sourceHandle name or index and a named targetHandle")
 
-            # Use handle names directly (xyflow edges are name-based)
             output_name = source_handle
+            if isinstance(source_handle, int) or (
+                source_handle.isascii() and source_handle.isdigit()
+            ):
+                output_index = str(int(source_handle))
+                output_name = next(
+                    (name for name, index in output_mappings.get(source_id, {}).items()
+                     if index == output_index),
+                    None,
+                )
+                if output_name is None:
+                    raise ValueError(
+                        f"Cannot resolve output index {source_handle!r} for node '{source_id}'"
+                    )
+            elif re.fullmatch(r"-[0-9]+", source_handle):
+                raise ValueError(f"Invalid output index {source_handle!r} for node '{source_id}'")
             input_name = target_handle
 
             if target_id not in input_connections:

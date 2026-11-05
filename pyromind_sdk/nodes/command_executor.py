@@ -52,6 +52,52 @@ def replace_template(template: str, replacements: Dict[str, Any], exclude_keys: 
     return result
 
 
+def _command_substitution_end(script: str, start: int) -> int:
+    """Locate a simple $(...) block without interpreting its quotes as outer quotes."""
+    unsupported = (
+        "Input binding with complex command substitutions is unsupported; "
+        "pass inputs as separate argv arguments"
+    )
+    if script.startswith("$((", start):
+        raise ValueError(unsupported)
+    index = start + 2
+    depth = 1
+    quote = None
+    while index < len(script):
+        char = script[index]
+        if char == "\\" and quote != "'" and index + 1 < len(script):
+            index += 2
+            continue
+        if quote != "'":
+            if script.startswith("$(", index):
+                index = _command_substitution_end(script, index)
+                continue
+            if char == "`" or script.startswith(("${", "$'"), index):
+                raise ValueError(unsupported)
+        if quote is None and (
+            char == "#"
+            or re.match(r"case\b", script[index:])
+            and (index == 0 or not re.match(r"\w", script[index - 1]))
+        ):
+            # Case patterns and comments can contain unmatched ')' tokens.
+            # Avoid treating this boundary scanner as a complete shell parser.
+            raise ValueError(unsupported)
+        if char in ("'", '"'):
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+        elif quote is None:
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    return index + 1
+        index += 1
+    raise ValueError("Unterminated command substitution in input template")
+
+
 def _bind_shell_inputs(script: str, names: List[str], first_arg: int) -> str:
     """Replace shell-source placeholders with quoted positional expansions."""
     if not names:
@@ -63,6 +109,22 @@ def _bind_shell_inputs(script: str, names: List[str], first_arg: int) -> str:
     quote = None
     index = 0
     while index < len(script):
+        if quote != "'" and script.startswith("$(", index):
+            end = _command_substitution_end(script, index)
+            block = script[index:end]
+            if extract_placeholders([block]) & positions.keys():
+                raise ValueError(
+                    "Input placeholders in command substitutions are unsupported; "
+                    "pass inputs as separate argv arguments"
+                )
+            output.append(block)
+            index = end
+            continue
+        if quote != "'" and script[index] == "`":
+            raise ValueError(
+                "Input binding with backtick command substitutions is unsupported; "
+                "use $(...) without input placeholders or pass inputs as argv"
+            )
         match = re.match(r"\{\{([A-Za-z0-9_-]+)\}\}", script[index:])
         if match and match.group(1) in positions:
             expansion = "${%d}" % positions[match.group(1)]

@@ -28,6 +28,38 @@ from pyromind_sdk.client.workflow import (
 )
 
 
+@pytest.fixture(params=["node_info", "node_definition", "partial_definition"])
+def indexed_output_workflow(request):
+    node_info = {
+        "SourceNode": {
+            "input": {}, "output": ["STRING", "STRING"],
+            "output_name": ["first", "second"],
+        },
+        "SinkNode": {
+            "input": {"required": {"text": ["STRING"]}},
+            "output": [], "output_name": [], "output_node": True,
+        },
+    }
+    nodes = [
+        {"id": str(index), "type": "default", "data": {"nodeType": name, "config": {}}}
+        for index, name in enumerate(node_info, start=1)
+    ]
+    for node in nodes:
+        if request.param == "node_definition":
+            node["data"]["nodeDefinition"] = node_info[node["data"]["nodeType"]]
+        elif request.param == "partial_definition":
+            node["data"]["nodeDefinition"] = {"input": {}}
+    converter = WorkflowLiteConverter(
+        node_info=None if request.param == "node_definition" else node_info,
+        auto_layout=False,
+    )
+    workflow = {
+        "id": "workflow", "nodes": nodes,
+        "edges": [{"id": "edge", "source": "1", "target": "2", "targetHandle": "text"}],
+    }
+    return converter, workflow, node_info
+
+
 class TestWorkflowMapper:
     """Test WorkflowMapper class."""
 
@@ -292,7 +324,7 @@ class TestWorkflowLiteConverter:
         with pytest.raises(ValueError, match="Only Xyflow data.config and edges"):
             WorkflowLiteConverter().to_lite(workflow)
 
-    def test_to_lite_rejects_numeric_edge_handle(self):
+    def test_to_lite_rejects_output_index_without_definitions(self):
         workflow = {
             "nodes": [{
                 "id": "1", "type": "default",
@@ -304,8 +336,41 @@ class TestWorkflowLiteConverter:
             }],
         }
 
-        with pytest.raises(ValueError, match="named sourceHandle and targetHandle"):
+        with pytest.raises(ValueError, match="Cannot resolve output index"):
             WorkflowLiteConverter().to_lite(workflow)
+
+    @pytest.mark.parametrize("handle,expected", [
+        (0, "first"), ("0", "first"), (None, "first"),
+        (1, "second"), ("1", "second"), ("second", "second"),
+    ])
+    def test_indexed_outputs_convert_to_valid_lite_and_round_trip(
+        self, indexed_output_workflow, handle, expected,
+    ):
+        converter, workflow, node_info = indexed_output_workflow
+        if handle is not None:
+            workflow["edges"][0]["sourceHandle"] = handle
+
+        lite = converter.to_lite(workflow)
+
+        assert lite["nodes"]["sink"]["inputs"]["text"] == {
+            "node_id": "1", "output_name": expected,
+        }
+        valid, errors = validate_lite_format(lite, node_info=node_info)
+        assert valid, errors
+        restored = converter.to_standard(lite, original_workflow=workflow)
+        assert restored["edges"][0]["sourceHandle"] == expected
+        valid, errors = validate_standard_format(restored, node_info=node_info)
+        assert valid, errors
+
+    @pytest.mark.parametrize("handle", [2, "2", -1, "-1", True, None, 0.5, []])
+    def test_to_lite_rejects_invalid_output_indices_and_handles(
+        self, indexed_output_workflow, handle,
+    ):
+        converter, workflow, _node_info = indexed_output_workflow
+        workflow["edges"][0]["sourceHandle"] = handle
+
+        with pytest.raises(ValueError, match="sourceHandle|output index"):
+            converter.to_lite(workflow)
 
     def test_to_standard_basic(self):
         """Test basic conversion to standard format."""
