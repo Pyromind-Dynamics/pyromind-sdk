@@ -427,3 +427,27 @@ def test_unbound_integer_config_still_requires_valid_range(validator: Callable) 
 
     assert not valid
     assert any("count" in error and "minimum" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_valid"),
+    [
+        ("max_model_len", "", True),
+        ("max_model_len", "  ", False),
+        ("max_model_len", "invalid", False),
+        ("count", "", False),
+    ],
+)
+def test_optional_integer_empty_string_matches_execution_template(
+    validator: Callable, field: str, value: str, expected_valid: bool
+) -> None:
+    node_info = copy.deepcopy(NODE_INFO)
+    node_info["CountSink"]["input"]["optional"]["max_model_len"] = ("INT",)
+    workflow = _from_dsl('sink = CountSink(id="one", count=1)')
+    workflow["nodes"][0]["data"]["config"][field] = value
+
+    valid, errors = validator(workflow, node_info=node_info)
+
+    assert valid is expected_valid, errors
+    if not expected_valid:
+        assert any(field in error for error in errors)

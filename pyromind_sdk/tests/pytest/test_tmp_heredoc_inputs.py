@@ -10,6 +10,7 @@ Regression tests for private input file indirection:
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import importlib.util
 from pathlib import Path
@@ -57,7 +58,7 @@ def test_build_command_template_passes_string_inputs_as_argv(tmp_path: Path) -> 
     script = command_template[2]
 
     assert "mktemp -d /tmp/pyromind-inputs." in script
-    assert 'printf "%s" "$1" > "$input_dir/system_prompt"' in script
+    assert 'printf "%s" "${1}" > "$input_dir/system_prompt"' in script
     assert "{{system_prompt}}" not in script
     assert command_template[3:] == ["pyromind-node", "{{system_prompt}}"]
 
@@ -66,6 +67,25 @@ def test_build_command_template_passes_string_inputs_as_argv(tmp_path: Path) -> 
         command_template, inputs={"system_prompt": "IGNORED"}, output_names=["out"]
     )
     assert prepared_parts[2] == script
+
+
+def test_input_files_preserve_values_after_ninth_argument(tmp_path: Path) -> None:
+    names = [f"input_{index}" for index in range(1, 13)]
+    values = ["/workspace/models/checkpoints/grpo0610", *map(str, range(2, 10)), "0", "", "2"]
+    command = build_command_template(
+        python_code=str(tmp_path / "node.py"),
+        function_name="run",
+        input_types={"required": {name: ("STRING", {}) for name in names}},
+        output_names=[],
+        conda_env="",
+    )
+    writes = [line for line in command[2].splitlines() if line.startswith('printf "%s" ')]
+    subprocess.run(
+        ["bash", "-c", "\n".join(writes), "pyromind-node", *values],
+        env={**os.environ, "input_dir": str(tmp_path)},
+        check=True,
+    )
+    assert [(tmp_path / name).read_text(encoding="utf-8") for name in names] == values
 
 
 def test_function_call_wrapper_reads_explicit_private_files(tmp_path: Path) -> None:
@@ -182,7 +202,7 @@ def test_build_command_template_accelerate_mode_uses_accelerate_config_input(tmp
 
     script = command_template[2]
     assert 'accelerate launch --config_file "$input_dir/accelerate_config"' in script
-    assert 'printf "%s" "$2" > "$input_dir/accelerate_config"' in script
+    assert 'printf "%s" "${2}" > "$input_dir/accelerate_config"' in script
     assert "{{accelerate_config}}" not in script
     assert command_template[-2:] == ["{{system_prompt}}", "{{accelerate_config}}"]
     assert '__pyromind_input_file__' in script

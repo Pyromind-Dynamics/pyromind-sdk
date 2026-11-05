@@ -514,12 +514,21 @@ def _validate_xyflow_config(
 
     node_def = node_info[node_type]
     input_defs = node_def.get("input", {})
+    required_params = input_defs.get("required", {})
+    optional_params = input_defs.get("optional", {})
     all_params = {}
-    all_params.update(input_defs.get("required", {}))
-    all_params.update(input_defs.get("optional", {}))
+    all_params.update(required_params)
+    all_params.update(optional_params)
 
     for param_name, param_value in config.items():
         if param_name in all_params:
+            # Empty optional values use the execution template's unset sentinel.
+            if (
+                param_name in optional_params
+                and param_name not in required_params
+                and param_value == ""
+            ):
+                continue
             param_def = all_params[param_name]
             errors.extend(_validate_parameter_constraints(
                 param_value, param_def, str(node.get("id")), node_type, param_name
