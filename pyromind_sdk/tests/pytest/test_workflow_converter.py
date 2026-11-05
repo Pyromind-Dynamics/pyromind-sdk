@@ -1448,7 +1448,7 @@ class TestValidationFunctions:
                 {
                     "id": "1", "type": "TestNode",
                     "position": {"x": 0, "y": 0},
-                    "data": {"label": "TestNode", "nodeType": "TestNode", "config": {"dataset": 123}, "nodeDefinition": test_node_def},
+                    "data": {"label": "TestNode", "nodeType": "TestNode", "config": {"dataset": 123, "model_path": "/workspace/models/example"}, "nodeDefinition": test_node_def},
                     "inputs": [{"name": "dataset", "type": "INT", "link": None}, {"name": "model_path", "type": "MODEL", "link": None}],
                     "outputs": [{"name": "output", "type": "STRING", "links": []}],
                     "widgets_values": [123, None]
@@ -1468,7 +1468,7 @@ class TestValidationFunctions:
                 {
                     "id": "1", "type": "TestNode",
                     "position": {"x": 0, "y": 0},
-                    "data": {"label": "TestNode", "nodeType": "TestNode", "config": {"dataset": "test"}, "nodeDefinition": test_node_def},
+                    "data": {"label": "TestNode", "nodeType": "TestNode", "config": {"dataset": "test", "model_path": "/workspace/models/example"}, "nodeDefinition": test_node_def},
                     "inputs": [{"name": "dataset", "type": "STRING", "link": None}, {"name": "model_path", "type": "MODEL", "link": None}],
                     "outputs": [{"name": "output", "type": "STRING", "links": []}],
                     "widgets_values": ["test", None]
@@ -1514,7 +1514,7 @@ class TestValidationFunctions:
                 {
                     "id": "1", "type": "TestNode",
                     "position": {"x": 0, "y": 0},
-                    "data": {"label": "TestNode", "nodeType": "TestNode", "config": {"dataset": "test_dataset"}, "nodeDefinition": node_def},
+                    "data": {"label": "TestNode", "nodeType": "TestNode", "config": {"dataset": "test_dataset", "model_path": "/workspace/models/example"}, "nodeDefinition": node_def},
                     "inputs": [{"name": "dataset", "type": "STRING", "link": None}, {"name": "model_path", "type": "MODEL", "link": None}],
                     "outputs": [{"name": "output", "type": "STRING", "links": []}],
                     "widgets_values": ["test_dataset", None]
