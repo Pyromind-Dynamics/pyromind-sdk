@@ -10,6 +10,7 @@ Regression tests for private input file indirection:
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import sys
 import importlib.util
@@ -86,6 +87,57 @@ def test_input_files_preserve_values_after_ninth_argument(tmp_path: Path) -> Non
         check=True,
     )
     assert [(tmp_path / name).read_text(encoding="utf-8") for name in names] == values
+
+
+def test_parallel_commands_install_sdk_into_separate_private_directories(tmp_path: Path) -> None:
+    fake_python = tmp_path / "python3"
+    fake_python.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        "def value(flag): return args[args.index(flag) + 1]\n"
+        "if args[:2] == ['-m', 'pip']:\n"
+        "    assert '--no-deps' in args\n"
+        "    target = Path(value('--target'))\n"
+        "    target.mkdir(parents=True)\n"
+        "    (target / 'installed').touch()\n"
+        "else:\n"
+        "    directory = Path(value('--input-dir'))\n"
+        "    target = Path(os.environ['PYTHONPATH'].split(os.pathsep)[0])\n"
+        "    assert target.parent == directory\n"
+        "    assert (target / 'installed').is_file()\n"
+        "    output = Path(json.loads(value('--output-paths'))['out'])\n"
+        "    output.write_text(json.dumps({'message': (directory / 'message').read_text(), 'target': str(target)}))\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    command = build_command_template(
+        python_code=str(tmp_path / "node.py"),
+        function_name="run",
+        input_types={"required": {"message": ("STRING", {})}},
+        output_names=["out"],
+        python_command=str(fake_python),
+        conda_env="",
+    )
+    values = ["first invocation", "second invocation"]
+    outputs = [tmp_path / "first.json", tmp_path / "second.json"]
+    processes = [
+        subprocess.Popen(
+            ["bash", "-c", command[2].replace("{{out}}", str(output)), "pyromind-node", value],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        for output, value in zip(outputs, values)
+    ]
+    results = [process.communicate(timeout=15) for process in processes]
+    for process, (_stdout, stderr) in zip(processes, results):
+        assert process.returncode == 0, stderr
+    records = [json.loads(output.read_text(encoding="utf-8")) for output in outputs]
+    assert [record["message"] for record in records] == values
+    assert records[0]["target"] != records[1]["target"]
+    assert all(not Path(record["target"]).exists() for record in records)
 
 
 def test_function_call_wrapper_reads_explicit_private_files(tmp_path: Path) -> None:
@@ -201,6 +253,8 @@ def test_build_command_template_accelerate_mode_uses_accelerate_config_input(tmp
     )
 
     script = command_template[2]
+    assert "python3 -m pip install --no-deps" in script
+    assert script.index("pip install") < script.index("accelerate launch")
     assert 'accelerate launch --config_file "$input_dir/accelerate_config"' in script
     assert 'printf "%s" "${2}" > "$input_dir/accelerate_config"' in script
     assert "{{accelerate_config}}" not in script

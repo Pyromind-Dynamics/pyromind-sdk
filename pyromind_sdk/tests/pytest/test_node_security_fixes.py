@@ -176,8 +176,11 @@ def test_yaml_shell_template_rejects_unrecognized_runtime_placeholder() -> None:
         )
 
 
-@pytest.mark.parametrize("command", ["python3; id", "python3 $(id)", "python3 -c pass", "/bin/sh"])
-def test_python_command_rejects_shell_syntax(command: str, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "command",
+    ["python3; id", "python3 $(id)", "python3 -c pass", "/bin/sh", "python3 -E", "python3 -I", "python3 -S"],
+)
+def test_python_command_rejects_unsupported_commands(command: str, tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="Python executable with supported options"):
         build_command_template(
             python_code=str(tmp_path / "node.py"),
