@@ -18,6 +18,10 @@ SHELL_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 INPUT_FILE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 TEMPLATE_PLACEHOLDER = re.compile(r"\{\{[^{}]+\}\}")
 
+# Temporary runtime package for node images that still bundle the older wrapper.
+INPUT_DIR_RUNTIME_SDK_PACKAGE = "pyromind-sdk==0.1.15.dev10"
+INPUT_DIR_RUNTIME_SDK_INDEX = "https://test.pypi.org/simple/"
+
 
 def _validate_shell_identifier(name: str) -> None:
     if not isinstance(name, str) or not SHELL_IDENTIFIER.fullmatch(name):
@@ -312,17 +316,58 @@ def build_command_template(
     bash_commands.append("umask 077")
     bash_commands.append('input_dir="$(mktemp -d /tmp/pyromind-inputs.XXXXXXXXXX)"')
     bash_commands.append('trap \'rm -rf -- "$input_dir"\' EXIT')
+    # The task image may contain an older package with the same published
+    # version. Check the wrapper CLI itself before using private file inputs.
+    python_exec = (python_command or "python3").strip()
+    python_exec = "python3" if python_exec == "accelerate" else _python_executable(python_exec)
+    wrapper_probe = (
+        f"{python_exec} -m {wrapper_module} --help 2>/dev/null "
+        "| grep -F -- '--input-dir' >/dev/null"
+    )
+    runtime_install = (
+        f"{python_exec} -m pip install --no-input --no-cache-dir --quiet "
+        "--no-deps --ignore-installed --only-binary=:all: "
+        f"--index-url {shlex.quote(INPUT_DIR_RUNTIME_SDK_INDEX)} "
+        '--target "$input_dir/.pyromind-sdk-runtime" '
+        f"{shlex.quote(INPUT_DIR_RUNTIME_SDK_PACKAGE)}"
+    )
+    isolated_python = not is_accelerate and any(
+        option in {"-E", "-I", "-S"}
+        for option in shlex.split((python_command or "python3").strip())[1:]
+    )
+    if isolated_python:
+        # These options either ignore PYTHONPATH or disable pip; a temporary
+        # target install cannot safely replace an old runtime package.
+        isolated_error = (
+            "pyromind-sdk runtime requires --input-dir; "
+            "temporary installation is unavailable with -E, -I or -S"
+        )
+        bash_commands.extend(
+            [
+                f"if ! {wrapper_probe}; then",
+                f"  echo {shlex.quote(isolated_error)} >&2",
+                "  exit 1",
+                "fi",
+            ]
+        )
+    else:
+        bash_commands.extend(
+            [
+                f"if ! {wrapper_probe}; then",
+                f"  if ! {runtime_install}; then",
+                "    echo 'Unable to install a compatible pyromind-sdk runtime' >&2",
+                "    exit 1",
+                "  fi",
+                '  export PYTHONPATH="$input_dir/.pyromind-sdk-runtime${PYTHONPATH:+:$PYTHONPATH}"',
+                "fi",
+                f"if ! {wrapper_probe}; then",
+                "  echo 'pyromind-sdk runtime wrapper does not support --input-dir' >&2",
+                "  exit 1",
+                "fi",
+            ]
+        )
     for index, input_name in enumerate(input_names, start=1):
         bash_commands.append(f'printf "%s" "${index}" > "$input_dir/{input_name}"')
-    # TODO 临时安装sdk
-    # 4. Install pyromind-sdk if not available (skip for accelerate mode)
-    python_exec = (python_command or "python3").strip()
-    if python_exec != "accelerate":
-        python_exec = _python_executable(python_exec)
-        bash_commands.append(
-            f"{python_exec} -c \"import pyromind_sdk\" 2>/dev/null || "
-            f"{python_exec} -m pip install pyromind-sdk -q"
-        )
 
     # 5. Execute wrapper command
     wrapper_cmd_full = " ".join([wrapper_cmd] + wrapper_args)
@@ -331,7 +376,7 @@ def build_command_template(
     # Combine all commands.
     #
     # Use newlines for clear command boundaries and `set -e` for fail fast.
-    full_command = "\n".join(["set -e ; true"] + bash_commands)
+    full_command = "\n".join(["set -e ; true", "set -o pipefail"] + bash_commands)
     command_parts = ["bash", "-c", full_command, "pyromind-node"]
     command_parts.extend(f"{{{{{name}}}}}" for name in input_names)
     if gpu_count_placeholder:
