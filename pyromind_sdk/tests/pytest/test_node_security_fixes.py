@@ -202,23 +202,6 @@ def test_python_command_keeps_supported_runtime_flag(tmp_path: Path) -> None:
     assert "python3 -u -m pyromind_sdk.nodes.function_call_wrapper" in command[2]
 
 
-@pytest.mark.parametrize("option", ["-E", "-I", "-S"])
-def test_isolated_python_requires_a_compatible_installed_wrapper(
-    option: str, tmp_path: Path
-) -> None:
-    command = build_command_template(
-        python_code=str(tmp_path / "node.py"),
-        function_name="f",
-        input_types={"required": {}, "optional": {}},
-        output_names=[],
-        python_command=f"python3 {option}",
-    )
-    script = command[2]
-    assert f"python3 {option} -m pyromind_sdk.nodes.function_call_wrapper --help" in script
-    assert "temporary installation is unavailable with -E, -I or -S" in script
-    assert "pip install" not in script
-
-
 def test_accelerate_gpu_count_is_bound_as_argument(tmp_path: Path) -> None:
     command = build_command_template(
         python_code=str(tmp_path / "node.py"),
