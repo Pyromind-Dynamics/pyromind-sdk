@@ -40,7 +40,6 @@ from .validator import (
     validate_standard_format,
     validate_workflow_lite,
     validate_workflow_standard,
-    validate_workflow_legacy,
     _is_type_compatible as is_type_compatible,
 )
 
@@ -72,7 +71,6 @@ __all__ = [
     "validate_standard_format",
     "validate_workflow_lite",
     "validate_workflow_standard",
-    "validate_workflow_legacy",
     # Type compatibility
     "is_type_compatible",
 ]

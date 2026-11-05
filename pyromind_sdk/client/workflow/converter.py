@@ -1,15 +1,13 @@
 """
-Universal Workflow Format Converter
+Xyflow Workflow Format Converter
 
-This module provides a generic, node-agnostic conversion between the standard
+This module provides a generic, node-agnostic conversion between the Xyflow
 workflow format and workflow_lite format. It doesn't require hardcoded logic for
 specific node types, making it work with any node definitions.
 
-Standard Workflow Format:
-  - Complex structure with UI metadata (pos, size, flags, order, mode)
-  - Links as arrays: [link_id, source_node, source_socket, target_node, target_socket, type]
-  - Inputs/outputs with verbose metadata
-  - Hard to read and edit manually
+Xyflow Workflow Format:
+  - Nodes with data.nodeType and data.config
+  - Edges with sourceHandle and targetHandle names
 
 Workflow Lite Format:
   - Simplified structure focusing on execution logic
@@ -20,7 +18,7 @@ Workflow Lite Format:
 Architecture:
   - WorkflowMapper: Handles node ID and name mapping
   - TypeResolver: Resolves input/output types from node_info
-  - LinkBuilder: Builds and validates links
+  - LinkBuilder: Builds and validates edges
   - WorkflowLiteConverter: Main orchestrator using helper classes
 """
 
@@ -32,10 +30,10 @@ from collections import defaultdict, deque
 
 def _get_node_type(node: Dict) -> str:
     """Extract node type from xyflow node dict."""
-    node_type = node.get("type", "")
-    if node_type == "default":
-        data = node.get("data", {})
-        return data.get("nodeType", "")
+    data = node.get("data")
+    node_type = data.get("nodeType") if isinstance(data, dict) else None
+    if not isinstance(node_type, str) or not node_type:
+        raise ValueError("Xyflow nodes require data.nodeType")
     return node_type
 
 
@@ -57,7 +55,7 @@ class WorkflowMapper:
         Build mappings from a list of nodes (xyflow format).
 
         In xyflow format, node IDs are strings. The node type is extracted from
-        data.nodeType (for "default" type nodes) or from the type field directly.
+        data.nodeType.
 
         Args:
             nodes: List of node dictionaries from workflow
@@ -88,7 +86,7 @@ class WorkflowMapper:
         Build mappings from lite format nodes.
 
         In xyflow format, lite node names become string IDs directly.
-        The 'index' field is preserved for backward compatibility.
+        The 'index' field preserves the original Xyflow node ID.
 
         Args:
             lite_nodes: Dictionary of {node_name: node_data} from lite format
@@ -318,9 +316,9 @@ class TypeResolver:
 
 class LinkBuilder:
     """
-    Builds and manages workflow links.
+    Builds and manages workflow edges.
 
-    Handles conversion between connection format and link arrays.
+    Handles conversion between lite connections and Xyflow edges.
     """
 
     def __init__(self, type_resolver: TypeResolver):
@@ -331,18 +329,12 @@ class LinkBuilder:
             type_resolver: TypeResolver instance for determining link types
         """
         self.type_resolver = type_resolver
-        self._next_link_id = 1
-
-    def reset_link_id(self) -> None:
-        """Reset link ID counter."""
-        self._next_link_id = 1
 
     def build_socket_mappings(self, nodes: List[Dict]) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Dict[str, str]]]:
         """
         Build socket name → index mappings for nodes.
 
-        Supports both xyflow format (with data.nodeDefinition) and legacy format
-        (with inputs/outputs arrays).
+        Uses Xyflow data.nodeDefinition or the supplied node_info.
 
         Args:
             nodes: List of node dictionaries
@@ -370,12 +362,6 @@ class LinkBuilder:
                         for param_name in input_defs[category]:
                             input_map[param_name] = str(idx)
                             idx += 1
-            elif "inputs" in node:
-                # Legacy format: map inputs from inputs array
-                for idx, inp in enumerate(node.get("inputs", [])):
-                    name = inp.get("name", "")
-                    if name:
-                        input_map[name] = str(idx)
             elif node_type in self.type_resolver.node_info:
                 param_order = self.type_resolver.get_parameter_order(node_type)
                 for idx, param_name in enumerate(param_order):
@@ -388,12 +374,6 @@ class LinkBuilder:
                 output_names = node_def.get("output_name", [])
                 for idx, name in enumerate(output_names):
                     output_map[name] = str(idx)
-            elif "outputs" in node:
-                # Legacy format: map outputs from outputs array
-                for idx, out in enumerate(node.get("outputs", [])):
-                    name = out.get("name", "")
-                    if name:
-                        output_map[name] = str(idx)
             elif node_type in self.type_resolver.node_info:
                 ni_data = self.type_resolver.node_info[node_type]
                 output_names = ni_data.get("output_name", [])
@@ -427,26 +407,25 @@ class LinkBuilder:
         input_connections: Dict[str, Dict[str, Dict]] = {}
 
         for edge in edges:
-            source_id = str(edge.get("source", ""))
-            target_id = str(edge.get("target", ""))
+            if not isinstance(edge, dict):
+                raise TypeError("Xyflow edges must be dictionaries")
+            source = edge.get("source")
+            target = edge.get("target")
+            source_id = str(source) if source is not None else ""
+            target_id = str(target) if target is not None else ""
             source_handle = edge.get("sourceHandle", "")
             target_handle = edge.get("targetHandle", "")
 
-            if not source_id or not target_id:
-                continue
+            if (
+                not source_id or not target_id
+                or not isinstance(source_handle, str) or not source_handle
+                or not isinstance(target_handle, str) or not target_handle
+            ):
+                raise ValueError("Xyflow edges require named sourceHandle and targetHandle")
 
             # Use handle names directly (xyflow edges are name-based)
             output_name = source_handle
             input_name = target_handle
-
-            # Fallback: try to resolve from output_mappings if handle is an index string
-            if output_name.isdigit():
-                out_map = output_mappings.get(source_id, {})
-                # reverse lookup
-                for name, idx in out_map.items():
-                    if idx == output_name:
-                        output_name = name
-                        break
 
             if target_id not in input_connections:
                 input_connections[target_id] = {}
@@ -511,103 +490,6 @@ class LinkBuilder:
 
         return edges
 
-    def _calculate_input_index(
-        self,
-        node_data: Dict,
-        target_input_name: str,
-        node_type: str = None,
-        param_order: List[str] = None
-    ) -> int:
-        """
-        Calculate the input index for a given input name.
-
-        In standard format, inputs array contains inputs in node_info order.
-        Only includes: connections and inputs with widgets (including optional inputs).
-
-        Args:
-            node_data: Node data from lite format
-            target_input_name: Name of the input to find index for
-            node_type: Node type (for type checking)
-            param_order: Parameter order from node_info (for correct ordering)
-
-        Returns:
-            Input index in the standard format inputs array
-        """
-        lite_inputs = node_data.get("inputs", {})
-        if node_type is None:
-            node_type = node_data.get("type", "")
-        
-        # If we have param_order, use it to determine the correct index
-        # IMPORTANT: Only connected inputs (with links) are in inputs_array
-        # Unconnected inputs (direct values) are NOT in inputs_array, only in widgets_values
-        if param_order and target_input_name in param_order:
-            target_param_idx = param_order.index(target_input_name)
-            input_idx = 0
-            
-            # Count inputs that come before this one in param_order
-            # Only count those that will actually be in inputs_array
-            # - Only connected inputs (have link) are in inputs_array
-            # - Unconnected inputs (direct values) are NOT in inputs_array
-            for i in range(target_param_idx):
-                param_name = param_order[i]
-                
-                # Check if this parameter should be in inputs_array
-                # Only connected inputs are in inputs_array
-                should_be_in_inputs = False
-                
-                if param_name in lite_inputs:
-                    input_value = lite_inputs[param_name]
-                    # Only if it's a connection (has node_id), it's in inputs_array
-                    if isinstance(input_value, dict) and "node_id" in input_value:
-                        should_be_in_inputs = True
-                
-                if should_be_in_inputs:
-                    input_idx += 1
-            
-            return input_idx
-        
-        # Fallback: old logic (for nodes without node_info)
-        # Count only connections
-        input_idx = 0
-        for inp_name in lite_inputs.keys():
-            if inp_name == target_input_name:
-                break
-            inp_value = lite_inputs[inp_name]
-            # Count if it's a connection
-            if isinstance(inp_value, dict) and "node_id" in inp_value:
-                input_idx += 1
-
-        return input_idx
-
-    def _determine_link_type(
-        self,
-        source_id: int,
-        output_name: str,
-        output_idx: int,
-        node_id_to_name: Dict[int, str],
-        lite_nodes: Dict[str, Dict]
-    ) -> str:
-        """
-        Determine the type of a link based on source node output.
-
-        Args:
-            source_id: Source node ID
-            output_name: Output name
-            output_idx: Output index
-            node_id_to_name: Mapping from node ID to name
-            lite_nodes: Lite format nodes
-
-        Returns:
-            Link type string
-        """
-        source_node_name = node_id_to_name.get(source_id)
-        if source_node_name:
-            source_node_data = lite_nodes.get(source_node_name, {})
-            source_node_type = source_node_data.get("type")
-            if source_node_type:
-                return self.type_resolver.get_output_type(source_node_type, output_idx, output_name)
-
-        return "AUTO"
 
 
 class LayoutGenerator:
@@ -768,7 +650,7 @@ class LayoutGenerator:
         """
         Find node name by its ID in lite format.
 
-        Supports both string IDs (xyflow) and int IDs (legacy).
+        Lite node indices may be strings or integers.
 
         Args:
             lite_nodes: Dictionary of {node_name: node_data}
@@ -810,7 +692,6 @@ class WorkflowLiteConverter:
         self.node_mapper = WorkflowMapper()
         self.layout_generator = LayoutGenerator() if auto_layout else None
         self._next_node_id = 1
-        self._next_link_id = 1
 
     def set_node_info(self, node_info: Dict[str, Any]) -> None:
         """
@@ -840,11 +721,24 @@ class WorkflowLiteConverter:
         Returns:
             Workflow lite dictionary
         """
-        # Build mappings
-        self.node_mapper.build_from_nodes(workflow.get("nodes", []))
-        input_mappings, output_mappings = self.link_builder.build_socket_mappings(workflow.get("nodes", []))
-
+        if not isinstance(workflow, dict):
+            raise TypeError("Xyflow workflow must be a dictionary")
+        if "links" in workflow:
+            raise ValueError("Only Xyflow nodes+edges workflows are supported")
+        nodes = workflow.get("nodes")
         edges = workflow.get("edges", [])
+        if not isinstance(nodes, list) or not isinstance(edges, list):
+            raise TypeError("Xyflow workflows require nodes and edges lists")
+        for node in nodes:
+            if not isinstance(node, dict):
+                raise TypeError("Xyflow nodes must be dictionaries")
+            if any(field in node for field in ("inputs", "outputs", "widgets_values")):
+                raise ValueError("Only Xyflow data.config and edges are supported")
+
+        # Build mappings
+        self.node_mapper.build_from_nodes(nodes)
+        input_mappings, output_mappings = self.link_builder.build_socket_mappings(nodes)
+
         input_connections = {}
         if edges:
             input_connections = self.link_builder.build_input_connections(
@@ -856,7 +750,7 @@ class WorkflowLiteConverter:
 
         # Convert nodes
         lite_nodes = {}
-        for node in workflow.get("nodes", []):
+        for node in nodes:
             node_id = str(node.get("id", ""))
             node_name = self.node_mapper.get_name(node_id)
             if node_name:
@@ -970,121 +864,6 @@ class WorkflowLiteConverter:
             "index": node.get("id", 0)
         }
 
-    def _extract_using_node_info(
-        self,
-        node_type: str,
-        widgets_values: List[Any],
-        input_connections: Dict
-    ) -> Dict[str, Any]:
-        """
-        Extract parameters using node_info for accurate mapping.
-
-        Args:
-            node_type: Type of the node
-            widgets_values: Widget values list
-            input_connections: Connected inputs mapping
-
-        Returns:
-            Dictionary mapping parameter names to values
-        """
-        parameters = {}
-
-        # Get node definition
-        if node_type not in self.type_resolver.node_info:
-            return {}
-
-        node_def = self.type_resolver.node_info[node_type]
-        input_defs = node_def.get("input", {})
-        required_params = input_defs.get("required", {})
-        optional_params = input_defs.get("optional", {})
-
-        # Helper function to check if a type is widget-able
-        def is_widgetable_type(param_type: str) -> bool:
-            """Check if parameter type is widget-able (primitive type)."""
-            widgetable_types = {"STRING", "INT", "FLOAT", "BOOLEAN", "COMBO", "ENV"}
-            return param_type in widgetable_types
-
-        # Helper function to get parameter type
-        def get_param_type(param_def: Any) -> str:
-            """Get parameter type from node_info definition."""
-            if isinstance(param_def, list) and len(param_def) > 0:
-                first_elem = param_def[0]
-                if isinstance(first_elem, str):
-                    return first_elem
-                elif isinstance(first_elem, list):
-                    return "COMBO"
-            return "STRING"
-
-        # widgets_values is in to_standard order:
-        # 1. required + widget-able (STRING, INT, etc.)
-        # 2. required + non-widget (MODEL, VAE, etc.)
-        # 3. optional + widget-able (only those with connections)
-        # 4. optional + non-widget (only those with connections)
-        # Note: optional params without connections are NOT in widgets_values
-
-        # Collect parameters in to_standard order
-        required_widgetable = []
-        required_nonwidget = []
-        optional_widgetable_in_widgets = []  # optional widget-able that are in widgets_values
-        optional_nonwidget_in_widgets = []  # optional non-widget that are in widgets_values
-
-        # Process required parameters
-        for param_name, param_def in required_params.items():
-            param_type = get_param_type(param_def)
-            if is_widgetable_type(param_type):
-                required_widgetable.append((param_name, param_type))
-            else:
-                required_nonwidget.append((param_name, param_type))
-
-        # Process optional parameters (only those with connections are in widgets_values)
-        for param_name, param_def in optional_params.items():
-            if param_name not in input_connections:
-                continue  # Not in widgets_values
-            param_type = get_param_type(param_def)
-            if is_widgetable_type(param_type):
-                optional_widgetable_in_widgets.append((param_name, param_type))
-            else:
-                optional_nonwidget_in_widgets.append((param_name, param_type))
-
-        # Map widgets_values to parameters in to_standard order
-        widget_idx = 0
-
-        # 1. required + widget-able
-        for param_name, param_type in required_widgetable:
-            if widget_idx >= len(widgets_values):
-                break
-            if param_name not in input_connections:
-                # Non-connected: extract actual value
-                parameters[param_name] = widgets_values[widget_idx]
-            # Connected: skip (will be added via input_connections)
-            widget_idx += 1
-
-        # 2. required + non-widget
-        for param_name, param_type in required_nonwidget:
-            if widget_idx >= len(widgets_values):
-                break
-            if param_name not in input_connections:
-                # Non-connected: extract actual value
-                parameters[param_name] = widgets_values[widget_idx]
-            # Connected: skip (will be added via input_connections)
-            widget_idx += 1
-
-        # 3. optional + widget-able (with connections)
-        for param_name, param_type in optional_widgetable_in_widgets:
-            if widget_idx >= len(widgets_values):
-                break
-            # These all have connections, so skip (will be added via input_connections)
-            widget_idx += 1
-
-        # 4. optional + non-widget (with connections)
-        for param_name, param_type in optional_nonwidget_in_widgets:
-            if widget_idx >= len(widgets_values):
-                break
-            # These all have connections, so skip (will be added via input_connections)
-            widget_idx += 1
-
-        return parameters
-
     def _convert_node_to_standard(
         self,
         node_name: str,
@@ -1133,7 +912,7 @@ class WorkflowLiteConverter:
 
         return {
             "id": node_id,
-            "type": node_type,
+            "type": "default",
             "position": pos,
             "data": data
         }
@@ -1207,12 +986,12 @@ def to_workflow_lite(
     node_info: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    Convert standard workflow to workflow_lite format.
+    Convert Xyflow workflow to workflow_lite format.
 
     Convenience function that creates a converter and performs conversion.
 
     Args:
-        workflow: Standard workflow dictionary
+        workflow: Xyflow workflow dictionary
         node_info: Optional node information dictionary from get_node_info API
 
     Returns:
@@ -1227,7 +1006,7 @@ def to_workflow_standard(
     original_workflow: Optional[Dict] = None
 ) -> Dict[str, Any]:
     """
-    Convert workflow_lite to standard workflow format.
+    Convert workflow_lite to Xyflow workflow format.
 
     Convenience function that creates a converter and performs conversion.
 
@@ -1236,7 +1015,7 @@ def to_workflow_standard(
         original_workflow: Optional original workflow to preserve metadata
 
     Returns:
-        Standard workflow dictionary
+        Xyflow workflow dictionary
     """
     converter = WorkflowLiteConverter()
     return converter.to_standard(lite, original_workflow)

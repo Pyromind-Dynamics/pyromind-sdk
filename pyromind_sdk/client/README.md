@@ -896,22 +896,18 @@ client = PyroMindAPIClient(
 
 ## Workflow Validation
 
-The SDK provides workflow validation functionality, supporting both standard and lite formats.
+The SDK validates Xyflow and workflow_lite formats.
 
 ### Validate Workflow
 
 ```python
-from pyromind_sdk.client.workflow import validate_workflow, ValidationError
+from pyromind_sdk.client.workflow import validate_workflow
 
-# Validate workflow (auto-detect format)
-try:
-    result = validate_workflow(workflow_data)
-    print(f"Valid: {result.is_valid}")
-    if not result.is_valid:
-        for error in result.errors:
-            print(f"Error: {error}")
-except ValidationError as e:
-    print(f"Validation error: {e}")
+# Validate an Xyflow workflow against node definitions for this client
+is_valid, errors = validate_workflow(workflow_data, client=client)
+print(f"Valid: {is_valid}")
+for error in errors:
+    print(f"Error: {error}")
 ```
 
 ### Validate Specific Format
@@ -922,23 +918,19 @@ from pyromind_sdk.client.workflow import (
     validate_standard_format,
     validate_workflow_lite,
     validate_workflow_standard,
-    validate_workflow_legacy,
 )
 
 # Validate lite format
-result = validate_lite_format(workflow_data)
+is_valid, errors = validate_lite_format(lite_workflow)
 
-# Validate standard format
-result = validate_standard_format(workflow_data)
+# Validate Xyflow format
+is_valid, errors = validate_standard_format(workflow_data, node_info=node_info)
 
-# Validate lite workflow
-result = validate_workflow_lite(workflow_data)
+# Validate lite workflow (boolean convenience API)
+is_valid = validate_workflow_lite(lite_workflow)
 
-# Validate standard workflow
-result = validate_workflow_standard(workflow_data)
-
-# Validate legacy format
-result = validate_workflow_legacy(workflow_data)
+# Validate Xyflow workflow (boolean convenience API)
+is_valid = validate_workflow_standard(workflow_data, node_info=node_info)
 ```
 
 ### Workflow Format Conversion
@@ -951,10 +943,10 @@ from pyromind_sdk.client.workflow import (
     LayoutGenerator,
 )
 
-# Convert standard workflow to lite format
+# Convert Xyflow workflow to lite format
 lite_workflow = to_workflow_lite(standard_workflow)
 
-# Convert lite workflow to standard format
+# Convert lite workflow to Xyflow format
 standard_workflow = to_workflow_standard(lite_workflow)
 
 # Use converter

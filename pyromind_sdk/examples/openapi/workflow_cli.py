@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-Workflow Format Converter CLI
+Xyflow Workflow Converter CLI
 
 Command-line interface for converting between workflow formats and validating workflows.
 
 This tool supports two workflow formats:
-- Standard format: Complex structure with UI metadata, numeric IDs, and link arrays
+- Xyflow format: Nodes with `data.nodeType` and `data.config`, plus named `edges`
 - Lite format: Simplified structure with named nodes and embedded connections
 
 Usage Examples:
-    # Convert standard to lite format
+    # Convert Xyflow to lite format
     python workflow_cli.py convert workflow.json output.lite.json
 
-    # Convert lite to standard format (with automatic node layout)
+    # Convert lite to Xyflow format (with automatic node layout)
     python workflow_cli.py convert --to-standard workflow.lite.json output.json
 
-    # Convert lite to standard format (without auto layout, preserves [0,0] positions)
+    # Convert lite to Xyflow format (without auto layout, preserves [0,0] positions)
     python workflow_cli.py convert --to-standard --no-auto-layout workflow.lite.json output.json
 
     # Validate a workflow (auto-detects format)
@@ -75,10 +75,10 @@ Examples:
   # Convert to lite format
   python workflow_cli.py convert workflow.json output.lite.json
 
-  # Convert to standard format (with auto layout enabled by default)
+  # Convert to Xyflow format (with auto layout enabled by default)
   python workflow_cli.py convert --to-standard workflow.lite.json output.json
 
-  # Convert to standard format without auto layout
+  # Convert to Xyflow format without auto layout
   python workflow_cli.py convert --to-standard --no-auto-layout workflow.lite.json output.json
 
   # Validate workflow (auto-detects format)
@@ -109,7 +109,7 @@ Examples:
     parser.add_argument(
         "--to-standard",
         action="store_true",
-        help="Convert from lite to standard format (default: standard to lite)"
+        help="Convert from lite to Xyflow format (default: Xyflow to lite)"
     )
     parser.add_argument(
         "--with-node-info",
@@ -120,13 +120,13 @@ Examples:
         "--auto-layout",
         action="store_true",
         default=True,
-        help="Enable automatic node layout when converting to standard format (default: enabled)"
+        help="Enable automatic node layout when converting to Xyflow format (default: enabled)"
     )
     parser.add_argument(
         "--no-auto-layout",
         action="store_false",
         dest="auto_layout",
-        help="Disable automatic node layout when converting to standard format"
+        help="Disable automatic node layout when converting to Xyflow format"
     )
 
     args = parser.parse_args()

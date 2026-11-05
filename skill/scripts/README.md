@@ -21,8 +21,8 @@ python skill/scripts/convert_workflow.py INPUT.json OUTPUT.json
 python skill/scripts/convert_workflow.py --to-standard INPUT.lite.json OUTPUT.json
 ```
 
-- Default direction: `standard -> lite`
-- `--to-standard`: `lite -> standard`
+- Default direction: `Xyflow -> lite`
+- `--to-standard`: `lite -> Xyflow`
 
 ### 2) Validate workflow
 
@@ -41,8 +41,8 @@ python skill/scripts/roundtrip_check.py INPUT.json
 python skill/scripts/roundtrip_check.py INPUT.json --output REGENERATED.json
 ```
 
-- Runs `standard -> lite -> standard`
-- Prints node/link count and `last_node_id`/`last_link_id`
+- Runs `Xyflow -> lite -> Xyflow`
+- Prints node and edge counts
 
 ### 4) Inspect YAML node
 
