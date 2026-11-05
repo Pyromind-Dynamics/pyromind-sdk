@@ -313,7 +313,7 @@ def build_command_template(
     bash_commands.append('input_dir="$(mktemp -d /tmp/pyromind-inputs.XXXXXXXXXX)"')
     bash_commands.append('trap \'rm -rf -- "$input_dir"\' EXIT')
     for index, input_name in enumerate(input_names, start=1):
-        bash_commands.append(f'printf "%s" "${index}" > "$input_dir/{input_name}"')
+        bash_commands.append(f'printf "%s" "${{{index}}}" > "$input_dir/{input_name}"')
     #todo 临时安装
     # 4. Install the temporary SDK version (skip for accelerate mode).
     python_exec = (python_command or "python3").strip()
