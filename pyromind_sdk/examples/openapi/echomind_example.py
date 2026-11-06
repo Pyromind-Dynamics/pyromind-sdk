@@ -62,7 +62,7 @@ def create_echomind_example():
             print(f"  Execution Mode: {job.execution_mode}")
             print(f"  Custom Runtime Script Path: {job.custom_runtime_script_path}")
             if job.secret_key:
-                print(f"  Secret Key: {job.secret_key[:8]}...")
+                print("  Secret Key: ***")
         except Exception as e:
             print(f"  Note: Could not fetch job details: {e}")
 
@@ -139,7 +139,7 @@ def get_echomind_example(job_id: str):
         print(f"  Execution Mode: {job.execution_mode}")
         print(f"  Custom Runtime Script Path: {job.custom_runtime_script_path}")
         if job.secret_key:
-            print(f"  Secret Key: {job.secret_key[:8]}...")
+            print("  Secret Key: ***")
         if job.resources:
             print(f"  Resources:")
             print(f"    CPU: {job.resources.cpu}")
