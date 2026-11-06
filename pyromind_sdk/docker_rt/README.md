@@ -160,11 +160,14 @@ Only the PyroMind-specific variables you **must** know to use builds and pushes 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `DOCKER_RT_BUILD_REGISTRY` | Cluster profile | Registry prefix (with namespace) used to expand short tags. |
-| `DOCKER_RT_BUILD_PUSH` | `true` | Push the image after building. Set `false` to keep the workspace archive only. |
+| `DOCKER_RT_BUILD_PUSH` | `false` | Push the workspace archive automatically after a successful build. Off by default: the build container runs every Dockerfile `RUN` as root, so a credential placed in it is readable by the Dockerfile's author. Pushing always happens from the daemon, **after** the sandbox is gone. Use `docker push <tag>` to push on demand. |
 | `DOCKER_RT_BUILD_PUSH_CHECK` | `fail` | Pre-push registry reachability check: `fail`, `warn` or `off`. |
 | `DOCKER_RT_BUILD_IMAGE` | Cluster-specific | Builder sandbox image; must include shell and `sleep` (the `-debug` variant). |
+| `DOCKER_RT_BUILD_CONTEXT_MODE` | `storage` | How the build context reaches the cluster: `storage` (the only default — staged through workspace storage, then copied locally inside the sandbox) or `upload` (the old direct upload, opt-in for environments without storage). **There is no automatic fallback**: a misconfigured storage fails the build instead of quietly taking the slow route. |
+| `PYROMIND_STORAGE_SECRET_KEY` | unset | The storage secret key. `/storage_info` no longer returns it; set it yourself — when it is missing or wrong, the build fails with `storage connection failed`. |
+| `PYROMIND_STORAGE_ENDPOINT` | per cluster (automatic) | Storage endpoint, taken from `CLUSTER_RESOURCE` (every cluster has one). Normally no need to set it. |
 | `DOCKER_RT_REGISTRY_USERNAME` / `DOCKER_RT_REGISTRY_PASSWORD` | unset | Registry credentials. |
-| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | unset | Path to a Docker `config.json` (alternative to username/password). |
+| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | removed | No longer read. Credentials come only from `DOCKER_RT_REGISTRY_USERNAME` + `DOCKER_RT_REGISTRY_PASSWORD`; there is no config-file fallback. |
 | `DOCKER_RT_REGISTRY_NAMESPACE` | Cluster profile | Namespace for short tags. |
 | `DOCKER_RT_ACR_ACCESS_KEY_ID` / `DOCKER_RT_ACR_ACCESS_KEY_SECRET` | unset | Only needed for automatic ACR repository creation; not needed for an existing repository. |
 

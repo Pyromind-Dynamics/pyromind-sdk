@@ -64,20 +64,41 @@ from __future__ import annotations
 
 import io
 import itertools
+import json
 import logging
 import os
 import re
 import secrets
 import shlex
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, NamedTuple
 
 logger = logging.getLogger("docker_rt.context_staging")
 
-#: ``auto`` (try storage, fall back to a direct upload), ``storage`` (storage or
-#: fail), ``upload`` (never touch storage — the pre-storage behaviour).
+#: ``storage`` (default): the workspace route **or a hard error**. ``auto`` is
+#: kept only as an alias for ``storage`` — the fallback it used to mean is gone
+#: on purpose: a silent fall-back turns a broken deployment into a build that is
+#: merely slow, and the operator never finds out that storage is misconfigured.
+#: ``upload`` is the old direct ``put_archive`` route, opt-in only.
 STAGING_MODES = ("auto", "storage", "upload")
+
+#: Whether a build in this process has connected to storage successfully.
+#: The sweep keys on it (together with an explicit configuration) so a daemon
+#: that has not built anything never probes storage — checking at startup was
+#: both useless and confusing: the answer only matters to `docker build`.
+_storage_verified = False
+
+
+def storage_verified() -> bool:
+    return _storage_verified
+
+
+def mark_storage_verified() -> None:
+    global _storage_verified
+    _storage_verified = True
 
 #: Default mount target. Inside ``/kaniko`` so kaniko's ``DeleteFilesystem``
 #: (multi-stage builds) cannot wipe it.
@@ -123,9 +144,13 @@ def _env(name: str, default: str = "") -> str:
 
 
 def staging_mode() -> str:
-    """``DOCKER_RT_BUILD_CONTEXT_MODE``, normalised (unknown values → ``auto``)."""
-    mode = _env("DOCKER_RT_BUILD_CONTEXT_MODE", "auto").lower()
-    return mode if mode in STAGING_MODES else "auto"
+    """``DOCKER_RT_BUILD_CONTEXT_MODE``, normalised (unknown values → ``storage``).
+
+    An unknown value is treated as ``storage`` rather than ``auto``: the safe
+    direction here is "fail loudly", not "quietly upload over the exec channel".
+    """
+    mode = _env("DOCKER_RT_BUILD_CONTEXT_MODE", "storage").lower()
+    return mode if mode in STAGING_MODES else "storage"
 
 
 def staging_enabled() -> bool:
@@ -134,8 +159,13 @@ def staging_enabled() -> bool:
 
 
 def staging_required() -> bool:
-    """Whether a storage failure must fail the build instead of falling back."""
-    return staging_mode() == "storage"
+    """Whether a storage failure must fail the build instead of falling back.
+
+    True for every mode except the explicitly opted-in ``upload``. ``auto`` is
+    **not** a "try storage, else upload" switch any more — that fallback hid
+    misconfigured deployments behind a build that was merely slow.
+    """
+    return staging_mode() != "upload"
 
 
 def staging_mount_path() -> str:
@@ -320,75 +350,654 @@ def parse_staged_size(stdout: str) -> int | None:
     return None
 
 
-def resolve_bucket(storage: Any, info: Any) -> str:
-    """Pick the bucket that holds this user's workspace.
+def workspace_bucket(profile: Any) -> str:
+    """The bucket holding this user's workspace: the account's ``uid``.
 
-    Resolution order, cheapest and least privileged first:
-
-    1. ``PYROMIND_STORAGE_BUCKET`` (already honoured by ``StorageClient``);
-    2. the single bucket the credentials can list — this is what a real
-       deployment returns, and the credential is scoped to exactly one bucket;
-    3. ``uid`` from ``/storage_info``;
-    4. the only numeric-looking candidate.
+    ``bucket root == JuiceFS subPath "<uid>" == /workspace``, so the uid *is*
+    the bucket name. It comes from ``/user_info`` and nowhere else — there is
+    no storage endpoint to ask about it and nothing for the operator to
+    configure.
     """
-    current = getattr(storage, "current_bucket", None)
-    if current:
-        return str(current)
-
-    names: list[str] = []
     try:
-        names = [str(b.name) for b in storage.client.list_buckets()]
-    except Exception as exc:  # noqa: BLE001 - listing may be denied by design
-        logger.debug("list_buckets failed: %s", exc)
-
-    if len(names) == 1:
-        return names[0]
-
-    uid = str(getattr(info, "uid", "") or "")
-    if uid and (not names or uid in names):
-        return uid
-
-    numeric = [n for n in names if n.isdigit()]
-    if len(numeric) == 1:
-        return numeric[0]
-
-    if names:
+        user = getattr(profile.get_user_info(), "user", None)
+        uid = str(getattr(user, "uid", "") or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        raise StagingError(f"storage connection failed: {exc}") from exc
+    if not uid:
         raise StagingError(
-            "cannot tell which storage bucket holds this user's workspace "
-            f"(candidates: {', '.join(sorted(names))}); set PYROMIND_STORAGE_BUCKET"
+            "storage connection failed: /user_info returned no uid, so the "
+            "workspace bucket cannot be determined"
         )
-    raise StagingError(
-        "no storage bucket available for this account: /storage_info returned no "
-        "uid and the credentials cannot list buckets; set PYROMIND_STORAGE_BUCKET"
-    )
+    return uid
+
+
+def storage_endpoint_for(cluster: str | None) -> str:
+    """Storage endpoint for a cluster, from :data:`client.base.CLUSTER_RESOURCE`.
+
+    The profile's ``/storage_info`` may omit ``url`` (and the SDK's own
+    ``CLUSTER_STORAGE_ENDPOINTS`` table does not list every cluster), while the
+    cluster table always has it. One table, no second copy to drift.
+    """
+    try:
+        from ...client.base import CLUSTER_RESOURCE, parse_cluster_code
+
+        code, _ = parse_cluster_code(cluster or "")
+        entry = CLUSTER_RESOURCE.get(code) or {}
+        return str(entry.get("storage") or "").strip()
+    except Exception as exc:  # noqa: BLE001 - never let table lookup break a build
+        logger.debug("cluster storage endpoint lookup failed: %s", exc)
+        return ""
 
 
 def connect_storage(cluster: str | None = None) -> tuple[Any, str]:
-    """Open a storage client and resolve the bucket holding the workspace.
+    """Open a storage client for this user's workspace.
 
-    Shared by :class:`StorageStager` and :func:`sweep_stale_staging`. The
-    ``minio`` import lives in here so that merely importing this module — which
-    the ``upload`` staging mode and the sweeper both do — never needs it.
+    Each piece comes from exactly one place:
 
-    Raises :class:`StagingError` when the client or the credentials are
-    unavailable, or when the bucket cannot be determined.
+    * **endpoint** — :data:`client.base.CLUSTER_RESOURCE`;
+    * **bucket** — ``ProfileClient.get_user_info().user.uid``;
+    * **credentials** — the environment, read by ``StorageClient`` itself
+      (``PYROMIND_API_KEY`` + ``PYROMIND_STORAGE_SECRET_KEY``).
+
+    ``/storage_info`` is deliberately **not** consulted: the platform is
+    removing it, and its masked credential fields (``X805***NQNN``) were never
+    usable anyway.
+
+    Called **only from a build or a push** — never at daemon startup. A daemon
+    that is merely listening must not probe (or fail on) storage; the check
+    belongs to the command that needs it.
+
+    The ``minio`` import lives in here so that merely importing this module
+    never needs it.
+
+    Raises :class:`StagingError` when the endpoint is unknown, the uid cannot be
+    read, or the credentials are missing/rejected.
     """
     try:
         from ...client.profile import ProfileClient
         from ...client.storage import StorageClient
     except Exception as exc:  # noqa: BLE001 - minio missing / SDK trimmed
         raise StagingError(f"storage client unavailable: {exc}") from exc
+
+    endpoint = storage_endpoint_for(cluster)
+    if not endpoint:
+        raise StagingError(
+            "no storage endpoint for cluster "
+            f"{cluster or storage_cluster() or '<unset>'!r}"
+        )
+
+    bucket = workspace_bucket(ProfileClient(cluster=cluster))
+
+    # No access_key/secret_key here on purpose: passing them would mean asking
+    # the profile API for a credential it now masks, and ``StorageClient``
+    # already reads both from the environment.
     try:
-        info = ProfileClient(cluster=cluster).get_storage_info()
-        storage = StorageClient(
-            endpoint=getattr(info, "url", None),
-            access_key=info.access_key,
-            secret_key=info.secret_key,
+        storage = StorageClient(endpoint=endpoint, cluster=cluster)
+    except ValueError as exc:  # missing/invalid secret key lands here
+        raise StagingError(
+            "storage connection failed: PYROMIND_STORAGE_SECRET_KEY is missing "
+            "or invalid"
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise StagingError(f"storage connection failed: {exc}") from exc
+    # Prime the region cache *for this bucket*: minio's write path calls
+    # GetBucketLocation first, which the gateway rejects with AccessDenied —
+    # the same reason StorageClient caches it whenever a bucket is passed in.
+    # We resolved the bucket ourselves, so cache it here or every put_object
+    # dies before it starts.
+    try:
+        storage._cache_region(bucket)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("region cache priming failed: %s", exc)
+    from . import workspace_storage
+
+    workspace_storage.tune_http_client(storage)
+    return storage, bucket
+
+
+# --------------------------------------------------------------------------
+# workspace image archive index — what `docker images` lists
+# --------------------------------------------------------------------------
+
+#: Suffix of the metadata sidecar written next to every archive a build
+#: produces: ``<archive>.tar`` → ``<archive>.tar.meta.json``.
+IMAGE_META_SUFFIX = ".meta.json"
+
+#: How many tail bytes of a docker-archive are searched for its manifest.
+#: kaniko writes ``manifest.json`` as the last entry, so ~2 KiB is enough;
+#: 32 KiB leaves room for multi-tag manifests while keeping the gateway
+#: round-trip small (a 64 KiB tail measured 10–80 s here, 16 KiB 2–20 s).
+_TAR_TAIL_WINDOW = 32 * 1024
+
+#: Everything `docker images` needs lives in one object. The index is written
+#: once from a full scan and then updated in place by every build, so a listing
+#: is one ranged GET instead of one slow round-trip per archive.
+IMAGE_INDEX_OBJECT = "docker_images/index.json"
+IMAGE_INDEX_VERSION = 1
+
+#: Docker's decimal units, exactly the strings ``docker images`` prints.
+_SIZE_UNITS = ("B", "kB", "MB", "GB", "TB", "PB", "EB")
+
+
+def human_size(size: int) -> str:
+    """Bytes → the same readable string the Docker CLI shows (``12.3kB``)."""
+    value = float(size or 0)
+    for unit in _SIZE_UNITS:
+        if abs(value) < 1000 or unit == _SIZE_UNITS[-1]:
+            return f"{value:.3g}{unit}"
+        value /= 1000
+
+#: One process-wide lock: two concurrent listings must not both run the slow
+#: full scan and then overwrite each other's result.
+_INDEX_LOCK = threading.Lock()
+
+#: The index is read on every `docker images`; cache it in-process so the slow
+#: gateway read is paid once per write, not once per command.
+_INDEX_CACHE_LOCK = threading.Lock()
+_INDEX_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_INDEX_CACHE_TTL_S = 60.0
+
+
+def _scan_workers() -> int:
+    raw = (os.getenv("DOCKER_RT_IMAGE_SCAN_WORKERS") or "").strip()
+    try:
+        return max(1, min(16, int(raw))) if raw else 4
+    except ValueError:
+        return 4
+
+
+def _index_key(cluster: str | None) -> str:
+    return cluster if cluster is not None else (storage_cluster() or "")
+
+
+def _drop_index_cache(cluster: str | None) -> None:
+    with _INDEX_CACHE_LOCK:
+        _INDEX_CACHE.pop(_index_key(cluster), None)
+
+
+def _images_prefix() -> str:
+    """Workspace-relative prefix the build archives land in.
+
+    ``kaniko.DEFAULT_IMAGES_DIR`` is the *in-sandbox* path (``/workspace/
+    docker_images``); the object key is **workspace-relative** (bucket root ==
+    ``/workspace``), so the ``/workspace`` component must be stripped.
+    """
+    from .kaniko import DEFAULT_IMAGES_DIR
+    from .context_staging import DEFAULT_WORKSPACE as _workspace
+
+    prefix = DEFAULT_IMAGES_DIR
+    if prefix.startswith(_workspace + "/"):
+        prefix = prefix[len(_workspace) + 1 :]
+    return prefix.strip("/")
+
+
+def image_meta_object_name(tag: str) -> str:
+    """``docker.io/ns/app:1`` → ``docker_images/docker.io_ns_app_1.tar.meta.json``."""
+    from .kaniko import image_archive_name
+
+    return f"{_images_prefix()}/{image_archive_name(tag)}{IMAGE_META_SUFFIX}"
+
+
+def image_archive_object_name(tag: str) -> str:
+    """Workspace object key of the archive a build writes for ``tag``."""
+    from .kaniko import image_archive_name
+
+    return f"{_images_prefix()}/{image_archive_name(tag)}"
+
+
+def write_image_meta(
+    *,
+    tag: str,
+    digest: str = "",
+    size: int = 0,
+    cluster: str | None = None,
+) -> None:
+    """Persist one image's metadata beside its archive in the workspace.
+
+    Written by the daemon after a successful build. Failures raise — the caller
+    decides whether a build can survive without its metadata (it can, so the
+    build path treats this as a warning).
+    """
+    storage, bucket = connect_storage(
+        cluster if cluster is not None else storage_cluster()
+    )
+    payload = json.dumps(
+        {
+            "tags": [tag],
+            "digest": digest,
+            "size": int(size or 0),
+            "created": int(time.time()),
+            "archive": image_archive_object_name(tag),
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    from . import workspace_storage
+
+    workspace_storage.upload_bytes(
+        storage, bucket, image_meta_object_name(tag), payload
+    )
+
+
+def _read_object_bytes(
+    storage: Any, bucket: str, name: str, *, size: int | None = None
+) -> bytes:
+    """Read a whole object through :mod:`workspace_storage` (Range + 续传).
+
+    ``client/storage.py`` 的方法保持原样不动；网关对全量 GET / stat 返回
+    AccessDenied、Range 响应会中途截断，续传逻辑在 workspace_storage 里。
+    ``size`` 已知时按大小校验，避免短读被当成读完。
+    """
+    from . import workspace_storage
+
+    return workspace_storage.read_bytes(storage, bucket, name, size=size)
+
+
+def _parse_repo_tags(tail: bytes) -> list[str]:
+    marker = tail.rfind(b'"RepoTags"')
+    if marker < 0:
+        return []
+    start = tail.find(b"[", marker)
+    if start < 0:
+        return []
+    depth = 0
+    for index in range(start, len(tail)):
+        char = tail[index : index + 1]
+        if char == b"[":
+            depth += 1
+        elif char == b"]":
+            depth -= 1
+            if depth == 0:
+                try:
+                    tags = json.loads(tail[start : index + 1].decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    return []
+                return [str(t) for t in tags if t]
+    return []
+
+
+def _tags_from_tar_tail(storage: Any, bucket: str, name: str, size: int) -> list[str]:
+    """Read ``RepoTags`` out of a docker-archive without downloading it.
+
+    kaniko writes ``manifest.json`` as the last entry of the tar, so the tags
+    live in the final 64 KiB. The read goes through the resumable channel: a
+    single plain ranged GET is regularly truncated by the gateway, which used
+    to make legacy archives disappear from `docker images`.
+    """
+    window = min(max(size, 0), _TAR_TAIL_WINDOW)
+    if window <= 0:
+        return []
+    from . import workspace_storage
+
+    try:
+        tail = workspace_storage.read_range(
+            storage, bucket, name, offset=max(0, size - window), length=window
+        )
+    except FileNotFoundError:
+        return []
+    except Exception as exc:  # noqa: BLE001 - one unreadable archive must not fail the listing
+        logger.debug("tail read failed for %s: %s", name, exc)
+        return []
+    return _parse_repo_tags(tail)
+
+
+def _iso_epoch(value: Any) -> int | None:
+    try:
+        return int(datetime.fromisoformat(str(value)).timestamp())
+    except (TypeError, ValueError):
+        return None
+
+
+def _inspect_archive(
+    storage: Any,
+    bucket: str,
+    name: str,
+    size: int,
+    *,
+    meta_size: int | None = None,
+    modified: Any = None,
+) -> list[dict[str, Any]]:
+    """Tags/digest/size for one archive: meta sidecar first, tar tail second."""
+    tags: list[str] = []
+    digest = ""
+    created: int | None = None
+    if meta_size is not None:
+        meta_name = f"{name}{IMAGE_META_SUFFIX}"
+        try:
+            meta = json.loads(
+                _read_object_bytes(storage, bucket, meta_name, size=meta_size)
+            )
+            tags = [str(t) for t in meta.get("tags") or []]
+            digest = str(meta.get("digest") or "")
+            created = int(meta.get("created") or 0) or None
+            size = size or int(meta.get("size") or 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("unreadable meta %s: %s", meta_name, exc)
+    if not tags:
+        tags = _tags_from_tar_tail(storage, bucket, name, size)
+        created = created or _iso_epoch(modified)
+    if not tags:
+        logger.warning(
+            "cannot read tags from %s; skipping it in docker images", name
+        )
+        return []
+    return [
+        {
+            "tag": tag,
+            "digest": digest,
+            "size": size,
+            "size_human": human_size(size),
+            "archive": name,
+            "created": created,
+        }
+        for tag in tags
+    ]
+
+
+def _scan_workspace_images(cluster: str | None = None) -> list[dict[str, Any]]:
+    """Full scan of ``docker_images/`` — only used when the index is missing.
+
+    The listing itself is one call; every archive is then inspected in parallel
+    (meta sidecar, or a 64 KiB tail read for legacy archives that predate it).
+    A single round-trip is slow enough here that doing these serially is what
+    made the first `docker images` take ~12 minutes.
+    """
+    storage, bucket = connect_storage(
+        cluster if cluster is not None else storage_cluster()
+    )
+    prefix = _images_prefix()
+    # Recursive on purpose: recursive=False would only surface the
+    # `docker_images/` folder marker itself, not the archives inside it.
+    entries = storage.list_files(prefix, bucket_name=bucket, recursive=True)
+    listing = {str(e.get("object_name") or ""): e for e in entries}
+    meta_sizes = {
+        name: int(entry.get("size") or 0)
+        for name, entry in listing.items()
+        if name.endswith(IMAGE_META_SUFFIX)
+    }
+    targets = [
+        (name, int(entry.get("size") or 0), entry.get("last_modified"))
+        for name, entry in sorted(listing.items())
+        if name.endswith(".tar")
+    ]
+
+    images: list[dict[str, Any]] = []
+    seen_tags: set[str] = set()
+
+    def inspect(target: tuple[str, int, Any]) -> list[dict[str, Any]]:
+        name, size, modified = target
+        return _inspect_archive(
+            storage,
+            bucket,
+            name,
+            size,
+            meta_size=meta_sizes.get(f"{name}{IMAGE_META_SUFFIX}"),
+            modified=modified,
+        )
+
+    if targets:
+        with ThreadPoolExecutor(max_workers=_scan_workers()) as pool:
+            futures = {pool.submit(inspect, target): target for target in targets}
+            for future in as_completed(futures):
+                try:
+                    found = future.result()
+                except Exception as exc:  # noqa: BLE001 - one archive must not fail the scan
+                    logger.warning(
+                        "cannot inspect %s: %s", futures[future][0], exc
+                    )
+                    continue
+                for entry in found:
+                    if entry["tag"] in seen_tags:
+                        continue
+                    seen_tags.add(entry["tag"])
+                    images.append(entry)
+    images.sort(key=lambda entry: entry["tag"])
+    return images
+
+
+def _index_doc(images: list[dict[str, Any]], *, complete: bool) -> dict[str, Any]:
+    return {
+        "version": IMAGE_INDEX_VERSION,
+        "generated_at": int(time.time()),
+        "complete": bool(complete),
+        "images": list(images),
+    }
+
+
+def _write_image_index(
+    images: list[dict[str, Any]], *, complete: bool, cluster: str | None
+) -> dict[str, Any]:
+    doc = _index_doc(images, complete=complete)
+    # Cache before uploading: if the (slow) gateway write fails, this daemon's
+    # `docker images` still shows the scan result instead of repeating it.
+    with _INDEX_CACHE_LOCK:
+        _INDEX_CACHE[_index_key(cluster)] = (time.time(), doc)
+    payload = json.dumps(doc, ensure_ascii=False).encode("utf-8")
+    storage, bucket = connect_storage(
+        cluster if cluster is not None else storage_cluster()
+    )
+    from . import workspace_storage
+
+    workspace_storage.upload_bytes(storage, bucket, IMAGE_INDEX_OBJECT, payload)
+    return doc
+
+
+def write_image_index(
+    images: list[dict[str, Any]] | None = None,
+    *,
+    complete: bool = True,
+    cluster: str | None = None,
+) -> dict[str, Any]:
+    """Write ``index.json``; no ``images`` means scan the directory first."""
+    with _INDEX_LOCK:
+        if images is None:
+            images = _scan_workspace_images(cluster)
+            complete = True
+        return _write_image_index(images, complete=complete, cluster=cluster)
+
+
+def _with_human_sizes(doc: dict[str, Any]) -> dict[str, Any]:
+    """Fill ``size_human`` on entries written before the field existed."""
+    for entry in doc.get("images") or []:
+        if isinstance(entry, dict) and "size_human" not in entry:
+            entry["size_human"] = human_size(int(entry.get("size") or 0))
+    return doc
+
+
+def read_image_index(cluster: str | None = None) -> dict[str, Any] | None:
+    """The persisted image index — one ranged GET, or ``None`` if absent."""
+    key = _index_key(cluster)
+    with _INDEX_CACHE_LOCK:
+        hit = _INDEX_CACHE.get(key)
+        if hit is not None and time.time() - hit[0] <= _INDEX_CACHE_TTL_S:
+            return hit[1]
+    try:
+        storage, bucket = connect_storage(
+            cluster if cluster is not None else storage_cluster()
+        )
+        raw = _read_object_bytes(storage, bucket, IMAGE_INDEX_OBJECT)
+        doc = json.loads(raw.decode("utf-8") or "null")
+        if isinstance(doc, dict) and isinstance(doc.get("images"), list):
+            doc = _with_human_sizes(doc)
+            with _INDEX_CACHE_LOCK:
+                _INDEX_CACHE[key] = (time.time(), doc)
+            return doc
+    except Exception as exc:  # noqa: BLE001 - absence/ACL noise → None, callers rescan
+        logger.debug("image index read failed: %s", exc)
+    return None
+
+
+def _tag_variants(ref: str) -> set[str]:
+    """Spellings a pushed/listed reference may have after CLI normalization.
+
+    Docker canonicalizes ``app:1`` to ``docker.io/library/app:1`` before it
+    reaches the daemon, while the build destination is
+    ``docker.io/<ns>/app:1``. Matching on the full form alone would make
+    `docker push app:1` miss the archive the same daemon just built.
+    """
+    raw = (ref or "").strip()
+    if not raw:
+        return set()
+    last = raw.rsplit("/", 1)[-1]
+    if ":" not in last:
+        raw = f"{raw}:latest"
+    out = {raw}
+    repo, _, tag = raw.rpartition(":")
+    if repo.startswith("docker.io/"):
+        out.add(f"{repo[len('docker.io/'):]}:{tag}")
+    out.add(f"{repo.rsplit('/', 1)[-1]}:{tag}")
+    return out
+
+
+def tags_equivalent(left: str, right: str) -> bool:
+    """Whether two image references name the same tag after Docker's normalization."""
+    return bool(_tag_variants(left) & _tag_variants(right))
+
+
+def lookup_image_archive(
+    tag: str, cluster: str | None = None
+) -> dict[str, Any] | None:
+    """The index entry for ``tag``, tolerating Docker's name normalization."""
+    doc = read_image_index(cluster)
+    if not doc:
+        return None
+    images = [e for e in doc.get("images") or [] if e.get("tag")]
+    for entry in images:
+        if str(entry.get("tag")) == tag:
+            return entry
+    wanted = _tag_variants(tag)
+    hits = [
+        entry
+        for entry in images
+        if wanted & _tag_variants(str(entry.get("tag") or ""))
+    ]
+    archives = {entry.get("archive") for entry in hits}
+    if len(archives) == 1:
+        return hits[0]
+    return None
+
+
+def archive_size(archive: str, cluster: str | None = None) -> int | None:
+    """Bytes of one workspace ``.tar`` object, or ``None`` when unknown.
+
+    The build's local cache fetch can fail (a flaky pre-api connection), which
+    used to leave ``size: 0`` in the index and an empty DISK USAGE column. The
+    object size itself is cheap to read from storage, so ask that instead.
+    """
+    try:
+        from . import workspace_storage
+
+        storage, bucket = connect_storage(
+            cluster if cluster is not None else storage_cluster()
+        )
+        return workspace_storage.object_size(storage, bucket, archive)
+    except Exception as exc:  # noqa: BLE001 - size is best-effort
+        logger.debug("archive size lookup failed for %s: %s", archive, exc)
+        return None
+
+
+def set_image_index_size(
+    tag: str, size: int, cluster: str | None = None
+) -> bool:
+    """Record a measured archive size for ``tag``; no-op when already right.
+
+    Used by ``docker push`` once the archive is in hand, so an image whose
+    build-time cache fetch failed stops showing 0 B.
+    """
+    wanted = _tag_variants(tag)
+    with _INDEX_LOCK:
+        doc = read_image_index(cluster)
+        if not doc:
+            return False
+        changed = False
+        for entry in doc.get("images") or []:
+            if not isinstance(entry, dict):
+                continue
+            entry_tag = str(entry.get("tag") or "")
+            if entry_tag != tag and not (_tag_variants(entry_tag) & wanted):
+                continue
+            if int(entry.get("size") or 0) != int(size):
+                entry["size"] = int(size)
+                entry["size_human"] = human_size(int(size))
+                changed = True
+        if not changed:
+            return False
+        _write_image_index(
+            doc.get("images") or [],
+            complete=bool(doc.get("complete", True)),
             cluster=cluster,
         )
-    except Exception as exc:  # noqa: BLE001
-        raise StagingError(f"cannot resolve storage credentials: {exc}") from exc
-    return storage, resolve_bucket(storage, info)
+        return True
+
+
+def upsert_image_index(
+    *,
+    tags: list[str] | None = None,
+    tag: str = "",
+    archive: str,
+    digest: str = "",
+    size: int = 0,
+    created: int | None = None,
+    cluster: str | None = None,
+) -> dict[str, Any]:
+    """Add/replace one image in ``index.json`` after a build — no full rescan.
+
+    ``tags`` covers multi-``-t`` builds (all names point at one archive). When
+    no index exists yet the result is marked ``complete: false`` so the next
+    `docker images` still scans the directory once and fills in archives that
+    were built before the index existed.
+    """
+    wanted = [t for t in (tags or []) if t] or ([tag] if tag else [])
+    if not wanted:
+        raise ValueError("upsert_image_index needs at least one tag")
+    stamp = created or int(time.time())
+    entries = [
+        {
+            "tag": name,
+            "digest": digest,
+            "size": int(size or 0),
+            "size_human": human_size(int(size or 0)),
+            "archive": archive,
+            "created": stamp,
+        }
+        for name in wanted
+    ]
+    with _INDEX_LOCK:
+        doc = read_image_index(cluster)
+        wanted_set = set(wanted)
+        images = [
+            item
+            for item in (doc or {}).get("images") or []
+            if str(item.get("archive")) != archive
+            and str(item.get("tag")) not in wanted_set
+        ]
+        images.extend(entries)
+        images.sort(key=lambda item: str(item.get("tag") or ""))
+        complete = bool(doc.get("complete", True)) if doc is not None else False
+        return _write_image_index(images, complete=complete, cluster=cluster)
+
+
+def list_workspace_images(
+    cluster: str | None = None, *, refresh: bool = False
+) -> list[dict[str, Any]]:
+    """One entry per image archive in the user's workspace — `docker images`.
+
+    The index is the fast path. It is only (re)built by scanning the directory
+    when it does not exist, is explicitly refreshed, or a previous build left it
+    marked incomplete — a build updates it in place instead.
+    """
+    if not refresh:
+        doc = read_image_index(cluster)
+        if doc is not None and doc.get("complete", True):
+            return list(doc.get("images") or [])
+    with _INDEX_LOCK:
+        if not refresh:
+            # Another request may have finished the scan while we waited.
+            doc = read_image_index(cluster)
+            if doc is not None and doc.get("complete", True):
+                return list(doc.get("images") or [])
+        images = _scan_workspace_images(cluster)
+        doc = _write_image_index(images, complete=True, cluster=cluster)
+        return list(doc.get("images") or [])
 
 
 class StorageStager:
@@ -426,6 +1035,7 @@ class StorageStager:
         storage, bucket = connect_storage(self._cluster)
         self._storage = storage
         self._bucket = bucket
+        mark_storage_verified()
         return storage
 
     @property
@@ -591,6 +1201,15 @@ def sweep_stale_staging(
         return []
     age_limit = sweep_max_age_s() if max_age_s is None else max(0, max_age_s)
     now = time.time() if now is None else now
+
+    if storage is None and not (
+        _storage_verified or _env("PYROMIND_STORAGE_SECRET_KEY")
+    ):
+        # Nothing in this process has used storage and nothing is explicitly
+        # configured: do not probe it. Whether storage works only matters to
+        # `docker build`, and that is where the error belongs.
+        logger.debug("staging sweep skipped: storage is not configured")
+        return []
 
     if storage is None:
         try:

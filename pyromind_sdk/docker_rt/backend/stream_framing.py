@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import struct
 
-STREAM_STDIN = 0
 STREAM_STDOUT = 1
 STREAM_STDERR = 2
 

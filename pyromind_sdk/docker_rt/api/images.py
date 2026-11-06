@@ -1,4 +1,7 @@
-"""Docker image listing / inspect (templates / known images)."""
+"""Docker image listing / inspect payloads (templates / known images).
+
+只负责「名字 ↔ Docker 资源」的转换；路由在 ``aio_server`` 里。
+"""
 
 from __future__ import annotations
 
@@ -7,12 +10,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from fastapi import APIRouter, Request
-
 from ..backend.buildkit import normalize_for_registry
-from ..backend.runtime import DEFAULT_IMAGE
-
-router = APIRouter(tags=["images"])
 
 
 def image_id(name: str) -> str:
@@ -25,18 +23,15 @@ def _strip_sha256(value: str) -> str:
     return value[len(prefix):] if value.startswith(prefix) else value
 
 
-def _image_id(name: str) -> str:
-    """Backward-compatible alias."""
-    return image_id(name)
-
-
 def _repo_tag(name: str) -> str:
     if ":" in name.rsplit("/", 1)[-1]:
         return name
     return f"{name}:latest"
 
 
-def to_image_summary(name: str, *, created: int | None = None) -> dict[str, Any]:
+def to_image_summary(
+    name: str, *, created: int | None = None, size: int = 0
+) -> dict[str, Any]:
     return {
         "Containers": -1,
         "Created": created or int(time.time()),
@@ -46,7 +41,7 @@ def to_image_summary(name: str, *, created: int | None = None) -> dict[str, Any]
         "RepoDigests": [],
         "RepoTags": [_repo_tag(name)],
         "SharedSize": -1,
-        "Size": 0,
+        "Size": int(size or 0),
     }
 
 
@@ -136,27 +131,3 @@ def resolve_image_name(ref: str, names: Iterable[str]) -> str | None:
             if n == candidate or _repo_tag(n) == candidate:
                 return n
     return None
-
-
-@router.get("/images/json")
-async def list_images(request: Request) -> list[dict[str, Any]]:
-    store = request.app.state.store
-    # **只列真实存在的镜像**：默认镜像（仅在 create/run 未给 Image 时才使用）
-    # 不算"本地已有镜像"，否则用户没拉过镜像也会在 docker images 里看到它
-    # （2026-10-15 用户报：SWE-bench 默认镜像凭空出现）。
-    return [to_image_summary(n) for n in sorted(store.known_images())]
-
-
-@router.get("/images/{name:path}/json")
-async def inspect_image_route(request: Request, name: str) -> dict[str, Any]:
-    store = request.app.state.store
-    default = getattr(request.app.state, "default_image", None) or DEFAULT_IMAGE
-    names = store.known_images() - {
-        getattr(request.app.state, "default_image", None) or DEFAULT_IMAGE
-    }  # 隐式默认镜像不算"本地已有"（用户没显式拉/用过就不该看到）
-    resolved = resolve_image_name(name, names)
-    if resolved is None:
-        from fastapi import HTTPException
-
-        raise HTTPException(status_code=404, detail=f"No such image: {name}")
-    return to_image_inspect(resolved)

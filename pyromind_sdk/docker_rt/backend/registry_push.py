@@ -24,7 +24,6 @@ never been exercised against the real endpoint (see the module tests).
 from __future__ import annotations
 
 import base64
-import binascii
 import datetime as _dt
 import difflib
 import hashlib
@@ -41,7 +40,6 @@ logger = logging.getLogger("docker_rt.registry_push")
 
 UTC = _dt.timezone.utc
 
-DEFAULT_DOCKER_CONFIG_SECRET = "/etc/docker-image/.dockerconfigjson"
 ACR_API_ENDPOINT = "https://cr.{region_id}.aliyuncs.com/"
 ACR_API_VERSION = "2018-12-01"
 
@@ -264,142 +262,47 @@ def _auth_field(username: str, password: str) -> str:
     return _b64(f"{username}:{password}".encode("utf-8"))
 
 
-def normalize_docker_config(raw: dict[str, Any] | None) -> dict[str, str]:
-    """Reduce a ``config.json`` to ``{host: auth_b64}`` usable for **push**.
-
-    Tolerates everything the real platform secrets contain:
-
-    * entry with ``auth`` already set — kept verbatim;
-    * entry with only ``username``/``password`` — ``auth`` assembled here;
-    * key carrying an ``https://`` prefix — kept as its own key and, when it is
-      a Docker Hub spelling, also normalised;
-    * entry with only ``identitytoken`` — **dropped**: an identity token cannot
-      authorise a push.
-    """
-    auths = (raw or {}).get("auths") if isinstance(raw, dict) else None
-    if not isinstance(auths, dict):
-        return {}
-    out: dict[str, str] = {}
-    for host, entry in auths.items():
-        if not isinstance(entry, dict):
-            continue
-        auth = (entry.get("auth") or "").strip()
-        if not auth:
-            user = str(entry.get("username") or "").strip()
-            password = str(entry.get("password") or "").strip()
-            if user and password:
-                auth = _auth_field(user, password)
-        if not auth:
-            if entry.get("identitytoken"):
-                logger.warning(
-                    "dropping registry credential for %s: identitytoken cannot push",
-                    host,
-                )
-            continue
-        out[str(host)] = auth
-    return out
-
-
-def read_docker_config_file(path: str) -> dict[str, Any]:
-    """Read a plain ``config.json`` from disk."""
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except FileNotFoundError as exc:
-        raise RegistryConfigError(f"dockerconfig not found: {path}") from exc
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RegistryConfigError(f"dockerconfig unreadable: {path}: {exc}") from exc
-    return data if isinstance(data, dict) else {}
-
-
-def read_docker_config_secret(path: str | None = None) -> dict[str, Any]:
-    """Read the kubelet-mounted ``kubernetes.io/dockerconfigjson`` secret.
-
-    The mounted file holds the **base64** of the ``config.json`` (that is how the
-    platform publishes it), but a plain JSON file is accepted too.
-    """
-    target = (path or _env("DOCKER_RT_REGISTRY_DOCKERCONFIG") or DEFAULT_DOCKER_CONFIG_SECRET)
-    try:
-        with open(target, "r", encoding="utf-8") as handle:
-            text = handle.read().strip()
-    except FileNotFoundError as exc:
-        raise RegistryConfigError(f"dockerconfig secret not found: {target}") from exc
-    except OSError as exc:
-        raise RegistryConfigError(f"dockerconfig secret unreadable: {target}: {exc}") from exc
-
-    if not text:
-        raise RegistryConfigError(f"dockerconfig secret is empty: {target}")
-    if text.startswith("{"):
-        data = json.loads(text)
-        return data if isinstance(data, dict) else {}
-    try:
-        decoded = base64.b64decode(text, validate=True).decode("utf-8")
-    except (binascii.Error, UnicodeDecodeError) as exc:
-        raise RegistryConfigError(
-            f"dockerconfig secret is neither JSON nor base64: {target}"
-        ) from exc
-    data = json.loads(decoded)
-    return data if isinstance(data, dict) else {}
-
-
 def _credentials_from_env() -> tuple[str, str]:
+    """The **only** credential source: explicit environment variables.
+
+    There is deliberately no ``config.json`` reader and no well-known default
+    path. Reading the daemon host's docker config made the credential implicit —
+    a deployment could "happen to work" because somebody once ran
+    ``docker login`` on that machine, and nobody could tell where the credential
+    came from. ``DOCKER_RT_REGISTRY_DOCKERCONFIG`` is gone for the same reason.
+
+    These values never leave this process: they are not written to a file, not
+    passed to a sandbox, and not embedded in a build script.
+    """
     return (
         _env("DOCKER_RT_REGISTRY_USERNAME"),
         _env("DOCKER_RT_REGISTRY_PASSWORD"),
     )
 
 
+def registry_credentials() -> tuple[str, str]:
+    """Public accessor for the explicit push credentials (username, password)."""
+    return _credentials_from_env()
+
+
 def credential_source() -> str:
-    """``"username_password"``, ``"dockerconfig"`` or ``""`` when unconfigured."""
+    """``"username_password"`` or ``""`` when unconfigured."""
     username, password = _credentials_from_env()
-    if username and password:
-        return "username_password"
-    if _env("DOCKER_RT_REGISTRY_DOCKERCONFIG"):
-        return "dockerconfig"
-    if os.path.exists(DEFAULT_DOCKER_CONFIG_SECRET):
-        return "dockerconfig"
-    return ""
+    return "username_password" if username and password else ""
 
 
-def docker_config_auths(prefix: str | None = None, cluster: str | None = None) -> dict[str, str]:
-    """``{host: auth_b64}`` to hand to the builder image."""
-    source = credential_source()
-    if not source:
-        return {}
-    raw: dict[str, Any]
-    if source == "username_password":
-        username, password = _credentials_from_env()
-        raw = {"auths": {host: {"username": username, "password": password} for host in
-                         registry_hosts_for(prefix or build_registry(cluster), cluster)}}
-    else:
-        raw = read_docker_config_secret()
-    return normalize_docker_config(raw)
+def auth_for_host(host: str = "") -> str:
+    """The ``auth`` field (base64 of ``user:pass``) for one registry host.
 
-
-def docker_config_payload(prefix: str | None = None, cluster: str | None = None) -> dict[str, Any]:
-    """The ``config.json`` object to inject into the build sandbox.
-
-    ``auths`` values **must** be objects (``{"auth": <b64>}``), not bare
-    strings: kaniko decodes the file into Go's ``types.AuthConfig`` and fails
-    with ``json: cannot unmarshal string into Go struct field ConfigFile.auths``
-    when it sees a plain string.
+    ``host`` is accepted so callers can keep their per-host call sites, but the
+    credentials themselves are global: only one registry is ever configured per
+    daemon, and the host is part of the push target, not of the secret.
     """
-    auths = docker_config_auths(prefix, cluster)
-    if not auths:
-        return {}
-    return {"auths": {host: {"auth": auth} for host, auth in auths.items()}}
-
-
-def docker_config_b64(prefix: str | None = None, cluster: str | None = None) -> str:
-    """Base64 of the ``config.json`` injected into the build sandbox.
-
-    Returns ``""`` when no credentials are configured: some registries allow
-    anonymous pushes, so a missing credential is a warning, not a failure.
-    """
-    payload = docker_config_payload(prefix, cluster)
-    if not payload:
+    del host  # kept for call-site clarity; credentials are daemon-wide
+    username, password = _credentials_from_env()
+    if not username or not password:
         return ""
-    return _b64(json.dumps(payload).encode("utf-8"))
+    return _auth_field(username, password)
 
 
 # --------------------------------------------------------------------------
@@ -454,7 +357,6 @@ KNOWN_REGISTRY_ENV = (
     "DOCKER_RT_REGISTRY_NAMESPACE",
     "DOCKER_RT_REGISTRY_USERNAME",
     "DOCKER_RT_REGISTRY_PASSWORD",
-    "DOCKER_RT_REGISTRY_DOCKERCONFIG",
 )
 KNOWN_ALIYUN_ENV = (
     "ALIBABA_CLOUD_ACCESS_KEY_ID",
@@ -817,8 +719,8 @@ def push_plan(cluster: str | None = None) -> PushPlan:
     source = credential_source()
     if not source:
         warnings.append(
-            "no push credentials configured (DOCKER_RT_REGISTRY_USERNAME+PASSWORD "
-            f"or DOCKER_RT_REGISTRY_DOCKERCONFIG); assuming the target allows "
+            "no push credentials configured (DOCKER_RT_REGISTRY_USERNAME + "
+            "DOCKER_RT_REGISTRY_PASSWORD); assuming the target allows "
             "anonymous pushes"
         )
 

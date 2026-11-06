@@ -19,13 +19,10 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 from .api.system import API_VERSION, MIN_API_VERSION  # noqa: E402
 from .backend.archive import (  # noqa: E402
     TarHead,
-    finish_put_archive,
     iter_archive_chunks,
-    open_put_archive,
     path_stat,
     put_archive,
     scan_tar_head,
-    write_put_chunk,
 )
 import uuid
 from .backend.events import EventBus  # noqa: E402
@@ -37,7 +34,6 @@ from .backend.exec_utils import (  # noqa: E402
 )
 from .backend.reconcile import (  # noqa: E402
     _container_state_from_status,
-    reconcile_on_startup,
     reconcile_pyromind_sandboxes,
 )
 from .backend.runtime import (  # noqa: E402
@@ -47,7 +43,6 @@ from .backend.runtime import (  # noqa: E402
     docker_rt_pod_meta,
     parse_binds,
     parse_env_list,
-    probe_kube_auth,
     resolve_kubeconfig,
     resolve_namespace,
     start_kube_environment,
@@ -82,7 +77,6 @@ from .backend.service_dns import (  # noqa: E402
     create_service_for_pod,
     delete_service,
     read_pod_uid,
-    reap_orphan_services,
     resolve_service_name,
 )
 from .backend.resources import (  # noqa: E402
@@ -105,6 +99,11 @@ from .register_context import (  # noqa: E402
 )
 from .api import images as images_mod  # noqa: E402
 from pyromind_sdk.client.base import format_exception_message  # noqa: E402
+from pyromind_sdk.log_redaction import (  # noqa: E402
+    RedactionFilter,
+    redact,
+    redact_text,
+)
 from pyromind_sdk.client.trace import (  # noqa: E402
     TRACE_ID_HEADER,
     ensure_trace_id,
@@ -141,18 +140,23 @@ def _compact(value: Any) -> Any:
 
 
 def _log_preview(payload: Any, *, limit: int = _LOG_BODY_MAX) -> str:
-    """把 JSON/字节转成一行可读预览（超长截断）。"""
+    """把 JSON/字节转成一行可读预览（超长截断，敏感字段已脱敏）。
+
+    ``POST /auth/login``（``password``）、``POST /containers/create``
+    （``Env`` / ``HostConfig.Binds``）、``POST /build``（``buildargs``）都会把
+    凭据放在 body 里 —— 这一层是**唯一**的出口，所以脱敏放在这里做。
+    """
     if payload is None or payload == b"" or payload == {}:
         return ""
     if isinstance(payload, (bytes, bytearray)):
         size = len(payload)
         if size > limit:
             return f"<{size} bytes>"
-        return bytes(payload).decode("utf-8", "replace")
+        return redact_text(bytes(payload).decode("utf-8", "replace"))
     try:
-        text = json.dumps(payload, ensure_ascii=False, default=str)
+        text = json.dumps(redact(payload), ensure_ascii=False, default=str)
     except (TypeError, ValueError):
-        text = str(payload)
+        text = redact_text(str(payload))
     return text if len(text) <= limit else f"{text[:limit]}...<truncated>"
 
 
@@ -227,7 +231,8 @@ async def _api_trace_middleware(request: web.Request, handler: Any):
     trace_id = incoming or new_trace_id()
     token = set_trace_id(trace_id)
     started = time.monotonic()
-    command = f"{request.method} {request.path_qs}"
+    # 查询串里也可能带凭据（``?access_key_id=...``），一律过一遍脱敏
+    command = redact_text(f"{request.method} {request.path_qs}")
     body_in = await _request_body_preview(request)
     logger.info("[api] --> %s%s", command, f" {body_in}" if body_in else "")
 
@@ -805,7 +810,7 @@ async def _stream_pyromind_exec(
         # 含义完全不同 —— 前者"命令可能已经跑过"，脚本/agent 该据此决定**不要盲目
         # 重试**；只留一句人话文本的话，这个区分就丢了。
         code = getattr(exc, "code", None)
-        reason = f"docker-rt: {exc}" + (f" [{code}]" if code else "")
+        reason = f"docker-rt: {redact_text(str(exc))}" + (f" [{code}]" if code else "")
         logger.warning(
             "pyromind exec stream failed id=%s: %s",
             session_id[:12] or "?",
@@ -1193,17 +1198,7 @@ async def info(request: web.Request) -> web.Response:
     )
 
 
-# ---- containers helpers (shared shape with FastAPI module) ----
-
-
-def _status_text(state: ContainerState) -> str:
-    if state == ContainerState.RUNNING:
-        return "Up"
-    if state == ContainerState.CREATED:
-        return "Created"
-    if state == ContainerState.EXITED:
-        return "Exited"
-    return state.value
+# ---- containers helpers ----
 
 
 def _display_status(c: Any) -> str:
@@ -2939,15 +2934,77 @@ async def container_logs(request: web.Request) -> web.StreamResponse:
 
 
 async def list_images(request: web.Request) -> web.Response:
-    """`docker images` —— **只列真实存在的镜像**。
+    """`docker images` —— 只列有归档的镜像，本地缓存优先。
 
-    隐式默认镜像（create/run 未给 Image 时才兜底用）**不算**"本地已有"：
-    用户没显式拉/用过它，就不该凭空出现在列表里（2026-10-15 用户报）。
+    1. **本地归档缓存**（`~/.docker-rt/image-cache/`）：构建完成时 daemon
+       通过 middleware 文件通道把归档拉回来的本地副本 —— 最快、最可靠，
+       workspace 网关的读路径（AccessDenied / 断流）完全不参与；
+    2. **workspace 归档索引**（`docker_images/index.json`）：覆盖其它机器或
+       更早构建的归档，一次 ranged GET 读取。
+
+    容器（构建沙箱、集群里跑着的沙箱）引用的镜像**不算本地镜像**：它们只
+    存在于集群侧，列出来会让 `docker images` 凭空多出 kaniko 构建镜像、
+    osworld 等用户没构建过的名字（2026-11-06 用户报）。
     """
-    store: ContainerStore = request.app["store"]
-    default = request.app["default_image"]
-    names = store.known_images() - {default}
-    return _json([images_mod.to_image_summary(n) for n in sorted(names)])
+    from .backend import context_staging, build_sandbox
+
+    summaries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    # 1) local archive cache — written by every build of this daemon
+    try:
+        cache_dir = build_sandbox.image_cache_dir()
+        for meta_path in sorted(cache_dir.glob("*.tar.meta.json")):
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                continue
+            archive = cache_dir / meta_path.name[: -len(".meta.json")]
+            if not archive.is_file():
+                continue
+            for tag in meta.get("tags") or []:
+                if tag in seen:
+                    continue
+                seen.add(tag)
+                summaries.append(
+                    images_mod.to_image_summary(
+                        tag,
+                        created=meta.get("created"),
+                        size=archive.stat().st_size,
+                    )
+                )
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("docker_rt").warning(
+            "cannot scan the local image cache: %s", exc
+        )
+
+    # 2) the workspace archive index (built once by a scan; updated by builds)
+    try:
+        started = time.monotonic()
+        entries = await asyncio.to_thread(context_staging.list_workspace_images)
+        logging.getLogger("docker_rt").info(
+            "workspace images: %d entr(y/ies) in %.1fs",
+            len(entries),
+            time.monotonic() - started,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("docker_rt").warning(
+            "cannot list workspace image archives: %s", exc
+        )
+        entries = []
+    for entry in entries:
+        if entry["tag"] in seen:
+            continue
+        seen.add(entry["tag"])
+        summaries.append(
+            images_mod.to_image_summary(
+                entry["tag"],
+                created=entry.get("created"),
+                size=entry.get("size") or 0,
+            )
+        )
+
+    return _json(summaries)
 
 
 async def inspect_image(request: web.Request) -> web.Response:
@@ -2997,6 +3054,154 @@ async def create_image(request: web.Request) -> web.StreamResponse:
         action="pull",
         actor_id=full,
         attributes={"name": full},
+    )
+    return resp
+
+
+async def push_image(request: web.Request) -> web.StreamResponse:
+    """POST /images/{name}/push — ``docker push``.
+
+    Credentials come **only** from ``DOCKER_RT_REGISTRY_USERNAME`` /
+    ``DOCKER_RT_REGISTRY_PASSWORD``. ``X-Registry-Auth`` is deliberately
+    ignored: Docker's own contract is that the *client* reads its
+    ``~/.docker/config.json`` and ships the credential in that header, so
+    honouring it would make an implicit credential from some other machine the
+    source of truth. There is no config-file fallback on this side either.
+
+    The push itself happens here, in the daemon, against the archive the build
+    left behind. Nothing is injected into a build container.
+    """
+    from .backend import context_staging, kaniko, registry_client, registry_push
+
+    store: ContainerStore = request.app["store"]
+    ref = request.match_info["name"]
+    tag = (request.rel_url.query.get("tag") or "").strip()
+    if tag and ":" not in ref.rsplit("/", 1)[-1]:
+        ref = f"{ref}:{tag}"
+
+    if registry_client.is_archive_name(ref):
+        # The user copied a workspace file name instead of a tag. Docker also
+        # appends ``:latest`` and may prefix ``docker.io/library/`` before the
+        # request arrives, so the check has to look at the repository segment,
+        # not ``ref.endswith('.tar')``.
+        return _err(
+            400,
+            f"'{ref}' is an archive file name, not an image tag. Run `docker images` "
+            "and push a listed tag, e.g. docker.io/jiangwc3439/gemini-web-to-api:dev-9",
+        )
+
+    destination = store.resolve_image(ref) or ref
+    # The CLI may hand us a short name, an image id, or ``docker.io/library/…``
+    # while the archive is stored under the configured registry prefix. Use the
+    # tag the archive actually carries whenever the index can name it.
+    try:
+        entry = await asyncio.to_thread(
+            context_staging.lookup_image_archive, destination
+        )
+    except Exception:  # noqa: BLE001 - lookup is a convenience, not a gate
+        entry = None
+    if entry and entry.get("tag"):
+        destination = str(entry["tag"])
+    if not registry_push.credential_source():
+        return _err(
+            400,
+            "no push credentials: set DOCKER_RT_REGISTRY_USERNAME and "
+            "DOCKER_RT_REGISTRY_PASSWORD on the daemon (restart it after "
+            "changing them). Credentials are never read from a docker config.",
+        )
+
+    resp = web.StreamResponse(
+        status=200,
+        headers={"Api-Version": API_VERSION, "Content-Type": "application/json"},
+    )
+    await resp.prepare(request)
+
+    async def emit(payload: dict) -> None:
+        await resp.write((json.dumps(payload) + "\n").encode())
+        await resp.drain()
+
+    try:
+        _host, _repo, _tag = registry_client.parse_destination(destination)
+        display = f"{_host}/{_repo}:{_tag}"
+    except Exception:  # noqa: BLE001 - the display name must never fail a push
+        display = destination
+    await emit({"status": f"The push refers to repository [{display}]"})
+
+    username, password = registry_push.registry_credentials()
+    cleanup = lambda: None  # noqa: E731
+    loop = asyncio.get_running_loop()
+    progress_queue: "asyncio.Queue[str]" = asyncio.Queue()
+
+    def report(message: str) -> None:
+        # Called from the worker thread running the download / push.
+        loop.call_soon_threadsafe(progress_queue.put_nowait, message)
+
+    async def run_blocking(func, *args, **kwargs):
+        """Run a blocking step here, streaming its progress into the response."""
+        task = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+        while True:
+            if task.done():
+                # Let the last ``call_soon_threadsafe`` callbacks run before
+                # deciding there is no progress left to emit.
+                await asyncio.sleep(0.05)
+                while not progress_queue.empty():
+                    await emit({"status": progress_queue.get_nowait()})
+                if task.done() and progress_queue.empty():
+                    break
+            try:
+                message = await asyncio.wait_for(progress_queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            await emit({"status": message})
+        return task.result()
+
+    try:
+        path, cleanup = await run_blocking(
+            registry_client.locate_archive,
+            destination,
+            images_dir=kaniko.DEFAULT_IMAGES_DIR,
+            progress=report,
+        )
+        try:
+            # The archive is in hand now: repair an index entry that a failed
+            # build-time cache fetch left at 0 B.
+            await asyncio.to_thread(
+                context_staging.set_image_index_size,
+                destination,
+                path.stat().st_size,
+            )
+        except Exception:  # noqa: BLE001 - repair must never fail the push
+            pass
+        digest = await run_blocking(
+            registry_client.push_archive,
+            path,
+            destination,
+            username=username,
+            password=password,
+            insecure=kaniko.registry_insecure(),
+            progress=report,
+        )
+    except registry_client.ArchiveNotFound:
+        # Docker's wording: a push names a repository:tag, never an image id.
+        host, repo, tag = registry_client.parse_destination(destination)
+        message = f"tag does not exist: {host}/{repo}:{tag}"
+        await emit({"error": message, "errorDetail": {"message": message}})
+        return resp
+    except Exception as exc:  # noqa: BLE001 — Docker wants the error in the stream
+        message = redact_text(str(exc))
+        await emit({"error": message, "errorDetail": {"message": message}})
+        return resp
+    finally:
+        cleanup()
+
+    await emit({"status": f"{digest}: digest: {digest.split(':', 1)[-1]} size: ok"})
+    await emit({"status": f"{destination}: pushed"})
+    store.register_image(destination)
+    await _events(request).emit(
+        type="image",
+        action="push",
+        actor_id=destination,
+        attributes={"name": destination},
     )
     return resp
 
@@ -3785,21 +3990,6 @@ def _mark_protocol_upgraded(protocol: Any) -> None:
         )
 
 
-def _attach_command(record: Any) -> list[str]:
-    """Command to run when emulating Docker attach (sandbox Pod PID1 is sleep)."""
-    cmd = list(record.cmd) if record.cmd else (
-        ["bash"] if getattr(record, "tty", False) else ["sh"]
-    )
-    if getattr(record, "tty", False) and cmd in (
-        ["bash"],
-        ["sh"],
-        ["/bin/bash"],
-        ["/bin/sh"],
-    ):
-        cmd = [cmd[0], "-i"]
-    return cmd
-
-
 async def _wait_container_running(
     store: ContainerStore,
     cid: str,
@@ -3874,7 +4064,7 @@ async def _exec_hijack(
     logger.info(
         "exec hijack start id=%s cmd=%s tty=%s stdin=%s cwd=%s",
         exec_rec.id[:12],
-        cmd,
+        redact(cmd),
         tty,
         stdin,
         cwd or "/",
@@ -4647,7 +4837,7 @@ async def _hijack_pyromind_terminal(
         kube_env.sandbox_id,
         cols,
         rows,
-        cmd or "(login shell)",
+        redact(cmd) if cmd else "(login shell)",
     )
     # 收尾摘要用的观测点（2026-10-16 补日志）：
     #   * ``stop``  —— 这条会话**为什么结束**（=`_ws_close_note` 的一句话）；
@@ -4695,7 +4885,7 @@ async def _hijack_pyromind_terminal(
                 await _write_exec_error(
                     resp,
                     f"docker-rt: cannot open an interactive session for "
-                    f"{kube_env.sandbox_id}: {exc}",
+                    f"{kube_env.sandbox_id}: {redact_text(str(exc))}",
                     tty=tty,
                 )
                 return True
@@ -5340,6 +5530,7 @@ def _add_routes(app: web.Application) -> None:
     _add_route(app, "GET", "/images/{name:.+}/json", inspect_image)
     _add_route(app, "DELETE", "/images/{name:.+}", delete_image)
     _add_route(app, "POST", "/images/create", create_image)
+    _add_route(app, "POST", "/images/{name:.+}/push", push_image)
     _add_route(app, "POST", "/build", build_image)
     _add_route(app, "GET", "/volumes", list_volumes)
     _add_route(app, "POST", "/volumes/create", create_volume)
@@ -5420,7 +5611,7 @@ async def on_startup(app: web.Application) -> None:
             osworld_count=osworld_count,
         )
     except Exception:
-        logger.exception("reconcile_on_startup failed (continuing with empty store)")
+        logger.exception("reconcile failed (continuing with empty store)")
 
 
     # Rebuild TCP publishes for adopted Running containers.
@@ -5559,6 +5750,9 @@ def configure_daemon_logging() -> None:
     logging.basicConfig(level=level, format=DAEMON_LOG_FORMAT)
     for root_handler in logging.getLogger().handlers:
         root_handler.addFilter(TraceIdFilter())
+        # ``docker_rt.*`` 没有自己的 handler，靠传播落到 root ——
+        # 脱敏必须挂在 handler 上才能盖住它们。
+        root_handler.addFilter(RedactionFilter())
     # SDK 的 logger propagate=False 且有自己的 handler ⇒ 级别/格式也统一成同一套
     install_console_logging(
         "pyromind_sdk", level=level, fmt=DAEMON_LOG_FORMAT

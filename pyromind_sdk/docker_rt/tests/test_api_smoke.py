@@ -1,4 +1,4 @@
-"""API smoke tests with mocked KubeEnvironment (no real cluster)."""
+"""API smoke tests with a mocked sandbox environment (no real cluster)."""
 
 from __future__ import annotations
 
@@ -657,10 +657,59 @@ async def test_images_create_stub(aiohttp_client):
     assert resp.status == 200
     text = await resp.text()
     assert "Pull complete" in text or "up to date" in text
+    # The pull is a stub: no archive lands locally, so `docker images` must not
+    # invent one. The name stays resolvable for inspect/run.
     resp = await client.get("/images/json")
     images = await resp.json()
     tags = [t for img in images for t in (img.get("RepoTags") or [])]
-    assert any("alpine" in t for t in tags)
+    assert not any("alpine" in t for t in tags)
+
+    resp = await client.get("/images/alpine:3.19/json")
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_images_list_ignores_container_images(aiohttp_client):
+    """Cluster-side images referenced by containers are not local images."""
+    from ..aio_server import create_aio_app
+
+    app = create_aio_app(run_reconcile=False)
+    client = await aiohttp_client(app)
+    resp = await client.post(
+        "/containers/create?name=img-src",
+        json={"Image": "cluster/only:1", "Cmd": ["sleep", "1h"]},
+    )
+    assert resp.status == 201
+
+    images = await (await client.get("/images/json")).json()
+    tags = [t for img in images for t in (img.get("RepoTags") or [])]
+    assert not any("cluster/only:1" in t for t in tags)
+
+
+@pytest.mark.asyncio
+async def test_images_list_reports_the_workspace_index_size(monkeypatch, tmp_path):
+    """`docker images` takes DISK USAGE from the index entry's size."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from ..aio_server import create_aio_app
+    from ..backend import build_sandbox, context_staging
+
+    monkeypatch.setattr(
+        context_staging,
+        "list_workspace_images",
+        lambda *a, **k: [
+            {"tag": "docker.io/ns/app:1", "size": 12345, "created": 1700000000}
+        ],
+    )
+    monkeypatch.setattr(build_sandbox, "image_cache_dir", lambda: tmp_path)
+
+    app = create_aio_app(run_reconcile=False)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/images/json")
+        images = await resp.json()
+
+    match = next(i for i in images if "docker.io/ns/app:1" in (i.get("RepoTags") or []))
+    assert match["Size"] == 12345
 
 
 @pytest.mark.asyncio
