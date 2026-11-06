@@ -522,14 +522,25 @@ def _validate_xyflow_config(
 
     for param_name, param_value in config.items():
         if param_name in all_params:
-            # Empty optional values use the execution template's unset sentinel.
-            if (
-                param_name in optional_params
-                and param_name not in required_params
-                and param_value == ""
-            ):
-                continue
             param_def = all_params[param_name]
+            if param_value == "":
+                options = (
+                    param_def[1]
+                    if isinstance(param_def, (list, tuple)) and len(param_def) > 1
+                    else None
+                )
+                default = options.get("default") if isinstance(options, dict) else None
+                if default is not None:
+                    # An empty form field uses the server-owned default.
+                    param_value = default
+                elif param_name in optional_params and param_name not in required_params:
+                    continue
+                else:
+                    errors.append(
+                        f"Node {node.get('id')} (type '{node_type}') parameter '{param_name}' "
+                        "is required and cannot be empty"
+                    )
+                    continue
             errors.extend(_validate_parameter_constraints(
                 param_value, param_def, str(node.get("id")), node_type, param_name
             ))

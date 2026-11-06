@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
+_LEGACY_INPUT_ROOT = "/tmp"
 
 # Import type conversion functions to avoid code duplication
 try:
@@ -27,6 +28,59 @@ try:
 except ImportError:
     # If relative import fails, try absolute import
     from pyromind_sdk.nodes.type_converter import convert_string_to_python_type, convert_inputs, validate_output_type
+
+
+def _resolve_legacy_input_files(
+    inputs: Dict[str, Any], input_types: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Recognize the complete /tmp/<parameter> payload emitted by old generators."""
+    if not isinstance(inputs, dict) or not isinstance(input_types, dict) or not inputs:
+        return inputs
+    required = input_types.get("required", {})
+    optional = input_types.get("optional", {})
+    if not isinstance(required, dict) or not isinstance(optional, dict):
+        return inputs
+    declared = {**required, **optional}
+    if set(inputs) != set(declared) or any(
+        not isinstance(name, str)
+        or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", name)
+        or not isinstance(value, str)
+        or value != f"/tmp/{name}"
+        for name, value in inputs.items()
+    ):
+        return inputs
+
+    logger.info("Using legacy input file protocol for %d declared inputs", len(inputs))
+    directory_fd = os.open(
+        os.path.realpath(_LEGACY_INPUT_ROOT),
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        resolved = {}
+        for name in inputs:
+            fd = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd
+            )
+            try:
+                info = os.fstat(fd)
+                # Old heredocs normally create 0644 files, so they cannot meet
+                # the new private-file mode. Still reject unsafe shared writes.
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or info.st_mode & 0o022
+                    or info.st_nlink != 1
+                ):
+                    raise ValueError(f"Unsafe legacy input file: /tmp/{name}")
+                with os.fdopen(fd, "r", encoding="utf-8") as file:
+                    fd = -1
+                    resolved[name] = file.read().rstrip("\n")
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+        return resolved
+    finally:
+        os.close(directory_fd)
 
 
 def _resolve_inputs_from_tmp_files(obj: Any, input_dir: Optional[str] = None) -> Any:
@@ -133,6 +187,45 @@ def get_function_from_module(module, function_name: str):
     return getattr(module, function_name)
 
 
+def _empty_optional_needs_omission(type_spec: Any) -> bool:
+    """Avoid converting an unset numeric, boolean, or choice input from ``''``."""
+    if isinstance(type_spec, list):
+        return "" not in type_spec
+    if isinstance(type_spec, str):
+        parts = {part.strip().upper() for part in type_spec.split("|")}
+        if parts & {"STRING", "PATH", "MODEL", "ENV", "ACCELERATE_CONFIG"}:
+            return False
+        return bool(parts & {"INT", "FLOAT", "BOOLEAN"})
+    return False
+
+
+def _normalize_empty_optional_inputs(
+    inputs: Dict[str, Any], input_types: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Use declared defaults and omit unset typed inputs before conversion."""
+    if not isinstance(inputs, dict) or not isinstance(input_types, dict):
+        return inputs
+    optional = input_types.get("optional", {})
+    required = input_types.get("required", {})
+    if not isinstance(optional, dict) or not isinstance(required, dict):
+        return inputs
+
+    normalized = inputs.copy()
+    for name, spec in optional.items():
+        if name in required or not isinstance(normalized.get(name), str) or normalized[name] != "":
+            continue
+        if not isinstance(spec, (list, tuple)) or not spec:
+            continue
+        type_spec = spec[0]
+        options = spec[1] if len(spec) > 1 and isinstance(spec[1], dict) else {}
+        default = options.get("default")
+        if default is not None and default != "":
+            normalized[name] = default
+        elif _empty_optional_needs_omission(type_spec):
+            normalized.pop(name)
+    return normalized
+
+
 def function_call_wrapper(
     python_code: str,
     function_name: str,
@@ -161,6 +254,8 @@ def function_call_wrapper(
         output_paths: Output file path dictionary, key is output name, value is file path
         return_types: Output type list (optional, for type validation)
         return_names: Output name list (optional, for type validation)
+        input_dir: Private directory for explicit file references. When omitted,
+            complete legacy /tmp/<input-name> payloads are also supported.
         
     Raises:
         FileNotFoundError: If Python file does not exist
@@ -176,8 +271,11 @@ def function_call_wrapper(
     func = get_function_from_module(module, function_name)
     
     # 3. Type conversion
-    # Resolve only explicit references from this invocation's private directory.
+    # Without --input-dir, accept only the complete legacy generator payload.
+    if input_dir is None:
+        inputs = _resolve_legacy_input_files(inputs, input_types)
     inputs = _resolve_inputs_from_tmp_files(inputs, input_dir)
+    inputs = _normalize_empty_optional_inputs(inputs, input_types)
     converted_inputs = convert_inputs(inputs, input_types)
     
     # 4. Call function

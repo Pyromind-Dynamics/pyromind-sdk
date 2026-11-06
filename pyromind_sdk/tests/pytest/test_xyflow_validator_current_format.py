@@ -430,20 +430,39 @@ def test_unbound_integer_config_still_requires_valid_range(validator: Callable) 
 
 
 @pytest.mark.parametrize(
-    ("field", "value", "expected_valid"),
+    ("node_type", "field", "value", "expected_valid"),
     [
-        ("max_model_len", "", True),
-        ("max_model_len", "  ", False),
-        ("max_model_len", "invalid", False),
-        ("count", "", False),
+        ("VLLMInference", "max_model_len", "", True),
+        ("VLLMInference", "max_model_len", "  ", False),
+        ("VLLMInference", "max_model_len", "invalid", False),
+        ("VLLMInference", "other_int", "", True),
+        ("CountSink", "max_model_len", "", True),
+        ("CountSink", "optional_float", "", True),
+        ("CountSink", "optional_mode", "", True),
+        ("CountSink", "optional_mode", "unknown", False),
+        ("CountSink", "count", "", False),
     ],
 )
-def test_optional_integer_empty_string_matches_execution_template(
-    validator: Callable, field: str, value: str, expected_valid: bool
+def test_empty_optional_fields_are_accepted_across_nodes(
+    validator: Callable, node_type: str, field: str, value: str, expected_valid: bool
 ) -> None:
     node_info = copy.deepcopy(NODE_INFO)
     node_info["CountSink"]["input"]["optional"]["max_model_len"] = ("INT",)
+    node_info["CountSink"]["input"]["optional"]["optional_float"] = ("FLOAT",)
+    node_info["CountSink"]["input"]["optional"]["optional_mode"] = (["train", "eval"],)
+    node_info["VLLMInference"] = {
+        "input": {
+            "required": {"model_path": ("STRING",)},
+            "optional": {"max_model_len": ("INT",), "other_int": ("INT",)},
+        },
+        "output": [],
+        "output_name": [],
+        "output_node": True,
+    }
     workflow = _from_dsl('sink = CountSink(id="one", count=1)')
+    if node_type == "VLLMInference":
+        workflow["nodes"][0]["data"]["nodeType"] = node_type
+        workflow["nodes"][0]["data"]["config"] = {"model_path": "/workspace/model"}
     workflow["nodes"][0]["data"]["config"][field] = value
 
     valid, errors = validator(workflow, node_info=node_info)
@@ -451,3 +470,43 @@ def test_optional_integer_empty_string_matches_execution_template(
     assert valid is expected_valid, errors
     if not expected_valid:
         assert any(field in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("category", "field", "default", "expected_valid"),
+    [
+        ("required", "count", 3, True),
+        ("required", "count", 0, False),
+        ("optional", "other_count", 3, True),
+        ("optional", "other_count", 0, False),
+    ],
+)
+def test_empty_form_field_validates_server_default(
+    validator: Callable, category: str, field: str, default: int, expected_valid: bool
+) -> None:
+    node_info = copy.deepcopy(NODE_INFO)
+    node_info["CountSink"]["input"][category][field] = (
+        "INT", {"default": default, "min": 1, "max": 8}
+    )
+    workflow = _from_dsl('sink = CountSink(id="one", count=1)')
+    workflow["nodes"][0]["data"]["config"][field] = ""
+
+    valid, errors = validator(workflow, node_info=node_info)
+
+    assert valid is expected_valid, errors
+    if not expected_valid:
+        assert any(field in error and "minimum" in error for error in errors)
+
+
+@pytest.mark.parametrize("node_type,field", [("StringSink", "text"), ("ModeSink", "mode")])
+def test_empty_required_field_without_default_is_rejected(
+    validator: Callable, node_type: str, field: str
+) -> None:
+    workflow = _from_dsl('sink = CountSink(id="one", count=1)')
+    workflow["nodes"][0]["data"]["nodeType"] = node_type
+    workflow["nodes"][0]["data"]["config"] = {field: ""}
+
+    valid, errors = validator(workflow, node_info=NODE_INFO)
+
+    assert not valid
+    assert any(field in error and "cannot be empty" in error for error in errors)
