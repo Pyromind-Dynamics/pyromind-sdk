@@ -76,7 +76,7 @@ def api_key() -> str:
         pytest.skip(
             "PYROMIND_API_KEY is not set — set it to run sandbox file integration tests."
         )
-    print(f"\n[INFO] Using API key: {key[:10]}...{key[-4:] if len(key) > 14 else '***'}")
+    print("[INFO] Using API key: ***")
     return key
 
 

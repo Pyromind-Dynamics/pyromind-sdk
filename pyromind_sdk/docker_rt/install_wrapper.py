@@ -12,7 +12,7 @@ from pathlib import Path
 WRAPPER_DIR = Path.home() / ".pyromind" / "bin"
 WRAPPER_PATH = WRAPPER_DIR / "docker"
 PATH_LINE = 'export PATH="$HOME/.pyromind/bin:$PATH"'
-WRAPPER_VERSION = "19"
+WRAPPER_VERSION = "20"
 
 
 def _wrapper_version() -> str | None:
@@ -450,13 +450,11 @@ if [[ "${{args[0]:-}}" == "cp" ]]; then
   if [[ -t 2 ]]; then
     _cp_out="$(mktemp)"
     _cp_err="$(mktemp)"
-    _cp_no_script=0
-    if command -v script >/dev/null 2>&1; then
-      script -q /dev/null "$REAL_DOCKER" "${{args[@]}}" >"$_cp_out" 2>"$_cp_err" &
-    else
-      _cp_no_script=1
-      "$REAL_DOCKER" "${{args[@]}}" >"$_cp_out" 2>"$_cp_err" &
-    fi
+    # Do NOT wrap this in ``script``: the BSD form (``script -q /dev/null cmd``)
+    # is unsupported by util-linux' script on Linux ("Usage: script [options]
+    # [file]"); it starts an inner shell instead of running the command, so
+    # ``docker cp`` silently copied nothing (2026-11-06 用户报：无提示、无文件).
+    "$REAL_DOCKER" "${{args[@]}}" >"$_cp_out" 2>"$_cp_err" &
     _cp_pid=$!
     _spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
     _i=0
@@ -474,10 +472,8 @@ if [[ "${{args[0]:-}}" == "cp" ]]; then
       _success_line="$(printf '%s' "$_clean_out" | grep -a 'Successfully copied' | tail -n 1 | sed -E 's/^.*Successfully copied/Successfully copied/')"
       if [[ -n "$_success_line" ]]; then
         printf '%s\\n' "$_success_line" >&1
-      elif [[ $_cp_no_script -eq 1 ]]; then
-        printf 'Successfully copied %s -> %s\\n' "${{src}}" "${{dst}}" >&1
       else
-        printf '%s\\n' "$_clean_out" >&1
+        printf 'Successfully copied %s -> %s\\n' "${{src}}" "${{dst}}" >&1
       fi
       cat "$_cp_err" >&2
     else

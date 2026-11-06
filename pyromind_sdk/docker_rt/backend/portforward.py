@@ -209,23 +209,6 @@ def published_to_network_settings(
     return out
 
 
-def published_to_list_ports(
-    published: list[PublishedBinding],
-) -> list[dict[str, Any]]:
-    """Docker ``ps`` Ports array."""
-    rows: list[dict[str, Any]] = []
-    for b in published:
-        rows.append(
-            {
-                "IP": b.host_ip,
-                "PrivatePort": b.container_port,
-                "PublicPort": b.host_port,
-                "Type": b.protocol,
-            }
-        )
-    return rows
-
-
 async def probe_pod_network(pod_ip: str, port: int, *, timeout: float = 1.0) -> bool:
     """Return True if this host can route TCP to ``pod_ip`` (CIDR reachable).
 

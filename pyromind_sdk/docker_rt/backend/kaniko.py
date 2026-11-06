@@ -262,7 +262,6 @@ def kaniko_args(
     buildargs: dict[str, str] | None = None,
     labels: dict[str, str] | None = None,
     target: str | None = None,
-    push: bool = True,
     digest_file: str | None = None,
     cache: bool | None = None,
     cache_repo_ref: str | None = None,
@@ -280,10 +279,13 @@ def kaniko_args(
     the mounted workspace images directory whether or not it is pushed.
     """
     dests = [d for d in (destinations or []) if (d or "").strip()]
-    if push and not dests:
-        raise ValueError("kaniko requires at least one --destination when pushing")
-
     args: list[str] = []
+    # **Always** ``--no-push``. The build container runs every Dockerfile
+    # instruction as root, so a registry credential placed in it is readable by
+    # any ``RUN`` step. The archive below is written before the push would have
+    # happened, so nothing is lost: ``registry_push.push_archive`` pushes it
+    # afterwards, from the daemon, with credentials that never enter a sandbox.
+    args.append("--no-push")
     args.append(f"--context={context or context_uri()}")
     args.append(f"--dockerfile={dockerfile or 'Dockerfile'}")
     for dest in dests:
@@ -296,14 +298,9 @@ def kaniko_args(
     if target:
         args.append(f"--target={target}")
 
-    if not push:
-        args.append("--no-push")
-
-    # Archive the image into the mounted workspace directory. This applies with
-    # *and* without ``--no-push``: kaniko writes the tarball before it pushes
-    # (``DoPush``), so a build can push and leave a copy behind in one go. The
-    # value has to be a file path, and the name comes from ``--destination`` so
-    # each tag keeps its own archive.
+    # Archive the image into the mounted workspace directory. The value has to
+    # be a file path, and the name comes from ``--destination`` so each tag
+    # keeps its own archive.
     args.append(f"--tar-path={tar_path(dests)}")
 
     # Skip kaniko's push-permission probe.
@@ -353,14 +350,19 @@ def kaniko_args(
 def build_script(
     *,
     args: list[str],
-    docker_config_b64: str = "",
     workdir: str | None = None,
-    config_dir: str | None = None,
 ) -> str:
     """The worker's shell body — the script that actually runs kaniko.
 
     ``args`` is spliced in as a single shell word each, so it must already be
     fully formed (see :func:`kaniko_args`).
+
+    **No registry credentials are written here, ever.** kaniko unpacks the
+    ``FROM`` image's rootfs into this container's root and runs every Dockerfile
+    instruction in it as root, so anything readable by the executor is readable
+    by a ``RUN`` step as well — a ``0600`` config.json included. Pushing is a
+    separate step that happens after this container is gone (see
+    ``registry_push.push_archive``).
 
     Written to be run **detached**, hence the ``EXIT`` trap: it is the only
     thing that tells the poller "done, code N". A ``SIGKILL`` (the OOM killer)
@@ -368,28 +370,18 @@ def build_script(
     than trusting this file's absence to mean "still going".
     """
     wd = workdir or build_workdir()
-    cfg_dir = config_dir or docker_config_dir()
-    cfg_file = f"{cfg_dir}/config.json"
     rc_file = shlex.quote(exit_code_path())
 
     lines = [
         "set -eu",
-        # config.json carries registry credentials: keep it owner-only.
         "umask 077",
         # Clear a previous run's verdict *before* arming the trap, so a stale
         # rc can never be read as this build's outcome.
         f"rm -f {rc_file}",
         f"trap 'printf \"%s\\n\" \"$?\" > {rc_file}' EXIT",
         f"printf '%s\\n' $$ > {shlex.quote(pid_path())}",
-        f"mkdir -p {shlex.quote(wd)} {shlex.quote(cfg_dir)}",
+        f"mkdir -p {shlex.quote(wd)}",
     ]
-    if docker_config_b64:
-        lines.append(
-            f"printf '%s' {shlex.quote(docker_config_b64)} | base64 -d > {shlex.quote(cfg_file)}"
-        )
-        lines.append(f"chmod 600 {shlex.quote(cfg_file)}")
-        # 0600 is mandatory: kaniko refuses to read a world-readable config.
-        lines.append(f"export DOCKER_CONFIG={shlex.quote(cfg_dir)}")
     digest_path = shlex.quote(digest_file_path())
     lines.append("cd %s" % shlex.quote(wd))
     lines.append("rm -f %s" % digest_path)
@@ -405,9 +397,7 @@ def build_script(
 def start_script(
     *,
     args: list[str],
-    docker_config_b64: str = "",
     workdir: str | None = None,
-    config_dir: str | None = None,
 ) -> str:
     """The short script that starts the build and returns immediately.
 
@@ -427,12 +417,7 @@ def start_script(
     quoting rule of the *outer* shell can corrupt it.
     """
     worker_b64 = base64.b64encode(
-        build_script(
-            args=args,
-            docker_config_b64=docker_config_b64,
-            workdir=workdir,
-            config_dir=config_dir,
-        ).encode("utf-8")
+        build_script(args=args, workdir=workdir).encode("utf-8")
     ).decode("ascii")
     script_path = shlex.quote(worker_script_path())
     log_path = shlex.quote(build_log_path())

@@ -656,3 +656,21 @@ def test_generated_wrapper_drops_the_cli_legacy_builder_banner(
     assert "still-visible-stderr" in proc.stderr
     assert "step 1/2 : FROM scratch" in proc.stdout
     assert "DEPRECATED" not in proc.stdout
+
+
+def test_cp_branch_does_not_use_bsd_script(
+    monkeypatch: MonkeyPatch,
+    tmp_path,
+) -> None:
+    """util-linux' ``script`` cannot take a command; the wrapper must not use it."""
+    path = tmp_path / "docker"
+    monkeypatch.setattr(mod, "WRAPPER_PATH", path)
+    monkeypatch.setattr(mod, "find_real_docker", lambda: "/bin/true")
+    monkeypatch.setattr(mod, "_shell_rc_path", lambda: tmp_path / ".bashrc")
+
+    mod.install_wrapper()
+    script = path.read_text(encoding="utf-8")
+
+    assert 'script -q /dev/null "$REAL_DOCKER"' not in script
+    assert "copying" in script
+    assert "Successfully copied" in script
