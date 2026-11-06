@@ -929,6 +929,52 @@ def set_image_index_size(
         return True
 
 
+def remove_image_from_index(
+    *,
+    tags: list[str] | None = None,
+    cluster: str | None = None,
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """Remove ``tags`` from ``index.json``.
+
+    Returns ``(removed_entries, archives_still_referenced)``. The second value
+    lets ``docker rmi`` decide whether an archive can be deleted from the local
+    cache / workspace without breaking another tag that shares it.
+    """
+    wanted = {str(tag) for tag in (tags or []) if tag}
+    if not wanted:
+        return [], set()
+    wanted_variants: set[str] = set()
+    for tag in wanted:
+        wanted_variants |= _tag_variants(tag)
+    with _INDEX_LOCK:
+        doc = read_image_index(cluster)
+        if not doc:
+            return [], set()
+        kept: list[dict[str, Any]] = []
+        removed: list[dict[str, Any]] = []
+        for item in doc.get("images") or []:
+            if not isinstance(item, dict):
+                continue
+            item_tag = str(item.get("tag") or "")
+            if item_tag in wanted or (_tag_variants(item_tag) & wanted_variants):
+                removed.append(dict(item))
+                continue
+            kept.append(item)
+        live = {
+            str(item.get("archive") or "")
+            for item in kept
+            if item.get("archive")
+        }
+        if not removed:
+            return [], live
+        _write_image_index(
+            kept,
+            complete=bool(doc.get("complete", True)),
+            cluster=cluster,
+        )
+        return removed, live
+
+
 def upsert_image_index(
     *,
     tags: list[str] | None = None,

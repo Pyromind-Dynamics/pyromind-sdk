@@ -46,6 +46,7 @@ from pyromind_sdk.log_redaction import (
         "identitytoken",
         "token",
         "private_key",
+        "inf_sk",
         "AK",
         "sk",
     ],
@@ -119,6 +120,21 @@ def test_redact_handles_self_referential_containers() -> None:
             "Authorization: Bearer abcdefghijklmn",
             f"Authorization: Bearer {MASK}",
         ),
+        (
+            "Authorization: token abc123secret",
+            f"Authorization: {MASK}",
+        ),
+        (
+            "Authorization: SSWS abcdef123456",
+            f"Authorization: {MASK}",
+        ),
+        (
+            "docker login -u me -p hunter2 registry.example.com",
+            f"docker login -u me -p {MASK} registry.example.com",
+        ),
+        ("inf_sk=abcd1234", f"inf_sk={MASK}"),
+        ("SK=abcd1234 x=1", f"SK={MASK} x=1"),
+        ("task=build risk=low", "task=build risk=low"),
         (
             "GET /v1/sandboxes?access_key_id=AKID&x=1",
             f"GET /v1/sandboxes?access_key_id={MASK}&x=1",

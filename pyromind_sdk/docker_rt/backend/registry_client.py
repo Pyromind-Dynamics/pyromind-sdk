@@ -237,6 +237,35 @@ _REGISTRY_ENDPOINTS = {
     "index.docker.io": "registry-1.docker.io",
 }
 
+#: Token services we send the registry credential to even though they are not
+#: the registry host itself. Everything else must be declared explicitly:
+#: a registry controls the ``WWW-Authenticate`` realm, so following it blindly
+#: hands ``DOCKER_RT_REGISTRY_USERNAME/PASSWORD`` to whatever host it names.
+_KNOWN_TOKEN_HOSTS = frozenset({"auth.docker.io"})
+
+#: Comma-separated extra token hosts (self-hosted registries with a separate
+#: auth service, e.g. ``auth.harbor.example.com``).
+_AUTH_HOSTS_ENV = "DOCKER_RT_REGISTRY_AUTH_HOSTS"
+
+
+def _host_without_port(value: str) -> str:
+    """``localhost:5000`` → ``localhost``, ``[::1]:5000`` → ``::1``."""
+    host = (value or "").strip().lower()
+    if host.startswith("["):
+        return host.split("]", 1)[0].lstrip("[")
+    if host.count(":") == 1:
+        return host.rsplit(":", 1)[0]
+    return host
+
+
+def _configured_auth_hosts() -> set[str]:
+    raw = os.getenv(_AUTH_HOSTS_ENV) or ""
+    return {
+        _host_without_port(item)
+        for item in raw.split(",")
+        if item.strip()
+    }
+
 
 class _Registry:
     """One registry-v2 session: bearer/basic auth, blob upload, manifest PUT."""
@@ -312,6 +341,25 @@ class _Registry:
             conn.close()
 
     # -- auth --------------------------------------------------------------
+    def _auth_host_allowed(self, realm_host: str) -> bool:
+        """Whether the registry credential may be sent to ``realm_host``.
+
+        The realm comes from the registry's own 401 response, so it is
+        attacker-controlled. Allowed: the registry host/endpoint itself, a
+        well-known token service (Docker Hub), an explicitly configured host,
+        or a sibling ACR host under ``aliyuncs.com``.
+        """
+        realm = _host_without_port(realm_host)
+        host = _host_without_port(self.host)
+        endpoint = _host_without_port(self._endpoint)
+        if not realm:
+            return False
+        if realm in {host, endpoint}:
+            return True
+        if realm in _KNOWN_TOKEN_HOSTS or realm in _configured_auth_hosts():
+            return True
+        return host.endswith(".aliyuncs.com") and realm.endswith(".aliyuncs.com")
+
     def authenticate(self) -> None:
         """Discover the auth scheme from an unauthenticated ``/v2/`` probe."""
         conn = self._conn()
@@ -342,8 +390,33 @@ class _Registry:
         scope = params.get("scope") or f"repository:{self.repo}:pull,push"
         query = urlencode({"service": params.get("service", ""), "scope": scope})
         parsed = urlparse(realm)
+        scheme = (parsed.scheme or "https").lower()
+        if scheme not in {"http", "https"}:
+            raise PushError(
+                f"registry {self.host} sent an unsupported token realm scheme "
+                f"{scheme!r}"
+            )
+        if scheme == "http" and not self._insecure:
+            raise PushError(
+                f"registry {self.host} sent a plaintext token realm; refusing to "
+                "send credentials over HTTP (only allowed with "
+                "DOCKER_RT_BUILD_REGISTRY_INSECURE=true for a trusted local registry)"
+            )
+        realm_host = (parsed.hostname or "").lower()
+        if not self._auth_host_allowed(realm_host):
+            raise PushError(
+                f"registry {self.host} asked for credentials on {realm_host!r}; "
+                "refusing to send them to an unrelated host. If that endpoint is "
+                f"trusted, list it in {_AUTH_HOSTS_ENV}=<host[,host]>."
+            )
         target = f"{parsed.path}?{query}"
-        conn = http.client.HTTPSConnection(parsed.netloc, timeout=self._timeout)
+        netloc = realm_host if parsed.port is None else f"{realm_host}:{parsed.port}"
+        conn_cls = (
+            http.client.HTTPConnection
+            if scheme == "http"
+            else http.client.HTTPSConnection
+        )
+        conn = conn_cls(netloc, timeout=self._timeout)
         try:
             conn.request(
                 "GET",

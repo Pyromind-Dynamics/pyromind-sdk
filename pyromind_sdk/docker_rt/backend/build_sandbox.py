@@ -2125,20 +2125,31 @@ async def _cache_archive_from_sandbox(
 ) -> Path:
     """Pull the built archive out of the sandbox into the local image cache.
 
-    Uses the middleware file channel (``read_file``) — the same transport
-    ``docker cp`` runs on in production — instead of the workspace storage
-    gateway, whose read path rejects plain GETs and aborts ranged ones.
+    Uses the middleware file channel — the same transport ``docker cp`` runs on
+    in production — instead of the workspace storage gateway, whose read path
+    rejects plain GETs and aborts ranged ones. The response is streamed straight
+    into the cache file: a multi-GB archive must never be materialised in the
+    daemon's memory.
     """
     cache_dir = image_cache_dir()
     target = cache_dir / archive_name
-    data = await sandbox._client.read_file(
-        sandbox.sandbox_id, f"{kaniko.DEFAULT_IMAGES_DIR}/{archive_name}"
-    )
-    if not data:
-        raise RuntimeError("the archive read back from the sandbox is empty")
     tmp = target.with_name(target.name + ".part")
-    tmp.write_bytes(data)
-    tmp.replace(target)
+    try:
+        with open(tmp, "wb") as handle:
+            written = await sandbox._client._stream_file_to(
+                sandbox.sandbox_id,
+                f"{kaniko.DEFAULT_IMAGES_DIR}/{archive_name}",
+                handle,
+            )
+        if not written:
+            raise RuntimeError("the archive read back from the sandbox is empty")
+        tmp.replace(target)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     meta = {
         "tags": list(tags),
         "digest": digest,

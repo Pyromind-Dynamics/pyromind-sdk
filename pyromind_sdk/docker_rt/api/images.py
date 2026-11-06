@@ -91,15 +91,50 @@ def to_image_inspect(name: str, *, created: float | None = None) -> dict[str, An
     }
 
 
+def _ref_variants(ref: str) -> set[str]:
+    """Every spelling of a reference after Docker Hub normalization.
+
+    The CLI sends the name the user typed (``alpine:3.19``), while builds and
+    pulls are stored under the canonical form (``docker.io/library/alpine:3.19``);
+    the reverse also happens for archived images. Resolution must accept both.
+    """
+    raw = (ref or "").strip()
+    if not raw or raw.startswith("sha256:"):
+        return {raw} if raw else set()
+    last = raw.rsplit("/", 1)[-1]
+    if ":" not in last:
+        raw = f"{raw}:latest"
+    repo, _, tag = raw.rpartition(":")
+    out = {raw}
+    if repo.startswith("docker.io/"):
+        rest = repo[len("docker.io/"):]
+        out.add(f"{rest}:{tag}")
+        out.add(f"{rest.rsplit('/', 1)[-1]}:{tag}")
+        if "/" not in rest:
+            out.add(f"docker.io/library/{rest}:{tag}")
+    else:
+        first = repo.split("/", 1)[0]
+        explicit_registry = "/" in repo and (
+            "." in first or ":" in first or first == "localhost"
+        )
+        if not explicit_registry:
+            if "/" in repo:
+                out.add(f"docker.io/{repo}:{tag}")
+            else:
+                out.add(f"docker.io/library/{repo}:{tag}")
+    return out
+
+
 def resolve_image_name(ref: str, names: Iterable[str]) -> str | None:
     """Resolve a name, tag, or ``sha256:…`` id against known image names."""
     known = list(names)
     if not ref:
         return None
-    # Exact name / tag
-    for n in known:
-        if ref == n or ref == _repo_tag(n):
-            return n
+    # Exact name / tag, accepting Docker Hub's short and canonical spellings.
+    for candidate in _ref_variants(ref):
+        for n in known:
+            if candidate == n or candidate == _repo_tag(n):
+                return n
     # 名字可能被 registry 规范化过（ACR 不接受连续分隔符等，见
     # buildkit.normalize_for_registry）—— 拿规范化后的形式再比一次，否则
     # `docker inspect <用户写的原名>` 会在 404 和 200 之间飘。

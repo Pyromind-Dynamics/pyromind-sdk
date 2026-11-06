@@ -108,7 +108,7 @@ The build uses Storage as temporary file storage; the final result is stored at:
 
 ### Push to a registry
 
-Builds push to a registry by default. Short image names require a registry prefix and credentials with push permission:
+Builds do **not** push by default (`DOCKER_RT_BUILD_PUSH=false`); after a successful build, push the archive explicitly with `docker push <tag>`. Short image names require a registry prefix and credentials with push permission:
 
 ```bash
 export DOCKER_RT_BUILD_REGISTRY="registry.example.com/team"
@@ -118,7 +118,7 @@ export DOCKER_RT_REGISTRY_PASSWORD="registry-token"
 docker build -t myapp:dev .
 ```
 
-Fully qualified tags are used as written; short tags are expanded with `DOCKER_RT_BUILD_REGISTRY` or the cluster's configured registry. Credentials may also be supplied through a Docker `config.json`.
+Fully qualified tags are used as written; short tags are expanded with `DOCKER_RT_BUILD_REGISTRY` or the cluster's configured registry. Credentials come only from `DOCKER_RT_REGISTRY_USERNAME` + `DOCKER_RT_REGISTRY_PASSWORD`: docker-rt never reads a Docker `config.json` and ignores `X-Registry-Auth` on push.
 
 `DOCKER_RT_BUILD_PUSH_CHECK` defaults to `fail`: before building, docker-rt probes reachability from the build sandbox to the registry, so an unreachable registry fails immediately instead of wasting a full build.
 
@@ -154,6 +154,17 @@ Only the PyroMind-specific variables you **must** know to use builds and pushes 
 | `PYROMIND_API_KEY` | Prompted if missing | PyroMind API credential. |
 | `PYROMIND_CLUSTER` | Prompted if missing | Target cluster (one enabled for your account). |
 | `PYROMIND_BASE_URL` | Resolved from cluster | Explicit API endpoint override. |
+
+### Listener
+
+The daemon protects its API **only** with the transport. There is no token and no TLS: anyone who can reach the socket or port acts with your `PYROMIND_API_KEY`.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DOCKER_RT_SOCK` | `/tmp/docker-rt.sock` | Unix socket path. Created owner-only (mode `0700`) regardless of the caller's umask. |
+| `DOCKER_RT_HOST` | unset | TCP listen address. When set, the plaintext Docker API is served on `DOCKER_RT_PORT` with **no authentication**. For remote use prefer an SSH tunnel to the Unix socket. |
+| `DOCKER_RT_PORT` | `2375` | TCP port used when `DOCKER_RT_HOST` is set. |
+| `DOCKER_RT_ALLOW_UNAUTHENTICATED_TCP` | `false` | Required acknowledgement for binding TCP on a non-loopback address; without it the daemon refuses to start. Every TCP bind logs a warning that clients are unauthenticated. |
 
 ### Build and push
 

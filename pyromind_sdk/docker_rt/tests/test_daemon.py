@@ -269,6 +269,35 @@ def test_server_main_connection_failure_returns_before_context(
     assert activated == []
 
 
+def test_non_loopback_tcp_needs_an_explicit_opt_in(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The Docker API has no auth; binding it to the network must be deliberate."""
+    import pytest
+
+    from .. import aio_server
+
+    monkeypatch.setenv("DOCKER_RT_HOST", "0.0.0.0")
+    monkeypatch.delenv("DOCKER_RT_ALLOW_UNAUTHENTICATED_TCP", raising=False)
+    monkeypatch.setattr(aio_server, "configure_daemon_logging", lambda: None)
+    monkeypatch.setattr(aio_server, "create_aio_app", lambda **kwargs: object())
+
+    with pytest.raises(SystemExit) as excinfo:
+        aio_server.main()
+    assert excinfo.value.code == 2
+
+
+def test_loopback_hosts_are_recognised() -> None:
+    from ..aio_server import _is_loopback_host
+
+    assert _is_loopback_host("127.0.0.1")
+    assert _is_loopback_host("localhost")
+    assert _is_loopback_host("::1")
+    assert _is_loopback_host("[::1]")
+    assert not _is_loopback_host("0.0.0.0")
+    assert not _is_loopback_host("10.0.0.5")
+
+
 def test_cluster_help_lists_every_configured_cluster() -> None:
     """``--cluster`` 的可选项来自 ``CLUSTER_RESOURCE``，不是写死的示例。"""
     from ...client.base import CLUSTER_RESOURCE

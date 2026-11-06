@@ -94,6 +94,31 @@ def test_docker_hub_connects_to_the_registry_endpoint() -> None:
     assert reg._endpoint == "registry-1.docker.io"
 
 
+def test_bearer_realm_is_limited_to_the_registry_or_known_auth_hosts() -> None:
+    """A registry controls the realm; credentials must not follow it blindly."""
+    reg = rc._Registry("docker.io", "ns/app", "user", "pass")
+    assert reg._auth_host_allowed("auth.docker.io")
+    assert reg._auth_host_allowed("registry-1.docker.io")
+    assert not reg._auth_host_allowed("169.254.169.254")
+    assert not reg._auth_host_allowed("evil.example.com")
+    assert not reg._auth_host_allowed("")
+
+    local = rc._Registry("localhost:5000", "app", "u", "p")
+    assert local._auth_host_allowed("localhost")
+
+    acr = rc._Registry(
+        "pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com", "ns/app", "u", "p"
+    )
+    assert acr._auth_host_allowed("pyromind-registry.cn-shanghai.cr.aliyuncs.com")
+    assert not acr._auth_host_allowed("aliyuncs.com.evil.example")
+
+
+def test_bearer_realm_can_be_allowlisted(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(rc._AUTH_HOSTS_ENV, "auth.harbor.example.com")
+    reg = rc._Registry("harbor.example.com", "ns/app", "u", "p")
+    assert reg._auth_host_allowed("auth.harbor.example.com")
+
+
 def test_parse_destination_rejects_an_empty_ref() -> None:
     with pytest.raises(rc.PushError):
         rc.parse_destination("")

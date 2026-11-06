@@ -131,7 +131,8 @@ _TEXT_PAIR = re.compile(
     r"(?i)"
     r"(\b[A-Za-z0-9_.\-]{0,64}"
     r"(?:password|passwd|pwd|secret|token|api[_\-]?key|apikey|access[_\-]?key"
-    r"|secret[_\-]?key|credential|authorization|signature|private[_\-]?key)"
+    r"|secret[_\-]?key|credential|authorization|signature|private[_\-]?key"
+    r"|inf[_\-]?sk)"
     r"[A-Za-z0-9_.\-]{0,64}\b)"
     r"([\"']?\s*[=:]\s*)"
     r"(\"[^\"]*\"|'[^']*'|[^\s,;&\"']+)"
@@ -141,6 +142,27 @@ _TEXT_PAIR = re.compile(
 _TEXT_FLAG = re.compile(
     r"(?i)(--?(?:password|passwd|token|secret|registry-password|api-key|apikey"
     r"|access-key|secret-key)\b(?:=|\s+))(\S+)"
+)
+
+#: ``Authorization: Bearer xxx`` / ``Authorization: token xxx`` / ``SSWS xxx``.
+#: The scheme is optional: any value after ``Authorization:`` is a credential.
+_TEXT_AUTH = re.compile(
+    r"(?i)\b(authorization\s*[:=]\s*)"
+    r"(?:(?P<scheme>[A-Za-z][A-Za-z0-9_-]*)\s+)?"
+    r"(?P<value>\"[^\"]*\"|'[^']*'|[^\s,;&\"']+)"
+)
+
+#: ``docker login -p xxx`` — ``-p`` is too generic for ``_TEXT_FLAG``
+#: (``docker run -p 8080:80``), so it is scoped to a ``login`` command.
+_TEXT_LOGIN_PASSWORD = re.compile(
+    r"(?i)(\blogin\b[^\r\n]*?\s-p\s+)(\"[^\"]*\"|'[^']*'|[^\s,;&\"']+)"
+)
+
+#: bare ``AK=…`` / ``SK=…``. ``inf_sk=…`` is handled by :data:`_TEXT_PAIR`;
+#: the lookbehind keeps ``task=…`` / ``risk=…`` out.
+_TEXT_SHORT_KEY = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])((?:ak|sk))(\s*[=:]\s*)"
+    r"(\"[^\"]*\"|'[^']*'|[^\s,;&\"']+)"
 )
 
 #: ``Authorization: Bearer xxx`` / ``Authorization: Basic xxx``
@@ -250,20 +272,39 @@ def _mask_pair(mask: str):
     return _replace
 
 
-def redact_text(text: Any, *, mask: str = MASK) -> str:
-    """把一段文本里的密钥抹掉（命令行、``KEY=VALUE``、URL、Bearer token）。
+def _mask_authorization(mask: str):
+    """``Authorization: <scheme> <credential>`` 的替换函数。
 
-    顺序有讲究：先抹 ``Bearer xxx`` / ``user:pass@host``，再抹 ``KEY=VALUE``。
-    反过来的话 ``Authorization: Bearer abc`` 里的 ``Bearer`` 会先被换成 ``***``，
-    真正的 token 反倒留在后面。
+    已知认证方案（Bearer/Basic/…）保留方案名，其余方案（``token``、``SSWS``…）
+    连同方案一起抹掉 —— 关键是值一定不能留。
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        scheme = (match.group("scheme") or "").strip()
+        if scheme and scheme.lower() in _AUTH_SCHEMES:
+            return f"{match.group(1)}{scheme} {mask}"
+        return f"{match.group(1)}{mask}"
+
+    return _replace
+
+
+def redact_text(text: Any, *, mask: str = MASK) -> str:
+    """把一段文本里的密钥抹掉（命令行、``KEY=VALUE``、URL、Authorization）。
+
+    顺序有讲究：``Authorization`` 必须**先**整值抹掉，否则 ``KEY=VALUE`` 规则
+    只会吃掉方案名（``Bearer``），真正的 token 留在后面；``Bearer xxx`` 规则
+    再兜底没有 ``Authorization:`` 前缀的裸 token。
     """
     if not text:
         return "" if text is None else text
     out = str(text)
+    out = _TEXT_AUTH.sub(_mask_authorization(mask), out)
     out = _TEXT_FLAG.sub(lambda m: f"{m.group(1)}{mask}", out)
+    out = _TEXT_LOGIN_PASSWORD.sub(lambda m: f"{m.group(1)}{mask}", out)
     out = _TEXT_BEARER.sub(lambda m: f"{m.group(1)} {mask}", out)
     out = _TEXT_URL_CRED.sub(lambda m: f"{m.group(1)}:{mask}@", out)
     out = _TEXT_PAIR.sub(_mask_pair(mask), out)
+    out = _TEXT_SHORT_KEY.sub(_mask_pair(mask), out)
     return out
 
 

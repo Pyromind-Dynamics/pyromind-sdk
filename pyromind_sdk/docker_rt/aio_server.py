@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -2933,6 +2934,79 @@ async def container_logs(request: web.Request) -> web.StreamResponse:
 # ---- images ----
 
 
+def _local_cache_images() -> dict[str, str]:
+    """Local archive-cache tags → archive file name (``image-cache/*.tar``)."""
+    from .backend import build_sandbox
+
+    out: dict[str, str] = {}
+    try:
+        cache = build_sandbox.image_cache_dir()
+        for meta_path in sorted(cache.glob("*.tar.meta.json")):
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001 - one broken sidecar is not fatal
+                continue
+            archive = cache / meta_path.name[: -len(".meta.json")]
+            if not archive.is_file():
+                continue
+            for tag in meta.get("tags") or []:
+                if tag:
+                    out[str(tag)] = archive.name
+    except Exception:  # noqa: BLE001 - the cache scan must never fail a request
+        pass
+    return out
+
+
+def _image_index_tags() -> set[str]:
+    """Tags in the persisted workspace index; never triggers a full scan."""
+    from .backend import context_staging
+
+    doc = context_staging.read_image_index()
+    return {
+        str(entry.get("tag"))
+        for entry in (doc or {}).get("images") or []
+        if isinstance(entry, dict) and entry.get("tag")
+    }
+
+
+def _drop_image_files(
+    *, cache_names: set[str], archive_keys: set[str]
+) -> None:
+    """Delete a removed image from the local cache and the workspace.
+
+    Best-effort per object: a missing file is fine, and a storage failure must
+    not turn a successful local removal into an error.
+    """
+    from .backend import build_sandbox, context_staging
+
+    cache = build_sandbox.image_cache_dir()
+    for name in cache_names:
+        for path in (cache / name, cache / (name + context_staging.IMAGE_META_SUFFIX)):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning("docker rmi could not delete %s: %s", path, exc)
+    if not archive_keys:
+        return
+    try:
+        storage, bucket = context_staging.connect_storage(
+            context_staging.storage_cluster()
+        )
+    except Exception as exc:  # noqa: BLE001 - local removal already succeeded
+        logger.warning("docker rmi could not reach workspace storage: %s", exc)
+        return
+    for key in archive_keys:
+        for object_name in (key, key + context_staging.IMAGE_META_SUFFIX):
+            try:
+                storage.delete_file(object_name, bucket_name=bucket)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "docker rmi could not delete %s/%s: %s", bucket, object_name, exc
+                )
+
+
 async def list_images(request: web.Request) -> web.Response:
     """`docker images` —— 只列有归档的镜像，本地缓存优先。
 
@@ -2945,9 +3019,14 @@ async def list_images(request: web.Request) -> web.Response:
     容器（构建沙箱、集群里跑着的沙箱）引用的镜像**不算本地镜像**：它们只
     存在于集群侧，列出来会让 `docker images` 凭空多出 kaniko 构建镜像、
     osworld 等用户没构建过的名字（2026-11-06 用户报）。
+
+    另外，``docker pull`` / ``docker push`` / ``docker build`` 显式注册过的
+    镜像即使没有本地归档也要列出来（Docker 语义：pull 完 `docker images`
+    能看到它）。
     """
     from .backend import context_staging, build_sandbox
 
+    store: ContainerStore = request.app["store"]
     summaries: list[dict[str, Any]] = []
     seen: set[str] = set()
 
@@ -3004,6 +3083,18 @@ async def list_images(request: web.Request) -> web.Response:
             )
         )
 
+    # 3) explicitly pulled/pushed names without an archive (pull is a stub).
+    # Build aliases are skipped when their real (registry) tag is already listed:
+    # the index/cache entry is the image, the alias is only a lookup shortcut.
+    for name in sorted(store.registered_images()):
+        if name in seen:
+            continue
+        target = store.resolve_image(name)
+        if target != name and target in seen:
+            continue
+        seen.add(name)
+        summaries.append(images_mod.to_image_summary(name))
+
     return _json(summaries)
 
 
@@ -3013,7 +3104,22 @@ async def inspect_image(request: web.Request) -> web.Response:
     default = request.app["default_image"]
     names = {default} | store.known_images()
     ref = request.match_info["name"]
-    resolved = images_mod.resolve_image_name(ref, names)
+    # A build alias (short tag) must resolve to the real registry tag: the
+    # image id is derived from the name, so answering under the alias would
+    # invent a second id for the same image.
+    lookup = store.resolve_image(ref) or ref
+    resolved = images_mod.resolve_image_name(lookup, names)
+    if resolved is None:
+        # The image may only exist as an archive (the daemon restarted since it
+        # was built), so `docker images` lists it while the in-memory store no
+        # longer knows it. Resolve against the same local-cache + index sources
+        # the listing uses.
+        for loader in (_local_cache_images, _image_index_tags):
+            try:
+                names |= set(await asyncio.to_thread(loader))
+            except Exception:  # noqa: BLE001 - absence of storage is not a 500
+                pass
+        resolved = images_mod.resolve_image_name(lookup, names)
     if resolved is None:
         return _err(404, f"No such image: {ref}")
     return _json(images_mod.to_image_inspect(resolved))
@@ -3210,9 +3316,20 @@ async def delete_image(request: web.Request) -> web.Response:
     """DELETE /images/{name} — stub remove for docker-py / SWE-bench cleanup."""
     store: ContainerStore = request.app["store"]
     default = request.app["default_image"]
-    names = {default} | store.known_images()
+    local_cache = await asyncio.to_thread(_local_cache_images)
+    names = {default} | store.known_images() | set(local_cache)
     ref = request.match_info["name"]
-    resolved = images_mod.resolve_image_name(ref, names)
+    # Resolve build aliases to the real registry tag first, so rmi removes the
+    # archive/index entry instead of a shortcut that owns no bytes.
+    lookup = store.resolve_image(ref) or ref
+    resolved = images_mod.resolve_image_name(lookup, names)
+    if resolved is None:
+        index_names: set[str] = set()
+        try:
+            index_names = await asyncio.to_thread(_image_index_tags)
+        except Exception:  # noqa: BLE001 - absence of storage is not a 500
+            pass
+        resolved = images_mod.resolve_image_name(lookup, names | index_names)
     if resolved is None:
         # Idempotent: missing image is fine for cleanup (force=True callers).
         force = request.rel_url.query.get("force", "false").lower() in {
@@ -3223,7 +3340,40 @@ async def delete_image(request: web.Request) -> web.Response:
         if force:
             return _json([])
         return _err(404, f"No such image: {ref}")
+
+    from .backend import context_staging, kaniko
+
     store.unregister_image(resolved)
+    # The tag may live in the workspace index (after a restart the store is
+    # empty). Removing only the in-memory record made `docker rmi` a no-op:
+    # the next `docker images` still listed the archive.
+    removed: list[dict[str, Any]] = []
+    live_archives: set[str] = set()
+    try:
+        removed, live_archives = await asyncio.to_thread(
+            context_staging.remove_image_from_index, tags=[resolved]
+        )
+    except Exception as exc:  # noqa: BLE001 - local removal still proceeds
+        logger.warning("docker rmi could not update the image index: %s", exc)
+
+    dead_archives = {
+        str(entry.get("archive") or "") for entry in removed
+    } - live_archives
+    dead_archives.discard("")
+    cache_names = {key.rsplit("/", 1)[-1] for key in dead_archives}
+    if resolved in local_cache:
+        cache_names.add(local_cache[resolved])
+    if not removed:
+        # No index entry (index unavailable, or a pull/push stub): still drop
+        # the cache file a build of this tag would have written.
+        cache_names.add(kaniko.image_archive_name(resolved))
+    if cache_names or dead_archives:
+        await asyncio.to_thread(
+            _drop_image_files,
+            cache_names=cache_names,
+            archive_keys=dead_archives,
+        )
+
     await _events(request).emit(
         type="image",
         action="delete",
@@ -5762,6 +5912,25 @@ def configure_daemon_logging() -> None:
     logging.getLogger("asyncio").addFilter(_UnixKeepaliveNoiseFilter())
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_loopback_host(host: str) -> bool:
+    value = (host or "").strip().strip("[]")
+    if not value:
+        return False
+    if value.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
 def main() -> None:
     import signal
 
@@ -5774,7 +5943,27 @@ def main() -> None:
 
     try:
         if host:
-            logger.info("Listening on TCP %s:%s", host, port)
+            # The Docker API has no authentication of its own; exposing it on a
+            # non-loopback address hands every route (create/exec/push with the
+            # daemon's credentials) to anyone who can reach the port. Remote
+            # binding therefore needs an explicit acknowledgement.
+            if not _is_loopback_host(host) and not _env_flag(
+                "DOCKER_RT_ALLOW_UNAUTHENTICATED_TCP"
+            ):
+                logger.error(
+                    "refusing to expose the unauthenticated docker-rt API on "
+                    "%s:%s; bind 127.0.0.1 and use an SSH tunnel, or set "
+                    "DOCKER_RT_ALLOW_UNAUTHENTICATED_TCP=1 to accept the risk",
+                    host,
+                    port,
+                )
+                raise SystemExit(2)
+            logger.warning(
+                "Listening on TCP %s:%s WITHOUT authentication; every client "
+                "gets the PYROMIND_API_KEY's authority",
+                host,
+                port,
+            )
             web.run_app(app, host=host, port=port, print=lambda *a, **k: None)
         else:
             try:
@@ -5784,8 +5973,15 @@ def main() -> None:
                 # 一行说清楚就够，不必甩 20 行 traceback。
                 logger.error("%s", exc)
                 raise SystemExit(1) from None
-            logger.info("Listening on unix://%s", sock)
-            web.run_app(app, path=sock, print=lambda *a, **k: None)
+            logger.info("Listening on unix://%s (owner-only socket)", sock)
+            # The API is protected only by the socket's file mode. Create it
+            # under umask 077 so other local users cannot connect (asyncio/
+            # aiohttp never chmod the path themselves).
+            old_umask = os.umask(0o077)
+            try:
+                web.run_app(app, path=sock, print=lambda *a, **k: None)
+            finally:
+                os.umask(old_umask)
     except SystemExit:
         raise
     except BaseException:

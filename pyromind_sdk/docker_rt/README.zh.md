@@ -108,7 +108,7 @@ PyroMind 后端（默认后端）没有 Kubernetes API 端口转发端点，因�
 
 ### 推送到镜像仓库
 
-构建默认在完成后推送镜像。使用短镜像名时，需要配置仓库前缀以及具备推送权限的凭据：
+构建完成后**不会**自动推送（`DOCKER_RT_BUILD_PUSH=false`）；需要时用 `docker push <tag>` 显式推送。使用短镜像名时，需要配置仓库前缀以及具备推送权限的凭据：
 
 ```bash
 export DOCKER_RT_BUILD_REGISTRY="registry.example.com/team"
@@ -118,7 +118,7 @@ export DOCKER_RT_REGISTRY_PASSWORD="registry-token"
 docker build -t myapp:dev .
 ```
 
-完整限定的镜像标签按原样使用；短标签由 `DOCKER_RT_BUILD_REGISTRY` 或集群的仓库配置补全。凭据也可通过 Docker `config.json` 提供。
+完整限定的镜像标签按原样使用；短标签由 `DOCKER_RT_BUILD_REGISTRY` 或集群的仓库配置补全。凭证只来自 `DOCKER_RT_REGISTRY_USERNAME` + `DOCKER_RT_REGISTRY_PASSWORD`：docker-rt 不读取 Docker `config.json`，推送时也忽略 `X-Registry-Auth`。
 
 `DOCKER_RT_BUILD_PUSH_CHECK` 默认为 `fail`：构建开始前先探测「构建 Sandbox → 仓库」的连通性，不通则立即失败，避免白跑一次完整构建。
 
@@ -154,6 +154,17 @@ docker build -t myapp:dev .
 | `PYROMIND_API_KEY` | 未设置时提示输入 | PyroMind API 凭据。 |
 | `PYROMIND_CLUSTER` | 未设置时提示输入 | 目标集群（你账号下已开通的集群）。 |
 | `PYROMIND_BASE_URL` | 根据集群解析 | 显式指定 API 地址。 |
+
+### 监听方式
+
+daemon 的 API **只靠传输层**做访问控制，没有 token、也没有 TLS：能连上 socket 或端口的人就拥有你的 `PYROMIND_API_KEY` 权限。
+
+| 变量 | 默认值 | 用途 |
+| --- | --- | --- |
+| `DOCKER_RT_SOCK` | `/tmp/docker-rt.sock` | Unix socket 路径。无论调用方 umask 如何，都按仅属主可访问（`0700`）创建。 |
+| `DOCKER_RT_HOST` | 未设置 | TCP 监听地址。设置后在该端口上提供**无鉴权**的明文 Docker API；远程使用请优先通过 SSH 隧道连 Unix socket。 |
+| `DOCKER_RT_PORT` | `2375` | 设置 `DOCKER_RT_HOST` 时使用的 TCP 端口。 |
+| `DOCKER_RT_ALLOW_UNAUTHENTICATED_TCP` | `false` | 允许绑定非 loopback 地址时必须显式设置，否则 daemon 拒绝启动。每次 TCP 绑定都会打印“客户端无鉴权”的警告。 |
 
 ### 构建与推送
 

@@ -728,6 +728,37 @@ class AsyncSandboxClient(PyroMindAsyncClient):
                 await self._handle_error_response(response, request_context)
             return await response.read()
 
+    async def _stream_file_to(
+        self,
+        sandbox_id: str,
+        path: str,
+        target: IO[bytes],
+        *,
+        chunk_size: int = 1024 * 1024,
+    ) -> int:
+        """Stream a sandbox file into an open binary handle; returns bytes written.
+
+        ``read_file`` buffers the whole response in memory. Image archives are
+        routinely hundreds of megabytes, so callers that only need the bytes on
+        disk use this instead; writes are pushed to a worker thread so the
+        event loop is not blocked.
+        """
+        url = self._build_url(f"/sandboxes/{sandbox_id}/files/read")
+        session = await self._get_session()
+        request_context = f"GET {url}"
+        written = 0
+        async with self._raw_request(
+            session, "GET", url, params={"path": path}
+        ) as response:
+            if not response.ok:
+                await self._handle_error_response(response, request_context)
+            async for chunk in response.content.iter_chunked(chunk_size):
+                if not chunk:
+                    continue
+                await asyncio.to_thread(target.write, chunk)
+                written += len(chunk)
+        return written
+
     # 分块大小：每块 2 MB（避免单次请求超时）
     _CHUNK_SIZE = 2 * 1024 * 1024
 
