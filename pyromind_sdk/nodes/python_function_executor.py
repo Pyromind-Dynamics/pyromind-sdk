@@ -314,7 +314,7 @@ def build_command_template(
     bash_commands.append('trap \'rm -rf -- "$input_dir"\' EXIT')
     for index, input_name in enumerate(input_names, start=1):
         bash_commands.append(f'printf "%s" "${{{index}}}" > "$input_dir/{input_name}"')
-    #todo 临时安装
+    #todo 临时安装测试版本
     # 4. Fetch the temporary SDK from TestPyPI, then install it and its
     # dependencies from PyPI into this invocation's private directory.
     python_exec = (python_command or "python3").strip()
@@ -325,11 +325,11 @@ def build_command_template(
         "-i https://test.pypi.org/simple/ pyromind-sdk==0.1.15.dev10 -q"
     )
     bash_commands.append(
-        f"{python_exec} -c \"import pyromind_sdk\" 2>/dev/null || "
-        f"{python_exec} -m pip install pyromind-sdk -q"
-        # f"{python_exec} -m pip install --ignore-installed --no-cache-dir "
-        # '--target "$input_dir/.pyromind-sdk-runtime" '
-        # '-i https://pypi.org/simple/ "$input_dir/.pyromind-sdk-wheel/"*.whl -q'
+        # f"{python_exec} -c \"import pyromind_sdk\" 2>/dev/null || "
+        # f"{python_exec} -m pip install pyromind-sdk -q"
+        f"{python_exec} -m pip install --ignore-installed --no-cache-dir "
+        '--target "$input_dir/.pyromind-sdk-runtime" '
+        '-i https://pypi.org/simple/ "$input_dir/.pyromind-sdk-wheel/"*.whl -q'
     )
     bash_commands.append(
         'export PYTHONPATH="$input_dir/.pyromind-sdk-runtime${PYTHONPATH:+:$PYTHONPATH}"'
