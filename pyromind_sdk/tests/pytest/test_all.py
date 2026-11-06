@@ -201,7 +201,7 @@ def check_environment():
     print("PyroMind SDK Integration Tests")
     print("=" * 60)
     print(f"Base URL: {base_url}")
-    print(f"API Key: {'Set (' + api_key[:10] + '...)'  if api_key else 'NOT SET'}")
+    print(f"API Key: {'Set' if api_key else 'NOT SET'}")
     print("=" * 60)
 
     if not api_key:

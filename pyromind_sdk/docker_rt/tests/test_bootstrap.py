@@ -222,9 +222,13 @@ def test_print_connected_includes_parameters() -> None:
     assert "OSWorld 0" in text
 
 
-def test_print_connected_can_show_full_key(
+def test_print_connected_never_prints_the_full_key(
     monkeypatch: MonkeyPatch,
 ) -> None:
+    """连 ``DOCKER_RT_SHOW_API_KEY`` 也救不回来：启动横幅只打脱敏后的 key。
+
+    这一段会进终端、也会进 ``docker-rt`` 的启动日志，完整 key 落盘即泄漏。
+    """
     monkeypatch.setenv("DOCKER_RT_SHOW_API_KEY", "true")
     stdout = io.StringIO()
 
@@ -235,7 +239,9 @@ def test_print_connected_can_show_full_key(
         stdout=stdout,
     )
 
-    assert "test-key" in stdout.getvalue()
+    text = stdout.getvalue()
+    assert "test-key" not in text
+    assert "***" in text
 
 
 def test_print_connected_reports_osworld_breakdown() -> None:
