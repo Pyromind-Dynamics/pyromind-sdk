@@ -42,6 +42,7 @@ import asyncio
 import bz2
 import gzip
 import io
+import json
 import logging
 import lzma
 import os
@@ -50,6 +51,7 @@ import secrets
 import shlex
 import tarfile
 import time
+from pathlib import Path
 from typing import Any, AsyncIterator, NamedTuple
 
 from . import buildkit, context_staging, kaniko, registry_push
@@ -560,19 +562,20 @@ def _build_registry_hint(tag: str) -> str:
 
 
 def _check_push_credentials(registry: str) -> str | None:
-    """Check if push credentials are configured, return hint if missing."""
+    """Check if push credentials are configured, return hint if missing.
+
+    Only the explicit environment variables count. There is no config-file
+    fallback any more: an implicit ``docker login`` on the daemon host must not
+    silently become a push credential.
+    """
     username = _env("DOCKER_RT_REGISTRY_USERNAME")
     password = _env("DOCKER_RT_REGISTRY_PASSWORD")
-    dockerconfig = _env("DOCKER_RT_REGISTRY_DOCKERCONFIG")
 
-    has_creds = (username and password) or dockerconfig
-
-    if not has_creds:
+    if not (username and password):
         return (
-            "No push credentials configured. Set one of: "
+            "No push credentials configured. Set "
             "DOCKER_RT_REGISTRY_USERNAME + DOCKER_RT_REGISTRY_PASSWORD "
-            "(registry username and password/API token), or "
-            "DOCKER_RT_REGISTRY_DOCKERCONFIG (path to dockerconfig.json or base64-encoded content). "
+            "(registry username and password/API token). "
             "For Docker Hub, use your username and an Access Token from "
             "https://hub.docker.com/settings/security"
         )
@@ -591,7 +594,6 @@ def kaniko_argv(
     buildargs: dict[str, str] | None = None,
     labels: dict[str, str] | None = None,
     target: str | None = None,
-    push: bool = True,
     platform: str | None = None,
 ) -> list[str]:
     """The kaniko argv for one build (pure)."""
@@ -601,7 +603,6 @@ def kaniko_argv(
         buildargs=buildargs,
         labels=labels,
         target=target,
-        push=push,
         digest_file=kaniko.digest_file_path(),
         platform=platform,
     )
@@ -614,8 +615,6 @@ def build_script(
     buildargs: dict[str, str] | None = None,
     labels: dict[str, str] | None = None,
     target: str | None = None,
-    push: bool = True,
-    docker_config_b64: str = "",
     platform: str | None = None,
 ) -> str:
     """The **worker** script — what actually runs kaniko (pure)."""
@@ -626,10 +625,8 @@ def build_script(
             buildargs=buildargs,
             labels=labels,
             target=target,
-            push=push,
             platform=platform,
         ),
-        docker_config_b64=docker_config_b64,
     )
 
 
@@ -640,8 +637,6 @@ def start_script(
     buildargs: dict[str, str] | None = None,
     labels: dict[str, str] | None = None,
     target: str | None = None,
-    push: bool = True,
-    docker_config_b64: str = "",
     platform: str | None = None,
 ) -> str:
     """The short script that detaches the worker and returns (pure)."""
@@ -652,10 +647,8 @@ def start_script(
             buildargs=buildargs,
             labels=labels,
             target=target,
-            push=push,
             platform=platform,
         ),
-        docker_config_b64=docker_config_b64,
     )
 
 
@@ -1133,18 +1126,15 @@ def push_fix_hints() -> list[str]:
             )
         else:
             hints.append("    plus credentials for THAT registry.")
-        # 凭据是**二选一**，不是三行都得设 —— 2026-10-09 用户就误读成了"必须配"。
-        hints.append("    Give them either way; only one of the two is needed:")
+        # 只有这一种来源：显式环境变量。不再有任何 config 文件回退 ——
+        # 隐式读宿主机的 docker config 会让凭据来源说不清，也让"碰巧登录过"
+        # 的机器莫名其妙就带上推送权限。
+        hints.append("    Both are needed:")
         hints.append("      DOCKER_RT_REGISTRY_USERNAME=<username for that registry>")
         hints.append("      DOCKER_RT_REGISTRY_PASSWORD=<password or temporary token>")
-        hints.append("        -- or --")
         hints.append(
-            "      DOCKER_RT_REGISTRY_DOCKERCONFIG=<path to a config.json already "
-            "logged in to it>"
-        )
-        hints.append(
-            "    Neither is mandatory: with neither set, the default "
-            f"{registry_push.DEFAULT_DOCKER_CONFIG_SECRET} is used if it exists."
+            "    These are read when docker-rt starts — restart the daemon after "
+            "changing them."
         )
     elif reachable:
         hints.append(
@@ -1385,50 +1375,36 @@ async def build_in_sandbox(
 
     destinations = list(dict.fromkeys(aliases.values()))
 
-    # Credentials are keyed by registry **host**, so this needs a prefix even when
-    # the push prefix itself is unresolved: a fully-qualified ``-t`` carries its
-    # own host. Passing ``""`` would make ``docker_config_b64`` re-resolve the
-    # prefix internally and raise on a cluster whose profile has a host but no
-    # namespace — killing a build that never needed the prefix.
-    credential_prefix = registry or (
-        destinations[0].rsplit("/", 1)[0] if destinations and "/" in destinations[0] else ""
-    )
-
     # 先做环境变量体检：拼错的变量常常就是下面那些"缺失 / 跳过"告警的真正原因，
     # 所以它必须排在它们**前面**（2026-10-09 用户 `DOCKER_RT_ACR_SECRET` → 建仓被跳过）。
     for warning in registry_push.unknown_env_warnings():
         yield {"stream": f"warning: {warning}\n"}
 
-    # Create any ACR repository *before* spending a sandbox.
-    try:
-        ensured = registry_push.ensure_repositories(destinations)
-    except RegistryConfigError as exc:
-        yield buildkit.error_event(str(exc))
-        return
-    if ensured.error:
-        yield buildkit.error_event(ensured.error)
-        return
-    for warning in ensured.warnings:
-        yield {"stream": f"warning: {warning}\n"}
+    # Everything below is about **pushing**. When the build does not push there
+    # is no repository to create and no credential to look for, and warning
+    # about them would be noise about an operation the user did not ask for.
+    if push:
+        # Create any ACR repository *before* spending a sandbox.
+        try:
+            ensured = registry_push.ensure_repositories(destinations)
+        except RegistryConfigError as exc:
+            yield buildkit.error_event(str(exc))
+            return
+        if ensured.error:
+            yield buildkit.error_event(ensured.error)
+            return
+        for warning in ensured.warnings:
+            yield {"stream": f"warning: {warning}\n"}
 
-    plan = registry_push.push_plan()
-    for warning in plan.warnings:
-        yield {"stream": f"warning: {warning}\n"}
+        plan = registry_push.push_plan()
+        for warning in plan.warnings:
+            yield {"stream": f"warning: {warning}\n"}
 
-    try:
-        docker_config_b64 = registry_push.docker_config_b64(credential_prefix)
-    except RegistryConfigError as exc:
-        # Configured-but-unreadable is a deployment error: fail before spending a
-        # sandbox rather than after a five-minute build that ends in a 401.
-        yield buildkit.error_event(str(exc))
-        return
-    if push and not docker_config_b64:
-        yield {
-            "stream": (
-                "warning: no push credentials resolved; assuming the registry "
-                "accepts anonymous pushes\n"
-            )
-        }
+    # Registry credentials are deliberately **not** resolved here. The build
+    # container runs every Dockerfile instruction as root, so anything the
+    # executor can read a ``RUN`` step can read too — a push credential placed
+    # in this sandbox is a credential handed to the Dockerfile's author. Pushing
+    # happens after the sandbox is gone (see ``registry_push.push_archive``).
 
     script = start_script(
         destinations=destinations,
@@ -1436,8 +1412,6 @@ async def build_in_sandbox(
         buildargs=buildargs,
         labels=labels,
         target=target,
-        push=push,
-        docker_config_b64=docker_config_b64,
         platform=platform,
     )
     # The destinations are worth stating up front: with kaniko, build and output
@@ -1491,12 +1465,11 @@ async def build_in_sandbox(
                 yield event
             await upload_task
         except Exception as exc:
-            if context_staging.staging_required():
-                yield buildkit.error_event(f"cannot stage the build context: {exc}")
-                return
-            logger.warning("context staging unavailable: %s", exc)
-            yield stage(f"Workspace staging unavailable ({exc}); uploading directly")
-            stager = None
+            # No fallback. A staging failure is a deployment problem, and
+            # silently uploading over the exec channel is exactly how it stayed
+            # undiagnosed (one websocket per 2 MiB, minutes for a small context).
+            yield buildkit.error_event(f"cannot stage the build context: {exc}")
+            return
         else:
             staging = stager.plan
             yield stage(
@@ -1535,8 +1508,8 @@ async def build_in_sandbox(
             """The archive directory, plus the staged context when there is one.
 
             The images mount is never the entry dropped on a retry: the archive
-            is the build's output, while the staged context can fall back to a
-            direct upload.
+            is the build's output. The staged context has no fallback route —
+            without this mount the build cannot be fed at all.
             """
             mounts = [images_mount_spec()]
             if plan is not None:
@@ -1642,18 +1615,13 @@ async def build_in_sandbox(
             else:
                 reason = ""
             if reason:
-                if context_staging.staging_required():
-                    # Same reasoning as the refused mount above: in ``storage``
-                    # mode a staged context that did not survive the copy is a
-                    # failure, and quietly uploading it again would hide a
-                    # broken mount behind a build that happens to work.
-                    yield buildkit.error_event(
-                        f"cannot use the staged build context ({reason})"
-                    )
-                    return
-                logger.warning("staged context unusable (%s)", reason)
-                yield stage(f"Staged context unusable ({reason}); uploading directly")
-                staging = None
+                # Same reasoning as the refused mount above: a staged context
+                # that did not survive the copy is a failure. Re-uploading it
+                # would hide a broken mount behind a build that happens to work.
+                yield buildkit.error_event(
+                    f"cannot use the staged build context ({reason})"
+                )
+                return
             else:
                 yield stage(
                     f"Build context copied in {time.monotonic() - copy_started:.1f}s"
@@ -1886,8 +1854,96 @@ async def build_in_sandbox(
         if not digest:
             digest = kaniko.parse_digest(await _read_digest(sandbox))
         if digest:
-            yield stage(f"Pushed {digest}")
+            yield stage(f"Built {digest}")
             yield {"aux": {"ID": digest}}
+
+        # Keep a **local** copy of the archive while the sandbox is still alive.
+        # The workspace storage gateway's read path is unusable from outside
+        # (plain GETs and stat are AccessDenied, ranged responses abort after a
+        # few hundred KB, and its instances disagree about what exists), while
+        # the middleware file channel used here is what `docker cp` runs on in
+        # production. `docker push` and `docker images` then work from the local
+        # cache and never touch the broken read path.
+        cached = None
+        try:
+            cached = await _cache_archive_from_sandbox(
+                sandbox,
+                archive_name=kaniko.image_archive_name(destinations[0]),
+                tags=destinations,
+                digest=digest,
+            )
+            yield stage(f"Image archived locally at {cached}")
+        except Exception as exc:  # noqa: BLE001 — a local copy is best-effort
+            yield {
+                "stream": (
+                    f"warning: could not cache the image archive locally: {exc}\n"
+                    "  `docker push` for this image will fall back to the "
+                    "workspace storage read path.\n"
+                )
+            }
+
+        # The metadata sidecar and the index entry are what `docker images`
+        # reads. Updating the index in place (instead of starting a full
+        # rescan) is what keeps listing fast after the first build; the scan
+        # only runs once, when no index exists yet.
+        archive_key = context_staging.image_archive_object_name(destinations[0])
+        archive_size = cached.stat().st_size if cached is not None else 0
+        if not archive_size:
+            # The local cache fetch is best-effort; when it fails the archive
+            # still exists in the workspace. Reading its size from storage is
+            # what keeps `docker images` from showing 0 B (2026-11-06 用户报).
+            archive_size = int(
+                await asyncio.to_thread(context_staging.archive_size, archive_key)
+                or 0
+            )
+        yield stage("Recording image metadata in the workspace…")
+        try:
+            await asyncio.to_thread(
+                context_staging.write_image_meta,
+                tag=destinations[0],
+                digest=digest,
+                size=archive_size,
+            )
+        except Exception as exc:  # noqa: BLE001 — never fail a built image on metadata
+            yield {
+                "stream": (
+                    f"warning: could not write the image metadata sidecar: {exc}\n"
+                )
+            }
+        try:
+            await asyncio.to_thread(
+                context_staging.upsert_image_index,
+                tags=destinations,
+                archive=archive_key,
+                digest=digest,
+                size=archive_size,
+            )
+        except Exception as exc:  # noqa: BLE001
+            yield {
+                "stream": (
+                    f"warning: could not update the image index: {exc}\n"
+                )
+            }
+
+        # Pushing is a **separate step**, after the archive exists and with
+        # credentials that never entered the build container. See
+        # ``registry_client`` for why that separation is the fix, not a detail.
+        if push:
+            pushed, push_error = await _push_archives(destinations)
+            if push_error:
+                yield buildkit.error_event(push_error)
+                return
+            if pushed:
+                yield stage(f"Pushed {pushed}")
+
+        if not push:
+            # The image is on disk, not in a registry — and the cluster can only
+            # pull from a registry, so `docker run` needs a push first.
+            yield stage(
+                "Not pushed: the archive is in "
+                f"{kaniko.tar_path(destinations)}. Run `docker push <tag>` before "
+                "`docker run` — the cluster pulls images from a registry."
+            )
         yield {"stream": "Successfully built\n"}
         yield {"docker_rt": {"aliases": aliases, "digest": digest}}
     finally:
@@ -2051,6 +2107,95 @@ async def _read_digest(sandbox: Any) -> str:
     if isinstance(result, dict):
         return str(result.get("output") or "")
     return ""
+
+
+def image_cache_dir() -> Path:
+    """Local archive cache: ``~/.docker-rt/image-cache/``."""
+    path = Path.home() / ".docker-rt" / "image-cache"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+async def _cache_archive_from_sandbox(
+    sandbox: Any,
+    *,
+    archive_name: str,
+    tags: list[str],
+    digest: str,
+) -> Path:
+    """Pull the built archive out of the sandbox into the local image cache.
+
+    Uses the middleware file channel — the same transport ``docker cp`` runs on
+    in production — instead of the workspace storage gateway, whose read path
+    rejects plain GETs and aborts ranged ones. The response is streamed straight
+    into the cache file: a multi-GB archive must never be materialised in the
+    daemon's memory.
+    """
+    cache_dir = image_cache_dir()
+    target = cache_dir / archive_name
+    tmp = target.with_name(target.name + ".part")
+    try:
+        with open(tmp, "wb") as handle:
+            written = await sandbox._client._stream_file_to(
+                sandbox.sandbox_id,
+                f"{kaniko.DEFAULT_IMAGES_DIR}/{archive_name}",
+                handle,
+            )
+        if not written:
+            raise RuntimeError("the archive read back from the sandbox is empty")
+        tmp.replace(target)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    meta = {
+        "tags": list(tags),
+        "digest": digest,
+        "created": int(time.time()),
+        "archive": f"{kaniko.DEFAULT_IMAGES_DIR.strip('/')}/{archive_name}",
+    }
+    (cache_dir / (archive_name + ".meta.json")).write_text(
+        json.dumps(meta, ensure_ascii=False), encoding="utf-8"
+    )
+    return target
+
+
+async def _push_archives(destinations: list[str]) -> tuple[str, str]:
+    """Push every built archive from the daemon; returns ``(digest, error)``.
+
+    This runs **outside** the build container on purpose. The credential must
+    never be visible to a Dockerfile ``RUN`` step, and the only way to guarantee
+    that is not to put it in that container at all (see ``registry_client``).
+    """
+    from . import registry_client
+
+    username, password = registry_push.registry_credentials()
+    last = ""
+    for destination in destinations:
+        try:
+            path, cleanup = await asyncio.to_thread(
+                registry_client.locate_archive,
+                destination,
+                images_dir=kaniko.DEFAULT_IMAGES_DIR,
+            )
+        except registry_client.PushError as exc:
+            return "", str(exc)
+        try:
+            last = await asyncio.to_thread(
+                registry_client.push_archive,
+                path,
+                destination,
+                username=username,
+                password=password,
+                insecure=kaniko.registry_insecure(),
+            )
+        except Exception as exc:  # noqa: BLE001 — report it, keep the archive
+            return "", f"pushing {destination} failed: {exc}"
+        finally:
+            cleanup()
+    return last, ""
 
 
 async def _archive_written(sandbox: Any, path: str) -> bool:
