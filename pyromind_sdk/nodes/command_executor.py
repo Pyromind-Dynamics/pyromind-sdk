@@ -25,13 +25,55 @@ POSIX_SHELL_NAMES = frozenset({
 
 # ========== Basic Utilities ==========
 
+# A placeholder is `{{name}}`, optionally with a rendering filter: `{{name|json}}`.
+# Filters exist because shell quoting alone does not escape a value for the
+# format it is being embedded into.
+PLACEHOLDER_FILTERS = frozenset({"json", "jsonstr"})
+_PLACEHOLDER_RE = re.compile(r"\{\{([a-zA-Z0-9_-]+)(?:\|([a-zA-Z_][a-zA-Z0-9_]*))?\}\}")
+
+
+def render_placeholder_value(name: str, value: Any, placeholder_filter: Optional[str] = None) -> str:
+    """Render one input value for substitution into a template part.
+
+    ``json``    gives a complete JSON literal, for a placeholder used where a
+                JSON value is expected: ``{"payload": {{x|json}}}``.
+    ``jsonstr`` gives the escaped body of a JSON string, for a placeholder that
+                already sits inside quotes: ``{"payload": "{{x|jsonstr}}"}``.
+    """
+    if placeholder_filter == "json":
+        return json.dumps(str(value), ensure_ascii=False)
+    if placeholder_filter == "jsonstr":
+        return json.dumps(str(value), ensure_ascii=False)[1:-1]
+    if placeholder_filter is not None:
+        raise ValueError(f"Unsupported placeholder filter: {placeholder_filter!r}")
+    return str(value)
+
+
+def parse_placeholder_filters(script: str) -> Dict[str, Optional[str]]:
+    """Map every placeholder in ``script`` to its filter (``None`` when absent).
+
+    Rejects unknown filters and a name used with two different filters inside
+    the same command part, which would make the argv binding ambiguous.
+    """
+    filters: Dict[str, Optional[str]] = {}
+    for match in _PLACEHOLDER_RE.finditer(script):
+        name, placeholder_filter = match.group(1), match.group(2)
+        if placeholder_filter is not None and placeholder_filter not in PLACEHOLDER_FILTERS:
+            raise ValueError(f"Unsupported placeholder filter: {placeholder_filter!r}")
+        if name in filters and filters[name] != placeholder_filter:
+            raise ValueError(
+                f"Placeholder {name!r} is used with conflicting filters in one command part"
+            )
+        filters[name] = placeholder_filter
+    return filters
+
+
 def extract_placeholders(command_template: List[str]) -> Set[str]:
-    """Extract all {{}} wrapped placeholders from command template"""
+    """Extract all {{}} wrapped placeholders from command template (filters dropped)"""
     placeholders = set()
     for part in command_template:
         if isinstance(part, str):
-            matches = re.findall(r'\{\{([a-zA-Z0-9_-]+)\}\}', part)
-            placeholders.update(matches)
+            placeholders.update(match.group(1) for match in _PLACEHOLDER_RE.finditer(part))
     return placeholders
 
 
@@ -45,11 +87,14 @@ def replace_template(template: str, replacements: Dict[str, Any], exclude_keys: 
     """
     if exclude_keys is None:
         exclude_keys = set()
-    result = template
-    for key, value in replacements.items():
-        if key not in exclude_keys:
-            result = result.replace(f"{{{{{key}}}}}", str(value))
-    return result
+
+    def substitute(match: "re.Match[str]") -> str:
+        key, placeholder_filter = match.group(1), match.group(2)
+        if key in exclude_keys or key not in replacements:
+            return match.group(0)
+        return render_placeholder_value(key, replacements[key], placeholder_filter)
+
+    return _PLACEHOLDER_RE.sub(substitute, template)
 
 
 def _command_substitution_end(script: str, start: int) -> int:
@@ -125,7 +170,7 @@ def _bind_shell_inputs(script: str, names: List[str], first_arg: int) -> str:
                 "Input binding with backtick command substitutions is unsupported; "
                 "use $(...) without input placeholders or pass inputs as argv"
             )
-        match = re.match(r"\{\{([A-Za-z0-9_-]+)\}\}", script[index:])
+        match = _PLACEHOLDER_RE.match(script[index:])
         if match and match.group(1) in positions:
             expansion = "${%d}" % positions[match.group(1)]
             if quote == "'":
@@ -857,10 +902,14 @@ def _prepare_actual_command(
             names = sorted(extract_placeholders([part]) & set(inputs or {}))
             if names:
                 _require_posix_source(command_parts, i)
+                filters = parse_placeholder_filters(part)
                 needs_shell_arg_zero = len(command_parts) == i + 1
                 first_arg = max(1, len(command_parts) - i - 1)
                 part = _bind_shell_inputs(part, names, first_arg)
-                shell_bindings.extend(str(inputs[name]) for name in names)
+                shell_bindings.extend(
+                    render_placeholder_value(name, inputs[name], filters.get(name))
+                    for name in names
+                )
         
         # Check if contains special parameters
         has_special_params = (

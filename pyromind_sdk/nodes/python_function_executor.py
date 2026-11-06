@@ -11,6 +11,7 @@ import re
 import shlex
 from typing import Dict, Any, List, Optional
 from pathlib import Path
+from . import __version__ as SDK_VERSION
 
 logger = logging.getLogger(__name__)
 AUTO_ACCELERATE_CONFIG_INPUT_NAME = "accelerate_config"
@@ -314,26 +315,46 @@ def build_command_template(
     bash_commands.append('trap \'rm -rf -- "$input_dir"\' EXIT')
     for index, input_name in enumerate(input_names, start=1):
         bash_commands.append(f'printf "%s" "${{{index}}}" > "$input_dir/{input_name}"')
-    #todo 临时安装测试版本
-    # 4. Fetch the temporary SDK from TestPyPI, then install it and its
-    # dependencies from PyPI into this invocation's private directory.
+    # 4. Development releases are isolated from the shared Conda environment.
+    # Stable releases refresh the shared Conda SDK from PyPI when needed.
     python_exec = (python_command or "python3").strip()
     python_exec = "python3" if python_exec == "accelerate" else _python_executable(python_exec)
-    bash_commands.append(
-        f"{python_exec} -m pip download --no-deps --only-binary=:all: --no-cache-dir "
-        '--dest "$input_dir/.pyromind-sdk-wheel" '
-        "-i https://test.pypi.org/simple/ pyromind-sdk==0.1.15.dev10 -q"
-    )
-    bash_commands.append(
-        # f"{python_exec} -c \"import pyromind_sdk\" 2>/dev/null || "
-        # f"{python_exec} -m pip install pyromind-sdk -q"
-        f"{python_exec} -m pip install --ignore-installed --no-cache-dir "
-        '--target "$input_dir/.pyromind-sdk-runtime" '
-        '-i https://pypi.org/simple/ "$input_dir/.pyromind-sdk-wheel/"*.whl -q'
-    )
-    bash_commands.append(
-        'export PYTHONPATH="$input_dir/.pyromind-sdk-runtime${PYTHONPATH:+:$PYTHONPATH}"'
-    )
+    if ".dev" in SDK_VERSION:
+        bash_commands.append(
+            f"{python_exec} -m pip download --no-deps --only-binary=:all: --no-cache-dir "
+            '--dest "$input_dir/.pyromind-sdk-wheel" '
+            f"-i https://test.pypi.org/simple/ pyromind-sdk=={SDK_VERSION} -q"
+        )
+        bash_commands.append(
+            f"{python_exec} -m pip install --ignore-installed --no-cache-dir "
+            '--target "$input_dir/.pyromind-sdk-runtime" '
+            '-i https://pypi.org/simple/ "$input_dir/.pyromind-sdk-wheel/"*.whl -q'
+        )
+        bash_commands.append(
+            'export PYTHONPATH="$input_dir/.pyromind-sdk-runtime${PYTHONPATH:+:$PYTHONPATH}"'
+        )
+    else:
+        # Pods using the same Conda prefix share site-packages. Serialize
+        # upgrades and let pip select the latest non-prerelease from PyPI.
+        refresh_sdk = (
+            "import fcntl, subprocess, sys\n"
+            "from pathlib import Path\n"
+            "with (Path(sys.prefix) / '.pyromind-sdk-update.lock').open('a+') as lock:\n"
+            "    fcntl.flock(lock, fcntl.LOCK_EX)\n"
+            "    subprocess.run([sys.executable, '-m', 'pip', 'install', '--upgrade', "
+            "'--no-input', '--index-url', 'https://pypi.org/simple/', "
+            "'--timeout', '10', '--retries', '2', 'pyromind-sdk', '-q'], check=True)\n"
+        )
+        bash_commands.append(f"{python_exec} -c {shlex.quote(refresh_sdk)}")
+        check_wrapper = (
+            "import inspect, sys, pyromind_sdk; "
+            "from pyromind_sdk.nodes.function_call_wrapper import function_call_wrapper; "
+            "actual = getattr(pyromind_sdk, '__version__', None); "
+            "sys.exit(0 if 'input_dir' in inspect.signature(function_call_wrapper).parameters "
+            "else f'PyPI pyromind-sdk {actual!r} lacks --input-dir; "
+            "publish a compatible stable SDK before running this node')"
+        )
+        bash_commands.append(f"{python_exec} -c {shlex.quote(check_wrapper)}")
 
     # 5. Execute wrapper command
     wrapper_cmd_full = " ".join([wrapper_cmd] + wrapper_args)

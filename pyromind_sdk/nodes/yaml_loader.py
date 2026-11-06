@@ -353,6 +353,15 @@ def validate_command_template(command_template: List[str]) -> None:
 
 def _bind_yaml_shell_template(parts: List[str], output_names: List[str]) -> List[str]:
     """Keep YAML input placeholders out of shell source before platform rendering."""
+    # Middleware only substitutes bare {{name}} placeholders. A filter here
+    # would survive Argo rendering without ever escaping the runtime value.
+    if any(
+        re.search(r"\{\{[^{}]*\|[^{}]*\}\}", part)
+        for part in parts
+        if isinstance(part, str)
+    ):
+        raise ValueError("Filtered placeholders are not supported in YAML node templates")
+
     secured = list(parts)
     for index, part in enumerate(parts):
         if not isinstance(part, str) or not _is_command_source(parts, index):

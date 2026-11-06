@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from pyromind_sdk.nodes.command_executor import prepare_command_template
+from pyromind_sdk.nodes.command_executor import execute_command_template, prepare_command_template
 from pyromind_sdk.nodes.function_call_wrapper import function_call_wrapper, load_python_module
 from pyromind_sdk.nodes.python_function_executor import build_command_template
 
@@ -90,6 +90,8 @@ def test_input_files_preserve_values_after_ninth_argument(tmp_path: Path) -> Non
 
 
 def test_parallel_commands_install_sdk_into_separate_private_directories(tmp_path: Path) -> None:
+    executor_module = _load_nodes_module("python_function_executor.py")
+    executor_module.SDK_VERSION = "0.1.16.dev1"
     fake_python = tmp_path / "python3"
     fake_python.write_text(
         f"#!{sys.executable}\n"
@@ -102,7 +104,7 @@ def test_parallel_commands_install_sdk_into_separate_private_directories(tmp_pat
         "    assert value('-i') == 'https://test.pypi.org/simple/'\n"
         "    destination = Path(value('--dest'))\n"
         "    destination.mkdir(parents=True)\n"
-        "    (destination / 'pyromind_sdk-0.1.15.dev10-py3-none-any.whl').touch()\n"
+        "    (destination / 'pyromind_sdk-0.1.16.dev1-py3-none-any.whl').touch()\n"
         "elif args[:3] == ['-m', 'pip', 'install']:\n"
         "    assert '--no-deps' not in args\n"
         "    assert value('-i') == 'https://pypi.org/simple/'\n"
@@ -122,7 +124,7 @@ def test_parallel_commands_install_sdk_into_separate_private_directories(tmp_pat
         encoding="utf-8",
     )
     fake_python.chmod(0o755)
-    command = build_command_template(
+    command = executor_module.build_command_template(
         python_code=str(tmp_path / "node.py"),
         function_name="run",
         input_types={"required": {"message": ("STRING", {})}},
@@ -148,6 +150,114 @@ def test_parallel_commands_install_sdk_into_separate_private_directories(tmp_pat
     assert [record["message"] for record in records] == values
     assert records[0]["target"] != records[1]["target"]
     assert all(not Path(record["target"]).exists() for record in records)
+
+
+@pytest.mark.parametrize("version", ["0.1.16.dev1", "0.1.16"])
+def test_runtime_install_follows_sdk_release_version(tmp_path: Path, version: str) -> None:
+    executor_module = _load_nodes_module("python_function_executor.py")
+    executor_module.SDK_VERSION = version
+    command = executor_module.build_command_template(
+        python_code=str(tmp_path / "node.py"),
+        function_name="run",
+        input_types={"required": {}, "optional": {}},
+        output_names=[],
+        conda_env="",
+    )
+
+    script = command[2]
+    if ".dev" in version:
+        assert f"-i https://test.pypi.org/simple/ pyromind-sdk=={version}" in script
+        assert '--target "$input_dir/.pyromind-sdk-runtime"' in script
+        assert 'export PYTHONPATH="$input_dir/.pyromind-sdk-runtime' in script
+    else:
+        assert "pip download" not in script
+        assert ".pyromind-sdk-runtime" not in script
+        assert "fcntl.flock" in script
+        assert "'--upgrade'" in script
+        assert "https://pypi.org/simple/" in script
+        assert "PyPI pyromind-sdk" in script
+
+
+def test_stable_command_refreshes_conda_sdk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    executor_module = _load_nodes_module("python_function_executor.py")
+    executor_module.SDK_VERSION = "0.1.16"
+    node_file = tmp_path / "node.py"
+    node_file.write_text("def run(text):\n    return {'out': text}\n", encoding="utf-8")
+    project_root = Path(__file__).resolve().parents[3]
+    site_dir = tmp_path / "site"
+    site_dir.mkdir()
+    conda_prefix = tmp_path / "conda"
+    conda_prefix.mkdir()
+    (site_dir / "sitecustomize.py").write_text(
+        f"import sys\nsys.prefix = {str(conda_prefix)!r}\n",
+        encoding="utf-8",
+    )
+    fake_pip = site_dir / "pip"
+    fake_pip.mkdir()
+    (fake_pip / "__init__.py").write_text("", encoding="utf-8")
+    pip_marker = tmp_path / "pip_invoked"
+    (fake_pip / "__main__.py").write_text(
+        "import sys\nfrom pathlib import Path\n"
+        "assert '--upgrade' in sys.argv and 'pyromind-sdk' in sys.argv\n"
+        f"Path({str(pip_marker)!r}).write_text('checked PyPI')\n",
+        encoding="utf-8",
+    )
+    current_pythonpath = os.environ.get("PYTHONPATH")
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join(filter(None, (str(site_dir), str(project_root), current_pythonpath))),
+    )
+    command = executor_module.build_command_template(
+        python_code=str(node_file),
+        function_name="run",
+        input_types={"required": {"text": ("STRING", {})}, "optional": {}},
+        output_names=["out"],
+        return_types=["STRING"],
+        python_command=sys.executable,
+        conda_env="",
+    )
+
+    result = execute_command_template(
+        command, inputs={"text": "hello; echo not-a-command"}, output_names=["out"]
+    )
+    assert result["success"], result["stderr"]
+    assert result["outputs"]["out"] == "hello; echo not-a-command"
+    assert pip_marker.read_text(encoding="utf-8") == "checked PyPI"
+    assert (conda_prefix / ".pyromind-sdk-update.lock").is_file()
+
+
+def test_stable_command_rejects_old_conda_sdk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_sdk = tmp_path / "old_sdk" / "pyromind_sdk" / "nodes"
+    old_sdk.mkdir(parents=True)
+    (old_sdk.parent / "__init__.py").write_text("", encoding="utf-8")
+    (old_sdk / "__init__.py").write_text("", encoding="utf-8")
+    (old_sdk / "function_call_wrapper.py").write_text(
+        "def function_call_wrapper(inputs):\n    return inputs\n", encoding="utf-8"
+    )
+    (old_sdk.parent.parent / "sitecustomize.py").write_text(
+        f"import sys\nsys.prefix = {str(tmp_path)!r}\n", encoding="utf-8"
+    )
+    fake_pip = old_sdk.parent.parent / "pip"
+    fake_pip.mkdir()
+    (fake_pip / "__init__.py").write_text("", encoding="utf-8")
+    (fake_pip / "__main__.py").write_text("", encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", str(old_sdk.parent.parent))
+    executor_module = _load_nodes_module("python_function_executor.py")
+    executor_module.SDK_VERSION = "0.1.16"
+    command = executor_module.build_command_template(
+        python_code=str(tmp_path / "node.py"),
+        function_name="run",
+        input_types={"required": {}, "optional": {}},
+        output_names=[],
+        python_command=sys.executable,
+        conda_env="",
+    )
+
+    result = execute_command_template(command, inputs={}, output_names=[])
+    assert not result["success"]
+    assert "PyPI pyromind-sdk None lacks --input-dir" in result["stderr"]
 
 
 def test_function_call_wrapper_reads_explicit_private_files(tmp_path: Path) -> None:
@@ -238,6 +348,7 @@ def test_load_python_module_imports_sibling_package_and_restores_sys_path(tmp_pa
 def test_build_command_template_accelerate_mode_uses_accelerate_config_input(tmp_path: Path) -> None:
     """ACCELERATE_CONFIG input should be written to tmp config file and passed by --config_file."""
     python_executor_module = _load_nodes_module("python_function_executor.py")
+    python_executor_module.SDK_VERSION = "0.1.16.dev1"
     build_template = python_executor_module.build_command_template
 
     dummy_py = tmp_path / "dummy_accelerate_module.py"
