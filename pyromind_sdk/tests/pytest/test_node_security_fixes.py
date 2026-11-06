@@ -1,6 +1,7 @@
 """Regression cases for user-controlled node data at execution boundaries."""
 
 import ast
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,10 +9,11 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+import pyromind_sdk.nodes.python_function_executor as executor_module
 from pyromind_sdk.client.workflow.validator import validate_standard_format, validate_workflow
 from pyromind_sdk.nodes.command_executor import _prepare_actual_command, execute_command_template
 from pyromind_sdk.nodes.function_call_wrapper import _resolve_inputs_from_tmp_files
-from pyromind_sdk.nodes.python_function_executor import build_command_template
+from pyromind_sdk.nodes.python_function_executor import SDK_VERSION, build_command_template
 from pyromind_sdk.nodes.python_to_yaml import yaml_to_python_code
 from pyromind_sdk.nodes.yaml_loader import create_node_class_from_yaml
 
@@ -46,7 +48,38 @@ def test_shell_argv_preserves_metacharacters(tmp_path: Path) -> None:
     assert not marker.exists()
 
 
-def test_generated_python_node_executes_without_parsing_input_as_shell(tmp_path: Path) -> None:
+def test_generated_python_node_executes_without_parsing_input_as_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Stub the development release's pip commands; run the real wrapper offline.
+    monkeypatch.setattr(executor_module, "SDK_VERSION", "0.1.16.dev1")
+    fake_python = tmp_path / "python3"
+    fake_python.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        "if args[:2] == ['-m', 'pip']:\n"
+        "    if args[2] == 'download':\n"
+        "        destination = Path(args[args.index('--dest') + 1])\n"
+        "        destination.mkdir(parents=True)\n"
+        "        (destination / 'pyromind_sdk-test-py3-none-any.whl').touch()\n"
+        "    elif args[2] == 'install':\n"
+        "        Path(args[args.index('--target') + 1]).mkdir(parents=True)\n"
+        "    else:\n"
+        "        raise AssertionError(f'Unexpected pip command: {args}')\n"
+        "    sys.exit(0)\n"
+        "if args[:1] == ['-c']:\n"
+        "    os.execv(sys.executable, [sys.executable, *args])\n"
+        "assert args[:2] == ['-m', 'pyromind_sdk.nodes.function_call_wrapper']\n"
+        "os.execv(sys.executable, [sys.executable, *args])\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    project_root = Path(__file__).resolve().parents[3]
+    existing_pythonpath = os.environ.get("PYTHONPATH")
+    pythonpath = os.pathsep.join(filter(None, (str(project_root), existing_pythonpath)))
+    monkeypatch.setenv("PYTHONPATH", pythonpath)
     node_file = tmp_path / "node.py"
     node_file.write_text(
         "def run(text):\n    return {'out': repr(text)}\n", encoding="utf-8"
@@ -59,7 +92,7 @@ def test_generated_python_node_executes_without_parsing_input_as_shell(tmp_path:
         input_types={"required": {"text": ("STRING", {})}, "optional": {}},
         output_names=["out"],
         return_types=["STRING"],
-        python_command=sys.executable,
+        python_command=str(fake_python),
         conda_env="",
     )
     result = execute_command_template(command, inputs={"text": value}, output_names=["out"])
@@ -201,7 +234,11 @@ def test_python_command_keeps_supported_runtime_flag(tmp_path: Path) -> None:
         python_command="python3 -u",
         conda_env="",
     )
-    assert "python3 -u -m pip install" in command[2]
+    if ".dev" in SDK_VERSION:
+        assert "python3 -u -m pip install" in command[2]
+    else:
+        assert "python3 -u -c" in command[2]
+        assert "pip install" not in command[2]
     assert "python3 -u -m pyromind_sdk.nodes.function_call_wrapper" in command[2]
 
 
