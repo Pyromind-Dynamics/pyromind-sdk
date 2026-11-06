@@ -90,7 +90,7 @@ def get_jupyter_example(jupyter_id: str):
         print(f"✓ Jupyter instance details:")
         print(f"  Name: {instance.name}")
         print(f"  Status: {instance.status}")
-        print(f"  Password: {instance.password}")
+        print("  Password: ***")
         if instance.resources:
             print(f"  Resources:")
             print(f"    CPU: {instance.resources.cpu}")

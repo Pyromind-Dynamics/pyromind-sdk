@@ -30,6 +30,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Optional
 
+from ..log_redaction import RedactionFilter
+
 TRACE_ID_HEADER = "X-Trace-Id"
 
 ENV_LOG_FORMAT = "PYROMIND_LOG_FORMAT"
@@ -155,6 +157,9 @@ def install_console_logging(
        一个 handler，父 logger 还会再往 root 传播一次 ⇒ 同一条日志在 daemon 日志里
        出现 3 遍。这里统一成一个 handler + ``propagate = False``。
     2. **没有 trace_id**：格式串带 ``%(trace_id)s``，由 ``TraceIdFilter`` 填。
+    3. **密钥外泄**：``RedactionFilter`` 挂在 handler 上，任何一条已经写出来的
+       日志行都会再过一次脱敏（见 :mod:`pyromind_sdk.log_redaction`）——
+       调用方漏了 ``redact`` 也不会把 password/token 打进日志。
     """
     logger = logging.getLogger(name)
     logger.propagate = False
@@ -167,6 +172,7 @@ def install_console_logging(
         handler = logging.StreamHandler()
         handler._pyromind_trace = True  # type: ignore[attr-defined]
         handler.addFilter(TraceIdFilter())
+        handler.addFilter(RedactionFilter())
         logger.addHandler(handler)
 
     handler.setFormatter(logging.Formatter(fmt or DEFAULT_LOG_FORMAT))

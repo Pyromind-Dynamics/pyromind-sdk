@@ -108,7 +108,7 @@ The build uses Storage as temporary file storage; the final result is stored at:
 
 ### Push to a registry
 
-Builds push to a registry by default. Short image names require a registry prefix and credentials with push permission:
+Builds do **not** push by default (`DOCKER_RT_BUILD_PUSH=false`); after a successful build, push the archive explicitly with `docker push <tag>`. Short image names require a registry prefix and credentials with push permission:
 
 ```bash
 export DOCKER_RT_BUILD_REGISTRY="registry.example.com/team"
@@ -118,7 +118,7 @@ export DOCKER_RT_REGISTRY_PASSWORD="registry-token"
 docker build -t myapp:dev .
 ```
 
-Fully qualified tags are used as written; short tags are expanded with `DOCKER_RT_BUILD_REGISTRY` or the cluster's configured registry. Credentials may also be supplied through a Docker `config.json`.
+Fully qualified tags are used as written; short tags are expanded with `DOCKER_RT_BUILD_REGISTRY` or the cluster's configured registry. Credentials come only from `DOCKER_RT_REGISTRY_USERNAME` + `DOCKER_RT_REGISTRY_PASSWORD`: docker-rt never reads a Docker `config.json` and ignores `X-Registry-Auth` on push.
 
 `DOCKER_RT_BUILD_PUSH_CHECK` defaults to `fail`: before building, docker-rt probes reachability from the build sandbox to the registry, so an unreachable registry fails immediately instead of wasting a full build.
 
@@ -155,18 +155,33 @@ Only the PyroMind-specific variables you **must** know to use builds and pushes 
 | `PYROMIND_CLUSTER` | Prompted if missing | Target cluster (one enabled for your account). |
 | `PYROMIND_BASE_URL` | Resolved from cluster | Explicit API endpoint override. |
 
+### Listener
+
+The daemon protects its API **only** with the transport. There is no token and no TLS: anyone who can reach the socket or port acts with your `PYROMIND_API_KEY`.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DOCKER_RT_SOCK` | `/tmp/docker-rt.sock` | Unix socket path. Created owner-only (mode `0700`) regardless of the caller's umask. |
+| `DOCKER_RT_HOST` | unset | TCP listen address. When set, the plaintext Docker API is served on `DOCKER_RT_PORT` with **no authentication**. For remote use prefer an SSH tunnel to the Unix socket. |
+| `DOCKER_RT_PORT` | `2375` | TCP port used when `DOCKER_RT_HOST` is set. |
+| `DOCKER_RT_ALLOW_UNAUTHENTICATED_TCP` | `false` | Required acknowledgement for binding TCP on a non-loopback address; without it the daemon refuses to start. Every TCP bind logs a warning that clients are unauthenticated. |
+
 ### Build and push
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `DOCKER_RT_BUILD_REGISTRY` | Cluster profile | Registry prefix (with namespace) used to expand short tags. |
-| `DOCKER_RT_BUILD_PUSH` | `true` | Push the image after building. Set `false` to keep the workspace archive only. |
+| `DOCKER_RT_BUILD_PUSH` | `false` | Push the workspace archive automatically after a successful build. Off by default: the build container runs every Dockerfile `RUN` as root, so a credential placed in it is readable by the Dockerfile's author. Pushing always happens from the daemon, **after** the sandbox is gone. Use `docker push <tag>` to push on demand. |
 | `DOCKER_RT_BUILD_PUSH_CHECK` | `fail` | Pre-push registry reachability check: `fail`, `warn` or `off`. |
 | `DOCKER_RT_BUILD_IMAGE` | Cluster-specific | Builder sandbox image; must include shell and `sleep` (the `-debug` variant). |
+| `DOCKER_RT_BUILD_CONTEXT_MODE` | `storage` | How the build context reaches the cluster: `storage` (the only default — staged through workspace storage, then copied locally inside the sandbox) or `upload` (the old direct upload, opt-in for environments without storage). **There is no automatic fallback**: a misconfigured storage fails the build instead of quietly taking the slow route. |
+| `PYROMIND_STORAGE_SECRET_KEY` | unset | The storage secret key. `/storage_info` no longer returns it; set it yourself — when it is missing or wrong, the build fails with `storage connection failed`. |
+| `PYROMIND_STORAGE_ENDPOINT` | per cluster (automatic) | Storage endpoint, taken from `CLUSTER_RESOURCE` (every cluster has one). Normally no need to set it. |
 | `DOCKER_RT_REGISTRY_USERNAME` / `DOCKER_RT_REGISTRY_PASSWORD` | unset | Registry credentials. |
-| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | unset | Path to a Docker `config.json` (alternative to username/password). |
+| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | removed | No longer read. Credentials come only from `DOCKER_RT_REGISTRY_USERNAME` + `DOCKER_RT_REGISTRY_PASSWORD`; there is no config-file fallback. |
 | `DOCKER_RT_REGISTRY_NAMESPACE` | Cluster profile | Namespace for short tags. |
 | `DOCKER_RT_ACR_ACCESS_KEY_ID` / `DOCKER_RT_ACR_ACCESS_KEY_SECRET` | unset | Only needed for automatic ACR repository creation; not needed for an existing repository. |
+| `DOCKER_RT_ACR_INSTANCE_ID` | unset | ACR instance id (`cri-...`); together with the two above it enables repository creation — missing any of them skips it. |
 
 ### Ports
 

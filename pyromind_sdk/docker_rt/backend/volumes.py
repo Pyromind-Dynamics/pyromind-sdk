@@ -1,4 +1,4 @@
-"""In-memory Docker Volume API store + JuiceFS subPath helpers."""
+"""In-memory Docker Volume API store."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ class VolumeRecord:
 
     @property
     def mountpoint(self) -> str:
-        # Informational only; real data lives on JuiceFS subPath.
+        # Informational only: the data lives in the sandbox, not on this host.
         return f"/var/lib/docker-rt/volumes/{self.name}/_data"
 
 
@@ -65,12 +65,6 @@ class VolumeStore:
     def get(self, name: str) -> VolumeRecord | None:
         return self._volumes.get(name)
 
-    def get_or_create(self, name: str, **kwargs: Any) -> VolumeRecord:
-        existing = self.get(name)
-        if existing:
-            return existing
-        return self.create(name=name, **kwargs)
-
     def list(self) -> list[VolumeRecord]:
         return list(self._volumes.values())
 
@@ -88,12 +82,6 @@ class VolumeStore:
         if rec is None:
             return False
         return bool(rec.anonymous)
-
-
-def volume_juicefs_subpath(uid: str, volume_name: str) -> str:
-    """Persistent subPath for a named Docker volume on the user JuiceFS PVC."""
-    safe = volume_name.replace("/", "-").strip() or "vol"
-    return f"{uid}/.docker-rt/volumes/{safe}"
 
 
 def to_volume_inspect(rec: VolumeRecord) -> dict[str, Any]:
