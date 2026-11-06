@@ -335,15 +335,30 @@ def build_command_template(
         )
     else:
         # Pods using the same Conda prefix share site-packages. Serialize
-        # upgrades and let pip select the latest non-prerelease from PyPI.
+        # checks and installs, including a downgrade from a pre-release.
         refresh_sdk = (
-            "import fcntl, subprocess, sys\n"
+            "import fcntl, importlib.metadata, json, re, subprocess, sys, urllib.request\n"
             "from pathlib import Path\n"
             "with (Path(sys.prefix) / '.pyromind-sdk-update.lock').open('a+') as lock:\n"
             "    fcntl.flock(lock, fcntl.LOCK_EX)\n"
-            "    subprocess.run([sys.executable, '-m', 'pip', 'install', '--upgrade', "
+            "    with urllib.request.urlopen('https://pypi.org/pypi/pyromind-sdk/json', timeout=10) as response:\n"
+            "        latest = json.load(response)['info']['version']\n"
+            "    if not isinstance(latest, str) or not re.fullmatch(r'(?:[0-9]+!)?[0-9]+(?:\\.[0-9]+)*(?:\\.post[0-9]+)?', latest):\n"
+            "        raise ValueError(f'PyPI returned a non-final SDK version: {latest!r}')\n"
+            "    try:\n"
+            "        installed = importlib.metadata.version('pyromind-sdk')\n"
+            "    except importlib.metadata.PackageNotFoundError:\n"
+            "        installed = None\n"
+            "    if installed != latest:\n"
+            "        install = [sys.executable, '-m', 'pip', 'install', '--upgrade', "
             "'--no-input', '--index-url', 'https://pypi.org/simple/', "
-            "'--timeout', '10', '--retries', '2', 'pyromind-sdk', '-q'], check=True)\n"
+            "'--timeout', '10', '--retries', '2', f'pyromind-sdk=={latest}', '-q']\n"
+            "        subprocess.run(install, check=True)\n"
+            "        if importlib.metadata.version('pyromind-sdk') != latest:\n"
+            "            subprocess.run(install + ['--force-reinstall'], check=True)\n"
+            "        actual = importlib.metadata.version('pyromind-sdk')\n"
+            "        if actual != latest:\n"
+            "            raise RuntimeError(f'Expected pyromind-sdk {latest}, found {actual}')\n"
         )
         bash_commands.append(f"{python_exec} -c {shlex.quote(refresh_sdk)}")
         check_wrapper = (

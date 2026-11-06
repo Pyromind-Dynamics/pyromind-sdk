@@ -173,12 +173,29 @@ def test_runtime_install_follows_sdk_release_version(tmp_path: Path, version: st
         assert "pip download" not in script
         assert ".pyromind-sdk-runtime" not in script
         assert "fcntl.flock" in script
+        assert "https://pypi.org/pypi/pyromind-sdk/json" in script
         assert "'--upgrade'" in script
+        assert "pyromind-sdk=={latest}" in script
         assert "https://pypi.org/simple/" in script
         assert "PyPI pyromind-sdk" in script
 
 
-def test_stable_command_refreshes_conda_sdk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "installed_version, latest_version",
+    [
+        ("0.1.16.dev1", "0.1.16"),
+        ("0.1.16+local", "0.1.16"),
+        ("0.1.16", "0.1.16"),
+        ("0.1.16", "0.1.17.dev1"),
+        ("0.1.16", "0.1.17rc1"),
+    ],
+)
+def test_stable_command_refreshes_conda_sdk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    installed_version: str,
+    latest_version: str,
+) -> None:
     executor_module = _load_nodes_module("python_function_executor.py")
     executor_module.SDK_VERSION = "0.1.16"
     node_file = tmp_path / "node.py"
@@ -188,18 +205,33 @@ def test_stable_command_refreshes_conda_sdk(tmp_path: Path, monkeypatch: pytest.
     site_dir.mkdir()
     conda_prefix = tmp_path / "conda"
     conda_prefix.mkdir()
+    pip_marker = tmp_path / "pip_invoked"
     (site_dir / "sitecustomize.py").write_text(
-        f"import sys\nsys.prefix = {str(conda_prefix)!r}\n",
+        "import importlib.metadata, io, sys, urllib.request\n"
+        "from pathlib import Path\n"
+        f"sys.prefix = {str(conda_prefix)!r}\n"
+        "_version = importlib.metadata.version\n"
+        "def version(name):\n"
+        f"    marker = Path({str(pip_marker)!r})\n"
+        f"    return ('0.1.16' if marker.exists() and "
+        f"({installed_version!r} != '0.1.16+local' or marker.read_text() == 'forced') "
+        f"else {installed_version!r}) "
+        "if name == 'pyromind-sdk' else _version(name)\n"
+        "importlib.metadata.version = version\n"
+        "def urlopen(url, timeout):\n"
+        "    assert url == 'https://pypi.org/pypi/pyromind-sdk/json' and timeout == 10\n"
+        f"    return io.BytesIO({json.dumps({'info': {'version': latest_version}}).encode()!r})\n"
+        "urllib.request.urlopen = urlopen\n",
         encoding="utf-8",
     )
     fake_pip = site_dir / "pip"
     fake_pip.mkdir()
     (fake_pip / "__init__.py").write_text("", encoding="utf-8")
-    pip_marker = tmp_path / "pip_invoked"
     (fake_pip / "__main__.py").write_text(
         "import sys\nfrom pathlib import Path\n"
-        "assert '--upgrade' in sys.argv and 'pyromind-sdk' in sys.argv\n"
-        f"Path({str(pip_marker)!r}).write_text('checked PyPI')\n",
+        "assert '--upgrade' in sys.argv and 'pyromind-sdk==0.1.16' in sys.argv\n"
+        f"Path({str(pip_marker)!r}).write_text("
+        "'forced' if '--force-reinstall' in sys.argv else 'initial')\n",
         encoding="utf-8",
     )
     current_pythonpath = os.environ.get("PYTHONPATH")
@@ -220,9 +252,16 @@ def test_stable_command_refreshes_conda_sdk(tmp_path: Path, monkeypatch: pytest.
     result = execute_command_template(
         command, inputs={"text": "hello; echo not-a-command"}, output_names=["out"]
     )
+    if latest_version != "0.1.16":
+        assert not result["success"]
+        assert "PyPI returned a non-final SDK version" in result["stderr"]
+        assert not pip_marker.exists()
+        return
     assert result["success"], result["stderr"]
     assert result["outputs"]["out"] == "hello; echo not-a-command"
-    assert pip_marker.read_text(encoding="utf-8") == "checked PyPI"
+    assert pip_marker.is_file() == (installed_version != "0.1.16")
+    if installed_version == "0.1.16+local":
+        assert pip_marker.read_text() == "forced"
     assert (conda_prefix / ".pyromind-sdk-update.lock").is_file()
 
 
@@ -237,12 +276,32 @@ def test_stable_command_rejects_old_conda_sdk(
         "def function_call_wrapper(inputs):\n    return inputs\n", encoding="utf-8"
     )
     (old_sdk.parent.parent / "sitecustomize.py").write_text(
-        f"import sys\nsys.prefix = {str(tmp_path)!r}\n", encoding="utf-8"
+        "import importlib.metadata, io, sys, urllib.request\n"
+        "from pathlib import Path\n"
+        f"sys.prefix = {str(tmp_path)!r}\n"
+        "_version = importlib.metadata.version\n"
+        "def version(name):\n"
+        "    if name == 'pyromind-sdk':\n"
+        f"        if Path({str(tmp_path / 'pip_invoked')!r}).exists():\n"
+        "            return '0.1.16'\n"
+        "        raise importlib.metadata.PackageNotFoundError(name)\n"
+        "    return _version(name)\n"
+        "importlib.metadata.version = version\n"
+        "def urlopen(url, timeout):\n"
+        "    assert url == 'https://pypi.org/pypi/pyromind-sdk/json' and timeout == 10\n"
+        "    return io.BytesIO(b'{\"info\": {\"version\": \"0.1.16\"}}')\n"
+        "urllib.request.urlopen = urlopen\n",
+        encoding="utf-8",
     )
     fake_pip = old_sdk.parent.parent / "pip"
     fake_pip.mkdir()
     (fake_pip / "__init__.py").write_text("", encoding="utf-8")
-    (fake_pip / "__main__.py").write_text("", encoding="utf-8")
+    (fake_pip / "__main__.py").write_text(
+        "import sys\nfrom pathlib import Path\n"
+        "assert 'pyromind-sdk==0.1.16' in sys.argv\n"
+        f"Path({str(tmp_path / 'pip_invoked')!r}).touch()\n",
+        encoding="utf-8",
+    )
     monkeypatch.setenv("PYTHONPATH", str(old_sdk.parent.parent))
     executor_module = _load_nodes_module("python_function_executor.py")
     executor_module.SDK_VERSION = "0.1.16"
