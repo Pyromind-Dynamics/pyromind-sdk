@@ -170,6 +170,7 @@ docker build -t myapp:dev .
 | `DOCKER_RT_REGISTRY_DOCKERCONFIG` | 已移除 | 不再读取。凭证只来自 `DOCKER_RT_REGISTRY_USERNAME` + `DOCKER_RT_REGISTRY_PASSWORD`，没有任何 config 文件回退。 |
 | `DOCKER_RT_REGISTRY_NAMESPACE` | 集群配置 | 短标签使用的命名空间。 |
 | `DOCKER_RT_ACR_ACCESS_KEY_ID` / `DOCKER_RT_ACR_ACCESS_KEY_SECRET` | 未设置 | 仅自动创建 ACR 仓库时需要；使用已存在的仓库不需要。 |
+| `DOCKER_RT_ACR_INSTANCE_ID` | 未设置 | ACR 实例 ID（`cri-...`）；与上面两项一起自动创建仓库，缺一则跳过建仓。 |
 
 ### 端口
 

@@ -170,6 +170,7 @@ Only the PyroMind-specific variables you **must** know to use builds and pushes 
 | `DOCKER_RT_REGISTRY_DOCKERCONFIG` | removed | No longer read. Credentials come only from `DOCKER_RT_REGISTRY_USERNAME` + `DOCKER_RT_REGISTRY_PASSWORD`; there is no config-file fallback. |
 | `DOCKER_RT_REGISTRY_NAMESPACE` | Cluster profile | Namespace for short tags. |
 | `DOCKER_RT_ACR_ACCESS_KEY_ID` / `DOCKER_RT_ACR_ACCESS_KEY_SECRET` | unset | Only needed for automatic ACR repository creation; not needed for an existing repository. |
+| `DOCKER_RT_ACR_INSTANCE_ID` | unset | ACR instance id (`cri-...`); together with the two above it enables repository creation — missing any of them skips it. |
 
 ### Ports
 
