@@ -7,13 +7,47 @@ Uses function_call_wrapper module to handle actual function calls.
 
 import logging
 import json
+import re
 import shlex
-import uuid
 from typing import Dict, Any, List, Optional
 from pathlib import Path
+from . import __version__ as SDK_VERSION
 
 logger = logging.getLogger(__name__)
 AUTO_ACCELERATE_CONFIG_INPUT_NAME = "accelerate_config"
+SHELL_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+INPUT_FILE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+TEMPLATE_PLACEHOLDER = re.compile(r"\{\{[^{}]+\}\}")
+
+
+def _validate_shell_identifier(name: str) -> None:
+    if not isinstance(name, str) or not SHELL_IDENTIFIER.fullmatch(name):
+        raise ValueError(f"Invalid shell identifier: {name!r}")
+
+
+def _python_executable(python_command: str) -> str:
+    """Quote a Python interpreter and a small set of safe runtime options."""
+    try:
+        parts = shlex.split((python_command or "python3").strip())
+    except ValueError as exc:
+        raise ValueError("python_command must be a Python executable with supported options") from exc
+    if not parts:
+        parts = ["python3"]
+    executable = parts[0]
+    if (
+        not re.fullmatch(r"[A-Za-z0-9_./-]+", executable)
+        or not re.fullmatch(r"(?:python|python\d+(?:\.\d+)?|pypy\d*(?:\.\d+)?)", Path(executable).name)
+    ):
+        raise ValueError("python_command must be a Python executable with supported options")
+    allowed_options = {"-u", "-B", "-s", "-O", "-OO"}
+    if any(option not in allowed_options for option in parts[1:]):
+        raise ValueError("python_command must be a Python executable with supported options")
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def _reject_shell_template_value(value: Any, field: str) -> None:
+    if TEMPLATE_PLACEHOLDER.search(str(value)):
+        raise ValueError(f"{field} cannot contain a shell-source placeholder")
 
 
 def _ensure_accelerate_config_required_input(input_types: Dict[str, Any]) -> str:
@@ -65,15 +99,18 @@ def _build_wrapper_command(
                 "accelerate mode requires a config file path. "
                 "Please provide an ACCELERATE_CONFIG input parameter."
             )
-        cfg_escaped = shlex.quote(accelerate_config_file)
+        # The caller supplies a validated input name in the private input dir.
+        cfg_escaped = accelerate_config_file
         # `accelerate launch` already chooses the Python executable. Passing an
         # extra `python` token makes it treated as a script path and fails.
         cmd = f"accelerate launch"
         if num_processes:
+            if not re.fullmatch(r'[1-9][0-9]*|"\$\{[1-9][0-9]*\}"', str(num_processes)):
+                raise ValueError("num_processes must be a positive integer or bound argument")
             cmd += f" --num_processes {num_processes}"
         cmd += f" --config_file {cfg_escaped} -m {wrapper_module}"
         return cmd
-    return f"{python_command_stripped} -m {wrapper_module}"
+    return f"{_python_executable(python_command_stripped)} -m {wrapper_module}"
 
 
 def build_command_template(
@@ -108,6 +145,20 @@ def build_command_template(
     Returns:
         COMMAND_TEMPLATE list
     """
+    # Names become shell path components and JSON file references.
+    all_inputs = {**input_types.get("required", {}), **input_types.get("optional", {})}
+    for input_name in all_inputs:
+        if not isinstance(input_name, str) or not INPUT_FILE_NAME.fullmatch(input_name):
+            raise ValueError(f"Invalid input name: {input_name!r}")
+    for key in (environment or {}):
+        _validate_shell_identifier(key)
+    _reject_shell_template_value(python_code, "python_code")
+    _reject_shell_template_value(function_name, "function_name")
+    if conda_env:
+        _reject_shell_template_value(conda_env, "conda_env")
+    if workdir:
+        _reject_shell_template_value(workdir, "workdir")
+
     # Escape python_code path
     python_code_escaped = shlex.quote(str(python_code))
     function_name_escaped = shlex.quote(str(function_name))
@@ -119,15 +170,28 @@ def build_command_template(
     accelerate_input_name: Optional[str] = None
     if (python_command or "").strip() == "accelerate":
         accelerate_input_name = _ensure_accelerate_config_required_input(input_types)
-        # Reuse generic /tmp/<input_name> heredoc path to avoid duplicate config writes.
-        accelerate_config_path = f"/tmp/{accelerate_input_name}"
+        accelerate_config_path = f'"$input_dir/{accelerate_input_name}"'
 
     is_accelerate = (python_command or "").strip() == "accelerate"
+    all_inputs = {**input_types.get("required", {}), **input_types.get("optional", {})}
+    input_names = list(all_inputs.keys())
+    gpu_count_placeholder = None
+    num_processes_arg = None
+    if is_accelerate and gpu_count:
+        gpu_count_value = str(gpu_count)
+        if re.fullmatch(r"[1-9][0-9]*", gpu_count_value):
+            num_processes_arg = gpu_count_value
+        else:
+            match = re.fullmatch(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}", gpu_count_value)
+            if not match:
+                raise ValueError("gpu_count must be a positive integer or input placeholder")
+            gpu_count_placeholder = match.group(1)
+            num_processes_arg = f'"${{{len(input_names) + 1}}}"'
     wrapper_cmd = _build_wrapper_command(
         python_command=python_command,
         wrapper_module=wrapper_module,
         accelerate_config_file=accelerate_config_path,
-        num_processes=gpu_count if is_accelerate and gpu_count else None,
+        num_processes=num_processes_arg,
     )
     
     # Build output path dictionary (using placeholders)
@@ -136,9 +200,7 @@ def build_command_template(
     output_paths_escaped = shlex.quote(output_paths_json)
 
     # Collect all input placeholders.
-    all_inputs = {**input_types.get("required", {}), **input_types.get("optional", {})}
-    input_names_for_heredoc = list(all_inputs.keys())
-    wrapper_input_names = [name for name in input_names_for_heredoc if name != accelerate_input_name]
+    wrapper_input_names = [name for name in input_names if name != accelerate_input_name]
 
     # Build wrapper input type definition JSON (exclude internal accelerate config input).
     wrapper_input_types = {
@@ -158,9 +220,8 @@ def build_command_template(
 
     # Build wrapper input parameter JSON dictionary.
     #
-    # Important: We intentionally pass /tmp/<input_name> paths here and put the real values
-    # into those files via heredoc blocks, to avoid shell/JSON escaping issues with large prompts.
-    inputs_dict = {name: f"/tmp/{name}" for name in wrapper_input_names}
+    # File references are explicit; a user string resembling a path stays a string.
+    inputs_dict = {name: {"__pyromind_input_file__": name} for name in wrapper_input_names}
     inputs_json = json.dumps(inputs_dict, ensure_ascii=False)
     inputs_escaped = shlex.quote(inputs_json)
     
@@ -170,7 +231,8 @@ def build_command_template(
         "--function-name", function_name_escaped,
         "--input-types", input_types_escaped,
         "--output-paths", output_paths_escaped,
-        "--inputs", inputs_escaped
+        "--inputs", inputs_escaped,
+        "--input-dir", '"$input_dir"',
     ]
     
     # Add return types and names (for type validation)
@@ -201,7 +263,14 @@ def build_command_template(
     # 1. Environment variables
     if environment:
         for key, value in environment.items():
-            value_escaped = shlex.quote(str(value))
+            value_str = str(value)
+            match = re.fullmatch(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}", value_str)
+            if match and match.group(1) in input_names:
+                position = input_names.index(match.group(1)) + 1
+                value_escaped = f'"${{{position}}}"'
+            else:
+                _reject_shell_template_value(value_str, f"environment.{key}")
+                value_escaped = shlex.quote(value_str)
             bash_commands.append(f"export {key}={value_escaped}")
     
     # 3. Python environment activation (prefer micromamba, fallback to conda)
@@ -239,32 +308,68 @@ def build_command_template(
         python_code_dir_escaped = shlex.quote(python_code_dir)
         bash_commands.append(f"cd {python_code_dir_escaped}")
     
-    # 2.1 Write each input into /tmp/<input_name> using heredoc.
-    # The platform replaces {{<input_name>}} placeholders at runtime before executing bash -c.
-    heredoc_commands: List[str] = []
-    for input_name in input_names_for_heredoc:
-        tmp_path = f"/tmp/{input_name}"
-        tmp_path_escaped = shlex.quote(tmp_path)
-        delim = f"PYROMIND_{uuid.uuid4().hex}"
-        placeholder = f"{{{{{input_name}}}}}"
-        # Ensure the delimiter is on its own line (bash heredoc requirement).
-        heredoc_commands.append(
-            "cat "
-            f"> {tmp_path_escaped} "
-            f"<<'{delim}'\n"
-            f"{placeholder}\n"
-            f"{delim}\n"
-        )
-
-    bash_commands.extend(heredoc_commands)
-    # TODO 临时安装sdk
-    # 4. Install pyromind-sdk if not available (skip for accelerate mode)
+    # Runtime inputs are separate argv elements. The shell script never parses
+    # their contents, including newlines or a former heredoc delimiter.
+    bash_commands.append("umask 077")
+    bash_commands.append('input_dir="$(mktemp -d /tmp/pyromind-inputs.XXXXXXXXXX)"')
+    bash_commands.append('trap \'rm -rf -- "$input_dir"\' EXIT')
+    for index, input_name in enumerate(input_names, start=1):
+        bash_commands.append(f'printf "%s" "${{{index}}}" > "$input_dir/{input_name}"')
+    # 4. Development releases are isolated from the shared Conda environment.
+    # Stable releases refresh the shared Conda SDK from PyPI when needed.
     python_exec = (python_command or "python3").strip()
-    if python_exec != "accelerate":
+    python_exec = "python3" if python_exec == "accelerate" else _python_executable(python_exec)
+    if ".dev" in SDK_VERSION:
         bash_commands.append(
-            f"{python_exec} -c \"import pyromind_sdk\" 2>/dev/null || "
-            f"{python_exec} -m pip install pyromind-sdk -q"
+            f"{python_exec} -m pip download --no-deps --only-binary=:all: --no-cache-dir "
+            '--dest "$input_dir/.pyromind-sdk-wheel" '
+            f"-i https://test.pypi.org/simple/ pyromind-sdk=={SDK_VERSION} -q"
         )
+        bash_commands.append(
+            f"{python_exec} -m pip install --ignore-installed --no-cache-dir "
+            '--target "$input_dir/.pyromind-sdk-runtime" '
+            '-i https://pypi.org/simple/ "$input_dir/.pyromind-sdk-wheel/"*.whl -q'
+        )
+        bash_commands.append(
+            'export PYTHONPATH="$input_dir/.pyromind-sdk-runtime${PYTHONPATH:+:$PYTHONPATH}"'
+        )
+    else:
+        # Pods using the same Conda prefix share site-packages. Serialize
+        # checks and installs, including a downgrade from a pre-release.
+        refresh_sdk = (
+            "import fcntl, importlib.metadata, json, re, subprocess, sys, urllib.request\n"
+            "from pathlib import Path\n"
+            "with (Path(sys.prefix) / '.pyromind-sdk-update.lock').open('a+') as lock:\n"
+            "    fcntl.flock(lock, fcntl.LOCK_EX)\n"
+            "    with urllib.request.urlopen('https://pypi.org/pypi/pyromind-sdk/json', timeout=10) as response:\n"
+            "        latest = json.load(response)['info']['version']\n"
+            "    if not isinstance(latest, str) or not re.fullmatch(r'(?:[0-9]+!)?[0-9]+(?:\\.[0-9]+)*(?:\\.post[0-9]+)?', latest):\n"
+            "        raise ValueError(f'PyPI returned a non-final SDK version: {latest!r}')\n"
+            "    try:\n"
+            "        installed = importlib.metadata.version('pyromind-sdk')\n"
+            "    except importlib.metadata.PackageNotFoundError:\n"
+            "        installed = None\n"
+            "    if installed != latest:\n"
+            "        install = [sys.executable, '-m', 'pip', 'install', '--upgrade', "
+            "'--no-input', '--index-url', 'https://pypi.org/simple/', "
+            "'--timeout', '10', '--retries', '2', f'pyromind-sdk=={latest}', '-q']\n"
+            "        subprocess.run(install, check=True)\n"
+            "        if importlib.metadata.version('pyromind-sdk') != latest:\n"
+            "            subprocess.run(install + ['--force-reinstall'], check=True)\n"
+            "        actual = importlib.metadata.version('pyromind-sdk')\n"
+            "        if actual != latest:\n"
+            "            raise RuntimeError(f'Expected pyromind-sdk {latest}, found {actual}')\n"
+        )
+        bash_commands.append(f"{python_exec} -c {shlex.quote(refresh_sdk)}")
+        check_wrapper = (
+            "import inspect, sys, pyromind_sdk; "
+            "from pyromind_sdk.nodes.function_call_wrapper import function_call_wrapper; "
+            "actual = getattr(pyromind_sdk, '__version__', None); "
+            "sys.exit(0 if 'input_dir' in inspect.signature(function_call_wrapper).parameters "
+            "else f'PyPI pyromind-sdk {actual!r} lacks --input-dir; "
+            "publish a compatible stable SDK before running this node')"
+        )
+        bash_commands.append(f"{python_exec} -c {shlex.quote(check_wrapper)}")
 
     # 5. Execute wrapper command
     wrapper_cmd_full = " ".join([wrapper_cmd] + wrapper_args)
@@ -272,11 +377,12 @@ def build_command_template(
     
     # Combine all commands.
     #
-    # Use newlines (instead of `&&`) to avoid bash parse issues around heredoc
-    # terminators (e.g. `DELIM\n && next_cmd` can be rejected by bash).
-    # We still want "fail fast" behavior, so enable `set -e`.
+    # Use newlines for clear command boundaries and `set -e` for fail fast.
     full_command = "\n".join(["set -e ; true"] + bash_commands)
-    command_parts = ["bash", "-c", full_command]
+    command_parts = ["bash", "-c", full_command, "pyromind-node"]
+    command_parts.extend(f"{{{{{name}}}}}" for name in input_names)
+    if gpu_count_placeholder:
+        command_parts.append(f"{{{{{gpu_count_placeholder}}}}}")
     return command_parts
 
 

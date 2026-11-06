@@ -17,16 +17,63 @@ from typing import Dict, Any, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
+POSIX_SHELL_NAMES = frozenset({
+    "sh", "bash", "dash", "ash", "ksh", "ksh88", "ksh93", "lksh", "mksh",
+    "pdksh", "posh", "yash", "zsh",
+})
+
 
 # ========== Basic Utilities ==========
 
+# A placeholder is `{{name}}`, optionally with a rendering filter: `{{name|json}}`.
+# Filters exist because shell quoting alone does not escape a value for the
+# format it is being embedded into.
+PLACEHOLDER_FILTERS = frozenset({"json", "jsonstr"})
+_PLACEHOLDER_RE = re.compile(r"\{\{([a-zA-Z0-9_-]+)(?:\|([a-zA-Z_][a-zA-Z0-9_]*))?\}\}")
+
+
+def render_placeholder_value(name: str, value: Any, placeholder_filter: Optional[str] = None) -> str:
+    """Render one input value for substitution into a template part.
+
+    ``json``    gives a complete JSON literal, for a placeholder used where a
+                JSON value is expected: ``{"payload": {{x|json}}}``.
+    ``jsonstr`` gives the escaped body of a JSON string, for a placeholder that
+                already sits inside quotes: ``{"payload": "{{x|jsonstr}}"}``.
+    """
+    if placeholder_filter == "json":
+        return json.dumps(str(value), ensure_ascii=False)
+    if placeholder_filter == "jsonstr":
+        return json.dumps(str(value), ensure_ascii=False)[1:-1]
+    if placeholder_filter is not None:
+        raise ValueError(f"Unsupported placeholder filter: {placeholder_filter!r}")
+    return str(value)
+
+
+def parse_placeholder_filters(script: str) -> Dict[str, Optional[str]]:
+    """Map every placeholder in ``script`` to its filter (``None`` when absent).
+
+    Rejects unknown filters and a name used with two different filters inside
+    the same command part, which would make the argv binding ambiguous.
+    """
+    filters: Dict[str, Optional[str]] = {}
+    for match in _PLACEHOLDER_RE.finditer(script):
+        name, placeholder_filter = match.group(1), match.group(2)
+        if placeholder_filter is not None and placeholder_filter not in PLACEHOLDER_FILTERS:
+            raise ValueError(f"Unsupported placeholder filter: {placeholder_filter!r}")
+        if name in filters and filters[name] != placeholder_filter:
+            raise ValueError(
+                f"Placeholder {name!r} is used with conflicting filters in one command part"
+            )
+        filters[name] = placeholder_filter
+    return filters
+
+
 def extract_placeholders(command_template: List[str]) -> Set[str]:
-    """Extract all {{}} wrapped placeholders from command template"""
+    """Extract all {{}} wrapped placeholders from command template (filters dropped)"""
     placeholders = set()
     for part in command_template:
         if isinstance(part, str):
-            matches = re.findall(r'\{\{([a-zA-Z0-9_-]+)\}\}', part)
-            placeholders.update(matches)
+            placeholders.update(match.group(1) for match in _PLACEHOLDER_RE.finditer(part))
     return placeholders
 
 
@@ -40,11 +87,249 @@ def replace_template(template: str, replacements: Dict[str, Any], exclude_keys: 
     """
     if exclude_keys is None:
         exclude_keys = set()
-    result = template
-    for key, value in replacements.items():
-        if key not in exclude_keys:
-            result = result.replace(f"{{{{{key}}}}}", str(value))
-    return result
+
+    def substitute(match: "re.Match[str]") -> str:
+        key, placeholder_filter = match.group(1), match.group(2)
+        if key in exclude_keys or key not in replacements:
+            return match.group(0)
+        return render_placeholder_value(key, replacements[key], placeholder_filter)
+
+    return _PLACEHOLDER_RE.sub(substitute, template)
+
+
+def _command_substitution_end(script: str, start: int) -> int:
+    """Locate a simple $(...) block without interpreting its quotes as outer quotes."""
+    unsupported = (
+        "Input binding with complex command substitutions is unsupported; "
+        "pass inputs as separate argv arguments"
+    )
+    if script.startswith("$((", start):
+        raise ValueError(unsupported)
+    index = start + 2
+    depth = 1
+    quote = None
+    while index < len(script):
+        char = script[index]
+        if char == "\\" and quote != "'" and index + 1 < len(script):
+            index += 2
+            continue
+        if quote != "'":
+            if script.startswith("$(", index):
+                index = _command_substitution_end(script, index)
+                continue
+            if char == "`" or script.startswith(("${", "$'"), index):
+                raise ValueError(unsupported)
+        if quote is None and (
+            char == "#"
+            or re.match(r"case\b", script[index:])
+            and (index == 0 or not re.match(r"\w", script[index - 1]))
+        ):
+            # Case patterns and comments can contain unmatched ')' tokens.
+            # Avoid treating this boundary scanner as a complete shell parser.
+            raise ValueError(unsupported)
+        if char in ("'", '"'):
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+        elif quote is None:
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    return index + 1
+        index += 1
+    raise ValueError("Unterminated command substitution in input template")
+
+
+def _bind_shell_inputs(script: str, names: List[str], first_arg: int) -> str:
+    """Replace shell-source placeholders with quoted positional expansions."""
+    if not names:
+        return script
+    if "<<" in script:
+        raise ValueError("Input placeholders in shell heredocs are unsafe; pass inputs as arguments")
+    positions = {name: first_arg + index for index, name in enumerate(names)}
+    output = []
+    quote = None
+    index = 0
+    while index < len(script):
+        if quote != "'" and script.startswith("$(", index):
+            end = _command_substitution_end(script, index)
+            block = script[index:end]
+            if extract_placeholders([block]) & positions.keys():
+                raise ValueError(
+                    "Input placeholders in command substitutions are unsupported; "
+                    "pass inputs as separate argv arguments"
+                )
+            output.append(block)
+            index = end
+            continue
+        if quote != "'" and script[index] == "`":
+            raise ValueError(
+                "Input binding with backtick command substitutions is unsupported; "
+                "use $(...) without input placeholders or pass inputs as argv"
+            )
+        match = _PLACEHOLDER_RE.match(script[index:])
+        if match and match.group(1) in positions:
+            expansion = "${%d}" % positions[match.group(1)]
+            if quote == "'":
+                output.append("'\"" + expansion + "\"'")
+            elif quote == '"':
+                output.append(expansion)
+            else:
+                output.append('"' + expansion + '"')
+            index += len(match.group(0))
+            continue
+        char = script[index]
+        if char == "\\" and quote != "'" and index + 1 < len(script):
+            output.append(script[index:index + 2])
+            index += 2
+            continue
+        if char in ("'", '"'):
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+        output.append(char)
+        index += 1
+    return "".join(output)
+
+
+def _posix_shell_index(parts: List[str]) -> Optional[int]:
+    """Recognize direct shells and explicit env/busybox wrappers."""
+    if not parts:
+        return None
+    index = 0
+    if os.path.basename(str(parts[0])) == "env":
+        index = 1
+        while index < len(parts):
+            arg = str(parts[index])
+            if arg == "--":
+                index += 1
+                break
+            if arg in ("-i", "--ignore-environment"):
+                index += 1
+            elif arg in ("-u", "--unset", "-C", "--chdir", "-a", "--argv0"):
+                index += 2
+            elif arg.startswith(("--unset=", "--chdir=", "--argv0=")):
+                index += 1
+            elif re.match(r"[A-Za-z_][A-Za-z0-9_]*=", arg):
+                index += 1
+            elif arg.startswith("-"):
+                return None
+            else:
+                break
+    if index < len(parts) and os.path.basename(str(parts[index])) == "busybox":
+        index += 1
+    if index < len(parts) and os.path.basename(str(parts[index])) in POSIX_SHELL_NAMES:
+        return index
+    return None
+
+
+def _shell_source_layout(parts: List[str], shell_index: int) -> Tuple[bool, Optional[int]]:
+    """Return (understood layout, source index); unknown options fail closed."""
+    short_flags = frozenset("abefhiklmnprstuvxBCEHPTc")
+    value_options = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file", "--emulate"}
+    long_flags = {
+        "--noprofile", "--norc", "--posix", "--login", "--restricted",
+        "--verbose", "--debugger", "--help", "--version",
+    }
+    index = shell_index + 1
+    command_mode = False
+    while index < len(parts):
+        option = str(parts[index])
+        if option in ("--", "-", "+"):
+            return True, index + 1 if command_mode else None
+        if not option.startswith(("-", "+")):
+            return True, index if command_mode else None
+        if option in value_options:
+            index += 2
+            continue
+        if option in long_flags:
+            index += 1
+            continue
+        if re.fullmatch(r"[-+][A-Za-z]+", option):
+            flags = option[1:]
+            if flags[-1] in ("o", "O") and set(flags[:-1]) <= short_flags:
+                if "c" in flags[:-1]:
+                    if not option.startswith("-"):
+                        return False, None
+                    command_mode = True
+                index += 2
+                continue
+            if set(flags) <= short_flags:
+                if option.startswith("-") and "c" in flags:
+                    # bash/sh/ksh/zsh can still parse options after -c.
+                    command_mode = True
+                elif "c" in flags:
+                    return False, None
+                index += 1
+                continue
+        # Do not mistake an unknown option's value for a script filename and
+        # thereby miss a later real -c operand.
+        return False, None
+    return True, None
+
+
+def _is_command_source(parts: List[str], index: int) -> bool:
+    """Detect source operands, including ambiguous `-c` forms to reject safely."""
+    if index < 1 or not parts:
+        return False
+    shell_index = _posix_shell_index(parts)
+    if shell_index is not None:
+        # Once a known shell's actual script is located, later -c tokens are
+        # ordinary positional arguments and must not change binding positions.
+        understood, source_index = _shell_source_layout(parts, shell_index)
+        if understood:
+            return source_index == index
+        # A partially understood shell layout has no trustworthy boundary
+        # between option values, source and argv. Never interpolate later
+        # inputs after a command-mode option in that layout.
+        return any(
+            re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", str(part))
+            for part in parts[shell_index + 1:index]
+        )
+    if shell_index is None and os.path.basename(str(parts[0])) == "env":
+        # Include the current token: -Sscript and --split-string=script can
+        # themselves contain code, without a separate source argv element.
+        if any(
+            str(part).startswith("-S") or str(part).startswith("--split-string")
+            for part in parts[1:index + 1]
+        ):
+            return True
+    if index < 2:
+        return False
+    # Unknown wrappers can contain several -c options (e.g. kubectl exec -c
+    # CONTAINER -- sh -c SCRIPT). Every candidate must fail closed, not only
+    # the first one, since no shell entry point was established.
+    for option_index in range(1, index):
+        if not re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", str(parts[option_index])):
+            continue
+        if option_index + 1 == index:
+            return True
+        if str(parts[option_index]) != "-c" or str(parts[option_index + 1]).startswith(("-", "+")):
+            # Combined options or options after -c make an unknown layout
+            # opaque: option values must not hide a later source string.
+            return True
+    return False
+
+
+def _is_shell_source(parts: List[str], index: int) -> bool:
+    """Whether this source string supports POSIX positional expansions."""
+    shell_index = _posix_shell_index(parts)
+    if shell_index is None:
+        return False
+    understood, source_index = _shell_source_layout(parts, shell_index)
+    return understood and source_index == index
+
+
+def _require_posix_source(parts: List[str], index: int) -> None:
+    if not _is_shell_source(parts, index):
+        raise ValueError(
+            "Input source placeholders require a supported POSIX shell and unambiguous options; "
+            "pass inputs as separate argv arguments for other commands"
+        )
 
 
 # ========== Input Type Parsing ==========
@@ -416,9 +701,10 @@ def prepare_command_template(
     
     # Process command template
     command_parts = []
-    for part in command_template:
+    for index, part in enumerate(command_template):
         if isinstance(part, str):
-            if "--output-paths" in part or "--inputs" in part:
+            command_source = _is_command_source(command_template, index)
+            if not command_source and ("--output-paths" in part or "--inputs" in part):
                 part = _process_special_command_part(part)
             command_parts.append(part)
         else:
@@ -601,19 +887,29 @@ def _prepare_actual_command(
     """
     actual_command_parts = []
     all_replacements = {**(inputs or {}), **output_file_paths}
+    shell_bindings = []
+    needs_shell_arg_zero = False
     
     for i, part in enumerate(command_parts):
         if not isinstance(part, str):
             actual_command_parts.append(part)
             continue
         
-        # Check if this is a bash -c command string
-        is_bash_c_command = (
-            i > 0 and
-            isinstance(command_parts[i-1], str) and
-            command_parts[i-1] == "-c" and
-            (" && " in part or " || " in part or " ; " in part)
-        )
+        # A value embedded in shell source cannot be made safe by replacing
+        # braces or quoting the entire command afterwards. Pass inputs as argv.
+        is_command_source = _is_command_source(command_parts, i)
+        if is_command_source:
+            names = sorted(extract_placeholders([part]) & set(inputs or {}))
+            if names:
+                _require_posix_source(command_parts, i)
+                filters = parse_placeholder_filters(part)
+                needs_shell_arg_zero = len(command_parts) == i + 1
+                first_arg = max(1, len(command_parts) - i - 1)
+                part = _bind_shell_inputs(part, names, first_arg)
+                shell_bindings.extend(
+                    render_placeholder_value(name, inputs[name], filters.get(name))
+                    for name in names
+                )
         
         # Check if contains special parameters
         has_special_params = (
@@ -621,11 +917,13 @@ def _prepare_actual_command(
             "--output-paths" in part
         )
         
-        if has_special_params and is_bash_c_command:
+        if has_special_params and is_command_source:
             actual_part = _process_bash_c_command_part(
-                part, inputs, output_file_paths, all_replacements
+                part, None, output_file_paths, output_file_paths
             )
             actual_command_parts.append(actual_part)
+        elif is_command_source:
+            actual_command_parts.append(replace_template(part, output_file_paths))
         elif has_special_params:
             actual_part = _process_normal_command_part(
                 part, inputs, output_file_paths
@@ -636,6 +934,10 @@ def _prepare_actual_command(
             actual_part = replace_template(part, all_replacements)
             actual_command_parts.append(actual_part)
     
+    if shell_bindings:
+        if needs_shell_arg_zero:
+            actual_command_parts.append("pyromind-node")
+        actual_command_parts.extend(shell_bindings)
     return actual_command_parts
 
 
