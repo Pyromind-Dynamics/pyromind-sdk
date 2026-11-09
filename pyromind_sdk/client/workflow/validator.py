@@ -66,8 +66,12 @@ def validate_workflow(
     strict: bool = False,
 ) -> Tuple[bool, List[str]]:
     """Validate an Xyflow workflow, optionally fetching the user's node schemas."""
+    if client is not None and not node_info and isinstance(workflow, dict):
+        schema_errors = _validate_standard_schema(workflow)
+        if all(error.startswith("Warning:") for error in schema_errors):
+            node_info, _ = _resolve_standard_node_info(workflow["nodes"], node_info, client)
     return validate_standard_format(
-        workflow, node_info=node_info, strict=strict, client=client
+        workflow, node_info=node_info, strict=strict
     )
 
 
@@ -217,7 +221,6 @@ def validate_standard_format(
     node_info: Optional[Dict] = None,
     strict: bool = False,
     exclude_string_types: bool = False,
-    client: Any = None,
 ) -> Tuple[bool, List[str]]:
     """
     Validate a Xyflow workflow.
@@ -234,7 +237,6 @@ def validate_standard_format(
         strict: If True, raise exception on first error
         exclude_string_types: If True, ignore STRING when a type union has
             more specific non-STRING members.
-        client: Optional SDK client for fetching node definitions
 
     Returns:
         Tuple of (is_valid, error_messages)
@@ -252,7 +254,7 @@ def validate_standard_format(
         return False, errors
 
     nodes = data.get("nodes", [])
-    node_info, node_info_error = _resolve_standard_node_info(nodes, node_info, client)
+    node_info, node_info_error = _resolve_standard_node_info(nodes, node_info, None)
     if node_info_error:
         errors.append(node_info_error)
         if strict:

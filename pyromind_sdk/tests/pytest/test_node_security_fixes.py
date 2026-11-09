@@ -325,7 +325,7 @@ def test_xyflow_requires_node_definitions_or_fetches_from_client() -> None:
 
     node_info = {"SafeNode": {"input": {"required": {}, "optional": {}}, "output": []}}
     client = SimpleNamespace(studio=SimpleNamespace(get_node_info=lambda: node_info))
-    valid, errors = validate_standard_format(workflow, client=client)
+    valid, errors = validate_standard_format(workflow, node_info=node_info)
     assert valid, errors
     valid, errors = validate_workflow(workflow, client=client)
     assert valid, errors
