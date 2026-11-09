@@ -232,7 +232,6 @@ def build_command_template(
         "--input-types", input_types_escaped,
         "--output-paths", output_paths_escaped,
         "--inputs", inputs_escaped,
-        "--input-dir", '"$input_dir"',
     ]
     
     # Add return types and names (for type validation)
@@ -313,6 +312,7 @@ def build_command_template(
     bash_commands.append("umask 077")
     bash_commands.append('input_dir="$(mktemp -d /tmp/pyromind-inputs.XXXXXXXXXX)"')
     bash_commands.append('trap \'rm -rf -- "$input_dir"\' EXIT')
+    bash_commands.append('export PYROMIND_SDK_INPUT_DIR="$input_dir"')
     for index, input_name in enumerate(input_names, start=1):
         bash_commands.append(f'printf "%s" "${{{index}}}" > "$input_dir/{input_name}"')
     # 4. Development releases are isolated from the shared Conda environment.
@@ -362,11 +362,11 @@ def build_command_template(
         )
         bash_commands.append(f"{python_exec} -c {shlex.quote(refresh_sdk)}")
         check_wrapper = (
-            "import inspect, sys, pyromind_sdk; "
-            "from pyromind_sdk.nodes.function_call_wrapper import function_call_wrapper; "
+            "import importlib, sys, pyromind_sdk; "
+            "wrapper = importlib.import_module('pyromind_sdk.nodes.function_call_wrapper'); "
             "actual = getattr(pyromind_sdk, '__version__', None); "
-            "sys.exit(0 if 'input_dir' in inspect.signature(function_call_wrapper).parameters "
-            "else f'PyPI pyromind-sdk {actual!r} lacks --input-dir; "
+            "sys.exit(0 if getattr(wrapper, '_PRIVATE_INPUT_DIR_ENV', None) == 'PYROMIND_SDK_INPUT_DIR' "
+            "else f'PyPI pyromind-sdk {actual!r} lacks private input file support; "
             "publish a compatible stable SDK before running this node')"
         )
         bash_commands.append(f"{python_exec} -c {shlex.quote(check_wrapper)}")

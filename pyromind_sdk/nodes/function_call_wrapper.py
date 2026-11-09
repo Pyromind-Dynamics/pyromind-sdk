@@ -21,6 +21,7 @@ from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
 _LEGACY_INPUT_ROOT = "/tmp"
+_PRIVATE_INPUT_DIR_ENV = "PYROMIND_SDK_INPUT_DIR"
 
 # Import type conversion functions to avoid code duplication
 try:
@@ -91,7 +92,7 @@ def _resolve_inputs_from_tmp_files(obj: Any, input_dir: Optional[str] = None) ->
             if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", name):
                 raise ValueError("Invalid input file reference")
             if not input_dir:
-                raise ValueError("Input file reference requires --input-dir")
+                raise ValueError("Input file reference requires a private input directory")
             directory_fd = os.open(input_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             try:
                 directory_stat = os.fstat(directory_fd)
@@ -222,7 +223,6 @@ def function_call_wrapper(
     output_paths: Dict[str, str],
     return_types: Optional[List[str]] = None,
     return_names: Optional[List[str]] = None,
-    input_dir: Optional[str] = None,
 ) -> None:
     """
     Python function call wrapper
@@ -242,8 +242,6 @@ def function_call_wrapper(
         output_paths: Output file path dictionary, key is output name, value is file path
         return_types: Output type list (optional, for type validation)
         return_names: Output name list (optional, for type validation)
-        input_dir: Private directory for explicit file references. When omitted,
-            complete legacy /tmp/<input-name> payloads are also supported.
         
     Raises:
         FileNotFoundError: If Python file does not exist
@@ -251,6 +249,8 @@ def function_call_wrapper(
         AttributeError: If function does not exist
         TypeError: If output type mismatch
     """
+    # Capture this before importing user code, which may change the process environment.
+    input_dir = os.environ.get(_PRIVATE_INPUT_DIR_ENV) or None
     # 1. Load Python module
     python_file = Path(python_code)
     module = load_python_module(python_file)
@@ -259,9 +259,8 @@ def function_call_wrapper(
     func = get_function_from_module(module, function_name)
     
     # 3. Type conversion
-    # Without --input-dir, accept only the complete legacy generator payload.
-    if input_dir is None:
-        inputs = _resolve_legacy_input_files(inputs, input_types)
+    # Old commands use /tmp/<input-name>; explicit file markers pass through unchanged.
+    inputs = _resolve_legacy_input_files(inputs, input_types)
     inputs = _resolve_inputs_from_tmp_files(inputs, input_dir)
     inputs = _normalize_empty_optional_inputs(inputs, input_types)
     converted_inputs = convert_inputs(inputs, input_types)
@@ -398,7 +397,8 @@ def main():
     parser.add_argument('--input-types', required=True, help='Input types JSON string')
     parser.add_argument('--output-paths', required=True, help='Output paths JSON string (dict: {output_name: file_path})')
     parser.add_argument('--inputs', required=True, help='Input values JSON string (dict: {input_name: value})')
-    parser.add_argument('--input-dir', help='Private directory for explicit input file references')
+    # Accept commands already generated with this flag; new commands use the environment.
+    parser.add_argument('--input-dir', help=argparse.SUPPRESS)
     parser.add_argument('--return-types', help='Return types JSON string (list of type names)')
     parser.add_argument('--return-names', help='Return names JSON string (list of output names)')
     
@@ -443,6 +443,8 @@ def main():
     
     # Call wrapper
     try:
+        if args.input_dir:
+            os.environ[_PRIVATE_INPUT_DIR_ENV] = args.input_dir
         function_call_wrapper(
             python_code=args.python_code,
             function_name=args.function_name,
@@ -451,7 +453,6 @@ def main():
             output_paths=output_paths,
             return_types=return_types,
             return_names=return_names,
-            input_dir=args.input_dir,
         )
     except Exception as e:
         logger.error(f"Error executing function: {e}")

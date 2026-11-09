@@ -22,14 +22,18 @@ def _run_wrapper(
     python_file = tmp_path / "node.py"
     python_file.write_text(source, encoding="utf-8")
     output = tmp_path / "result.json"
-    wrapper.function_call_wrapper(
-        python_code=str(python_file),
-        function_name="run",
-        inputs=inputs,
-        input_types=input_types,
-        output_paths={"result": str(output)},
-        input_dir=str(input_dir) if input_dir is not None else None,
-    )
+    with pytest.MonkeyPatch.context() as patch:
+        if input_dir is None:
+            patch.delenv("PYROMIND_SDK_INPUT_DIR", raising=False)
+        else:
+            patch.setenv("PYROMIND_SDK_INPUT_DIR", str(input_dir))
+        wrapper.function_call_wrapper(
+            python_code=str(python_file),
+            function_name="run",
+            inputs=inputs,
+            input_types=input_types,
+            output_paths={"result": str(output)},
+        )
     return json.loads(output.read_text(encoding="utf-8"))
 
 

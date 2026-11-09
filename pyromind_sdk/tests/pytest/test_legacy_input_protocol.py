@@ -35,14 +35,18 @@ def _call(tmp_path: Path, inputs: dict, input_types: dict, input_dir: Path | Non
     module_file = tmp_path / "node.py"
     module_file.write_text("def run(**values):\n    return {'result': values}\n", encoding="utf-8")
     output = tmp_path / "result.json"
-    wrapper.function_call_wrapper(
-        python_code=str(module_file),
-        function_name="run",
-        inputs=inputs,
-        input_types=input_types,
-        output_paths={"result": str(output)},
-        input_dir=str(input_dir) if input_dir is not None else None,
-    )
+    with pytest.MonkeyPatch.context() as patch:
+        if input_dir is None:
+            patch.delenv("PYROMIND_SDK_INPUT_DIR", raising=False)
+        else:
+            patch.setenv("PYROMIND_SDK_INPUT_DIR", str(input_dir))
+        wrapper.function_call_wrapper(
+            python_code=str(module_file),
+            function_name="run",
+            inputs=inputs,
+            input_types=input_types,
+            output_paths={"result": str(output)},
+        )
     return json.loads(output.read_text(encoding="utf-8"))
 
 
@@ -101,16 +105,27 @@ def test_only_the_complete_declared_legacy_shape_can_open_files(
     assert wrapper._resolve_legacy_input_files(inputs, input_types) == inputs
 
 
-def test_literal_tmp_paths_remain_strings_in_explicit_input_dir_mode(
+def test_old_generated_payload_still_works_with_private_dir_env(
     tmp_path: Path, legacy_root: Path
 ) -> None:
-    _write_legacy(legacy_root, "text", "must not be read\n")
+    _write_legacy(legacy_root, "text", "legacy content\n")
     directory = tmp_path / "private"
     directory.mkdir(mode=0o700)
 
     result = _call(tmp_path, {"text": "/tmp/text"}, _input_types(text="STRING"), directory)
 
-    assert result == {"text": "/tmp/text"}
+    assert result == {"text": "legacy content"}
+
+
+def test_nonlegacy_tmp_path_stays_literal_with_private_dir_env(
+    tmp_path: Path, legacy_root: Path
+) -> None:
+    directory = tmp_path / "private"
+    directory.mkdir(mode=0o700)
+
+    result = _call(tmp_path, {"text": "/tmp/other"}, _input_types(text="STRING"), directory)
+
+    assert result == {"text": "/tmp/other"}
 
 
 def test_explicit_file_protocol_still_preserves_trailing_newlines(
@@ -130,7 +145,7 @@ def test_explicit_reference_without_input_dir_is_not_treated_as_legacy(
     tmp_path: Path, legacy_root: Path
 ) -> None:
     _write_legacy(legacy_root, "text", "must not be read\n")
-    with pytest.raises(ValueError, match="requires --input-dir"):
+    with pytest.raises(ValueError, match="requires a private input directory"):
         _call(tmp_path, {"text": {"__pyromind_input_file__": "text"}}, _input_types(text="STRING"))
 
 
