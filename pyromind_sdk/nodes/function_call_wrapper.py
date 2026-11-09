@@ -30,6 +30,28 @@ except ImportError:
     from pyromind_sdk.nodes.type_converter import convert_string_to_python_type, convert_inputs, validate_output_type
 
 
+def _read_input_file(directory_fd: int, name: str, *, private: bool) -> str:
+    """Read a regular input file without following links or shared writes."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_mode & (0o077 if private else 0o022)
+            or (not private and info.st_nlink != 1)
+        ):
+            label = "Input file is not private" if private else f"Unsafe legacy input file: /tmp/{name}"
+            raise ValueError(label)
+        with os.fdopen(fd, "r", encoding="utf-8") as file:
+            fd = -1
+            contents = file.read()
+        return contents if private else contents.rstrip("\n")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def _resolve_legacy_input_files(
     inputs: Dict[str, Any], input_types: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -56,29 +78,7 @@ def _resolve_legacy_input_files(
         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
     )
     try:
-        resolved = {}
-        for name in inputs:
-            fd = os.open(
-                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd
-            )
-            try:
-                info = os.fstat(fd)
-                # Old heredocs normally create 0644 files, so they cannot meet
-                # the new private-file mode. Still reject unsafe shared writes.
-                if (
-                    not stat.S_ISREG(info.st_mode)
-                    or info.st_uid != os.geteuid()
-                    or info.st_mode & 0o022
-                    or info.st_nlink != 1
-                ):
-                    raise ValueError(f"Unsafe legacy input file: /tmp/{name}")
-                with os.fdopen(fd, "r", encoding="utf-8") as file:
-                    fd = -1
-                    resolved[name] = file.read().rstrip("\n")
-            finally:
-                if fd >= 0:
-                    os.close(fd)
-        return resolved
+        return {name: _read_input_file(directory_fd, name, private=False) for name in inputs}
     finally:
         os.close(directory_fd)
 
@@ -99,19 +99,7 @@ def _resolve_inputs_from_tmp_files(obj: Any, input_dir: Optional[str] = None) ->
                         or directory_stat.st_uid != os.geteuid()
                         or directory_stat.st_mode & 0o077):
                     raise ValueError("Input directory is not private")
-                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
-                try:
-                    file_stat = os.fstat(fd)
-                    if (not stat.S_ISREG(file_stat.st_mode)
-                            or file_stat.st_uid != os.geteuid()
-                            or file_stat.st_mode & 0o077):
-                        raise ValueError("Input file is not private")
-                    with os.fdopen(fd, "r", encoding="utf-8") as file:
-                        fd = -1
-                        return file.read()
-                finally:
-                    if fd >= 0:
-                        os.close(fd)
+                return _read_input_file(directory_fd, name, private=True)
             finally:
                 os.close(directory_fd)
         return {k: _resolve_inputs_from_tmp_files(v, input_dir) for k, v in obj.items()}
