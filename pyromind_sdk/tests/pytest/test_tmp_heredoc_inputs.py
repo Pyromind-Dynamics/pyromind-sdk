@@ -14,6 +14,7 @@ import json
 import subprocess
 import sys
 import importlib.util
+import inspect
 from pathlib import Path
 
 import pytest
@@ -60,6 +61,9 @@ def test_build_command_template_passes_string_inputs_as_argv(tmp_path: Path) -> 
 
     assert "mktemp -d /tmp/pyromind-inputs." in script
     assert 'printf "%s" "${1}" > "$input_dir/system_prompt"' in script
+    assert 'export PYROMIND_SDK_INPUT_DIR="$input_dir"' in script
+    assert "--input-dir" not in script
+    assert "input_dir" not in inspect.signature(function_call_wrapper).parameters
     assert "{{system_prompt}}" not in script
     assert command_template[3:] == ["pyromind-node", "{{system_prompt}}"]
 
@@ -115,7 +119,7 @@ def test_parallel_commands_install_sdk_into_separate_private_directories(tmp_pat
         "    target.mkdir(parents=True)\n"
         "    (target / 'installed').touch()\n"
         "else:\n"
-        "    directory = Path(value('--input-dir'))\n"
+        "    directory = Path(os.environ['PYROMIND_SDK_INPUT_DIR'])\n"
         "    target = Path(os.environ['PYTHONPATH'].split(os.pathsep)[0])\n"
         "    assert target.parent == directory\n"
         "    assert (target / 'installed').is_file()\n"
@@ -273,7 +277,9 @@ def test_stable_command_rejects_old_conda_sdk(
     (old_sdk.parent / "__init__.py").write_text("", encoding="utf-8")
     (old_sdk / "__init__.py").write_text("", encoding="utf-8")
     (old_sdk / "function_call_wrapper.py").write_text(
-        "def function_call_wrapper(inputs):\n    return inputs\n", encoding="utf-8"
+        "def function_call_wrapper(inputs):\n    return inputs\n"
+        "def _resolve_inputs_from_tmp_files(obj, input_dir=None):\n    return obj\n",
+        encoding="utf-8",
     )
     (old_sdk.parent.parent / "sitecustomize.py").write_text(
         "import importlib.metadata, io, sys, urllib.request\n"
@@ -316,10 +322,12 @@ def test_stable_command_rejects_old_conda_sdk(
 
     result = execute_command_template(command, inputs={}, output_names=[])
     assert not result["success"]
-    assert "PyPI pyromind-sdk None lacks --input-dir" in result["stderr"]
+    assert "PyPI pyromind-sdk None lacks private input file support" in result["stderr"]
 
 
-def test_function_call_wrapper_reads_explicit_private_files(tmp_path: Path) -> None:
+def test_function_call_wrapper_reads_explicit_private_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
     Only explicit references in the private directory are read.
     """
@@ -338,6 +346,7 @@ def test_function_call_wrapper_reads_explicit_private_files(tmp_path: Path) -> N
     tmp_prompt_file.chmod(0o600)
 
     out_file = tmp_path / "out.txt"
+    monkeypatch.setenv("PYROMIND_SDK_INPUT_DIR", str(input_dir))
 
     function_call_wrapper(
         python_code=str(dummy_py),
@@ -347,11 +356,39 @@ def test_function_call_wrapper_reads_explicit_private_files(tmp_path: Path) -> N
         output_paths={"out": str(out_file)},
         return_types=["STRING"],
         return_names=["out"],
-        input_dir=str(input_dir),
     )
 
     assert out_file.exists()
     assert out_file.read_text(encoding="utf-8") == content
+
+
+def test_existing_input_dir_cli_flag_still_works(tmp_path: Path) -> None:
+    module_file = tmp_path / "node.py"
+    module_file.write_text("def f(text):\n    return {'out': text}\n", encoding="utf-8")
+    input_dir = tmp_path / "private-inputs"
+    input_dir.mkdir(mode=0o700)
+    input_file = input_dir / "text"
+    input_file.write_text("old dev command", encoding="utf-8")
+    input_file.chmod(0o600)
+    output = tmp_path / "out.txt"
+    env = os.environ.copy()
+    env.pop("PYROMIND_SDK_INPUT_DIR", None)
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "pyromind_sdk.nodes.function_call_wrapper",
+            "--python-code", str(module_file),
+            "--function-name", "f",
+            "--input-types", json.dumps({"required": {"text": ["STRING", {}]}}),
+            "--output-paths", json.dumps({"out": str(output)}),
+            "--inputs", json.dumps({"text": {"__pyromind_input_file__": "text"}}),
+            "--input-dir", str(input_dir),
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert output.read_text(encoding="utf-8") == "old dev command"
 
 
 def test_load_python_module_imports_sibling_package_and_restores_sys_path(tmp_path: Path) -> None:
