@@ -3,17 +3,16 @@
 import ast
 import os
 import sys
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import yaml
 
-import pyromind_sdk.nodes.python_function_executor as executor_module
 from pyromind_sdk.client.workflow.validator import validate_standard_format, validate_workflow
 from pyromind_sdk.nodes.command_executor import _prepare_actual_command, execute_command_template
-from pyromind_sdk.nodes.function_call_wrapper import _resolve_inputs_from_tmp_files
-from pyromind_sdk.nodes.python_function_executor import SDK_VERSION, build_command_template
+from pyromind_sdk.nodes.python_function_executor import build_command_template
 from pyromind_sdk.nodes.python_to_yaml import yaml_to_python_code
 from pyromind_sdk.nodes.yaml_loader import create_node_class_from_yaml
 
@@ -51,53 +50,36 @@ def test_shell_argv_preserves_metacharacters(tmp_path: Path) -> None:
 def test_generated_python_node_executes_without_parsing_input_as_shell(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Stub the development release's pip commands; run the real wrapper offline.
-    monkeypatch.setattr(executor_module, "SDK_VERSION", "0.1.16.dev1")
-    fake_python = tmp_path / "python3"
-    fake_python.write_text(
-        f"#!{sys.executable}\n"
-        "import os, sys\n"
-        "from pathlib import Path\n"
-        "args = sys.argv[1:]\n"
-        "if args[:2] == ['-m', 'pip']:\n"
-        "    if args[2] == 'download':\n"
-        "        destination = Path(args[args.index('--dest') + 1])\n"
-        "        destination.mkdir(parents=True)\n"
-        "        (destination / 'pyromind_sdk-test-py3-none-any.whl').touch()\n"
-        "    elif args[2] == 'install':\n"
-        "        Path(args[args.index('--target') + 1]).mkdir(parents=True)\n"
-        "    else:\n"
-        "        raise AssertionError(f'Unexpected pip command: {args}')\n"
-        "    sys.exit(0)\n"
-        "if args[:1] == ['-c']:\n"
-        "    os.execv(sys.executable, [sys.executable, *args])\n"
-        "assert args[:2] == ['-m', 'pyromind_sdk.nodes.function_call_wrapper']\n"
-        "os.execv(sys.executable, [sys.executable, *args])\n",
-        encoding="utf-8",
-    )
-    fake_python.chmod(0o755)
     project_root = Path(__file__).resolve().parents[3]
     existing_pythonpath = os.environ.get("PYTHONPATH")
     pythonpath = os.pathsep.join(filter(None, (str(project_root), existing_pythonpath)))
     monkeypatch.setenv("PYTHONPATH", pythonpath)
+    input_name = f"input_{uuid.uuid4().hex}"
     node_file = tmp_path / "node.py"
     node_file.write_text(
-        "def run(text):\n    return {'out': repr(text)}\n", encoding="utf-8"
+        f"def run(**values):\n    return {{'out': repr(values[{input_name!r}])}}\n",
+        encoding="utf-8",
     )
     marker = tmp_path / "executed"
     value = f"line 1\n'quoted'; touch {marker}\nline 3\n"
     command = build_command_template(
         python_code=str(node_file),
         function_name="run",
-        input_types={"required": {"text": ("STRING", {})}, "optional": {}},
+        input_types={"required": {input_name: ("STRING", {})}, "optional": {}},
         output_names=["out"],
         return_types=["STRING"],
-        python_command=str(fake_python),
+        python_command=sys.executable,
         conda_env="",
     )
-    result = execute_command_template(command, inputs={"text": value}, output_names=["out"])
+    staged_file = Path("/tmp") / input_name
+    assert not os.path.lexists(staged_file)
+    try:
+        result = execute_command_template(command, inputs={input_name: value}, output_names=["out"])
+    finally:
+        staged_file.unlink(missing_ok=True)
     assert result["success"], result["stderr"]
-    assert result["outputs"]["out"] == repr(value)
+    # The retained /tmp protocol strips trailing newlines when the wrapper reads the file.
+    assert result["outputs"]["out"] == repr(value.rstrip("\n"))
     assert not marker.exists()
 
 
@@ -146,7 +128,8 @@ def test_input_file_name_keeps_supported_hyphen(tmp_path: Path) -> None:
         output_names=[],
         conda_env="",
     )
-    assert '"$input_dir/prompt-text"' in command[2]
+    assert '"prompt-text": "/tmp/prompt-text"' in command[2]
+    assert "__pyromind_input_file__" not in command[2]
     assert command[-1] == "{{prompt-text}}"
 
 
@@ -234,11 +217,8 @@ def test_python_command_keeps_supported_runtime_flag(tmp_path: Path) -> None:
         python_command="python3 -u",
         conda_env="",
     )
-    if ".dev" in SDK_VERSION:
-        assert "python3 -u -m pip install" in command[2]
-    else:
-        assert "python3 -u -c" in command[2]
-        assert "pip install" not in command[2]
+    assert 'python3 -u -c "import pyromind_sdk"' in command[2]
+    assert "python3 -u -m pip install pyromind-sdk -q" in command[2]
     assert "python3 -u -m pyromind_sdk.nodes.function_call_wrapper" in command[2]
 
 
@@ -265,35 +245,6 @@ def test_accelerate_gpu_count_is_bound_as_argument(tmp_path: Path) -> None:
             python_command="accelerate",
             gpu_count="1; id",
             conda_env="",
-        )
-
-
-def test_plain_tmp_path_is_not_dereferenced(tmp_path: Path) -> None:
-    secret = tmp_path / "secret"
-    secret.write_text("private data", encoding="utf-8")
-    assert _resolve_inputs_from_tmp_files({"text": str(secret)}) == {"text": str(secret)}
-
-
-def test_input_file_reference_rejects_traversal_and_symlink(tmp_path: Path) -> None:
-    private_dir = tmp_path / "private"
-    private_dir.mkdir(mode=0o700)
-    secret = tmp_path / "secret"
-    secret.write_text("private data", encoding="utf-8")
-    (private_dir / "linked").symlink_to(secret)
-
-    with pytest.raises(ValueError, match="Invalid input file reference"):
-        _resolve_inputs_from_tmp_files(
-            {"__pyromind_input_file__": "../secret"}, str(private_dir)
-        )
-    with pytest.raises(OSError):
-        _resolve_inputs_from_tmp_files(
-            {"__pyromind_input_file__": "linked"}, str(private_dir)
-        )
-    linked_dir = tmp_path / "linked-dir"
-    linked_dir.symlink_to(private_dir)
-    with pytest.raises(OSError):
-        _resolve_inputs_from_tmp_files(
-            {"__pyromind_input_file__": "linked"}, str(linked_dir)
         )
 
 

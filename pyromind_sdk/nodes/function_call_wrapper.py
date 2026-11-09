@@ -13,15 +13,11 @@ import os
 import json
 import importlib.util
 import argparse
-import re
-import stat
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
-_LEGACY_INPUT_ROOT = "/tmp"
-_PRIVATE_INPUT_DIR_ENV = "PYROMIND_SDK_INPUT_DIR"
 
 # Import type conversion functions to avoid code duplication
 try:
@@ -31,82 +27,38 @@ except ImportError:
     from pyromind_sdk.nodes.type_converter import convert_string_to_python_type, convert_inputs, validate_output_type
 
 
-def _read_input_file(directory_fd: int, name: str, *, private: bool) -> str:
-    """Read a regular input file without following links or shared writes."""
-    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
-    try:
-        info = os.fstat(fd)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_uid != os.geteuid()
-            or info.st_mode & (0o077 if private else 0o022)
-            or (not private and info.st_nlink != 1)
-        ):
-            label = "Input file is not private" if private else f"Unsafe legacy input file: /tmp/{name}"
-            raise ValueError(label)
-        with os.fdopen(fd, "r", encoding="utf-8") as file:
-            fd = -1
-            contents = file.read()
-        return contents if private else contents.rstrip("\n")
-    finally:
-        if fd >= 0:
-            os.close(fd)
+def _read_tmp_file_if_exists(value: Any) -> Any:
+    """
+    If `value` is a string pointing to an existing `/tmp/*` file,
+    read the file content and return it. Otherwise return the original value.
+
+    This supports passing large strings (e.g. system prompts) through heredoc files,
+    avoiding shell quoting/escaping issues.
+    """
+    if not isinstance(value, str):
+        return value
+
+    if not value.startswith("/tmp/"):
+        return value
+
+    tmp_root = Path("/tmp").resolve()
+    path = Path(value).resolve()
+    if tmp_root not in path.parents:
+        return value
+    if not path.is_file():
+        return value
+
+    # Remove only heredoc-added trailing newline(s), preserve other whitespace.
+    return path.read_text(encoding="utf-8").rstrip("\n")
 
 
-def _resolve_legacy_input_files(
-    inputs: Dict[str, Any], input_types: Dict[str, Any]
-) -> Dict[str, Any]:
-    """Recognize the complete /tmp/<parameter> payload emitted by old generators."""
-    if not isinstance(inputs, dict) or not isinstance(input_types, dict) or not inputs:
-        return inputs
-    required = input_types.get("required", {})
-    optional = input_types.get("optional", {})
-    if not isinstance(required, dict) or not isinstance(optional, dict):
-        return inputs
-    declared = {**required, **optional}
-    if set(inputs) != set(declared) or any(
-        not isinstance(name, str)
-        or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", name)
-        or not isinstance(value, str)
-        or value != f"/tmp/{name}"
-        for name, value in inputs.items()
-    ):
-        return inputs
-
-    logger.info("Using legacy input file protocol for %d declared inputs", len(inputs))
-    directory_fd = os.open(
-        os.path.realpath(_LEGACY_INPUT_ROOT),
-        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-    )
-    try:
-        return {name: _read_input_file(directory_fd, name, private=False) for name in inputs}
-    finally:
-        os.close(directory_fd)
-
-
-def _resolve_inputs_from_tmp_files(obj: Any, input_dir: Optional[str] = None) -> Any:
-    """Read only explicit references in this invocation's private directory."""
+def _resolve_inputs_from_tmp_files(obj: Any) -> Any:
+    """Recursively resolve `/tmp/*` string values into their file contents."""
     if isinstance(obj, dict):
-        if set(obj) == {"__pyromind_input_file__"}:
-            name = obj["__pyromind_input_file__"]
-            if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", name):
-                raise ValueError("Invalid input file reference")
-            if not input_dir:
-                raise ValueError("Input file reference requires a private input directory")
-            directory_fd = os.open(input_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            try:
-                directory_stat = os.fstat(directory_fd)
-                if (not stat.S_ISDIR(directory_stat.st_mode)
-                        or directory_stat.st_uid != os.geteuid()
-                        or directory_stat.st_mode & 0o077):
-                    raise ValueError("Input directory is not private")
-                return _read_input_file(directory_fd, name, private=True)
-            finally:
-                os.close(directory_fd)
-        return {k: _resolve_inputs_from_tmp_files(v, input_dir) for k, v in obj.items()}
+        return {k: _resolve_inputs_from_tmp_files(v) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_resolve_inputs_from_tmp_files(v, input_dir) for v in obj]
-    return obj
+        return [_resolve_inputs_from_tmp_files(v) for v in obj]
+    return _read_tmp_file_if_exists(obj)
 
 
 @contextmanager
@@ -176,45 +128,6 @@ def get_function_from_module(module, function_name: str):
     return getattr(module, function_name)
 
 
-def _empty_optional_needs_omission(type_spec: Any) -> bool:
-    """Avoid converting an unset numeric, boolean, or choice input from ``''``."""
-    if isinstance(type_spec, list):
-        return "" not in type_spec
-    if isinstance(type_spec, str):
-        parts = {part.strip().upper() for part in type_spec.split("|")}
-        if parts & {"STRING", "PATH", "MODEL", "ENV", "ACCELERATE_CONFIG"}:
-            return False
-        return bool(parts & {"INT", "FLOAT", "BOOLEAN"})
-    return False
-
-
-def _normalize_empty_optional_inputs(
-    inputs: Dict[str, Any], input_types: Dict[str, Any]
-) -> Dict[str, Any]:
-    """Use declared defaults and omit unset typed inputs before conversion."""
-    if not isinstance(inputs, dict) or not isinstance(input_types, dict):
-        return inputs
-    optional = input_types.get("optional", {})
-    required = input_types.get("required", {})
-    if not isinstance(optional, dict) or not isinstance(required, dict):
-        return inputs
-
-    normalized = inputs.copy()
-    for name, spec in optional.items():
-        if name in required or not isinstance(normalized.get(name), str) or normalized[name] != "":
-            continue
-        if not isinstance(spec, (list, tuple)) or not spec:
-            continue
-        type_spec = spec[0]
-        options = spec[1] if len(spec) > 1 and isinstance(spec[1], dict) else {}
-        default = options.get("default")
-        if default is not None and default != "":
-            normalized[name] = default
-        elif _empty_optional_needs_omission(type_spec):
-            normalized.pop(name)
-    return normalized
-
-
 def function_call_wrapper(
     python_code: str,
     function_name: str,
@@ -222,7 +135,7 @@ def function_call_wrapper(
     input_types: Dict[str, Any],
     output_paths: Dict[str, str],
     return_types: Optional[List[str]] = None,
-    return_names: Optional[List[str]] = None,
+    return_names: Optional[List[str]] = None
 ) -> None:
     """
     Python function call wrapper
@@ -249,8 +162,6 @@ def function_call_wrapper(
         AttributeError: If function does not exist
         TypeError: If output type mismatch
     """
-    # Capture this before importing user code, which may change the process environment.
-    input_dir = os.environ.get(_PRIVATE_INPUT_DIR_ENV) or None
     # 1. Load Python module
     python_file = Path(python_code)
     module = load_python_module(python_file)
@@ -259,10 +170,8 @@ def function_call_wrapper(
     func = get_function_from_module(module, function_name)
     
     # 3. Type conversion
-    # Old commands use /tmp/<input-name>; explicit file markers pass through unchanged.
-    inputs = _resolve_legacy_input_files(inputs, input_types)
-    inputs = _resolve_inputs_from_tmp_files(inputs, input_dir)
-    inputs = _normalize_empty_optional_inputs(inputs, input_types)
+    # Resolve /tmp/* file indirections back into real string content.
+    inputs = _resolve_inputs_from_tmp_files(inputs)
     converted_inputs = convert_inputs(inputs, input_types)
     
     # 4. Call function
@@ -397,8 +306,6 @@ def main():
     parser.add_argument('--input-types', required=True, help='Input types JSON string')
     parser.add_argument('--output-paths', required=True, help='Output paths JSON string (dict: {output_name: file_path})')
     parser.add_argument('--inputs', required=True, help='Input values JSON string (dict: {input_name: value})')
-    # Accept commands already generated with this flag; new commands use the environment.
-    parser.add_argument('--input-dir', help=argparse.SUPPRESS)
     parser.add_argument('--return-types', help='Return types JSON string (list of type names)')
     parser.add_argument('--return-names', help='Return names JSON string (list of output names)')
     
@@ -443,8 +350,6 @@ def main():
     
     # Call wrapper
     try:
-        if args.input_dir:
-            os.environ[_PRIVATE_INPUT_DIR_ENV] = args.input_dir
         function_call_wrapper(
             python_code=args.python_code,
             function_name=args.function_name,
@@ -452,7 +357,7 @@ def main():
             input_types=input_types,
             output_paths=output_paths,
             return_types=return_types,
-            return_names=return_names,
+            return_names=return_names
         )
     except Exception as e:
         logger.error(f"Error executing function: {e}")
