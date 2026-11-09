@@ -13,6 +13,7 @@ import subprocess
 import sys
 import importlib.util
 import inspect
+import shlex
 import uuid
 from pathlib import Path
 
@@ -74,6 +75,41 @@ def test_build_command_template_passes_string_inputs_as_argv(tmp_path: Path) -> 
         command_template, inputs={"system_prompt": "IGNORED"}, output_names=["out"]
     )
     assert prepared_parts[2] == script
+
+
+def test_conda_activation_does_not_receive_node_inputs(tmp_path: Path) -> None:
+    """Bash source must not inherit the input argv passed to bash -c."""
+    command = build_command_template(
+        python_code=str(tmp_path / "node.py"),
+        function_name="run",
+        input_types={
+            "required": {name: ("STRING", {}) for name in ("prompt", "question", "answer")},
+            "optional": {},
+        },
+        output_names=[],
+        conda_env="training",
+    )
+    activation = next(
+        line for line in command[2].splitlines()
+        if "source /workspace/.conda/bin/activate" in line
+    )
+    fake_activate = tmp_path / "activate"
+    args_file = tmp_path / "activation_args"
+    fake_activate.write_text(
+        'printf "%s\\n" "$@" > "$ACTIVATION_ARGS_FILE"\nconda() { :; }\n',
+        encoding="utf-8",
+    )
+    activation = activation.replace("[ -x /root/.local/bin/micromamba ]", "false")
+    activation = activation.replace("command -v micromamba >/dev/null 2>&1", "false")
+    activation = activation.replace(
+        "/workspace/.conda/bin/activate", shlex.quote(str(fake_activate))
+    )
+    subprocess.run(
+        ["bash", "-c", activation, "pyromind-node", "input", "question", "answer"],
+        env={**os.environ, "ACTIVATION_ARGS_FILE": str(args_file)},
+        check=True,
+    )
+    assert args_file.read_text(encoding="utf-8").splitlines() == ["base"]
 
 
 def test_input_files_preserve_values_after_ninth_argument(tmp_path: Path) -> None:

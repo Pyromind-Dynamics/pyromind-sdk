@@ -274,6 +274,8 @@ def build_command_template(
     # 3. Python environment activation (prefer micromamba, fallback to conda)
     if conda_env:
         conda_env_escaped = shlex.quote(str(conda_env))
+        # Bash receives node inputs as $1...; source needs an explicit argument
+        # so the activation script does not treat them as environment names.
         bash_commands.append(
             "if [ -x /root/.local/bin/micromamba ]; then "
             "export MAMBA_EXE=/root/.local/bin/micromamba; "
@@ -285,7 +287,7 @@ def build_command_template(
             "eval \"$(micromamba shell hook --shell bash --root-prefix \"$MAMBA_ROOT_PREFIX\")\"; "
             f"micromamba activate {conda_env_escaped}; "
             "elif [ -f /workspace/.conda/bin/activate ]; then "
-            "source /workspace/.conda/bin/activate; "
+            "source /workspace/.conda/bin/activate base; "
             f"conda activate {conda_env_escaped}; "
             "elif command -v conda >/dev/null 2>&1; then "
             f"conda activate {conda_env_escaped}; "
