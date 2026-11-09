@@ -340,22 +340,6 @@ def quantity_to_api_memory(q: str | None) -> str | None:
         raise ValueError(f"invalid memory {q!r}: {exc}") from exc
 
 
-def half_cpu_quantity(q: str) -> str:
-    """Return roughly half of a K8s cpu quantity (floor at 1m)."""
-    raw = (q or "").strip()
-    m = _CPU_Q.match(raw)
-    if not m:
-        return q
-    num = float(m.group("num"))
-    if m.group("unit") == "m":
-        milli = max(1, int(num) // 2)
-    else:
-        milli = max(1, int(round(num * 1000)) // 2)
-    if milli % 1000 == 0:
-        return str(milli // 1000)
-    return f"{milli}m"
-
-
 def half_to_api_cpu(q: str) -> str | None:
     """Half of a cpu quantity → create-API cores, rounded **up** to 2 decimals.
 
