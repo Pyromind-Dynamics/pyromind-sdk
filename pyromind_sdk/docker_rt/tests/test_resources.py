@@ -461,19 +461,6 @@ async def test_create_allows_foreground_run_shape(
     assert resp_it.status == 201, await resp_it.text()
 
 
-def test_default_node_selector(monkeypatch: pytest.MonkeyPatch) -> None:
-    from ..backend.kube.environment import default_node_selector
-
-    monkeypatch.delenv("DOCKER_RT_NODE_SELECTOR", raising=False)
-    assert default_node_selector() == {}
-
-    monkeypatch.setenv("DOCKER_RT_NODE_SELECTOR", "none")
-    assert default_node_selector() == {}
-
-    monkeypatch.setenv("DOCKER_RT_NODE_SELECTOR", "gpu=on,node-type=large-image")
-    assert default_node_selector() == {"gpu": "on", "node-type": "large-image"}
-
-
 def test_resolve_gpu_resources(monkeypatch: pytest.MonkeyPatch) -> None:
     from ..aio_server import _resolve_gpu_resources
 

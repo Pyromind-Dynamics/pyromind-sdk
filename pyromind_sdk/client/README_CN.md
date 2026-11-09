@@ -833,22 +833,18 @@ if result["errors"]:
 
 ## 工作流验证
 
-SDK 提供工作流验证功能，支持标准格式和轻量格式。
+SDK 提供 Xyflow 和 workflow_lite 两种工作流格式的验证功能。
 
 ### 验证工作流
 
 ```python
-from pyromind_sdk.client.workflow import validate_workflow, ValidationError
+from pyromind_sdk.client.workflow import validate_workflow
 
-# 验证工作流（自动检测格式）
-try:
-    result = validate_workflow(workflow_data)
-    print(f"Valid: {result.is_valid}")
-    if not result.is_valid:
-        for error in result.errors:
-            print(f"Error: {error}")
-except ValidationError as e:
-    print(f"Validation error: {e}")
+# 使用当前客户端的节点定义验证 Xyflow 工作流
+is_valid, errors = validate_workflow(workflow_data, client=client)
+print(f"Valid: {is_valid}")
+for error in errors:
+    print(f"Error: {error}")
 ```
 
 ### 验证特定格式
@@ -859,23 +855,19 @@ from pyromind_sdk.client.workflow import (
     validate_standard_format,
     validate_workflow_lite,
     validate_workflow_standard,
-    validate_workflow_legacy,
 )
 
 # 验证轻量格式
-result = validate_lite_format(workflow_data)
+is_valid, errors = validate_lite_format(lite_workflow)
 
-# 验证标准格式
-result = validate_standard_format(workflow_data)
+# 验证 Xyflow 格式
+is_valid, errors = validate_standard_format(workflow_data, node_info=node_info)
 
-# 验证轻量工作流
-result = validate_workflow_lite(workflow_data)
+# 验证轻量工作流（返回布尔值）
+is_valid = validate_workflow_lite(lite_workflow)
 
-# 验证标准工作流
-result = validate_workflow_standard(workflow_data)
-
-# 验证遗留格式
-result = validate_workflow_legacy(workflow_data)
+# 验证 Xyflow 工作流（返回布尔值）
+is_valid = validate_workflow_standard(workflow_data, node_info=node_info)
 ```
 
 ### 工作流格式转换
@@ -888,10 +880,10 @@ from pyromind_sdk.client.workflow import (
     LayoutGenerator,
 )
 
-# 将标准工作流转换为轻量格式
+# 将 Xyflow 工作流转换为轻量格式
 lite_workflow = to_workflow_lite(standard_workflow)
 
-# 将轻量工作流转换为标准格式
+# 将轻量工作流转换为 Xyflow 格式
 standard_workflow = to_workflow_standard(lite_workflow)
 
 # 使用转换器

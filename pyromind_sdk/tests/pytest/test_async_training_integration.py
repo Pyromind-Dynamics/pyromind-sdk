@@ -64,7 +64,7 @@ def api_key():
             "PYROMIND_API_KEY environment variable not set. "
             "Please set this environment variable to run integration tests."
         )
-    print(f"[INFO] Using API key: {api_key[:10]}...{api_key[-4:] if len(api_key) > 14 else '***'}")
+    print("[INFO] Using API key: ***")
     return api_key
 
 
@@ -161,7 +161,7 @@ def task_tracker():
 def workflow_file():
     """Get a workflow file for testing"""
     workflows_dir = EXAMPLES_DIR / "workflows"
-    workflow_files = ["clone.json", "llm_test.json", "join_path.json"]
+    workflow_files = ["clone-xyflow.json", "join-path-xyflow.json"]
     
     for workflow_file in workflow_files:
         workflow_path = workflows_dir / workflow_file
