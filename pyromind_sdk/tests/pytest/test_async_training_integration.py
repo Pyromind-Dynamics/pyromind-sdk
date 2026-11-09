@@ -161,7 +161,7 @@ def task_tracker():
 def workflow_file():
     """Get a workflow file for testing"""
     workflows_dir = EXAMPLES_DIR / "workflows"
-    workflow_files = ["clone.json", "llm_test.json", "join_path.json"]
+    workflow_files = ["clone-xyflow.json", "join-path-xyflow.json"]
     
     for workflow_file in workflow_files:
         workflow_path = workflows_dir / workflow_file

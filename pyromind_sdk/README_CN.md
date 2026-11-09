@@ -59,6 +59,12 @@ parameters:
 
 > **参数顺序要求**：`parameters` 列表中，`required_type: "required"` 的参数必须排在 `required_type: "optional"` 的参数之前，否则加载时会抛出验证错误。
 
+**命令模板的输入传递：**
+
+- `sh`、`bash`、`dash`、`ash`、`ksh`、`mksh`、`yash`、`zsh` 等 POSIX shell 的 `-c` / `-ec` 脚本内输入占位符，会转换为独立参数传递；YAML 加载和本地执行使用相同规则。
+- `fish`、`csh`、未知解释器或无法明确解析的包装命令，不允许在 `-c` 后的脚本文本内插入输入占位符。请保持脚本文本固定，把 `{{name}}` 放在单独的命令参数中，再用该解释器的参数语法读取。
+- 对普通命令，`-c` 后直接跟输入占位符也会因含义不明确而被拒绝。例如计数查询使用 `['grep', '--count', '{{pattern}}', 'file.txt']`，让搜索内容保持独立参数。
+
 ## 主要类
 
 ### 基础节点类
@@ -286,17 +292,16 @@ base_class: PortPodExecutionNode
 
 - `WorkflowLiteConverter`：工作流轻量格式转换器
 - `LayoutGenerator`：自动布局生成器
-- `to_workflow_lite(workflow: Dict) -> Dict`：将标准工作流转换为轻量格式
-- `to_workflow_standard(workflow: Dict) -> Dict`：将轻量工作流转换为标准格式
-- `validate_workflow(workflow: Dict, format: str = 'lite') -> ValidationResult`：验证工作流格式
+- `to_workflow_lite(workflow: Dict) -> Dict`：将 Xyflow 工作流转换为轻量格式
+- `to_workflow_standard(workflow: Dict) -> Dict`：将轻量工作流转换为 Xyflow 格式
+- `validate_workflow(workflow: Dict, client=None, node_info=None) -> Tuple[bool, List[str]]`：验证 Xyflow 工作流
 
 ### 工作流验证
 
-- `validate_lite_format(workflow: Dict) -> ValidationResult`：验证轻量格式工作流
-- `validate_standard_format(workflow: Dict) -> ValidationResult`：验证标准格式工作流
-- `validate_workflow_lite(workflow: Dict) -> ValidationResult`：验证轻量工作流
-- `validate_workflow_standard(workflow: Dict) -> ValidationResult`：验证标准工作流
-- `validate_workflow_legacy(workflow: Dict) -> ValidationResult`：验证遗留格式工作流
+- `validate_lite_format(workflow: Dict) -> Tuple[bool, List[str]]`：验证轻量格式工作流
+- `validate_standard_format(workflow: Dict) -> Tuple[bool, List[str]]`：验证 Xyflow 工作流
+- `validate_workflow_lite(workflow: Dict) -> bool`：验证轻量工作流
+- `validate_workflow_standard(workflow: Dict) -> bool`：验证 Xyflow 工作流
 
 ### 异常类
 

@@ -4,7 +4,8 @@ YAML node configuration system
 Provides functionality for loading nodes from YAML configuration files.
 """
 ## todo update_version
-__version__ = "0.1.16"
+## todo 决定环境的sdk走什么版本，如果配置的是dev会走临时目录的sdk的dev版本，如果是正式版本会走coda环境
+__version__ = "0.1.16.dev1"
 
 from .yaml_loader import (
     load_nodes_from_yaml,
