@@ -11,7 +11,6 @@ import re
 import shlex
 from typing import Dict, Any, List, Optional
 from pathlib import Path
-from . import __version__ as SDK_VERSION
 
 logger = logging.getLogger(__name__)
 AUTO_ACCELERATE_CONFIG_INPUT_NAME = "accelerate_config"
@@ -170,7 +169,7 @@ def build_command_template(
     accelerate_input_name: Optional[str] = None
     if (python_command or "").strip() == "accelerate":
         accelerate_input_name = _ensure_accelerate_config_required_input(input_types)
-        accelerate_config_path = f'"$input_dir/{accelerate_input_name}"'
+        accelerate_config_path = f"/tmp/{accelerate_input_name}"
 
     is_accelerate = (python_command or "").strip() == "accelerate"
     all_inputs = {**input_types.get("required", {}), **input_types.get("optional", {})}
@@ -220,8 +219,8 @@ def build_command_template(
 
     # Build wrapper input parameter JSON dictionary.
     #
-    # File references are explicit; a user string resembling a path stays a string.
-    inputs_dict = {name: {"__pyromind_input_file__": name} for name in wrapper_input_names}
+    # Keep the /tmp/<name> format accepted by older SDK wrappers.
+    inputs_dict = {name: f"/tmp/{name}" for name in wrapper_input_names}
     inputs_json = json.dumps(inputs_dict, ensure_ascii=False)
     inputs_escaped = shlex.quote(inputs_json)
     
@@ -307,69 +306,26 @@ def build_command_template(
         python_code_dir_escaped = shlex.quote(python_code_dir)
         bash_commands.append(f"cd {python_code_dir_escaped}")
     
-    # Runtime inputs are separate argv elements. The shell script never parses
-    # their contents, including newlines or a former heredoc delimiter.
-    bash_commands.append("umask 077")
-    bash_commands.append('input_dir="$(mktemp -d /tmp/pyromind-inputs.XXXXXXXXXX)"')
-    bash_commands.append('trap \'rm -rf -- "$input_dir"\' EXIT')
-    bash_commands.append('export PYROMIND_SDK_INPUT_DIR="$input_dir"')
-    for index, input_name in enumerate(input_names, start=1):
-        bash_commands.append(f'printf "%s" "${{{index}}}" > "$input_dir/{input_name}"')
-    # 4. Development releases are isolated from the shared Conda environment.
-    # Stable releases refresh the shared Conda SDK from PyPI when needed.
+    # 4. Stage inputs without putting their values in the shell script.
     python_exec = (python_command or "python3").strip()
     python_exec = "python3" if python_exec == "accelerate" else _python_executable(python_exec)
-    if ".dev" in SDK_VERSION:
+    if input_names:
+        # Values stay in argv, outside the shell script. Exclusive creation
+        # avoids following or overwriting a pre-existing /tmp/<input-name>.
+        stage_inputs = (
+            "import os,sys\n"
+            f"for name,value in zip({input_names!r},sys.argv[1:]):\n"
+            "    fd=os.open('/tmp/'+name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)\n"
+            "    with os.fdopen(fd,'w',encoding='utf-8') as file: file.write(value)"
+        )
+        values = " ".join(f'"${{{index}}}"' for index in range(1, len(input_names) + 1))
+        bash_commands.append(f"{python_exec} -c {shlex.quote(stage_inputs)} {values}")
+    # Keep the SDK already installed in the Pod; install only when it is absent.
+    if (python_command or "python3").strip() != "accelerate":
         bash_commands.append(
-            f"{python_exec} -m pip download --no-deps --only-binary=:all: --no-cache-dir "
-            '--dest "$input_dir/.pyromind-sdk-wheel" '
-            f"-i https://test.pypi.org/simple/ pyromind-sdk=={SDK_VERSION} -q"
+            f'{python_exec} -c "import pyromind_sdk" 2>/dev/null || '
+            f"{python_exec} -m pip install pyromind-sdk -q"
         )
-        bash_commands.append(
-            f"{python_exec} -m pip install --ignore-installed --no-cache-dir "
-            '--target "$input_dir/.pyromind-sdk-runtime" '
-            '-i https://pypi.org/simple/ "$input_dir/.pyromind-sdk-wheel/"*.whl -q'
-        )
-        bash_commands.append(
-            'export PYTHONPATH="$input_dir/.pyromind-sdk-runtime${PYTHONPATH:+:$PYTHONPATH}"'
-        )
-    else:
-        # Pods using the same Conda prefix share site-packages. Serialize
-        # checks and installs, including a downgrade from a pre-release.
-        refresh_sdk = (
-            "import fcntl, importlib.metadata, json, re, subprocess, sys, urllib.request\n"
-            "from pathlib import Path\n"
-            "with (Path(sys.prefix) / '.pyromind-sdk-update.lock').open('a+') as lock:\n"
-            "    fcntl.flock(lock, fcntl.LOCK_EX)\n"
-            "    with urllib.request.urlopen('https://pypi.org/pypi/pyromind-sdk/json', timeout=10) as response:\n"
-            "        latest = json.load(response)['info']['version']\n"
-            "    if not isinstance(latest, str) or not re.fullmatch(r'(?:[0-9]+!)?[0-9]+(?:\\.[0-9]+)*(?:\\.post[0-9]+)?', latest):\n"
-            "        raise ValueError(f'PyPI returned a non-final SDK version: {latest!r}')\n"
-            "    try:\n"
-            "        installed = importlib.metadata.version('pyromind-sdk')\n"
-            "    except importlib.metadata.PackageNotFoundError:\n"
-            "        installed = None\n"
-            "    if installed != latest:\n"
-            "        install = [sys.executable, '-m', 'pip', 'install', '--upgrade', "
-            "'--no-input', '--index-url', 'https://pypi.org/simple/', "
-            "'--timeout', '10', '--retries', '2', f'pyromind-sdk=={latest}', '-q']\n"
-            "        subprocess.run(install, check=True)\n"
-            "        if importlib.metadata.version('pyromind-sdk') != latest:\n"
-            "            subprocess.run(install + ['--force-reinstall'], check=True)\n"
-            "        actual = importlib.metadata.version('pyromind-sdk')\n"
-            "        if actual != latest:\n"
-            "            raise RuntimeError(f'Expected pyromind-sdk {latest}, found {actual}')\n"
-        )
-        bash_commands.append(f"{python_exec} -c {shlex.quote(refresh_sdk)}")
-        check_wrapper = (
-            "import importlib, sys, pyromind_sdk; "
-            "wrapper = importlib.import_module('pyromind_sdk.nodes.function_call_wrapper'); "
-            "actual = getattr(pyromind_sdk, '__version__', None); "
-            "sys.exit(0 if getattr(wrapper, '_PRIVATE_INPUT_DIR_ENV', None) == 'PYROMIND_SDK_INPUT_DIR' "
-            "else f'PyPI pyromind-sdk {actual!r} lacks private input file support; "
-            "publish a compatible stable SDK before running this node')"
-        )
-        bash_commands.append(f"{python_exec} -c {shlex.quote(check_wrapper)}")
 
     # 5. Execute wrapper command
     wrapper_cmd_full = " ".join([wrapper_cmd] + wrapper_args)
