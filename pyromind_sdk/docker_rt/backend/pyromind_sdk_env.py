@@ -1,8 +1,8 @@
 """PyromindSDK-backed environment adapter for docker-rt.
 
-This adapter exposes the same methods docker-rt expects from
-``KubeEnvironment``, but talks to ``k8s_middleware`` through the existing
-``pyromind_sdk.client.async_sandbox.AsyncSandboxClient`` OpenAPI client.
+docker-rt 建沙箱的**唯一**路径。它把 Docker 语义（create/start/exec/cp/pause）
+翻译成 ``k8s_middleware`` 的 OpenAPI 调用
+（``pyromind_sdk.client.async_sandbox.AsyncSandboxClient``）。
 """
 
 from __future__ import annotations
@@ -615,7 +615,10 @@ class PyromindSDK:
                 self.sandbox_status = status
                 self._terminal_phase = None
                 return
-            if status in {"failed", "error", "dead"}:
+            if status in {"failed", "error", "dead", "notfound"}:
+                # ``notfound`` matters most here: a sandbox that answers 404 is
+                # never going to run, and waiting out the full timeout only
+                # turns an immediate, diagnosable failure into a silent hang.
                 raise RuntimeError(
                     f"sandbox {self.sandbox_id} failed to reach running: {status}"
                 )
@@ -1026,6 +1029,12 @@ class PyromindSDK:
             except _SDK_API_ERRORS as exc:
                 self._phase_refreshed_at = loop.time()
                 if exc.status_code == 404:
+                    logger.warning(
+                        "sandbox %s is gone (404) while waiting for it to run — "
+                        "the platform reports no such sandbox even though the "
+                        "container may exist; waiting further is pointless",
+                        self.sandbox_id,
+                    )
                     self._terminal_phase = "NotFound"
                     self.sandbox_status = "NotFound"
                     return "NotFound"
@@ -1481,8 +1490,8 @@ class PyromindSDK:
 #     INTERNAL_SERVER_ERROR: InstanceService.delete_instance-instance`s status is
 #     Running, can not delete!
 #
-# 所以 `docker rm` 和 `docker rm -f` 是**同一套行为**（``api/containers.py`` 里写着
-# "intentionally share the same behavior"），走的都是
+# 所以 `docker rm` 和 `docker rm -f` 是**同一套行为**（``aio_server._remove_container``
+# 的 docstring 里写着两者共用一段），走的都是
 # ``PyromindSDK.cleanup()`` → ``_prepare_for_cleanup()``（只有 Running 才 pause）→
 # ``_cleanup_once()``（delete，并对"delete 撞上 pause 过渡"退避重试）。
 #

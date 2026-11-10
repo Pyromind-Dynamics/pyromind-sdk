@@ -8,6 +8,7 @@ active parameters with ANSI colors after a successful connection.
 
 from __future__ import annotations
 
+import getpass
 import logging
 import os
 import sys
@@ -17,6 +18,8 @@ try:
 except ImportError:
     pass
 from typing import Any
+
+from ..log_redaction import mask_secret
 
 logger = logging.getLogger("docker_rt.bootstrap")
 
@@ -58,7 +61,14 @@ def _prompt(
     *,
     stdin: Any | None = None,
     stdout: Any | None = None,
+    secret: bool = False,
 ) -> str:
+    """读一行输入。
+
+    ``secret=True`` 且接的是真终端时走 :func:`getpass.getpass`：API key 这类
+    输入不回显，终端回滚缓冲和后录屏都拿不到。注入 ``stdin``（测试）时保持
+    原来的 ``readline`` 路径。
+    """
     stdout = stdout or sys.stdout
     if stdin is not None:
         stdout.write(message)
@@ -67,6 +77,13 @@ def _prompt(
         if not line:
             raise RuntimeError(f"cannot read {message.strip(':')}: no input")
         return line.strip()
+    if secret and sys.stdin.isatty():
+        try:
+            return getpass.getpass(message, stream=stdout).strip()
+        except (EOFError, KeyboardInterrupt) as exc:
+            raise RuntimeError(
+                f"cannot read {message.strip(':')}: no input"
+            ) from exc
     return input(message).strip()
 
 
@@ -246,7 +263,7 @@ def prepare_env(
         prompt = "PYROMIND_API_KEY: "
         if color:
             prompt = f"{_BOLD}{_CYAN}PYROMIND_API_KEY:{_RESET} "
-        api_key = _prompt(prompt, stdin=stdin, stdout=stdout)
+        api_key = _prompt(prompt, stdin=stdin, stdout=stdout, secret=True)
         if not api_key:
             raise RuntimeError("PYROMIND_API_KEY cannot be empty")
         os.environ["PYROMIND_API_KEY"] = api_key
@@ -301,9 +318,8 @@ async def check_connection(
 
 
 def _mask_key(api_key: str) -> str:
-    if len(api_key) <= 8:
-        return "***"
-    return f"{api_key[:4]}***{api_key[-4:]}"
+    """只留首尾各 4 位，够认是哪个 key，又不足以复用。"""
+    return mask_secret(api_key)
 
 
 def print_connected(
@@ -331,13 +347,9 @@ def print_connected(
         value = "%s"
 
     stdout.write(f"\n{title}\n")
-    show_full = os.getenv("DOCKER_RT_SHOW_API_KEY", "").lower() in {
-        "1",
-        "true",
-        "yes",
-    }
-    display_key = api_key if show_full else _mask_key(api_key)
-    stdout.write(f"  {key_label}  = {value % display_key}\n")
+    # 永远只打脱敏后的 key：这一段会进终端、也会进 ``docker-rt`` 的启动日志，
+    # 完整 key 一旦落盘就等于泄漏（没有 ``DOCKER_RT_SHOW_API_KEY`` 这种逃生口了）。
+    stdout.write(f"  {key_label}  = {value % _mask_key(api_key)}\n")
     stdout.write(f"  {cluster_label} = {value % cluster}\n")
     sync_value = f"{custom_count} (CUSTOM {custom_count}, OSWorld {osworld_count})"
     stdout.write(f"  {sync_label}    = {value % sync_value}\n")

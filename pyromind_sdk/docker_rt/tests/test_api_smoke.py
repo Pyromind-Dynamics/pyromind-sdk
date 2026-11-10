@@ -1,8 +1,9 @@
-"""API smoke tests with mocked KubeEnvironment (no real cluster)."""
+"""API smoke tests with a mocked sandbox environment (no real cluster)."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import socket
 
@@ -704,10 +705,229 @@ async def test_images_create_stub(aiohttp_client):
     assert resp.status == 200
     text = await resp.text()
     assert "Pull complete" in text or "up to date" in text
+    # `docker pull` registers the name even though the pull itself is a stub;
+    # Docker lists a pulled image, so the stub must too.
     resp = await client.get("/images/json")
     images = await resp.json()
     tags = [t for img in images for t in (img.get("RepoTags") or [])]
     assert any("alpine" in t for t in tags)
+
+    resp = await client.get("/images/alpine:3.19/json")
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_images_list_ignores_container_images(aiohttp_client):
+    """Cluster-side images referenced by containers are not local images."""
+    from ..aio_server import create_aio_app
+
+    app = create_aio_app(run_reconcile=False)
+    client = await aiohttp_client(app)
+    resp = await client.post(
+        "/containers/create?name=img-src",
+        json={"Image": "cluster/only:1", "Cmd": ["sleep", "1h"]},
+    )
+    assert resp.status == 201
+
+    images = await (await client.get("/images/json")).json()
+    tags = [t for img in images for t in (img.get("RepoTags") or [])]
+    assert not any("cluster/only:1" in t for t in tags)
+
+
+@pytest.mark.asyncio
+async def test_images_list_reports_the_workspace_index_size(monkeypatch, tmp_path):
+    """`docker images` takes DISK USAGE from the index entry's size."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from ..aio_server import create_aio_app
+    from ..backend import build_sandbox, context_staging
+
+    monkeypatch.setattr(
+        context_staging,
+        "list_workspace_images",
+        lambda *a, **k: [
+            {"tag": "docker.io/ns/app:1", "size": 12345, "created": 1700000000}
+        ],
+    )
+    monkeypatch.setattr(build_sandbox, "image_cache_dir", lambda: tmp_path)
+
+    app = create_aio_app(run_reconcile=False)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/images/json")
+        images = await resp.json()
+
+    match = next(i for i in images if "docker.io/ns/app:1" in (i.get("RepoTags") or []))
+    assert match["Size"] == 12345
+
+
+def test_resolve_image_name_accepts_docker_hub_spellings():
+    """The CLI sends the short name; builds/pulls store the canonical one."""
+    from ..api.images import resolve_image_name
+
+    assert (
+        resolve_image_name(
+            "alpine:3.19", {"docker.io/library/alpine:3.19"}
+        )
+        == "docker.io/library/alpine:3.19"
+    )
+    assert (
+        resolve_image_name("ns/app:1", {"docker.io/ns/app:1"})
+        == "docker.io/ns/app:1"
+    )
+    assert resolve_image_name("docker.io/ns/app:1", {"ns/app:1"}) == "ns/app:1"
+    assert (
+        resolve_image_name("alpine", {"docker.io/library/alpine:latest"})
+        == "docker.io/library/alpine:latest"
+    )
+    assert (
+        resolve_image_name(
+            "registry.example.com/ns/app:1",
+            {"docker.io/registry.example.com/ns/app:1"},
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_images_pull_then_inspect_and_rmi_by_short_name(aiohttp_client):
+    """`docker pull alpine` must be inspectable/removable as `alpine`."""
+    from ..aio_server import create_aio_app
+
+    app = create_aio_app(run_reconcile=False)
+    client = await aiohttp_client(app)
+    assert (await client.post("/images/create?fromImage=alpine&tag=3.19")).status == 200
+
+    assert (await client.get("/images/alpine:3.19/json")).status == 200
+    assert (await client.delete("/images/alpine:3.19")).status == 200
+
+    images = await (await client.get("/images/json")).json()
+    tags = [t for img in images for t in (img.get("RepoTags") or [])]
+    assert not any("alpine" in t for t in tags)
+
+
+@pytest.mark.asyncio
+async def test_images_inspect_resolves_a_workspace_index_tag(aiohttp_client, monkeypatch):
+    """After a restart the store is empty; inspect must use the persisted index."""
+    from .. import aio_server
+    from ..aio_server import create_aio_app
+
+    monkeypatch.setattr(
+        aio_server, "_image_index_tags", lambda: {"docker.io/ns/app:1"}
+    )
+    app = create_aio_app(run_reconcile=False)
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/images/docker.io/ns/app:1/json")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["RepoTags"] == ["docker.io/ns/app:1"]
+
+
+@pytest.mark.asyncio
+async def test_images_inspect_and_rmi_resolve_the_local_cache(
+    aiohttp_client, monkeypatch, tmp_path
+):
+    """A daemon that has only the local archive cache must still serve inspect/rmi."""
+    from ..aio_server import create_aio_app
+    from ..backend import build_sandbox
+
+    archive = tmp_path / "docker.io_ns_app_1.tar"
+    meta = tmp_path / "docker.io_ns_app_1.tar.meta.json"
+    archive.write_bytes(b"x")
+    meta.write_text(json.dumps({"tags": ["docker.io/ns/app:1"]}), encoding="utf-8")
+    monkeypatch.setattr(build_sandbox, "image_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        "pyromind_sdk.docker_rt.backend.context_staging.read_image_index",
+        lambda *args, **kwargs: None,
+    )
+
+    app = create_aio_app(run_reconcile=False)
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/images/ns/app:1/json")
+    assert resp.status == 200
+    assert (await resp.json())["RepoTags"] == ["docker.io/ns/app:1"]
+
+    resp = await client.delete("/images/ns/app:1")
+    assert resp.status == 200
+    assert not archive.exists()
+    assert not meta.exists()
+
+
+@pytest.mark.asyncio
+async def test_images_build_alias_resolves_to_the_registry_tag(
+    aiohttp_client, monkeypatch, tmp_path
+):
+    """A short build tag is a lookup alias, not a second image with 0 bytes."""
+    from ..aio_server import create_aio_app
+    from ..backend import build_sandbox
+    from ..api.images import image_id
+
+    full = "registry.example.com/ns/app:1"
+    short = "app:1"
+    archive = tmp_path / "registry.example.com_ns_app_1.tar"
+    meta = tmp_path / "registry.example.com_ns_app_1.tar.meta.json"
+    archive.write_bytes(b"x")
+    meta.write_text(json.dumps({"tags": [full]}), encoding="utf-8")
+    monkeypatch.setattr(build_sandbox, "image_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        "pyromind_sdk.docker_rt.backend.context_staging.read_image_index",
+        lambda *args, **kwargs: None,
+    )
+
+    app = create_aio_app(run_reconcile=False)
+    app["store"].register_image_alias(short, full)
+    client = await aiohttp_client(app)
+
+    images = await (await client.get("/images/json")).json()
+    tags = [t for img in images for t in (img.get("RepoTags") or [])]
+    assert full in tags
+    assert short not in tags  # no duplicate 0 B entry
+
+    by_short = await (await client.get(f"/images/{short}/json")).json()
+    by_full = await (await client.get(f"/images/{full}/json")).json()
+    assert by_short["Id"] == by_full["Id"] == image_id(full)
+
+    assert (await client.delete(f"/images/{short}")).status == 200
+    assert not archive.exists()
+    assert not meta.exists()
+
+
+@pytest.mark.asyncio
+async def test_images_delete_removes_the_index_and_local_cache(
+    aiohttp_client, monkeypatch, tmp_path
+):
+    """`docker rmi` must not leave the tag in `docker images`."""
+    from .. import aio_server
+    from ..aio_server import create_aio_app
+    from ..backend import build_sandbox, context_staging
+
+    archive_key = "docker_images/app.tar"
+    archive = tmp_path / "app.tar"
+    meta = tmp_path / "app.tar.meta.json"
+    archive.write_bytes(b"x")
+    meta.write_text("{}")
+    monkeypatch.setattr(build_sandbox, "image_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(aio_server, "_image_index_tags", lambda: {"ns/app:1"})
+    monkeypatch.setattr(
+        context_staging,
+        "remove_image_from_index",
+        lambda **kwargs: ([{"tag": "ns/app:1", "archive": archive_key}], set()),
+    )
+    # No storage in this test: deleting the workspace object is best-effort.
+    monkeypatch.setattr(
+        context_staging,
+        "connect_storage",
+        lambda cluster=None: (_ for _ in ()).throw(RuntimeError("no storage")),
+    )
+
+    app = create_aio_app(run_reconcile=False)
+    client = await aiohttp_client(app)
+    resp = await client.delete("/images/ns/app:1")
+    assert resp.status == 200
+
+    assert not archive.exists()
+    assert not meta.exists()
 
 
 @pytest.mark.asyncio

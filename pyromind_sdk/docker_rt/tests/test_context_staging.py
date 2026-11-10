@@ -49,23 +49,37 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_mode_defaults_to_auto_and_ignores_nonsense() -> None:
+    """``auto`` is the default: local when in-cluster, else storage.
+
+    ``upload`` must be opted into, and ``auto`` still fails loudly — an
+    unavailable storage route is an error, never a silent upload.
+    """
     from ..backend import context_staging as cs
 
+    os.environ.pop("DOCKER_RT_BUILD_CONTEXT_MODE", None)
     assert cs.staging_mode() == "auto"
     assert cs.staging_enabled() is True
-    assert cs.staging_required() is False
+    assert cs.staging_required() is True
     os.environ["DOCKER_RT_BUILD_CONTEXT_MODE"] = "upload"
     try:
         assert cs.staging_enabled() is False
+        assert cs.staging_required() is False
     finally:
         del os.environ["DOCKER_RT_BUILD_CONTEXT_MODE"]
 
 
-def test_unknown_mode_falls_back_to_auto(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_unknown_mode_is_treated_as_auto(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A typo must fail loudly, not quietly restore the old direct upload.
+
+    ``auto`` only picks the no-upload local route when the daemon really runs
+    inside the cluster; everywhere else it is the storage route, whose failures
+    are fatal (``staging_required``).
+    """
     from ..backend import context_staging as cs
 
     monkeypatch.setenv("DOCKER_RT_BUILD_CONTEXT_MODE", "turbo")
     assert cs.staging_mode() == "auto"
+    assert cs.staging_required() is True
 
 
 def test_storage_mode_makes_staging_mandatory(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -256,48 +270,39 @@ class _FakeMinio:
         return [SimpleNamespace(name=name) for name in self._buckets]
 
 
-def _storage(buckets: list[str] | Exception, *, current: str | None = None) -> Any:
-    return SimpleNamespace(client=_FakeMinio(buckets), current_bucket=current)
+class _Profile:
+    """Minimal ``ProfileClient``: only ``get_user_info`` is used."""
+
+    def __init__(self, uid: Any = 1000001514, error: Exception | None = None) -> None:
+        self._uid = uid
+        self._error = error
+
+    def get_user_info(self) -> Any:
+        if self._error is not None:
+            raise self._error
+        return SimpleNamespace(user=SimpleNamespace(uid=self._uid))
 
 
-def test_bucket_prefers_the_configured_default() -> None:
+def test_workspace_bucket_is_the_user_uid() -> None:
+    """The uid *is* the bucket name — nothing else is consulted."""
     from ..backend import context_staging as cs
 
-    info = SimpleNamespace(uid="1000000001")
-    assert cs.resolve_bucket(_storage(["other", "x"], current="mine"), info) == "mine"
+    assert cs.workspace_bucket(_Profile(1000001514)) == "1000001514"
+    assert cs.workspace_bucket(_Profile("1000000001")) == "1000000001"
 
 
-def test_bucket_uses_the_single_visible_bucket() -> None:
-    """Real deployments return exactly one bucket and deny listing its contents."""
+def test_workspace_bucket_rejects_a_missing_uid() -> None:
     from ..backend import context_staging as cs
 
-    info = SimpleNamespace(uid=None)
-    assert cs.resolve_bucket(_storage(["1000000001"]), info) == "1000000001"
+    with pytest.raises(cs.StagingError, match="returned no uid"):
+        cs.workspace_bucket(_Profile(None))
 
 
-def test_bucket_falls_back_to_the_uid() -> None:
+def test_workspace_bucket_surfaces_profile_errors() -> None:
     from ..backend import context_staging as cs
 
-    info = SimpleNamespace(uid="1000000001")
-    assert cs.resolve_bucket(_storage(OSError("denied")), info) == "1000000001"
-
-
-def test_bucket_picks_the_only_numeric_candidate() -> None:
-    from ..backend import context_staging as cs
-
-    info = SimpleNamespace(uid=None)
-    assert cs.resolve_bucket(_storage(["shared", "assets", "1000000001"]), info) == (
-        "1000000001"
-    )
-
-
-def test_bucket_refuses_to_guess() -> None:
-    from ..backend import context_staging as cs
-
-    with pytest.raises(cs.StagingError, match="PYROMIND_STORAGE_BUCKET"):
-        cs.resolve_bucket(_storage(["a", "b", "c"]), SimpleNamespace(uid=None))
-    with pytest.raises(cs.StagingError, match="no storage bucket"):
-        cs.resolve_bucket(_storage(OSError("denied")), SimpleNamespace(uid=None))
+    with pytest.raises(cs.StagingError, match="storage connection failed"):
+        cs.workspace_bucket(_Profile(error=RuntimeError("api down")))
 
 
 # --------------------------------------------------------------------------
@@ -400,7 +405,9 @@ def test_local_is_a_known_staging_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cs.staging_mode() == "local"
     # Staging still runs — it just never uploads anything.
     assert cs.staging_enabled() is True
-    assert cs.staging_required() is False
+    # A local failure falls back to the storage route, so a storage failure is
+    # still fatal — ``upload`` is the only mode that never stages.
+    assert cs.staging_required() is True
 
 
 def test_local_staging_requested_follows_the_mode(
@@ -847,11 +854,51 @@ def test_sweep_survives_a_storage_client_that_cannot_be_opened(
     from ..backend import context_staging as cs
 
     def boom(_cluster: Any = None) -> Any:
-        raise cs.StagingError("cannot resolve storage credentials: no API key")
+        raise cs.StagingError("storage authentication failed: no API key")
 
+    # Storage must look configured, otherwise the sweep is skipped before it
+    # ever tries to connect (see the test below).
+    monkeypatch.setenv("PYROMIND_STORAGE_SECRET_KEY", "sk")
     monkeypatch.setattr(cs, "connect_storage", boom)
 
     assert cs.sweep_stale_staging(dead_pid=1) == []
+
+
+def test_sweep_never_probes_storage_before_a_build_used_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup must not check storage — the check belongs to `docker build`.
+
+    Nothing is configured here, so the sweep has to return without opening a
+    client; anything else makes the daemon look like it validates credentials
+    at launch, which is exactly what we do not want.
+    """
+    from ..backend import context_staging as cs
+
+    monkeypatch.delenv("PYROMIND_STORAGE_BUCKET", raising=False)
+    monkeypatch.delenv("PYROMIND_STORAGE_SECRET_KEY", raising=False)
+    monkeypatch.setattr(cs, "_storage_verified", False)
+
+    def must_not_connect(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("the sweep must not connect to storage here")
+
+    monkeypatch.setattr(cs, "connect_storage", must_not_connect)
+
+    assert cs.sweep_stale_staging(dead_pid=1) == []
+
+
+def test_storage_endpoint_comes_from_the_cluster_table() -> None:
+    """One table (``CLUSTER_RESOURCE``), including clusters the SDK map omits."""
+    from ..backend import context_staging as cs
+
+    assert (
+        cs.storage_endpoint_for("cn-east-1#pre")
+        == "https://storage-cn-east-1.pyromind-asia.cn"
+    )
+    assert cs.storage_endpoint_for("us-west-2") == "https://storage-us-west-2.pyromind.ai"
+    assert cs.storage_endpoint_for("not-a-cluster") == ""
+
+
 
 
 def test_sweep_max_age_defaults_and_clamps(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -977,102 +1024,3 @@ def test_local_sweep_honours_the_disable_knob(
 # storage credentials come from the cluster, not the portal
 # --------------------------------------------------------------------------
 
-
-def test_storage_credentials_come_from_the_cluster_not_the_portal(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """2026-10-23：portal 的 storage_info 一次 Read timeout 就把构建降级成直传。
-
-    直连 host 上的 ``/api/v1/storage_info`` 用同一个 API key 返回同样的东西，
-    而且这本来就是构建在用的那条 host，不再多一个共享入口。
-    """
-    import requests
-
-    from ..backend import context_staging as cs
-
-    seen: dict[str, object] = {}
-
-    class _Response:
-        def raise_for_status(self) -> None:
-            return None
-
-        def json(self) -> dict:
-            return {
-                "success": True,
-                "data": {
-                    "url": "https://storage-us-west-2.pyromind.ai",
-                    "access_key": "AK",
-                    "secret_key": "SK",
-                    "bucket_name": "1000001514",
-                    "uid": "1000001514",
-                },
-            }
-
-    def fake_post(url: str, **kwargs: object) -> _Response:
-        seen["url"] = url
-        seen["headers"] = kwargs.get("headers")
-        seen["timeout"] = kwargs.get("timeout")
-        return _Response()
-
-    monkeypatch.setenv("PYROMIND_API_KEY", "KEY")
-    monkeypatch.setattr(requests, "post", fake_post)
-
-    info = cs.storage_info_from_cluster("us-west-2")
-
-    assert seen["url"] == "https://api-us-west-2.pyromind.ai/api/v1/storage_info"
-    assert "portal" not in str(seen["url"])
-    assert seen["headers"] == {"Authorization": "Bearer KEY"}
-    assert seen["timeout"] == cs.STORAGE_INFO_TIMEOUT_S
-    assert info.url == "https://storage-us-west-2.pyromind.ai"
-    assert info.bucket_name == "1000001514"
-
-
-def test_storage_info_is_retried_three_times_before_giving_up(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import requests
-
-    from ..backend import context_staging as cs
-
-    calls: list[str] = []
-
-    def boom(url: str, **_kwargs: object) -> None:
-        calls.append(url)
-        raise TimeoutError("Read timed out")
-
-    monkeypatch.setenv("PYROMIND_API_KEY", "KEY")
-    monkeypatch.setattr(requests, "post", boom)
-    monkeypatch.setattr(cs, "STORAGE_INFO_BACKOFF_S", 0.0)
-
-    with pytest.raises(cs.StagingError):
-        cs.storage_info_from_cluster("us-west-2")
-
-    assert len(calls) == cs.STORAGE_INFO_ATTEMPTS == 3
-
-
-def test_storage_info_needs_a_cluster_and_a_key(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from ..backend import context_staging as cs
-
-    monkeypatch.delenv("PYROMIND_API_KEY", raising=False)
-    with pytest.raises(cs.StagingError, match="PYROMIND_CLUSTER"):
-        cs.storage_info_from_cluster(None)
-
-    monkeypatch.setenv("PYROMIND_API_KEY", "KEY")
-    with pytest.raises(cs.StagingError, match="PYROMIND_CLUSTER"):
-        cs.storage_info_from_cluster("")
-
-
-def test_resolve_bucket_prefers_the_name_the_cluster_reports() -> None:
-    """``/storage_info`` 直接给出 bucket_name 时不用再去 list —— 权威且省一次调用。"""
-    import types
-
-    from ..backend import context_staging as cs
-
-    storage = types.SimpleNamespace(
-        current_bucket=None,
-        client=types.SimpleNamespace(list_buckets=lambda: []),
-    )
-    info = types.SimpleNamespace(bucket_name="1000001514", uid="")
-    assert cs.resolve_bucket(storage, info) == "1000001514"

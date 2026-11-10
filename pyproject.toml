@@ -80,7 +80,6 @@ packages = [
     "pyromind_sdk.docker_rt",
     "pyromind_sdk.docker_rt.api",
     "pyromind_sdk.docker_rt.backend",
-    "pyromind_sdk.docker_rt.backend.kube",
     "pyromind_sdk.docker_rt.tests",
     "pyromind_sdk.rift",
     "pyromind_sdk.rift.pb",

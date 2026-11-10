@@ -1,18 +1,15 @@
-"""docker-rt: Docker Engine API facade over Kubernetes sandboxes."""
+"""docker-rt: Docker Engine API facade over PyroMind sandboxes (via k8s_middleware)."""
 
-from .backend.kube import (
+from .backend.runtime import (
     DEFAULT_IMAGE,
     DEFAULT_NAMESPACE,
-    KubeEnvironment,
-    KubeEnvironmentConfig,
+    resolve_kubeconfig,
+    resolve_namespace,
 )
-from .backend.runtime import resolve_kubeconfig, resolve_namespace
 
 __all__ = [
     "DEFAULT_IMAGE",
     "DEFAULT_NAMESPACE",
-    "KubeEnvironment",
-    "KubeEnvironmentConfig",
     "resolve_kubeconfig",
     "resolve_namespace",
 ]

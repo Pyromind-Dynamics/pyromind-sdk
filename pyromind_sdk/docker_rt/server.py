@@ -1,7 +1,7 @@
 """docker-rt daemon entrypoint (Unix socket or TCP).
 
-Uses aiohttp so ``docker exec -it`` TCP Upgrade works. FastAPI app in
-``app.py`` remains available for non-interactive / test use via uvicorn.
+用 aiohttp：``docker exec -it`` 的 TCP Upgrade 必须由我们自己接管，
+FastAPI/uvicorn 做不到。
 """
 
 from __future__ import annotations

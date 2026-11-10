@@ -8,7 +8,7 @@ HTTP requests, and error handling for all API clients.
 import os
 import logging
 import requests
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -21,6 +21,7 @@ from .trace import (
     reset_trace_id,
     set_trace_id,
 )
+from ..log_redaction import redact, redact_text
 
 
 # Constants
@@ -368,6 +369,8 @@ class PyroMindClient:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
+            # Same reason as the async client: do not depend on brotli decoding.
+            "Accept-Encoding": "gzip, deflate",
             "X-Cluster": self.cluster,
         })
     
@@ -584,14 +587,14 @@ class PyroMindClient:
         headers = dict(kwargs.pop("headers", None) or {})
         headers.update(self._trace_headers())
         kwargs.setdefault("timeout", self.timeout)
-        logger.debug("[REQUEST] %s %s", method.upper(), url)
+        logger.debug("[REQUEST] %s %s", method.upper(), redact_text(url))
         response = self.session.request(
             method=method, url=url, headers=headers, **kwargs
         )
         logger.debug(
             "[RESPONSE] %s %s -> %s (%s bytes)",
             method.upper(),
-            url,
+            redact_text(url),
             response.status_code,
             len(response.content or b""),
         )
@@ -661,11 +664,12 @@ class PyroMindClient:
         url = self._build_url(endpoint)
         request_context = self._build_request_context(method, url)
         
-        # Log request (single line)
-        safe_json = self._mask_sensitive_data(json_data) if json_data else None
+        # Log request (single line) —— params 里也可能带 access_key / api_key
+        safe_json = redact(json_data) if json_data else None
+        safe_params = redact(params) if params else None
         log_parts = [f"[REQUEST] {request_context}"]
-        if params:
-            log_parts.append(f"params={params}")
+        if safe_params:
+            log_parts.append(f"params={safe_params}")
         if safe_json:
             log_parts.append(f"body={safe_json}")
         logger.debug(" | ".join(log_parts))
@@ -690,14 +694,14 @@ class PyroMindClient:
             # Log response (single line)
             resp_log = f"[RESPONSE] {request_context} - Status: {response.status_code}"
             try:
-                safe_resp_headers = {k: '***' if k.lower() == 'authorization' else v for k, v in response.headers.items()}
+                safe_resp_headers = redact(dict(response.headers))
                 resp_log += f" | headers={safe_resp_headers}"
             except Exception:
                 pass
             try:
                 if response.content:
                     resp_json = response.json()
-                    safe_resp = self._mask_sensitive_data(resp_json)
+                    safe_resp = redact(resp_json)
                     resp_log += f" | body={safe_resp}"
             except Exception:
                 pass
@@ -720,35 +724,6 @@ class PyroMindClient:
                 status_code=None
             )
     
-    def _mask_sensitive_data(self, data: Any, mask: str = "***") -> Any:
-        """
-        Mask sensitive data in logs
-        
-        Args:
-            data: Data to mask
-            mask: Mask string to use
-            
-        Returns:
-            Data with sensitive fields masked
-        """
-        sensitive_keys = {'password', 'api_key', 'apikey', 'token', 'secret', 'authorization'}
-        
-        if isinstance(data, dict):
-            masked = {}
-            for key, value in data.items():
-                if key.lower() in sensitive_keys:
-                    masked[key] = mask
-                elif isinstance(value, (dict, list)):
-                    masked[key] = self._mask_sensitive_data(value, mask)
-                else:
-                    masked[key] = value
-            return masked
-        elif isinstance(data, list):
-            return [self._mask_sensitive_data(item, mask) for item in data]
-        return data
-
-
-
     def get(self, endpoint: str, params: Optional[Dict[str, Any]] = None, **kwargs) -> Dict[str, Any]:
         """Make a GET request"""
         return self._request("GET", endpoint, params=params, **kwargs)

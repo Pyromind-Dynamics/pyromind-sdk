@@ -1,4 +1,9 @@
-"""Bridge to in-tree ``backend.kube.KubeEnvironment`` (create deferred until start)."""
+"""Kubernetes plumbing for docker-rt: kubeconfig, API client, pod metadata.
+
+沙箱本身**不在这里创建** —— docker-rt 只通过 ``k8s_middleware`` 的
+``PyromindSDK``（见 :mod:`.pyromind_sdk_env`）建沙箱。这里的 kubeconfig /
+CoreV1Api 只服务几件本地就要做的事：port-forward、Service DNS、``docker cp``。
+"""
 
 from __future__ import annotations
 
@@ -18,15 +23,15 @@ logger = logging.getLogger("docker_rt.runtime")
 _DOCKER_RT_ROOT = Path(__file__).resolve().parents[1]
 _LOCAL_KUBECONFIG = _DOCKER_RT_ROOT / ".kube.yaml"
 
-from .kube import (  # noqa: E402
-    DEFAULT_KUBE_CONTEXT,
-    DEFAULT_IMAGE as _CS_DEFAULT_IMAGE,
-    DEFAULT_NAMESPACE as _CS_DEFAULT_NAMESPACE,
-    KubeEnvironment,
+DEFAULT_IMAGE = os.getenv(
+    "DOCKER_RT_DEFAULT_IMAGE",
+    "swebench/swesmith.x86_64.oauthlib_1776_oauthlib.1fd52536",
 )
+DEFAULT_KUBE_CONTEXT = "docker-desktop"
+"""kubeconfig context: ``DOCKER_RT_KUBE_CONTEXT`` / ``--kube-context`` 都没给时才用它。"""
 
-DEFAULT_KUBE_CONTEXT = DEFAULT_KUBE_CONTEXT
-DEFAULT_IMAGE = os.getenv("DOCKER_RT_DEFAULT_IMAGE", _CS_DEFAULT_IMAGE)
+_FALLBACK_NAMESPACE = "default"
+"""kubeconfig 里也读不到 namespace 时的兜底。"""
 
 
 def resolve_kubeconfig() -> str | None:
@@ -76,7 +81,7 @@ def resolve_namespace(
         ns = _namespace_from_kubeconfig(path, context=kube_context)
         if ns:
             return ns
-    return _CS_DEFAULT_NAMESPACE
+    return _FALLBACK_NAMESPACE
 
 
 def build_core_v1_api(
@@ -190,36 +195,6 @@ def _token_from_kubeconfig(path: str, *, context: str | None = None) -> str | No
     return None
 
 
-def probe_kube_auth(
-    namespace: str,
-    *,
-    kubeconfig: str | None = None,
-    kube_context: str | None = None,
-) -> None:
-    """Fail fast if we cannot list pods (catches anonymous / wrong ns)."""
-    from kubernetes.client.rest import ApiException
-
-    api = build_core_v1_api(kubeconfig=kubeconfig, kube_context=kube_context)
-    try:
-        api.list_namespaced_pod(namespace=namespace, limit=1)
-    except ApiException as exc:
-        body = ""
-        try:
-            body = (exc.body or "")[:300]
-        except Exception:
-            pass
-        if exc.status in (401, 403):
-            raise RuntimeError(
-                f"Kubernetes auth failed ({exc.status}) for namespace={namespace!r} "
-                f"kubeconfig={kubeconfig or resolve_kubeconfig()!r}. "
-                f"API message: {exc.reason}. body={body!r}. "
-                "system:anonymous ⇒ Authorization header missing/ignored. "
-                "Inside a Pod, verify: "
-                f"kubectl --kubeconfig <file> -n {namespace} get pods"
-            ) from exc
-        raise
-
-
 # Backward-compatible module default (resolved once at import).
 DEFAULT_NAMESPACE = resolve_namespace()
 
@@ -279,12 +254,6 @@ def docker_rt_pod_meta(
     if publish_all_ports:
         annotations[ANNOTATION_PUBLISH_ALL] = "true"
     return labels, annotations
-
-
-def docker_rt_labels(*, container_id: str, name: str) -> dict[str, str]:
-    """Backward-compatible: labels only (short id). Prefer ``docker_rt_pod_meta``."""
-    labels, _ = docker_rt_pod_meta(container_id=container_id, name=name)
-    return labels
 
 
 def parse_env_list(env_list: list[str] | None) -> dict[str, str]:
@@ -410,8 +379,11 @@ async def start_kube_environment(
     gpu: str | None = None,
     gpu_card: str | None = None,
     sandbox_client: AsyncSandboxClient | None = None,
-) -> KubeEnvironment:
-    """Start a sandbox through the k8s-middleware PyromindSDK backend."""
+) -> Any:
+    """Start a sandbox through the k8s-middleware PyromindSDK backend.
+
+    返回 :class:`~.pyromind_sdk_env.PyromindSDK`（延迟 import 避免循环依赖）。
+    """
     from .pyromind_sdk_env import PyromindSDK
 
     # 这一行是「真正发给集群的 sandbox 长什么样」的唯一记录：挂载、端口、资源
@@ -462,28 +434,3 @@ async def start_kube_environment(
         ready_timeout=ready_timeout,
         client=sandbox_client,
     )
-
-
-def attach_kube_environment(
-    *,
-    pod_name: str,
-    image: str,
-    namespace: str,
-    env: dict[str, str] | None = None,
-    working_dir: str = "/",
-    kubeconfig: str | None = None,
-    kube_context: str | None = None,
-) -> KubeEnvironment:
-    """Bind to an existing Pod (for daemon restart adopt)."""
-    kwargs: dict[str, Any] = {
-        "image": image,
-        "namespace": namespace,
-        "env": env or {},
-        "cwd": working_dir or "/",
-    }
-    kubeconfig = kubeconfig or resolve_kubeconfig()
-    if kubeconfig:
-        kwargs["kubeconfig"] = kubeconfig
-    if kube_context:
-        kwargs["context"] = kube_context
-    return KubeEnvironment.attach_existing(pod_name, **kwargs)

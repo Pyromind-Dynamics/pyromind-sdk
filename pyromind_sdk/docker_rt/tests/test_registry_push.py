@@ -181,129 +181,41 @@ def test_acr_host_spellings_include_vpc_and_public(monkeypatch: pytest.MonkeyPat
 # --------------------------------------------------------------------------
 
 
-def test_normalize_keeps_auth_and_synthesizes_missing_one() -> None:
-    from ..backend import registry_push
+def test_credentials_come_only_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A docker config on the daemon host is **not** a credential source.
 
-    raw = {
-        "auths": {
-            "docker.io": {"auth": "YWJj"},
-            "reg.example.com": {"username": "u", "password": "p"},
-        }
-    }
-    out = registry_push.normalize_docker_config(raw)
-    assert out["docker.io"] == "YWJj"
-    assert out["reg.example.com"] == base64.b64encode(b"u:p").decode()
-
-
-def test_normalize_drops_identitytoken_only_entries() -> None:
-    from ..backend import registry_push
-
-    out = registry_push.normalize_docker_config(
-        {"auths": {"docker.io": {"identitytoken": "abc"}}}
-    )
-    assert out == {}
-
-
-def test_normalize_keeps_https_prefixed_keys() -> None:
-    from ..backend import registry_push
-
-    out = registry_push.normalize_docker_config(
-        {"auths": {"https://index.docker.io/v1/": {"auth": "YWJj"}}}
-    )
-    assert out["https://index.docker.io/v1/"] == "YWJj"
-
-
-def test_normalize_tolerates_garbage() -> None:
-    from ..backend import registry_push
-
-    assert registry_push.normalize_docker_config(None) == {}
-    assert registry_push.normalize_docker_config({"auths": "nope"}) == {}
-    assert registry_push.normalize_docker_config({"auths": {"x": "nope"}}) == {}
-
-
-def test_read_docker_config_secret_accepts_base64(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    from ..backend import registry_push
-
-    path = tmp_path / "secret.json"
-    payload = {"auths": {"docker.io": {"auth": "YWJj"}}}
-    path.write_text(base64.b64encode(json.dumps(payload).encode()).decode(), encoding="utf-8")
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_DOCKERCONFIG", str(path))
-    assert registry_push.read_docker_config_secret() == payload
-
-
-def test_read_docker_config_secret_accepts_plain_json(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    from ..backend import registry_push
-
-    path = tmp_path / "config.json"
-    payload = {"auths": {"docker.io": {"auth": "YWJj"}}}
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_DOCKERCONFIG", str(path))
-    assert registry_push.read_docker_config_secret() == payload
-
-
-def test_read_docker_config_secret_rejects_non_json(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    from ..backend import registry_push
-
-    path = tmp_path / "secret.json"
-    path.write_text("not json nor base64!!", encoding="utf-8")
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_DOCKERCONFIG", str(path))
-    with pytest.raises(registry_push.RegistryConfigError):
-        registry_push.read_docker_config_secret()
-
-
-def test_read_docker_config_secret_missing_file(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    from ..backend import registry_push
-
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_DOCKERCONFIG", str(tmp_path / "nope.json"))
-    with pytest.raises(registry_push.RegistryConfigError):
-        registry_push.read_docker_config_secret()
-
-
-def test_username_password_beats_dockerconfig(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    from ..backend import registry_push
-
-    _clear(monkeypatch)
-    path = tmp_path / "config.json"
-    path.write_text(json.dumps({"auths": {"docker.io": {"auth": "not-a-real-auth"}}}), encoding="utf-8")
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_CLUSTER", "us-west-2")
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_DOCKERCONFIG", str(path))
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_USERNAME", "my-user")
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_PASSWORD", "pat")
-    assert registry_push.credential_source() == "username_password"
-    decoded = json.loads(base64.b64decode(registry_push.docker_config_b64("docker.io/my-user")))
-    assert decoded["auths"]["docker.io"]["auth"] == base64.b64encode(b"my-user:pat").decode()
-    assert "not-a-real-auth" not in json.dumps(decoded)
-
-
-def test_docker_config_auths_are_objects_not_strings(monkeypatch: pytest.MonkeyPatch) -> None:
-    """kaniko parses ``auths`` into ``types.AuthConfig``; a bare string breaks it.
-
-    Regression for: ``json: cannot unmarshal string into Go struct field
-    ConfigFile.auths of type types.AuthConfig``.
+    R2-vuln-0006 follow-up: an implicit source is how "it worked on that
+    machine" becomes an unexplained push permission. ``DOCKER_RT_REGISTRY_DOCKERCONFIG``
+    is gone, and a leftover value must be ignored rather than honoured.
     """
     from ..backend import registry_push
 
     _clear(monkeypatch)
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"auths": {"docker.io": {"auth": "ZnJvbS1maWxl"}}}), encoding="utf-8"
+    )
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_DOCKERCONFIG", str(config))
+    assert registry_push.credential_source() == ""
+    assert registry_push.registry_credentials() == ("", "")
+
     monkeypatch.setenv("DOCKER_RT_REGISTRY_USERNAME", "my-user")
     monkeypatch.setenv("DOCKER_RT_REGISTRY_PASSWORD", "pat")
-    decoded = json.loads(base64.b64decode(registry_push.docker_config_b64("docker.io/my-user")))
-
-    assert decoded["auths"], "expected at least one docker hub spelling"
-    for host, entry in decoded["auths"].items():
-        assert isinstance(entry, dict), f"{host} must map to an object, got {type(entry).__name__}"
-        assert entry.get("auth"), f"{host} must carry a non-empty auth field"
-        assert not isinstance(entry.get("auth"), dict)
+    assert registry_push.credential_source() == "username_password"
+    assert registry_push.registry_credentials() == ("my-user", "pat")
+    assert registry_push.auth_for_host("docker.io") == base64.b64encode(
+        b"my-user:pat"
+    ).decode()
 
 
-def test_docker_config_b64_empty_when_unconfigured(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+def test_auth_is_empty_without_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     from ..backend import registry_push
 
     _clear(monkeypatch)
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_DOCKERCONFIG", str(tmp_path / "missing.json"))
-    assert registry_push.credential_source() == "dockerconfig"
-    with pytest.raises(registry_push.RegistryConfigError):
-        # Configured but unreadable is an error, not a silent anonymous push.
-        registry_push.docker_config_b64("docker.io/my-user")
+    assert registry_push.auth_for_host("docker.io") == ""
+    assert registry_push.credential_source() == ""
 
 
 # --------------------------------------------------------------------------

@@ -1444,17 +1444,21 @@ async def test_exec_falls_back_to_container_workdir(
     assert fake_kube.last_attach_kwargs.get("cwd") == ""
 
 
-def test_argv_with_cwd_unit():
-    from ..backend.kube.environment import argv_with_cwd
+def test_argv_with_exec_cwd_unit():
+    from ..backend.exec_utils import argv_with_exec_cwd
 
-    assert argv_with_cwd(["pwd"], "") == ["pwd"]
-    assert argv_with_cwd(["pwd"], "/") == ["pwd"]
-    wrapped = argv_with_cwd(["git", "apply"], "/testbed")
-    assert wrapped[:4] == ["sh", "-c", 'cd /testbed && exec "$@"', "sh"]
-    assert wrapped[4:] == ["git", "apply"]
-    # Spaces / metacharacters are shell-quoted in the cd path.
-    wrapped = argv_with_cwd(["true"], "/tmp/my dir")
-    assert "cd '/tmp/my dir'" in wrapped[2] or 'cd "/tmp/my dir"' in wrapped[2] or "cd /tmp/my\\ dir" in wrapped[2]
+    assert argv_with_exec_cwd(["pwd"], "") == ["pwd"]
+    assert argv_with_exec_cwd(["pwd"], "/") == ["pwd"]
+    wrapped = argv_with_exec_cwd(["git", "apply"], "/testbed")
+    assert wrapped[:3] == ["sh", "-c", wrapped[2]]
+    assert "cd /testbed" in wrapped[2]
+    assert wrapped[2].rstrip().endswith('exec "$@"')
+    assert wrapped[3:] == ["sh", "git", "apply"]
+    # 退出码 126 是 Docker 对「cwd 进不去」的约定（和 127「找不到命令」分开）
+    assert "exit 126" in wrapped[2]
+    # 含空格/元字符的路径要被 shell-quote
+    wrapped = argv_with_exec_cwd(["true"], "/tmp/my dir")
+    assert "cd '/tmp/my dir'" in wrapped[2]
 
 
 def test_argv_with_exec_env_unit():

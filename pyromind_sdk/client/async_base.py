@@ -13,6 +13,7 @@ import aiohttp
 from typing import Optional, Dict, Any
 
 from .base import append_trace_id, extract_trace_id
+from ..log_redaction import redact, redact_text
 from .trace import (
     TRACE_ID_HEADER,
     current_trace_id,
@@ -420,10 +421,13 @@ class PyroMindAsyncClient:
         headers = dict(kwargs.pop("headers", None) or {})
         headers.setdefault(TRACE_ID_HEADER, ensure_trace_id())
         kwargs["headers"] = headers
-        logger.debug("[REQUEST] %s %s", method.upper(), url)
+        logger.debug("[REQUEST] %s %s", method.upper(), redact_text(url))
         async with session.request(method, url, **kwargs) as response:
             logger.debug(
-                "[RESPONSE] %s %s -> %s", method.upper(), url, response.status
+                "[RESPONSE] %s %s -> %s",
+                method.upper(),
+                redact_text(url),
+                response.status,
             )
             yield response
 
@@ -512,12 +516,12 @@ class PyroMindAsyncClient:
         extra_headers.setdefault(TRACE_ID_HEADER, trace_id)
         kwargs["headers"] = extra_headers
 
-        # 单行请求日志
-        log_parts = [f"[REQUEST] {method.upper()} {url}"]
+        # 单行请求日志（params 里也可能带 access_key / api_key）
+        log_parts = [f"[REQUEST] {method.upper()} {redact_text(url)}"]
         if params:
-            log_parts.append(f"params={params}")
+            log_parts.append(f"params={redact(params)}")
         if json_data:
-            log_parts.append(f"body={self._mask_sensitive_data(json_data)}")
+            log_parts.append(f"body={redact(json_data)}")
         log_parts.append(f"trace={trace_id}")
         logger.debug(" | ".join(log_parts))
 
@@ -537,7 +541,7 @@ class PyroMindAsyncClient:
                     try:
                         if response.content:
                             resp_json = await response.json()
-                            safe_resp = self._mask_sensitive_data(resp_json)
+                            safe_resp = redact(resp_json)
                             logger.debug(f"[RESPONSE] body: {safe_resp}")
                     except Exception:
                         logger.debug(f"[RESPONSE] body: <non-JSON content>")
@@ -576,33 +580,6 @@ class PyroMindAsyncClient:
             status_code=None
         )
     
-    def _mask_sensitive_data(self, data: Any, mask: str = "***") -> Any:
-        """
-        Mask sensitive data in logs
-        
-        Args:
-            data: Data to mask
-            mask: Mask string to use
-            
-        Returns:
-            Data with sensitive fields masked
-        """
-        sensitive_keys = {'password', 'api_key', 'apikey', 'token', 'secret', 'authorization'}
-        
-        if isinstance(data, dict):
-            masked = {}
-            for key, value in data.items():
-                if key.lower() in sensitive_keys:
-                    masked[key] = mask
-                elif isinstance(value, (dict, list)):
-                    masked[key] = self._mask_sensitive_data(value, mask)
-                else:
-                    masked[key] = value
-            return masked
-        elif isinstance(data, list):
-            return [self._mask_sensitive_data(item, mask) for item in data]
-        return data
-
     async def get(self, endpoint: str, params: Optional[Dict[str, Any]] = None, **kwargs) -> Dict[str, Any]:
         """Make an async GET request"""
         return await self._request("GET", endpoint, params=params, **kwargs)

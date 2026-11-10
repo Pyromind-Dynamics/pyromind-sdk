@@ -290,7 +290,7 @@ def _worker_script(sandbox: _FakeBuildSandbox, index: int = 0) -> str:
 def _install_fake(
     monkeypatch: pytest.MonkeyPatch, sandbox: _FakeBuildSandbox
 ) -> dict[str, Any]:
-    from ..backend import runtime
+    from ..backend import build_sandbox, runtime
 
     captured: dict[str, Any] = {}
 
@@ -298,7 +298,12 @@ def _install_fake(
         captured.update(kwargs)
         return sandbox
 
+    async def fake_push(destinations: list[str]) -> tuple[str, str]:
+        """No network, no credentials: this stands in for the daemon-side push."""
+        return "sha256:" + "b" * 64, ""
+
     monkeypatch.setattr(runtime, "start_kube_environment", fake_start)
+    monkeypatch.setattr(build_sandbox, "_push_archives", fake_push)
     return captured
 
 
@@ -792,16 +797,16 @@ async def test_build_in_sandbox_happy_path(monkeypatch: pytest.MonkeyPatch) -> N
     payload = tarfile.open(fileobj=io.BytesIO(blob)).extractfile(members[0]).read()
     assert gzip.decompress(payload) == _context_tar()
 
-    # The script was delivered as argv and the credentials were base64-inlined.
+    # The script was delivered as argv — and carries **no credential at all**.
+    # This is the R2-vuln-0006 assertion: a ``config.json`` written here would be
+    # readable by every Dockerfile ``RUN`` step, because kaniko runs them as root
+    # in this very container.
     assert sandbox.argv is not None
     script = _worker_script(sandbox)
     assert f"--context={kaniko_mod.context_uri()}" in script
     assert f"--digest-file={kaniko_mod.digest_file_path()}" in script
-    # Credentials are inlined as a base64 blob, never as plain text.
-    match = re.search(r"printf '%s' ([A-Za-z0-9+/=]+) \| base64 -d", script)
-    assert match, script
-    auths = json.loads(base64.b64decode(match.group(1)))["auths"]
-    assert "reg.example.com" in auths
+    assert "config.json" not in script
+    assert "DOCKER_CONFIG" not in script
     assert PUSH_PASSWORD not in script
 
     assert events[-1]["docker_rt"]["digest"] == GOOD_DIGEST
@@ -881,12 +886,11 @@ async def test_build_in_sandbox_fully_qualified_tag_without_a_prefix(
     script = _worker_script(sandbox)
     assert "--destination=docker.io/my-user/my-console:dev" in script
 
-    # The credential blob was still injected, keyed by the image's own host.
-    match = re.search(r"printf '%s' ([A-Za-z0-9+/=]+) \| base64 -d", script)
-    assert match, script
-    auths = json.loads(base64.b64decode(match.group(1)))["auths"]
-    assert "docker.io" in auths
-    assert PUSH_PASSWORD not in script  # the password is inlined only as base64
+    # No credential is injected any more, not even keyed by the image's own host:
+    # the push happens later, outside this container (R2-vuln-0006).
+    assert "config.json" not in script
+    assert "DOCKER_CONFIG" not in script
+    assert PUSH_PASSWORD not in script
 
     final = events[-1]
     assert (
@@ -1119,6 +1123,8 @@ async def test_build_in_sandbox_aborts_before_the_sandbox_when_acr_repo_fails(
     _clear(monkeypatch)
     monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
     monkeypatch.setenv("DOCKER_RT_REGISTRY_CLUSTER", "cn-east-1")
+    # Repository creation is a *push* pre-step: it only runs when pushing.
+    monkeypatch.setenv("DOCKER_RT_BUILD_PUSH", "true")
     _set_push_credentials(monkeypatch)
 
     def fake_ensure(refs: list[str], **_kwargs: Any):
@@ -1142,59 +1148,36 @@ async def test_build_in_sandbox_aborts_before_the_sandbox_when_acr_repo_fails(
 
 
 @pytest.mark.asyncio
-async def test_build_in_sandbox_fails_fast_when_configured_credentials_are_unreadable(
-    monkeypatch: pytest.MonkeyPatch, tmp_dir
-) -> None:
-    from ..backend import build_sandbox
-    from ..backend import runtime
-
-    _clear(monkeypatch)
-    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
-    monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
-    # Point the dockerconfig source at a file that does not exist so the test does
-    # not depend on what this machine happens to have under /etc.
-    monkeypatch.setenv("DOCKER_RT_REGISTRY_DOCKERCONFIG", str(tmp_dir / "absent.json"))
-
-    async def boom(**kwargs: Any):  # pragma: no cover - must not run
-        raise AssertionError("must not create a sandbox")
-
-    monkeypatch.setattr(runtime, "start_kube_environment", boom)
-
-    events = await _collect(
-        build_sandbox.build_in_sandbox(tar_bytes=_context_tar(), tags=["myapp"], namespace="ns")
-    )
-    assert events[0]["error"]
-    assert "dockerconfig secret not found" in events[0]["error"]
-
-
-@pytest.mark.asyncio
-async def test_build_in_sandbox_fails_before_the_sandbox_when_no_credentials_are_configured(
+async def test_build_without_pushing_needs_no_registry_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No push credentials is a hard pre-sandbox error, not a warning.
+    """R2-vuln-0006: the default build path touches credentials nowhere.
 
-    Pushing without credentials cannot succeed against either Docker Hub or ACR,
-    so failing before the sandbox costs the user nothing instead of several
-    minutes plus a 401.
+    Pushing moved after the build, so an archive-only build must succeed with no
+    registry credential configured — and nothing credential-shaped may reach the
+    sandbox (that is asserted on the generated script in ``test_kaniko``).
     """
     from ..backend import build_sandbox
-    from ..backend import runtime
 
     _clear(monkeypatch)
     monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
     monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
+    monkeypatch.setenv("DOCKER_RT_BUILD_PUSH_CHECK", "off")
+    # Deliberately no DOCKER_RT_REGISTRY_* credentials at all.
 
-    async def boom(**kwargs: Any):  # pragma: no cover - must not run
-        raise AssertionError("must not create a sandbox")
-
-    monkeypatch.setattr(runtime, "start_kube_environment", boom)
+    sandbox = _FakeBuildSandbox(stdout=f"docker-rt-digest: {GOOD_DIGEST}\n")
+    _install_fake(monkeypatch, sandbox)
 
     events = await _collect(
-        build_sandbox.build_in_sandbox(tar_bytes=_context_tar(), tags=["myapp"], namespace="ns")
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
     )
-    assert events[0]["error"]
-    assert "credentials" in events[0]["error"]
-    assert not any(e.get("stream") for e in events)
+    assert not [e for e in events if e.get("error")], events
+    text = "".join(event.get("stream", "") for event in events)
+    assert "Successfully built" in text
+    assert f"==> Built {GOOD_DIGEST}" in text
+    assert "Pushed" not in text
 
 
 def test_build_event_payload_is_json_serialisable(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1826,7 +1809,7 @@ def test_push_fix_hints_name_the_clusters_own_registry(
     assert "docker.io/my-user" in text
     assert "DOCKER_RT_REGISTRY_USERNAME" in text
     assert "DOCKER_RT_REGISTRY_PASSWORD" in text
-    assert "DOCKER_RT_REGISTRY_DOCKERCONFIG" in text
+    assert "DOCKER_RT_REGISTRY_DOCKERCONFIG" not in text
     # 两个退路 + 改完要重启
     assert "DOCKER_RT_BUILD_PUSH=false" in text
     assert "DOCKER_RT_BUILD_PUSH_CHECK=warn" in text
@@ -1871,14 +1854,13 @@ def test_push_fix_hints_warn_that_the_credentials_may_belong_elsewhere(
     assert "username_password" in text  # registry_push 给的来源标识
 
 
-def test_push_fix_hints_mark_the_dockerconfig_as_optional(
+def test_push_fix_hints_name_only_the_environment_variables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``DOCKER_RT_REGISTRY_DOCKERCONFIG`` 是**二选一**的备选，不是必填项。
+    """The hint must not advertise a config-file source that no longer exists.
 
-    2026-10-09 用户把三行读成了"都得配"，原话："这个是可选的吧，，，不用必须配置这个吧"。
-    代码里的优先级是 ``USERNAME+PASSWORD`` > 显式 dockerconfig > 默认的
-    ``/etc/docker-image/.dockerconfigjson``（存在就用），所以三种情况都不需要全设。
+    ``DOCKER_RT_REGISTRY_DOCKERCONFIG`` and the ``/etc/docker-image`` default were
+    removed on purpose: credentials come from the environment only.
     """
     from ..backend.build_sandbox import push_fix_hints
 
@@ -1889,10 +1871,10 @@ def test_push_fix_hints_mark_the_dockerconfig_as_optional(
     monkeypatch.setenv("DOCKER_RT_REGISTRY_PASSWORD", "p")
 
     text = _hints_text(push_fix_hints())
-    assert "DOCKER_RT_REGISTRY_DOCKERCONFIG" in text
-    assert "only one of the two is needed" in text
-    assert "Neither is mandatory" in text
-    assert "/etc/docker-image/.dockerconfigjson" in text
+    assert "DOCKER_RT_REGISTRY_USERNAME" in text
+    assert "DOCKER_RT_REGISTRY_PASSWORD" in text
+    assert "DOCKER_RT_REGISTRY_DOCKERCONFIG" not in text
+    assert "/etc/docker-image/.dockerconfigjson" not in text
 
 
 def test_push_fix_hints_always_offer_the_escape_hatches(
@@ -1937,6 +1919,7 @@ async def test_an_unreachable_push_target_stops_before_the_build(
     _clear(monkeypatch)
     monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
     monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "docker.io/jiangwc3439")
+    monkeypatch.setenv("DOCKER_RT_BUILD_PUSH", "true")
     monkeypatch.setenv("DOCKER_RT_BUILD_PUSH_CHECK", "fail")
     # 上海集群这个形状：推 Docker Hub，而集群只到得了自家 ACR。
     monkeypatch.setenv("PYROMIND_CLUSTER", "cn-east-1#pre")
@@ -1996,6 +1979,7 @@ async def test_a_reachable_push_target_lets_the_build_proceed(
     _clear(monkeypatch)
     monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
     monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "reg.example.com/rt")
+    monkeypatch.setenv("DOCKER_RT_BUILD_PUSH", "true")
     monkeypatch.setenv("DOCKER_RT_BUILD_PUSH_CHECK", "fail")
     _set_push_credentials(monkeypatch)
 
@@ -2037,6 +2021,7 @@ async def test_warn_mode_builds_even_when_the_push_target_is_unreachable(
     _clear(monkeypatch)
     monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
     monkeypatch.setenv("DOCKER_RT_BUILD_REGISTRY", "docker.io/jiangwc3439")
+    monkeypatch.setenv("DOCKER_RT_BUILD_PUSH", "true")
     monkeypatch.setenv("DOCKER_RT_BUILD_PUSH_CHECK", "warn")
     _set_push_credentials(monkeypatch)
 
@@ -2139,7 +2124,7 @@ async def test_build_in_sandbox_reports_each_stage(
         "==> Starting kaniko",
         "==> kaniko is running",
         "==> kaniko finished after",
-        f"==> Pushed {GOOD_DIGEST}",
+        f"==> Built {GOOD_DIGEST}",
         "push target: reg.example.com/rt/myapp:latest",
     ):
         assert expected in text, expected
@@ -2294,54 +2279,42 @@ async def test_context_is_staged_through_the_workspace_mount(
 
 
 @pytest.mark.asyncio
-async def test_a_refused_mount_falls_back_to_a_direct_upload(
+async def test_a_refused_mount_fails_the_build(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The mount is the only cluster-dependent part, so it must not be fatal.
+    """No fallback: a mount the cluster refuses is a deployment error.
 
-    A subPath the CSI driver refuses (missing directory, a storage layout the
-    mount cannot express) would otherwise turn a working build into a failure
-    over an optimisation.
+    Quietly dropping the mount and pushing the context down the exec channel is
+    exactly how a misconfigured storage stayed undiagnosed (it only looked like
+    a slow build).
     """
     from ..backend import build_sandbox, runtime
 
     _staging_ready(monkeypatch)
-    context = _context_tar()
     staging = _install_staging(monkeypatch)
     sandbox = _FakeBuildSandbox(stdout=_STAGED_STDOUT)
     attempts: list[Any] = []
 
     async def fake_start(**kwargs: Any) -> _FakeBuildSandbox:
-        mounts = kwargs.get("mounts") or []
-        attempts.append(mounts)
-        # Only the staged-context mount is refused — that is the cluster-layout
-        # dependency; the archive directory is a plain workspace path.
-        if any(".docker-rt-build" in str(m.get("Source", "")) for m in mounts):
-            raise RuntimeError("subPath .docker-rt-build not found")
-        return sandbox
+        attempts.append(kwargs.get("mounts") or [])
+        raise RuntimeError("subPath .docker-rt-build not found")
 
     monkeypatch.setattr(runtime, "start_kube_environment", fake_start)
 
     events = await _collect(
-        build_sandbox.build_in_sandbox(tar_bytes=context, tags=["myapp"], namespace="ns")
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
     )
     text = "".join(event.get("stream", "") for event in events)
-    stager = staging.stager
+    error = next((event["error"] for event in events if event.get("error")), "")
 
-    # The retry drops the staged-context mount and keeps the archive directory:
-    # without the former the build still works, without the latter the image has
-    # nowhere to land.
-    assert attempts == [
-        [_images_mount(), context_staging.mount_spec(stager.plan)],
-        [_images_mount()],
-    ]
-    assert "retrying without it" in text
-    # The direct upload carried the context, and staging did not try again.
-    assert len(sandbox.archives) == 1
-    assert sandbox.archives[0][1]
+    assert "cannot mount the staged build context" in error
+    assert len(attempts) == 1, "the mount must not be retried without the context"
+    assert not sandbox.archives, "no direct upload is allowed any more"
     # Whatever was already uploaded still has to go.
-    assert stager.cleaned_ok is True
-    assert any(event.get("docker_rt") for event in events)
+    assert staging.stager.cleaned_ok is True
+    assert "retrying without it" not in text
 
 
 @pytest.mark.asyncio
@@ -2363,16 +2336,15 @@ async def test_a_refused_mount_falls_back_to_a_direct_upload(
         ({"raise_on_stage_in": RuntimeError("websocket dropped")}, "did not complete"),
     ],
 )
-async def test_an_unusable_staged_context_falls_back_to_a_direct_upload(
+async def test_an_unusable_staged_context_fails_the_build(
     monkeypatch: pytest.MonkeyPatch,
     sandbox_kwargs: dict[str, Any],
     expected_reason: str,
 ) -> None:
-    """A short file must be caught here, not hours later by kaniko."""
+    """A short file must be caught here — and must not be papered over."""
     from ..backend import build_sandbox
 
     _staging_ready(monkeypatch)
-    context = _context_tar()
     staging = _install_staging(monkeypatch)
     # ``staged_bytes=None`` means "not the stage-in call", which is exactly what
     # the "no size marker" case wants: the fake answers with the launcher reply.
@@ -2380,14 +2352,16 @@ async def test_an_unusable_staged_context_falls_back_to_a_direct_upload(
     _install_fake(monkeypatch, sandbox)
 
     events = await _collect(
-        build_sandbox.build_in_sandbox(tar_bytes=context, tags=["myapp"], namespace="ns")
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
     )
-    text = "".join(event.get("stream", "") for event in events)
+    error = next((event["error"] for event in events if event.get("error")), "")
 
-    assert "Staged context unusable" in text
-    assert expected_reason in text
-    assert len(sandbox.archives) == 1
-    assert any(event.get("docker_rt") for event in events)
+    assert "cannot use the staged build context" in error
+    assert expected_reason in error
+    assert not sandbox.archives, "no direct upload is allowed any more"
+    assert not any(event.get("docker_rt") for event in events)
     assert staging.stager.cleaned_ok is True
 
 
@@ -2465,7 +2439,9 @@ async def test_storage_mode_fails_the_build_instead_of_falling_back(
 
     errors = [event for event in events if event.get("error")]
     assert len(errors) == 1
-    assert errors[0]["error"] == "cannot stage the build context: credentials rejected"
+    assert errors[0]["error"].startswith(
+        "cannot stage the build context: credentials rejected"
+    )
     assert captured == {}
     assert sandbox.calls == []
     assert sandbox.archives == []
@@ -2545,10 +2521,14 @@ async def test_storage_mode_fails_when_the_staged_copy_is_unusable(
 
 
 @pytest.mark.asyncio
-async def test_auto_mode_falls_back_when_staging_the_context_fails(
+async def test_auto_mode_also_refuses_to_fall_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A cluster without storage (or without the minio extra) must still build."""
+    """``auto`` is an alias for ``storage`` now — no silent direct upload.
+
+    The old fallback turned a broken deployment into a build that was merely
+    slow, which is why nobody fixed the storage configuration.
+    """
     from ..backend import build_sandbox
 
     _staging_ready(monkeypatch)
@@ -2563,16 +2543,13 @@ async def test_auto_mode_falls_back_when_staging_the_context_fails(
             tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
         )
     )
-    text = "".join(event.get("stream", "") for event in events)
+    errors = [event for event in events if event.get("error")]
 
-    assert "Workspace staging unavailable" in text
-    assert "no such host" in text
-    # No staged-context mount, but the archive directory still is one: the image
-    # has to land somewhere even when the context takes the slow route.
-    assert captured["mounts"] == [_images_mount()]
-    assert len(sandbox.archives) == 1
-    assert any(event.get("docker_rt") for event in events)
-    assert staging.stager.payload is None
+    assert len(errors) == 1
+    assert "no such host" in errors[0]["error"]
+    assert captured == {}, "no sandbox is created when staging fails"
+    assert sandbox.archives == [], "no direct upload is allowed any more"
+    assert not any(event.get("docker_rt") for event in events)
     # Nothing was uploaded, so cleanup is a no-op rather than a bogus delete.
     assert staging.stager.cleaned is False
 
@@ -3742,42 +3719,6 @@ async def test_a_lost_stage_in_stream_is_accepted_when_the_marker_arrived(
 
 
 @pytest.mark.asyncio
-async def test_a_lost_stage_in_stream_without_the_marker_still_falls_back(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """只收到半截输出 ⇒ 什么都没法证明 ⇒ 照旧回退直传。"""
-    from ...exec_stream import SandboxExecStreamError
-    from ..backend import build_sandbox
-
-    context = _context_tar()
-    packed = build_sandbox.pack_build_context(context)
-    _staging_ready(monkeypatch)
-    _install_staging(monkeypatch)
-    sandbox = _FakeBuildSandbox(
-        stdout=_STAGED_STDOUT,
-        responses=[
-            {
-                "stdout": "docker-rt-stag",
-                "raise": SandboxExecStreamError("lost", code="EXEC_STREAM_LOST"),
-            },
-            {"stderr": "docker-rt-status: launched\n"},
-            {"stdout": _STAGED_STDOUT, "stderr": "docker-rt-status: done rc=0\n"},
-        ],
-    )
-    _install_fake(monkeypatch, sandbox)
-
-    events = await _collect(
-        build_sandbox.build_in_sandbox(
-            tar_bytes=context, tags=["myapp"], namespace="ns"
-        )
-    )
-    text = "".join(event.get("stream", "") for event in events)
-
-    assert "Staged context unusable" in text
-    assert len(sandbox.archives) == 1  # fell back to the direct upload
-
-
-@pytest.mark.asyncio
 async def test_run_exec_keeps_the_output_that_arrived_before_the_stream_died() -> None:
     """``_run_exec`` 把已收到的输出挂在异常上，而不是随异常一起丢掉。"""
     from ...exec_stream import SandboxExecStreamError
@@ -4056,10 +3997,10 @@ def test_kaniko_ignores_the_rift_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     from ..backend import kaniko
 
     assert "--ignore-path=/opt/docker-rt/rift" in kaniko.kaniko_args(
-        destinations=["myapp:1"], push=False
+        destinations=["myapp:1"]
     )
 
     monkeypatch.setenv("DOCKER_RT_RIFT_REMOTE_DIR", "/workspace/.rift")
     assert "--ignore-path=/workspace/.rift" in kaniko.kaniko_args(
-        destinations=["myapp:1"], push=False
+        destinations=["myapp:1"]
     )

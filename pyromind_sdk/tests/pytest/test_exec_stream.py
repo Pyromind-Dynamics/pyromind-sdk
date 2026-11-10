@@ -66,6 +66,18 @@ def test_iter_exec_stream_yields_events(monkeypatch: pytest.MonkeyPatch) -> None
     assert chunks[-1].returncode == 0
 
 
+def test_stream_error_redacts_the_token_in_its_message() -> None:
+    """aiohttp quotes the full URL; that text reaches `docker build` output."""
+    err = SandboxExecStreamError(
+        "exec stream connection failed: Connection timeout to host "
+        "wss://pre-api.pyromind.ai/api/v1/sandboxes/sb-demo/"
+        "exec-stream?token=key-123456"
+    )
+
+    assert "key-123456" not in str(err)
+    assert "exec-stream?token=***" in str(err)
+
+
 def test_binary_event_frame_preserves_stdout_and_stderr_bytes() -> None:
     assert _binary_event_from_frame(b"\x01hello\xff") == {
         "type": "stdout",
@@ -141,6 +153,27 @@ def _collect(**kwargs):
         ]
 
     return asyncio.run(run())
+
+
+class _SilentWS(_FakeWS):
+    """A socket that connects, then never delivers a frame or a close."""
+
+    async def receive(self):
+        await asyncio.Event().wait()
+
+
+def test_stream_times_out_when_the_server_never_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wedged relay must not hold the caller past its own budget."""
+    ws = _SilentWS([])
+    _install_fake_ws(monkeypatch, ws)
+
+    with pytest.raises(SandboxExecStreamError) as excinfo:
+        _collect(command="sleep 1", timeout=0.2)
+
+    assert "timed out after 0.2s" in str(excinfo.value)
+    assert ws.closed
 
 
 def test_server_close_without_exit_raises_with_code_and_reason(

@@ -110,7 +110,7 @@ PyroMind 后端（默认后端）没有 Kubernetes API 端口转发端点，因�
 
 ### 推送到镜像仓库
 
-构建默认在完成后推送镜像。使用短镜像名时，需要配置仓库前缀以及具备推送权限的凭据：
+构建完成后**不会**自动推送（`DOCKER_RT_BUILD_PUSH=false`）；需要时用 `docker push <tag>` 显式推送。使用短镜像名时，需要配置仓库前缀以及具备推送权限的凭据：
 
 ```bash
 export DOCKER_RT_BUILD_REGISTRY="registry.example.com/team"
@@ -120,7 +120,7 @@ export DOCKER_RT_REGISTRY_PASSWORD="registry-token"
 docker build -t myapp:dev .
 ```
 
-完整限定的镜像标签按原样使用；短标签由 `DOCKER_RT_BUILD_REGISTRY` 或集群的仓库配置补全。凭据也可通过 Docker `config.json` 提供。
+完整限定的镜像标签按原样使用；短标签由 `DOCKER_RT_BUILD_REGISTRY` 或集群的仓库配置补全。凭证只来自 `DOCKER_RT_REGISTRY_USERNAME` + `DOCKER_RT_REGISTRY_PASSWORD`：docker-rt 不读取 Docker `config.json`，推送时也忽略 `X-Registry-Auth`。
 
 `DOCKER_RT_BUILD_PUSH_CHECK` 默认为 `fail`：构建开始前先探测「构建 Sandbox → 仓库」的连通性，不通则立即失败，避免白跑一次完整构建。
 
@@ -157,18 +157,33 @@ docker build -t myapp:dev .
 | `PYROMIND_CLUSTER` | 未设置时提示输入 | 目标集群（你账号下已开通的集群）。 |
 | `PYROMIND_BASE_URL` | 根据集群解析 | 显式指定 API 地址。 |
 
+### 监听方式
+
+daemon 的 API **只靠传输层**做访问控制，没有 token、也没有 TLS：能连上 socket 或端口的人就拥有你的 `PYROMIND_API_KEY` 权限。
+
+| 变量 | 默认值 | 用途 |
+| --- | --- | --- |
+| `DOCKER_RT_SOCK` | `/tmp/docker-rt.sock` | Unix socket 路径。无论调用方 umask 如何，都按仅属主可访问（`0700`）创建。 |
+| `DOCKER_RT_HOST` | 未设置 | TCP 监听地址。设置后在该端口上提供**无鉴权**的明文 Docker API；远程使用请优先通过 SSH 隧道连 Unix socket。 |
+| `DOCKER_RT_PORT` | `2375` | 设置 `DOCKER_RT_HOST` 时使用的 TCP 端口。 |
+| `DOCKER_RT_ALLOW_UNAUTHENTICATED_TCP` | `false` | 允许绑定非 loopback 地址时必须显式设置，否则 daemon 拒绝启动。每次 TCP 绑定都会打印“客户端无鉴权”的警告。 |
+
 ### 构建与推送
 
 | 变量 | 默认值 | 用途 |
 | --- | --- | --- |
 | `DOCKER_RT_BUILD_REGISTRY` | 集群配置 | 补全短镜像标签时使用的仓库前缀（含命名空间）。 |
-| `DOCKER_RT_BUILD_PUSH` | `true` | 构建后是否推送镜像；设为 `false` 时只保留 workspace 归档。 |
+| `DOCKER_RT_BUILD_PUSH` | `false` | 构建成功后是否自动推送 workspace 里的归档。**默认关闭**：构建容器以 root 执行每一条 Dockerfile `RUN`，放在里面的凭证就等于交给 Dockerfile 作者。推送一律由 daemon 在沙箱销毁**之后**执行；需要时用 `docker push <tag>` 手动触发。 |
 | `DOCKER_RT_BUILD_PUSH_CHECK` | `fail` | 推送前检查集群到仓库的连通性：`fail`、`warn` 或 `off`。 |
 | `DOCKER_RT_BUILD_IMAGE` | 随集群选择 | 临时构建 Sandbox 使用的镜像；必须包含 shell 和 `sleep`（`-debug` 版本）。 |
+| `DOCKER_RT_BUILD_CONTEXT_MODE` | `storage` | 构建上下文如何进集群：`storage`（唯一默认，经 workspace storage 中转，集群内本地 `cp`）或 `upload`（旧的直传，仅供没有 storage 的环境**显式**选用）。**没有自动回退**：storage 配置错误会直接让构建失败，而不是悄悄走慢速直传。 |
+| `PYROMIND_STORAGE_SECRET_KEY` | 未设置 | storage 的 secret key。`/storage_info` 不再返回，需要用户自行填写；没填或不对时构建直接报 `storage connection failed`。 |
+| `PYROMIND_STORAGE_ENDPOINT` | 按集群自动 | storage 端点，取自 `CLUSTER_RESOURCE`（每个集群都有），通常不需要设置。 |
 | `DOCKER_RT_REGISTRY_USERNAME` / `DOCKER_RT_REGISTRY_PASSWORD` | 未设置 | 仓库凭据。 |
-| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | 未设置 | Docker `config.json` 路径（与用户名/密码二选一）。 |
+| `DOCKER_RT_REGISTRY_DOCKERCONFIG` | 已移除 | 不再读取。凭证只来自 `DOCKER_RT_REGISTRY_USERNAME` + `DOCKER_RT_REGISTRY_PASSWORD`，没有任何 config 文件回退。 |
 | `DOCKER_RT_REGISTRY_NAMESPACE` | 集群配置 | 短标签使用的命名空间。 |
 | `DOCKER_RT_ACR_ACCESS_KEY_ID` / `DOCKER_RT_ACR_ACCESS_KEY_SECRET` | 未设置 | 仅自动创建 ACR 仓库时需要；使用已存在的仓库不需要。 |
+| `DOCKER_RT_ACR_INSTANCE_ID` | 未设置 | ACR 实例 ID（`cri-...`）；与上面两项一起自动创建仓库，缺一则跳过建仓。 |
 
 ### 端口
 

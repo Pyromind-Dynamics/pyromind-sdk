@@ -63,7 +63,7 @@ def api_key():
             "PYROMIND_API_KEY environment variable not set. "
             "Please set this environment variable to run integration tests."
         )
-    print(f"[INFO] Using API key: {api_key[:10]}...{api_key[-4:] if len(api_key) > 14 else '***'}")
+    print("[INFO] Using API key: ***")
     return api_key
 
 

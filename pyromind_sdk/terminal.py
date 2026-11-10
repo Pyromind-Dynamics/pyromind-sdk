@@ -42,6 +42,7 @@ from pyromind_sdk.client.base import (
     resolve_base_url_from_cluster,
 )
 from pyromind_sdk.client.trace import TRACE_ID_HEADER, ensure_trace_id
+from pyromind_sdk.log_redaction import redact_text
 
 logger = logging.getLogger("pyromind_sdk.ws")
 
@@ -55,7 +56,14 @@ _IDLE_TIMEOUT_S = 30 * 60  # 30 minutes
 
 
 class TerminalError(RuntimeError):
-    """Raised when an interactive terminal session cannot be established."""
+    """Raised when an interactive terminal session cannot be established.
+
+    Redacted at construction: the WebSocket URL carries ``?token=<api key>`` and
+    aiohttp's connection errors quote it back to ``docker exec`` output.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(redact_text(message))
 
 
 def _websocket_url(
@@ -130,7 +138,7 @@ async def _run_session(url: str) -> None:
                 heartbeat=30,
                 headers={TRACE_ID_HEADER: ensure_trace_id()},
             )
-            logger.debug("[ws] terminal connected %s", url)
+            logger.debug("[ws] terminal connected %s", redact_text(url))
         except aiohttp.WSServerHandshakeError as e:
             raise TerminalError(
                 f"Connection rejected (HTTP {e.status}). Check the API key and sandbox id."
