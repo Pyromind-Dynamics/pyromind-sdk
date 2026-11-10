@@ -61,7 +61,7 @@ import time
 from pathlib import Path
 from typing import Any, AsyncIterator, NamedTuple
 
-from . import buildkit, context_staging, kaniko, registry_push
+from . import buildkit, context_staging, image_meta, kaniko, registry_push
 from .registry_push import RegistryConfigError
 
 logger = logging.getLogger("docker_rt.build_sandbox")
@@ -2345,9 +2345,6 @@ async def _build_once(
 
         if not digest:
             digest = kaniko.parse_digest(await _read_digest(sandbox))
-        if digest:
-            yield stage(f"Built {digest}")
-            yield {"aux": {"ID": digest}}
 
         # Keep a **local** copy of the archive while the sandbox is still alive.
         # The workspace storage gateway's read path is unusable from outside
@@ -2357,8 +2354,9 @@ async def _build_once(
         # production. `docker push` and `docker images` then work from the local
         # cache and never touch the broken read path.
         cached = None
+        config_digest = ""
         try:
-            cached = await _cache_archive_from_sandbox(
+            cached, config_digest = await _cache_archive_from_sandbox(
                 sandbox,
                 archive_name=kaniko.image_archive_name(destinations[0]),
                 tags=destinations,
@@ -2373,6 +2371,16 @@ async def _build_once(
                     "workspace storage read path.\n"
                 )
             }
+
+        # The image ID Docker reports is the config digest inside the archive —
+        # not kaniko's ``--digest-file`` value (that is the manifest kaniko
+        # *would* push; docker-rt pushes the archive itself and the registry
+        # computes a different manifest digest). Keep the kaniko value in the
+        # metadata, show the real ID to the user.
+        image_id = config_digest or digest
+        if image_id:
+            yield stage(f"Built {image_id}")
+            yield {"aux": {"ID": image_id}}
 
         # The metadata sidecar and the index entry are what `docker images`
         # reads. Updating the index in place (instead of starting a full
@@ -2394,6 +2402,7 @@ async def _build_once(
                 context_staging.write_image_meta,
                 tag=destinations[0],
                 digest=digest,
+                config_digest=config_digest,
                 size=archive_size,
             )
         except Exception as exc:  # noqa: BLE001 — never fail a built image on metadata
@@ -2408,6 +2417,7 @@ async def _build_once(
                 tags=destinations,
                 archive=archive_key,
                 digest=digest,
+                config_digest=config_digest,
                 size=archive_size,
             )
         except Exception as exc:  # noqa: BLE001
@@ -2437,7 +2447,7 @@ async def _build_once(
                 "`docker run` — the cluster pulls images from a registry."
             )
         yield {"stream": "Successfully built\n"}
-        yield {"docker_rt": {"aliases": aliases, "digest": digest}}
+        yield {"docker_rt": {"aliases": aliases, "digest": image_id}}
         succeeded = True
     finally:
         # Stage-2 cleanup. The sandbox already deleted its own staged directory
@@ -2713,7 +2723,7 @@ async def _cache_archive_from_sandbox(
     archive_name: str,
     tags: list[str],
     digest: str,
-) -> Path:
+) -> tuple[Path, str]:
     """Pull the built archive out of the sandbox into the local image cache.
 
     Uses the middleware file channel — the same transport ``docker cp`` runs on
@@ -2721,6 +2731,9 @@ async def _cache_archive_from_sandbox(
     rejects plain GETs and aborts ranged ones. The response is streamed straight
     into the cache file: a multi-GB archive must never be materialised in the
     daemon's memory.
+
+    Returns ``(archive, config_digest)``; the digest is the image ID docker
+    shows, read from the archive itself (``""`` when unreadable).
     """
     cache_dir = image_cache_dir()
     target = cache_dir / archive_name
@@ -2741,16 +2754,19 @@ async def _cache_archive_from_sandbox(
         except OSError:
             pass
         raise
+    config_digest = kaniko.config_digest_from_archive(target)
     meta = {
         "tags": list(tags),
         "digest": digest,
+        "config_digest": config_digest,
+        "size": target.stat().st_size,
         "created": int(time.time()),
         "archive": f"{kaniko.DEFAULT_IMAGES_DIR.strip('/')}/{archive_name}",
     }
     (cache_dir / (archive_name + ".meta.json")).write_text(
         json.dumps(meta, ensure_ascii=False), encoding="utf-8"
     )
-    return target
+    return target, config_digest
 
 
 async def _push_archives(destinations: list[str]) -> tuple[str, str]:
@@ -2786,6 +2802,14 @@ async def _push_archives(destinations: list[str]) -> tuple[str, str]:
             return "", f"pushing {destination} failed: {exc}"
         finally:
             cleanup()
+        try:
+            # Same value `docker push` reports; `docker inspect` lists it as a
+            # RepoDigest, so a build-time push must record it too.
+            await asyncio.to_thread(
+                image_meta.record_push_digest, destination, last
+            )
+        except Exception:  # noqa: BLE001 - metadata is never worth failing a push
+            logger.debug("could not record the push digest", exc_info=True)
     return last, ""
 
 

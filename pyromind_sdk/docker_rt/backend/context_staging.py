@@ -616,6 +616,7 @@ def write_image_meta(
     *,
     tag: str,
     digest: str = "",
+    config_digest: str = "",
     size: int = 0,
     cluster: str | None = None,
 ) -> None:
@@ -632,6 +633,7 @@ def write_image_meta(
         {
             "tags": [tag],
             "digest": digest,
+            "config_digest": config_digest,
             "size": int(size or 0),
             "created": int(time.time()),
             "archive": image_archive_object_name(tag),
@@ -1048,6 +1050,7 @@ def upsert_image_index(
     tag: str = "",
     archive: str,
     digest: str = "",
+    config_digest: str = "",
     size: int = 0,
     created: int | None = None,
     cluster: str | None = None,
@@ -1067,6 +1070,7 @@ def upsert_image_index(
         {
             "tag": name,
             "digest": digest,
+            "config_digest": config_digest,
             "size": int(size or 0),
             "size_human": human_size(int(size or 0)),
             "archive": archive,

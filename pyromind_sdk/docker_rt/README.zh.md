@@ -177,6 +177,7 @@ daemon 的 API **只靠传输层**做访问控制，没有 token、也没有 TLS
 | `DOCKER_RT_BUILD_PUSH_CHECK` | `fail` | 推送前检查集群到仓库的连通性：`fail`、`warn` 或 `off`。 |
 | `DOCKER_RT_BUILD_IMAGE` | 随集群选择 | 临时构建 Sandbox 使用的镜像；必须包含 shell 和 `sleep`（`-debug` 版本）。 |
 | `DOCKER_RT_BUILD_CONTEXT_MODE` | `storage` | 构建上下文如何进集群：`storage`（唯一默认，经 workspace storage 中转，集群内本地 `cp`）或 `upload`（旧的直传，仅供没有 storage 的环境**显式**选用）。**没有自动回退**：storage 配置错误会直接让构建失败，而不是悄悄走慢速直传。 |
+| `PYROMIND_STORAGE_ACCESS_KEY` | `PYROMIND_API_KEY` | storage 的 access key。部分账号的存储 AK 与 API key 不同；不同时填这里，否则 S3 报 `The Access Key Id you provided does not exist`。 |
 | `PYROMIND_STORAGE_SECRET_KEY` | 未设置 | storage 的 secret key。`/storage_info` 不再返回，需要用户自行填写；没填或不对时构建直接报 `storage connection failed`。 |
 | `PYROMIND_STORAGE_ENDPOINT` | 按集群自动 | storage 端点，取自 `CLUSTER_RESOURCE`（每个集群都有），通常不需要设置。 |
 | `DOCKER_RT_REGISTRY_USERNAME` / `DOCKER_RT_REGISTRY_PASSWORD` | 未设置 | 仓库凭据。 |

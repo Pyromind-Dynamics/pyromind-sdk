@@ -2319,7 +2319,6 @@ async def _rift_health_loop(app: web.Application) -> None:
     if interval <= 0:
         return
     store: ContainerStore = app["store"]
-    locks: dict[str, asyncio.Lock] = {}
     failures: dict[str, int] = {}
     ping_misses: dict[str, int] = {}
     retry_at: dict[str, float] = {}
@@ -2335,7 +2334,9 @@ async def _rift_health_loop(app: web.Application) -> None:
                 continue
             if retry_at.get(record.id, 0.0) > loop.time():
                 continue
-            lock = locks.setdefault(record.id, asyncio.Lock())
+            # The same mutex the start/stop paths take: a bootstrap here must
+            # never race the bootstrap `docker start` is already running.
+            lock = record.lock
             if lock.locked():
                 continue
             async with lock:
@@ -3331,6 +3332,50 @@ def _local_cache_images() -> dict[str, str]:
     return out
 
 
+def _image_meta_for(tag: str) -> dict[str, Any]:
+    """Size / created / config digest for one tag (local cache first).
+
+    ``docker inspect`` must answer with the same numbers ``docker images``
+    shows; the local archive cache is authoritative, the workspace index is the
+    fallback for archives another machine built.
+    """
+    from .backend import build_sandbox, context_staging
+
+    try:
+        cache = build_sandbox.image_cache_dir()
+        for meta_path in cache.glob("*.tar.meta.json"):
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                continue
+            if tag not in (meta.get("tags") or []):
+                continue
+            archive = cache / meta_path.name[: -len(".meta.json")]
+            size = (
+                archive.stat().st_size
+                if archive.is_file()
+                else int(meta.get("size") or 0)
+            )
+            return {
+                "size": size,
+                "created": meta.get("created"),
+                "config_digest": str(meta.get("config_digest") or ""),
+            }
+    except Exception:  # noqa: BLE001 - absence of a cache is not an error
+        pass
+    try:
+        entry = context_staging.lookup_image_archive(tag)
+    except Exception:  # noqa: BLE001
+        entry = None
+    if entry:
+        return {
+            "size": int(entry.get("size") or 0),
+            "created": entry.get("created"),
+            "config_digest": str(entry.get("config_digest") or ""),
+        }
+    return {}
+
+
 def _image_index_tags() -> set[str]:
     """Tags in the persisted workspace index; never triggers a full scan."""
     from .backend import context_staging
@@ -3398,7 +3443,7 @@ async def list_images(request: web.Request) -> web.Response:
     镜像即使没有本地归档也要列出来（Docker 语义：pull 完 `docker images`
     能看到它）。
     """
-    from .backend import context_staging, build_sandbox
+    from .backend import context_staging, build_sandbox, image_meta
 
     store: ContainerStore = request.app["store"]
     summaries: list[dict[str, Any]] = []
@@ -3424,6 +3469,8 @@ async def list_images(request: web.Request) -> web.Response:
                         tag,
                         created=meta.get("created"),
                         size=archive.stat().st_size,
+                        config_digest=str(meta.get("config_digest") or ""),
+                        repo_digests=image_meta.repo_digests(tag),
                     )
                 )
     except Exception as exc:  # noqa: BLE001
@@ -3454,6 +3501,8 @@ async def list_images(request: web.Request) -> web.Response:
                 entry["tag"],
                 created=entry.get("created"),
                 size=entry.get("size") or 0,
+                config_digest=str(entry.get("config_digest") or ""),
+                repo_digests=image_meta.repo_digests(entry["tag"]),
             )
         )
 
@@ -3496,7 +3545,18 @@ async def inspect_image(request: web.Request) -> web.Response:
         resolved = images_mod.resolve_image_name(lookup, names)
     if resolved is None:
         return _err(404, f"No such image: {ref}")
-    return _json(images_mod.to_image_inspect(resolved))
+    from .backend import image_meta
+
+    meta = _image_meta_for(resolved)
+    return _json(
+        images_mod.to_image_inspect(
+            resolved,
+            created=meta.get("created"),
+            size=int(meta.get("size") or 0),
+            config_digest=str(meta.get("config_digest") or ""),
+            repo_digests=image_meta.repo_digests(resolved),
+        )
+    )
 
 
 async def create_image(request: web.Request) -> web.StreamResponse:
@@ -3676,6 +3736,16 @@ async def push_image(request: web.Request) -> web.StreamResponse:
 
     await emit({"status": f"{digest}: digest: {digest.split(':', 1)[-1]} size: ok"})
     await emit({"status": f"{destination}: pushed"})
+    try:
+        from .backend import image_meta
+
+        await asyncio.to_thread(
+            image_meta.record_push_digest, destination, digest
+        )
+    except Exception:  # noqa: BLE001 - metadata never fails a push
+        logging.getLogger("docker_rt").debug(
+            "could not record the push digest", exc_info=True
+        )
     store.register_image(destination)
     await _events(request).emit(
         type="image",
@@ -3747,6 +3817,12 @@ async def delete_image(request: web.Request) -> web.Response:
             cache_names=cache_names,
             archive_keys=dead_archives,
         )
+    try:
+        from .backend import image_meta
+
+        await asyncio.to_thread(image_meta.forget, [resolved])
+    except Exception:  # noqa: BLE001 - local removal still proceeds
+        logger.debug("docker rmi could not forget the push digest", exc_info=True)
 
     await _events(request).emit(
         type="image",
@@ -3755,7 +3831,17 @@ async def delete_image(request: web.Request) -> web.Response:
         attributes={"name": resolved},
     )
     # Docker returns a list of untagged/deleted layer records; empty is accepted.
-    return _json([{"Untagged": resolved}, {"Deleted": images_mod.image_id(resolved)}])
+    return _json(
+        [
+            {"Untagged": resolved},
+            {
+                "Deleted": images_mod.image_id(
+                    resolved,
+                    str(_image_meta_for(resolved).get("config_digest") or ""),
+                )
+            },
+        ]
+    )
 
 
 async def stream_events(request: web.Request) -> web.StreamResponse:

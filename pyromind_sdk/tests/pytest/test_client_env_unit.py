@@ -187,6 +187,27 @@ class TestStorageClientEndpoint:
         assert client.endpoint == "storage-us-west-2.pyromind.ai"
 
 
+class TestStorageClientCredentials:
+    """Storage has its own access key; the API key is only the fallback."""
+
+    def test_storage_access_key_overrides_api_key(self, monkeypatch):
+        monkeypatch.setenv("PYROMIND_API_KEY", "api-key")
+        monkeypatch.setenv("PYROMIND_STORAGE_ACCESS_KEY", "storage-ak")
+        client = StorageClient(secret_key="sk")
+        assert client.access_key == "storage-ak"
+
+    def test_api_key_used_when_storage_access_key_unset(self, monkeypatch):
+        monkeypatch.setenv("PYROMIND_API_KEY", "api-key")
+        monkeypatch.delenv("PYROMIND_STORAGE_ACCESS_KEY", raising=False)
+        client = StorageClient(secret_key="sk")
+        assert client.access_key == "api-key"
+
+    def test_explicit_access_key_wins(self, monkeypatch):
+        monkeypatch.setenv("PYROMIND_STORAGE_ACCESS_KEY", "storage-ak")
+        client = StorageClient(access_key="explicit", secret_key="sk")
+        assert client.access_key == "explicit"
+
+
 class TestInferenceStartupArgs:
     def test_dict_startup_args_are_serialized_to_argv(self):
         request = InferenceJobRequest(

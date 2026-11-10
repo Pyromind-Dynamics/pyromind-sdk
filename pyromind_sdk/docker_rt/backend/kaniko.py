@@ -30,10 +30,14 @@ Everything here is a pure function so it can be unit-tested without a cluster.
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import logging
 import os
 import re
 import shlex
+import tarfile
+from pathlib import Path
 
 logger = logging.getLogger("docker_rt.kaniko")
 
@@ -668,3 +672,33 @@ def parse_digest(raw: str | None) -> str:
         if line.startswith("sha256:") and len(line) > len("sha256:"):
             return line
     return ""
+
+
+def config_digest_from_archive(archive: str | Path) -> str:
+    """The image ID a ``docker save`` archive carries.
+
+    Docker's image ID is the sha256 of the image **config** blob (schema 2),
+    not of the manifest and not of the archive. ``--digest-file`` gives the
+    manifest digest kaniko *would* push, which differs once docker-rt pushes
+    the archive itself; reporting that as the image ID made `docker images`
+    and a registry-side check disagree. Returns ``""`` for anything that is
+    not a readable docker archive.
+    """
+    try:
+        with tarfile.open(archive, "r:*") as bundle:
+            manifest_member = bundle.extractfile("manifest.json")
+            if manifest_member is None:
+                return ""
+            manifest = json.loads(manifest_member.read() or b"[]")
+            config_name = str((manifest[0] if manifest else {}).get("Config") or "")
+            if not config_name:
+                return ""
+            config_member = bundle.extractfile(config_name)
+            if config_member is None:
+                return ""
+            blob = config_member.read()
+    except Exception:  # noqa: BLE001 - metadata must never fail a build
+        return ""
+    if not blob:
+        return ""
+    return "sha256:" + hashlib.sha256(blob).hexdigest()
