@@ -561,7 +561,7 @@ def test_required_input_with_empty_default_accepts_value(
     assert valid, errors
 
 
-@pytest.mark.parametrize("param_type,default", [("INT", 0), ("BOOLEAN", False), ("STRING", "fallback")])
+@pytest.mark.parametrize("param_type,default", [("INT", 0), ("FLOAT", 0.0), ("BOOLEAN", False), ("STRING", "fallback")])
 @pytest.mark.parametrize("config", [{}, {"text": ""}, {"text": None}])
 def test_usable_default_can_satisfy_required_input(
     validator: Callable, param_type: str, default: Any, config: dict[str, Any]
@@ -574,6 +574,31 @@ def test_usable_default_can_satisfy_required_input(
     valid, errors = validator(workflow, node_info=node_info)
 
     assert valid, errors
+
+
+@pytest.mark.parametrize(
+    "param_type,value,options,expected_valid",
+    [
+        ("INT", 0, {"min": 0}, True),
+        ("INT", 0, {"min": 1}, False),
+        ("FLOAT", 0.0, {"min": 0}, True),
+        ("FLOAT", 0.0, {"min": 0.1}, False),
+        ("BOOLEAN", False, {}, True),
+    ],
+)
+def test_required_falsey_values_are_checked_by_type_constraints(
+    validator: Callable, param_type: str, value: Any, options: dict[str, Any], expected_valid: bool
+) -> None:
+    node_info = copy.deepcopy(NODE_INFO)
+    node_info["StringSink"]["input"]["required"]["text"] = [param_type, options]
+    workflow = _from_dsl('sink = StringSink(id="one", text="value")')
+    workflow["nodes"][0]["data"]["config"]["text"] = value
+
+    valid, errors = validator(workflow, node_info=node_info)
+
+    assert valid is expected_valid, errors
+    if not expected_valid:
+        assert any("minimum" in error for error in errors)
 
 
 def test_required_numeric_whitespace_remains_invalid(validator: Callable) -> None:

@@ -4,6 +4,8 @@ import logging
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from ._input_validation import _has_usable_input_value
+
 logger = logging.getLogger(__name__)
 SPECIAL_NODE_TYPES = frozenset({"PrimitiveNode"})
 
@@ -527,10 +529,7 @@ def _validate_xyflow_config(
             param_def = all_params[param_name]
             is_required = param_name in required_params
             if param_value == "" or (
-                is_required and (
-                    param_value is None
-                    or isinstance(param_value, str) and not param_value.strip()
-                )
+                is_required and not _has_usable_input_value(param_value)
             ):
                 options = (
                     param_def[1]
@@ -538,9 +537,9 @@ def _validate_xyflow_config(
                     else None
                 )
                 default = options.get("default") if isinstance(options, dict) else None
-                default_available = default is not None
-                if is_required and isinstance(default, str) and not default.strip():
-                    default_available = False
+                default_available = (
+                    _has_usable_input_value(default) if is_required else default is not None
+                )
                 if default_available:
                     # An empty form field uses the server-owned default.
                     if param_value == "":
@@ -694,7 +693,7 @@ def _validate_standard_node_definition(
                         f"Node {node_id} (type '{node_type}') has unknown default parameter '{name}'"
                     )
                 elif name not in supplied:
-                    if name in required and isinstance(default, str) and not default.strip():
+                    if name in required and not _has_usable_input_value(default):
                         continue
                     # The Xyflow parser fills absent parameters from frontend
                     # defaults, so validate the effective value against the
@@ -708,9 +707,7 @@ def _validate_standard_node_definition(
         if name not in supplied and isinstance(spec, (list, tuple)) and len(spec) >= 2:
             options = spec[1]
             default = options.get("default") if isinstance(options, dict) else None
-            if default is not None and not (
-                isinstance(default, str) and not default.strip()
-            ):
+            if _has_usable_input_value(default):
                 errors.extend(_validate_parameter_constraints(
                     default, spec, str(node_id), node_type, name
                 ))
