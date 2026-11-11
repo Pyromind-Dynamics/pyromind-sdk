@@ -510,3 +510,118 @@ def test_empty_required_field_without_default_is_rejected(
 
     assert not valid
     assert any(field in error and "cannot be empty" in error for error in errors)
+
+
+@pytest.mark.parametrize("default", [None, "", " \t"])
+@pytest.mark.parametrize(
+    "config", [{}, {"text": ""}, {"text": None}, {"text": " \t"}],
+    ids=["missing", "empty", "null", "whitespace"],
+)
+def test_empty_default_cannot_satisfy_required_input(
+    validator: Callable, default: Any, config: dict[str, Any]
+) -> None:
+    node_info = copy.deepcopy(NODE_INFO)
+    node_info["StringSink"]["input"]["required"]["text"] = ["STRING", {"default": default}]
+    workflow = _from_dsl('sink = StringSink(id="one", text="value")')
+    workflow["nodes"][0]["data"]["config"] = config
+
+    valid, errors = validator(workflow, node_info=node_info)
+
+    assert not valid
+    assert any("text" in error and ("required" in error or "empty" in error) for error in errors)
+
+
+@pytest.mark.parametrize("default", ["", " \t"])
+def test_frontend_empty_default_cannot_satisfy_required_input(
+    validator: Callable, default: str
+) -> None:
+    workflow = _from_dsl('sink = StringSink(id="one", text="value")')
+    data = workflow["nodes"][0]["data"]
+    data["config"] = {}
+    data["nodeDefinition"] = {
+        "input": {"required": {"text": ["STRING", {"default": default}]}}
+    }
+
+    valid, errors = validator(workflow, node_info=NODE_INFO)
+
+    assert not valid
+    assert any("text" in error and "required" in error for error in errors)
+
+
+@pytest.mark.parametrize("default", ["", " \t"])
+def test_required_input_with_empty_default_accepts_value(
+    validator: Callable, default: str
+) -> None:
+    node_info = copy.deepcopy(NODE_INFO)
+    node_info["StringSink"]["input"]["required"]["text"] = ["STRING", {"default": default}]
+    workflow = _from_dsl('sink = StringSink(id="one", text="project")')
+
+    valid, errors = validator(workflow, node_info=node_info)
+
+    assert valid, errors
+
+
+@pytest.mark.parametrize("param_type,default", [("INT", 0), ("FLOAT", 0.0), ("BOOLEAN", False), ("STRING", "fallback")])
+@pytest.mark.parametrize("config", [{}, {"text": ""}, {"text": None}])
+def test_usable_default_can_satisfy_required_input(
+    validator: Callable, param_type: str, default: Any, config: dict[str, Any]
+) -> None:
+    node_info = copy.deepcopy(NODE_INFO)
+    node_info["StringSink"]["input"]["required"]["text"] = [param_type, {"default": default}]
+    workflow = _from_dsl('sink = StringSink(id="one", text="value")')
+    workflow["nodes"][0]["data"]["config"] = config
+
+    valid, errors = validator(workflow, node_info=node_info)
+
+    assert valid, errors
+
+
+@pytest.mark.parametrize(
+    "param_type,value,options,expected_valid",
+    [
+        ("INT", 0, {"min": 0}, True),
+        ("INT", 0, {"min": 1}, False),
+        ("FLOAT", 0.0, {"min": 0}, True),
+        ("FLOAT", 0.0, {"min": 0.1}, False),
+        ("BOOLEAN", False, {}, True),
+    ],
+)
+def test_required_falsey_values_are_checked_by_type_constraints(
+    validator: Callable, param_type: str, value: Any, options: dict[str, Any], expected_valid: bool
+) -> None:
+    node_info = copy.deepcopy(NODE_INFO)
+    node_info["StringSink"]["input"]["required"]["text"] = [param_type, options]
+    workflow = _from_dsl('sink = StringSink(id="one", text="value")')
+    workflow["nodes"][0]["data"]["config"]["text"] = value
+
+    valid, errors = validator(workflow, node_info=node_info)
+
+    assert valid is expected_valid, errors
+    if not expected_valid:
+        assert any("minimum" in error for error in errors)
+
+
+def test_required_numeric_whitespace_remains_invalid(validator: Callable) -> None:
+    node_info = copy.deepcopy(NODE_INFO)
+    node_info["CountSink"]["input"]["required"]["count"] = ["INT", {"default": 3}]
+    workflow = _from_dsl('sink = CountSink(id="one", count=1)')
+    workflow["nodes"][0]["data"]["config"]["count"] = " \t"
+
+    valid, errors = validator(workflow, node_info=node_info)
+
+    assert not valid
+    assert any("count" in error and "invalid INT" in error for error in errors)
+
+
+def test_dynamic_input_can_satisfy_required_input_with_empty_default(validator: Callable) -> None:
+    node_info = copy.deepcopy(NODE_INFO)
+    node_info["StringSink"]["input"]["required"]["text"] = ["STRING", {"default": ""}]
+    workflow = _from_dsl(
+        'source = Producer(id="one")\n'
+        'sink = StringSink(id="two", text=source.string)'
+    )
+    workflow["nodes"][1]["data"]["config"]["text"] = ""
+
+    valid, errors = validator(workflow, node_info=node_info)
+
+    assert valid, errors
