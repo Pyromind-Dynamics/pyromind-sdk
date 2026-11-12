@@ -22,6 +22,7 @@ from .trace import (
     set_trace_id,
 )
 from ..log_redaction import redact, redact_text
+from ..token import HttpTokenCache
 
 
 # Constants
@@ -323,9 +324,13 @@ class PyroMindClient:
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
         
+        # The API key is NOT a default header: every request carries a
+        # short-lived token instead (see ``token.HttpTokenCache``), so a
+        # captured request never exposes the long-lived credential.
+        self._tokens = HttpTokenCache(self.base_url, api_key)
+
         # Set default headers
         self.session.headers.update({
-            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
             # Same reason as the async client: do not depend on brotli decoding.
@@ -545,6 +550,7 @@ class PyroMindClient:
         """
         headers = dict(kwargs.pop("headers", None) or {})
         headers.update(self._trace_headers())
+        headers["Authorization"] = f"Bearer {self._tokens.token()}"
         kwargs.setdefault("timeout", self.timeout)
         logger.debug("[REQUEST] %s %s", method.upper(), redact_text(url))
         response = self.session.request(
@@ -641,15 +647,24 @@ class PyroMindClient:
         kwargs["headers"] = extra_headers
         
         try:
-            response = self.session.request(
-                method=method,
-                url=url,
-                params=params,
-                json=json_data,
-                timeout=self.timeout,
-                **kwargs
-            )
-            
+            # A 401 means the request never ran (expired/rotated token), so one
+            # refresh-and-retry is always safe — even for POST.
+            for attempt in (0, 1):
+                extra_headers["Authorization"] = (
+                    f"Bearer {self._tokens.token(force_refresh=attempt > 0)}"
+                )
+                response = self.session.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    json=json_data,
+                    timeout=self.timeout,
+                    **kwargs
+                )
+                if response.status_code != 401 or attempt == 1:
+                    break
+                logger.info("[AUTH] token rejected, refreshing once: %s", request_context)
+
             # Log response (single line)
             resp_log = f"[RESPONSE] {request_context} - Status: {response.status_code}"
             try:

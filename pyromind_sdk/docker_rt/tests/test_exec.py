@@ -12,6 +12,21 @@ import pytest
 from .helpers import FakeKubeEnv, create_started_container
 
 
+@pytest.fixture(autouse=True)
+def _stub_terminal_token(monkeypatch):
+    """The terminal WS now authenticates with a first-frame token.
+
+    Unit tests must not perform a real exchange; the token value is opaque to
+    everything below ``_hijack_pyromind_terminal``.
+    """
+    from .. import aio_server as mod
+
+    async def fake_token(*_args, **_kwargs):
+        return "test-token"
+
+    monkeypatch.setattr(mod, "async_fetch_terminal_token", fake_token)
+
+
 @pytest.mark.asyncio
 async def test_exec_create_inspect_and_oneshot(aiohttp_client, fake_kube: FakeKubeEnv):
     from ..aio_server import create_aio_app
@@ -757,7 +772,7 @@ async def _drive_terminal_bridge(
             return captured["ws"]
 
     monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: FakeSession())
-    monkeypatch.setattr(mod, "_pyromind_terminal_url", lambda *a, **k: "ws://fake")
+    monkeypatch.setattr(mod, "_pyromind_terminal_target", lambda *a, **k: ("ws://fake", ""))
 
     kube_env = PyromindSDK.__new__(PyromindSDK)
     kube_env.sandbox_id = "sb-terminal"
@@ -1672,7 +1687,7 @@ async def test_exec_with_stdin_and_no_tty_frames_the_terminal_output(monkeypatch
             [SimpleNamespace(type=aiohttp.WSMsgType.BINARY, data=b"hello\r\n")]
         )
         monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: _FakeSession(ws, **k))
-        monkeypatch.setattr(mod, "_pyromind_terminal_url", lambda *a, **k: "ws://fake")
+        monkeypatch.setattr(mod, "_pyromind_terminal_target", lambda *a, **k: ("ws://fake", ""))
 
         written: list[bytes] = []
 
@@ -1982,7 +1997,7 @@ async def test_stdin_eof_does_not_teardown_the_session(monkeypatch):
         tail_wait=0.4,
     )
     monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: _FakeSession(ws, **k))
-    monkeypatch.setattr(mod, "_pyromind_terminal_url", lambda *a, **k: "ws://fake")
+    monkeypatch.setattr(mod, "_pyromind_terminal_target", lambda *a, **k: ("ws://fake", ""))
 
     written: list[bytes] = []
 

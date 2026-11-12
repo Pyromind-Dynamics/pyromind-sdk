@@ -39,6 +39,16 @@ from ..backend.reconcile import _container_state_from_status
 from ..backend.store import ContainerRecord, ContainerState
 
 
+@pytest.fixture(autouse=True)
+def _stub_exec_stream_token(monkeypatch):
+    """Unit tests must not perform a real token exchange for exec-stream."""
+
+    async def fake_token(*_args, **_kwargs):
+        return "test-token"
+
+    monkeypatch.setattr(env_mod, "async_fetch_exec_stream_token", fake_token)
+
+
 def _adapter_with_fake_client() -> tuple[PyromindSDK, MagicMock]:
     adapter = PyromindSDK.__new__(PyromindSDK)
     adapter.sandbox_id = "sb-test-1"
@@ -450,6 +460,12 @@ def test_attach_exec_preserves_argv_quoting(monkeypatch: MonkeyPatch):
         cwd="",
     )
 
+    # The token is fetched lazily inside the async iterator, so the stream
+    # arguments become visible once the background reader starts consuming.
+    for _ in range(100):
+        ws.update(timeout=0.01)
+        if ws.peek_stdout() and not ws.is_open():
+            break
     assert captured["command"] == [
         "sh", "-c", "test -d /home/user && echo OK || echo NOT_EXIST"
     ]
@@ -457,10 +473,6 @@ def test_attach_exec_preserves_argv_quoting(monkeypatch: MonkeyPatch):
     assert captured["cwd"] == "/workspace"
     assert captured["timeout"] is None
     assert captured["stop_event"].is_set() is False
-    for _ in range(100):
-        ws.update(timeout=0.01)
-        if ws.peek_stdout() and not ws.is_open():
-            break
     assert ws.read_stdout() == b"OK\n"
     assert ws.returncode == 0
     assert client.exec_command_stream.call_count == 0
@@ -1165,7 +1177,7 @@ def test_id_filter_uses_docker_id_not_sandbox_id() -> None:
 
 
 def test_pyromind_terminal_url_uses_base_url(monkeypatch: MonkeyPatch) -> None:
-    from ..aio_server import _pyromind_terminal_url
+    from ..aio_server import _pyromind_terminal_target
 
     adapter = PyromindSDK.__new__(PyromindSDK)
     adapter.sandbox_id = "sb-1"
@@ -1174,12 +1186,14 @@ def test_pyromind_terminal_url_uses_base_url(monkeypatch: MonkeyPatch) -> None:
     )
     monkeypatch.delenv("PYROMIND_API_KEY", raising=False)
 
-    url = _pyromind_terminal_url(adapter)
+    url, api_key = _pyromind_terminal_target(adapter)
 
     assert url.startswith(
         "wss://pre-api.pyromind.ai/api/v1/sandboxes/sb-1/terminal?"
     )
     assert "cols=80&rows=24" in url
+    assert api_key == ""
+    assert "token=" not in url
 
 
 def test_pyromind_terminal_url_carries_command_and_size(
@@ -1190,7 +1204,7 @@ def test_pyromind_terminal_url_carries_command_and_size(
     Without this the terminal side would open its login shell and the command
     the user typed would be silently dropped.
     """
-    from ..aio_server import _pyromind_terminal_url
+    from ..aio_server import _pyromind_terminal_target
 
     adapter = PyromindSDK.__new__(PyromindSDK)
     adapter.sandbox_id = "sb-1"
@@ -1199,7 +1213,7 @@ def test_pyromind_terminal_url_carries_command_and_size(
     )
     monkeypatch.delenv("PYROMIND_API_KEY", raising=False)
 
-    url = _pyromind_terminal_url(
+    url, _api_key = _pyromind_terminal_target(
         adapter, cols=132, rows=43, cmd=["bash", "-l"], cwd="/workspace"
     )
 
