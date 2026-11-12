@@ -55,8 +55,7 @@ pyromind_sdk/
 ├── cli.py                            # Unified `pyromind` CLI
 ├── python_function_to_yaml_cli.py    # Python-to-YAML CLI
 ├── test_run_workflow_cli.py          # Workflow submission CLI
-├── exec_stream.py                    # Streaming sandbox exec helpers
-└── terminal.py                       # Interactive sandbox terminal
+└── exec_stream.py                    # Streaming sandbox exec helpers
 ```
 
 ## Requirements
@@ -263,12 +262,13 @@ docker rm -f demo
 ### Command channel (rift)
 
 `docker exec`, `docker cp`, interactive `docker exec -it` and `docker attach` do
-not use the platform exec WebSocket. Pod Running is only a prerequisite:
-`docker-rt` injects `rift-client`, waits until it answers Ping, and only then
-reports the container as Running/Up. These calls **always** go through the
-**rift gateway** (gRPC over HTTP/2) to the sandbox Service on port `7500` — this
-is not a runtime switch and the platform exec API is only used internally by
-the bootstrap itself:
+not use the platform exec WebSocket. Pod Running is only a prerequisite: the
+**platform injects `rift-client` when it creates the sandbox Pod** (initContainer
+binary + per-sandbox token Secret), where it runs as PID 1 (`--supervise`) and
+execs the user process. `docker-rt` uploads nothing; it waits until rift-client
+answers Ping and only then reports the container as Running/Up. These calls
+**always** go through the **rift gateway** (gRPC over HTTP/2) to the sandbox
+Service on port `7500` — this is not a runtime switch:
 
 ```text
 docker exec / cp -> docker-rt -> rift gateway (auth) -> Service:7500 -> rift-client
@@ -276,33 +276,34 @@ docker exec / cp -> docker-rt -> rift gateway (auth) -> Service:7500 -> rift-cli
 
 Requirements and behaviour:
 
-- Set `DOCKER_RT_RIFT_GATEWAY` to a reachable gateway. Use
+- Set `DOCKER_RT_RIFT_GATEWAY` to a reachable gateway (or `PYROMIND_CLUSTER`,
+  which resolves it from the SDK cluster map). Use
   `DOCKER_RT_RIFT_GATEWAY_TLS=true` for a public-CA TLS endpoint, or
   `DOCKER_RT_RIFT_GATEWAY_CA=/path/ca.pem` for a private CA. The gateway itself
   is configured with `RIFT_AUTH_URL` pointing at the platform authorizer.
   Without a gateway, exec/cp fail with `[RIFT_UNAVAILABLE]`.
-- The architecture-specific binary ships with the SDK
-  (`rift-client-linux-amd64` / `arm64`); override its directory with
-  `DOCKER_RT_RIFT_BIN_DIR`.
-- `docker start` does not return until rift-client is ready. Bootstrap retries
-  `DOCKER_RT_RIFT_RETRY` times (default 3); if the channel never comes up,
-  start fails and the container is not reported as Running. A live channel is
-  re-checked every `DOCKER_RT_RIFT_HEALTH_INTERVAL` seconds.
+- The rift-client Go sources and the injection image live in
+  `k8s_middleware/rift`; the SDK ships only the Python gRPC stubs and the proto.
+- `docker start` does not return until rift-client answers Ping
+  (`DOCKER_RT_RIFT_PING_ATTEMPTS` × `DOCKER_RT_RIFT_PING_INTERVAL`); if the
+  channel never comes up, start fails and the container is not reported as
+  Running. A live channel is re-checked every
+  `DOCKER_RT_RIFT_HEALTH_INTERVAL` seconds.
 - There is deliberately **no fallback** to the platform exec channel: if rift
   is unavailable the command fails loudly instead of silently switching
   transport.
-- `docker stop` + `docker start` recreates the sandbox Pod, so docker-rt re-runs
-  the bootstrap and always restarts the process. The 10 MB binary is re-uploaded
-  unless the injection directory survives on a persistent mount and its hash
-  matches (`DOCKER_RT_RIFT_REMOTE_DIR`, default `/opt/docker-rt/rift`).
+- Sandboxes created **before** platform-side injection have no rift-client and
+  must be recreated (`docker rm` + `docker run`). `docker stop` + `docker start`
+  resumes the Pod; the platform refreshes the token Secret on resume.
 - The gateway compares the caller's access key against the sandbox `Pipe` and
-  forwards the same key as `x-rift-token`; the pod holds it in a `0400` file and
-  compares it in constant time. No public key, KV or signing is involved.
+  forwards the same key as `x-rift-token`; the pod reads it from the mounted
+  Secret file (`0444`, so non-root image users can read it too) and compares it
+  in constant time. No public key, KV or signing is involved.
 - Feishu alerts for an unreachable `rift-client` are emitted by the gateway
   (it counts consecutive failures per sandbox), not by the local daemon.
 
 See [`pyromind_sdk/rift/README.md`](pyromind_sdk/rift/README.md)
-for the full environment-variable table and the bootstrap sequence.
+for the full environment-variable table.
 
 ## Custom workflow nodes
 
@@ -323,12 +324,11 @@ See [node SDK documentation](pyromind_sdk/README_CN.md) and the [examples](pyrom
 
 The client workflow package validates and converts workflow payloads between standard and lightweight representations. Its public helpers include `validate_workflow`, `validate_standard_format`, `to_workflow_lite`, `to_workflow_standard`, `WorkflowLiteConverter`, and `LayoutGenerator`.
 
-The `pyromind` command provides three user-facing tools:
+The `pyromind` command provides two user-facing tools:
 
 | Command | Purpose |
 | --- | --- |
 | `pyromind python-to-yaml <file> <function> --node-name <name>` | Statically analyze a Python function and print or write a YAML node definition. |
-| `pyromind terminal <sandbox-id>` | Open an interactive terminal in a running custom sandbox. Requires API key and cluster settings. |
 | `pyromind docker-rt` | Start the Docker-compatible runtime described below. |
 
 For example, write a node definition to a file:

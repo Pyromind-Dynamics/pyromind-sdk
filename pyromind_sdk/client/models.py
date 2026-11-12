@@ -219,6 +219,10 @@ class SandboxRequest(BaseModel):
             should not change it.
         env: **CUSTOM only.** Container environment variables (docker ``-e``
             style). Applied when the sandbox is created; ignored on update.
+        command: **CUSTOM only.** Container command (``docker run IMG cmd``),
+            overrides the image Cmd. Applied when the sandbox is created.
+        entrypoint: **CUSTOM only.** Entrypoint override (``docker
+            --entrypoint``); an explicit value voids the image Cmd.
     """
     sandbox_type: SandboxType
     resources: Optional[ResourceConfig] = None
@@ -279,6 +283,21 @@ class SandboxRequest(BaseModel):
         description=(
             "CUSTOM only: container environment variables (docker -e style). "
             "Applied when the sandbox is created; ignored on update."
+        ),
+    )
+    command: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "CUSTOM only: container command (docker run IMG cmd), overrides "
+            "the image Cmd. Applied when the sandbox is created."
+        ),
+    )
+    entrypoint: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "CUSTOM only: entrypoint override (docker --entrypoint). An "
+            "explicit value (even an empty list) replaces the image "
+            "Entrypoint and voids the image Cmd."
         ),
     )
 

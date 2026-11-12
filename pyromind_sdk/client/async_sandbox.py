@@ -663,7 +663,6 @@ class AsyncSandboxClient(PyroMindAsyncClient):
         url = build_exec_stream_websocket_url(
             self.base_url,
             sandbox_id,
-            self.api_key,
             self.cluster,
         )
         async for chunk in iter_exec_stream_async(
@@ -672,6 +671,7 @@ class AsyncSandboxClient(PyroMindAsyncClient):
             cwd=cwd.strip() if cwd else "",
             timeout=timeout,
             tty=tty,
+            api_key=self.api_key,
         ):
             yield chunk
 

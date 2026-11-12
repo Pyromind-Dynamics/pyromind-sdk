@@ -141,6 +141,8 @@ def test_close_sandbox_client_clears_shared_singleton() -> None:
 
 def test_rename_keeps_other_fields_and_updates_name():
     adapter, client = _adapter_with_fake_client()
+    adapter.command = ["python", "app.py"]
+    adapter.entrypoint = ["/usr/bin/tini", "--"]
 
     asyncio.run(adapter.rename("new-name"))
 
@@ -149,6 +151,22 @@ def test_rename_keeps_other_fields_and_updates_name():
     assert request.image == "busybox:1.36"
     assert request.port_mappings[0].container_port == 80
     assert adapter.name == "new-name"
+    # 平台 edit 见到 image 就重解析 argv：rename 必须带上原始 command/entrypoint，
+    # 否则用户的主进程命令会被悄悄换成镜像默认值。
+    assert request.command == ["python", "app.py"]
+    assert request.entrypoint == ["/usr/bin/tini", "--"]
+
+
+def test_rename_without_command_sends_none_not_empty_list():
+    adapter, client = _adapter_with_fake_client()
+    adapter.command = []
+    adapter.entrypoint = None
+
+    asyncio.run(adapter.rename("new-name"))
+
+    request = client.update.call_args.args[1]
+    assert request.command is None
+    assert request.entrypoint is None
 
 
 def test_restart_pauses_then_resumes():
@@ -1088,49 +1106,10 @@ def test_id_filter_uses_docker_id_not_sandbox_id() -> None:
     assert _matches_filters(record, {"id": ["sb-different"]}) is False
 
 
-def test_pyromind_terminal_url_uses_base_url(monkeypatch: MonkeyPatch) -> None:
-    from ..aio_server import _pyromind_terminal_url
-
-    adapter = PyromindSDK.__new__(PyromindSDK)
-    adapter.sandbox_id = "sb-1"
-    monkeypatch.setenv(
-        "PYROMIND_BASE_URL", "https://pre-api.pyromind.ai/api/v1"
-    )
-    monkeypatch.delenv("PYROMIND_API_KEY", raising=False)
-
-    url = _pyromind_terminal_url(adapter)
-
-    assert url.startswith(
-        "wss://pre-api.pyromind.ai/api/v1/sandboxes/sb-1/terminal?"
-    )
-    assert "cols=80&rows=24" in url
 
 
-def test_pyromind_terminal_url_carries_command_and_size(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """``docker exec -it <cid> <cmd>`` must reach the PTY as an argv.
 
-    Without this the terminal side would open its login shell and the command
-    the user typed would be silently dropped.
-    """
-    from ..aio_server import _pyromind_terminal_url
 
-    adapter = PyromindSDK.__new__(PyromindSDK)
-    adapter.sandbox_id = "sb-1"
-    monkeypatch.setenv(
-        "PYROMIND_BASE_URL", "https://pre-api.pyromind.ai/api/v1"
-    )
-    monkeypatch.delenv("PYROMIND_API_KEY", raising=False)
-
-    url = _pyromind_terminal_url(
-        adapter, cols=132, rows=43, cmd=["bash", "-l"], cwd="/workspace"
-    )
-
-    assert "cols=132&rows=43" in url
-    assert "command=bash" in url
-    assert "command=-l" in url
-    assert "cwd=%2Fworkspace" in url
 
 
 # ---------------------------------------------------------------------------

@@ -258,11 +258,9 @@ def extra_flags() -> list[str]:
         return []
 
 
-def rift_remote_dir() -> str:
-    """Pod 内 rift-client 的目录 —— 必须让 kaniko 忽略（既不删也不进镜像）。"""
-    from pyromind_sdk.rift.config import load_rift_config
-
-    return load_rift_config().remote_dir.rstrip("/") or "/opt/docker-rt/rift"
+#: 平台注入到构建沙箱里的目录：rift-client 二进制与 per-sandbox token。
+#: 必须让 kaniko 忽略（既不删也不进镜像）。路径由平台模板固定，不可配置。
+RIFT_IGNORE_PATHS = ("/opt/rift", "/opt/rift-token")
 
 
 def kaniko_args(
@@ -314,13 +312,14 @@ def kaniko_args(
     # keeps its own archive.
     args.append(f"--tar-path={tar_path(dests)}")
 
-    # 构建沙箱里还跑着 rift-client（构建的 exec / 上下文拷贝都靠它），它位于一个
-    # **普通 rootfs 目录**（默认 /opt/docker-rt/rift）。kaniko 的 DeleteFilesystem
-    # 会把这类目录清掉，更糟的是之后的快照会把它们（含 access key 的 token）
-    # 打进用户镜像。``--ignore-path`` 同时作用于两者：kaniko 把它加进
+    # 构建沙箱里还跑着 rift-client（构建的 exec / 上下文拷贝都靠它），平台把它注入
+    # 在两个**普通 rootfs 目录**：/opt/rift（二进制）与 /opt/rift-token（含 access
+    # key 的 token）。kaniko 的 DeleteFilesystem 会把这类目录清掉，更糟的是之后的
+    # 快照会把它们打进用户镜像。``--ignore-path`` 同时作用于两者：kaniko 把它加进
     # defaultIgnoreList，DeleteFilesystem 与 GetFSFromLayers 都用这份列表
     # （v1.24.0：cmd/executor/cmd/root.go:163、pkg/util/fs_util.go:233/1084）。
-    args.append(f"--ignore-path={rift_remote_dir()}")
+    for path in RIFT_IGNORE_PATHS:
+        args.append(f"--ignore-path={path}")
 
     # Skip kaniko's push-permission probe.
     #

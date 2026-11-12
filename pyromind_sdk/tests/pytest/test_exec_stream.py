@@ -20,14 +20,12 @@ def test_build_exec_stream_url_resolves_portal_to_direct_cluster() -> None:
     url = build_exec_stream_websocket_url(
         "https://pre-api-portal.pyromind.ai/api/v1",
         "sb-demo",
-        "key-123",
         # Bare `us-west-1` means prod; the env suffix selects pre.
         "us-west-1#pre",
     )
 
     assert url == (
-        "wss://pre-api.pyromind.ai/api/v1/sandboxes/sb-demo/"
-        "exec-stream?token=key-123"
+        "wss://pre-api.pyromind.ai/api/v1/sandboxes/sb-demo/exec-stream"
     )
 
 
@@ -35,13 +33,27 @@ def test_build_exec_stream_url_keeps_direct_base_url() -> None:
     url = build_exec_stream_websocket_url(
         "https://pre-api.pyromind.ai/api/v1",
         "sb-demo",
-        "",
         "us-west-1",
     )
 
     assert url == (
         "wss://pre-api.pyromind.ai/api/v1/sandboxes/sb-demo/exec-stream"
     )
+
+
+def test_exec_stream_auth_headers_carry_bearer_key_not_url() -> None:
+    """vuln-0016: the access key travels in the Authorization header only."""
+    from pyromind_sdk.exec_stream import exec_stream_auth_headers
+
+    url = build_exec_stream_websocket_url(
+        "https://pre-api.pyromind.ai/api/v1", "sb-demo"
+    )
+    assert "token" not in url and "key-123" not in url
+
+    headers = exec_stream_auth_headers("key-123")
+    assert headers["Authorization"] == "Bearer key-123"
+
+    assert "Authorization" not in exec_stream_auth_headers("")
 
 
 def test_iter_exec_stream_yields_events(monkeypatch: pytest.MonkeyPatch) -> None:

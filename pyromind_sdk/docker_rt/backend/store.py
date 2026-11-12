@@ -64,6 +64,8 @@ class ContainerRecord:
     created: float = field(default_factory=time.time)
     env: dict[str, str] = field(default_factory=dict)
     cmd: list[str] = field(default_factory=list)
+    # docker --entrypoint：None=未指定（用镜像 Entrypoint），[]=显式清空
+    entrypoint: list[str] | None = None
     working_dir: str = "/"
     # `docker run --rm`（HostConfig.AutoRemove）—— 前台 run 跑完命令后据此删容器。
     auto_remove: bool = False
@@ -257,6 +259,7 @@ class ContainerStore:
         image: str,
         env: dict[str, str],
         cmd: list[str],
+        entrypoint: list[str] | None = None,
         working_dir: str,
         auto_remove: bool = False,
         namespace: str,
@@ -301,6 +304,7 @@ class ContainerStore:
                 image=image,
                 env=env,
                 cmd=cmd,
+                entrypoint=entrypoint,
                 working_dir=working_dir or "/",
             auto_remove=auto_remove,
                 namespace=namespace,

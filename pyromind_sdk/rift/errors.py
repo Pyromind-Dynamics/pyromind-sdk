@@ -17,7 +17,3 @@ class RiftUnauthenticated(RiftError):
 
 class RiftPermissionDenied(RiftError):
     """The caller does not own the sandbox, or the operation is not allowed."""
-
-
-class RiftBinaryMissing(RiftError):
-    """No rift-client binary for the sandbox architecture is available locally."""

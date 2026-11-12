@@ -14,8 +14,9 @@
    executor 镜像的最终 stage 是 `FROM scratch`，里面**只有** `/kaniko/executor`
    一个静态二进制 + CA bundle + credential helper —— **没有 shell、没有 busybox、
    没有 `sleep`**。
-   而 k8s 的 CUSTOM sandbox 模板硬编码了 `command: ["sleep", "infinity"]`，
-   用默认镜像会直接 `exec: "sleep": executable file not found in $PATH` →
+   而构建沙箱的 create 请求显式指定 `entrypoint: ["sleep", "infinity"]`
+   （平台把它交给 rift-client 监管执行），用默认镜像会直接
+   `exec: "sleep": executable file not found in $PATH` →
    CrashLoopBackOff；就算起来了也没法 `sh -c` 把命令发进去。
    `-debug` 就是官方为这种场景发的同一镜像 + busybox（`/busybox`，
    并在 PATH 里加了它，`/bin/sh` 软链到 `busybox/sh`）。

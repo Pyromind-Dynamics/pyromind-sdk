@@ -88,28 +88,13 @@ packages = [
 [tool.setuptools.package-data]
 pyromind_sdk = ["*.md"]
 "pyromind_sdk.docker_rt" = ["*.md", "requirements.txt", "requirements-dev.txt"]
-# rift-client is shipped as architecture-specific release binaries; build them
-# with `pyromind_sdk/rift/client/make build-linux` before building the wheel.
+# rift-client 的 Go 源码与二进制在 k8s_middleware/rift（平台注入镜像）；
+# SDK 只带 Python gRPC stubs 与 proto。
 "pyromind_sdk.rift" = [
     "README.md",
     "proto/*.proto",
-    "bin/rift-client-linux-*",
-    "bin/rift-client.sha256",
-    "bin/rift-client.version",
 ]
 "pyromind_sdk.examples" = ["*.yaml", "utils/*.py"]
-
-# The wheel is runtime-only. Go sources and their tests build the binaries and
-# are kept in the sdist (release checks read them), but docker-rt never needs
-# them at run time.
-[tool.setuptools.exclude-package-data]
-"pyromind_sdk.rift" = [
-    "client/*.go",
-    "client/go.mod",
-    "client/go.sum",
-    "client/Makefile",
-    "client/pb/*.go",
-]
 
 [tool.pytest.ini_options]
 # Exclude test_yaml_nodes.py from pytest collection

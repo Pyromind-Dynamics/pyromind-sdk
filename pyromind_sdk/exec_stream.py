@@ -15,7 +15,7 @@ from typing import (
     Optional,
     Union,
 )
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -34,9 +34,10 @@ _STDERR_CHANNEL = 2
 class SandboxExecStreamError(RuntimeError):
     """Raised when the streaming exec endpoint reports a terminal error.
 
-    The message is redacted here, because aiohttp's connection errors quote the
-    full URL — including ``?token=<api key>`` — and this text is shown to the
-    user by ``docker build`` / ``docker exec`` without going through logging.
+    The message is redacted here as defense in depth: aiohttp's connection
+    errors quote the full URL back to the user (``docker build`` / ``docker
+    exec`` show it without going through logging). The access key itself
+    travels in the Authorization header, never in the URL (vuln-0016).
     """
 
     def __init__(self, message: str, code: Optional[str] = None) -> None:
@@ -56,20 +57,28 @@ def _resolve_stream_base_url(base_url: str, cluster: Optional[str]) -> str:
 def build_exec_stream_websocket_url(
     base_url: str,
     sandbox_id: str,
-    api_key: str = "",
     cluster: Optional[str] = None,
 ) -> str:
-    """Build the direct per-cluster exec-stream WebSocket URL."""
+    """Build the direct per-cluster exec-stream WebSocket URL.
+
+    The URL carries no credentials: the access key goes in the Authorization
+    header at connect time (vuln-0016 — query-string keys leak into access
+    logs, shell history and process listings).
+    """
     base = _resolve_stream_base_url(base_url, cluster)
     for http_scheme, ws_scheme in (("https://", "wss://"), ("http://", "ws://")):
         if base.startswith(http_scheme):
             base = ws_scheme + base[len(http_scheme):]
             break
-    query = {}
+    return f"{base}/sandboxes/{sandbox_id}/exec-stream"
+
+
+def exec_stream_auth_headers(api_key: str) -> Dict[str, str]:
+    """Connect-time headers: trace id plus Bearer auth when a key is present."""
+    headers = {TRACE_ID_HEADER: ensure_trace_id()}
     if api_key:
-        query["token"] = api_key
-    suffix = f"?{urlencode(query)}" if query else ""
-    return f"{base}/sandboxes/{sandbox_id}/exec-stream{suffix}"
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
 
 
 def _binary_event_from_frame(data: bytes) -> Optional[Dict[str, Any]]:
@@ -143,6 +152,7 @@ async def _iter_exec_stream_events(
     stop_event: Optional[threading.Event] = None,
     ping_interval_s: float = 10.0,
     stdin_close: Optional[threading.Event] = None,
+    api_key: str = "",
 ) -> AsyncIterator[Dict[str, Any]]:
     # Output-only channel: the server refused stdin support here (see the
     # docker_rt README). Interactive sessions use the terminal WebSocket.
@@ -158,9 +168,10 @@ async def _iter_exec_stream_events(
     async with aiohttp.ClientSession(timeout=timeout_config) as session:
         try:
             # trace 头一并带上：服务端（中间件）会沿用它，
-            # 这条连接就能和发起它的 docker 命令/请求对上
+            # 这条连接就能和发起它的 docker 命令/请求对上。
+            # access key 走 Authorization 头，不进 URL（vuln-0016）。
             ws = await session.ws_connect(
-                url, heartbeat=30, headers={TRACE_ID_HEADER: ensure_trace_id()}
+                url, heartbeat=30, headers=exec_stream_auth_headers(api_key)
             )
             logger.debug("[ws] exec-stream connected %s", redact_text(url))
         except aiohttp.WSServerHandshakeError as exc:
@@ -354,6 +365,7 @@ def iter_exec_stream(
     timeout: Optional[int] = None,
     tty: bool = False,
     stop_event: Optional[threading.Event] = None,
+    api_key: str = "",
 ) -> Iterator[SandboxExecStreamChunk]:
     """Yield streaming exec events synchronously."""
     events: "queue.Queue[tuple[str, Any]]" = queue.Queue(
@@ -387,6 +399,7 @@ def iter_exec_stream(
                     timeout=timeout,
                     tty=tty,
                     stop_event=stop_event,
+                    api_key=api_key,
                 ):
                     put_event("event", event)
             except BaseException as exc:
@@ -428,6 +441,7 @@ async def iter_exec_stream_async(
     tty: bool = False,
     stop_event: Optional[threading.Event] = None,
     stdin_close: Optional[threading.Event] = None,
+    api_key: str = "",
 ) -> AsyncIterator[SandboxExecStreamChunk]:
     """Yield streaming exec events asynchronously."""
     async for event in _iter_exec_stream_events(
@@ -438,5 +452,6 @@ async def iter_exec_stream_async(
         tty=tty,
         stop_event=stop_event,
         stdin_close=stdin_close,
+        api_key=api_key,
     ):
         yield SandboxExecStreamChunk(**event)

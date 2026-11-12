@@ -49,7 +49,7 @@ async def test_exec_is_rejected_at_create_time(aiohttp_client, monkeypatch) -> N
     assert resp.status == 409
     message = (await resp.json())["message"]
     assert "rift-client is not ready" in message
-    assert "docker stop" in message
+    assert "recreated" in message
 
 
 @pytest.mark.asyncio
@@ -95,20 +95,93 @@ def test_list_item_state_matches_status_while_not_ready() -> None:
     assert item["State"] == "running"
 
 
-def test_wait_ping_explains_a_missing_pipe() -> None:
-    import asyncio
+def _connect_env(monkeypatch, client, *, gateway="gw.example:443", attempts=2):
+    import logging
 
-    from ...rift.bootstrap import _wait_ping
-    from ...rift.errors import RiftUnavailable
+    from ..backend import pyromind_sdk_env as mod
+
+    monkeypatch.setattr(
+        mod,
+        "load_rift_config",
+        lambda: SimpleNamespace(
+            gateway=gateway, ping_attempts=attempts, ping_interval=0
+        ),
+    )
+    env = PyromindSDK.__new__(PyromindSDK)
+    env.sandbox_id = "sb-1"
+    env.rift_ready = False
+    env.rift_last_error = ""
+    env._rift_client = client
+    env.logger = logging.getLogger("test.connect_rift")
+    return env
+
+
+def test_connect_rift_marks_ready_on_ping(monkeypatch) -> None:
+    import asyncio
 
     class _Client:
         async def ping(self) -> str:
+            return "v0.1.0+abc123"
+
+    env = _connect_env(monkeypatch, _Client())
+    asyncio.run(env.connect_rift())
+    assert env.rift_ready is True
+    assert env.rift_last_error == ""
+
+
+def test_connect_rift_fails_loudly_after_retries(monkeypatch) -> None:
+    """Ping 不通就硬失败：不回退平台 exec，也不静默放行。"""
+    import asyncio
+
+    from ...rift.errors import RiftUnavailable
+
+    class _Client:
+        def __init__(self):
+            self.calls = 0
+
+        async def ping(self) -> str:
+            self.calls += 1
             raise RiftUnavailable("sandbox not found")
 
+    client = _Client()
+    env = _connect_env(monkeypatch, client, attempts=3)
     with pytest.raises(RiftUnavailable) as excinfo:
-        asyncio.run(_wait_ping(_Client(), attempts=1, interval=0))
-    assert "no Pipe" in str(excinfo.value)
-    assert "docker stop" in str(excinfo.value)
+        asyncio.run(env.connect_rift())
+    assert "did not answer Ping" in str(excinfo.value)
+    assert client.calls == 3
+    assert env.rift_ready is False
+
+
+def test_connect_rift_auth_failure_is_not_retried(monkeypatch) -> None:
+    import asyncio
+
+    from ...rift.errors import RiftUnauthenticated
+
+    class _Client:
+        def __init__(self):
+            self.calls = 0
+
+        async def ping(self) -> str:
+            self.calls += 1
+            raise RiftUnauthenticated("bad key")
+
+    client = _Client()
+    env = _connect_env(monkeypatch, client, attempts=5)
+    with pytest.raises(RiftUnauthenticated):
+        asyncio.run(env.connect_rift())
+    assert client.calls == 1
+    assert env.rift_ready is False
+
+
+def test_connect_rift_requires_a_gateway(monkeypatch) -> None:
+    import asyncio
+
+    from ...rift.errors import RiftUnavailable
+
+    env = _connect_env(monkeypatch, None, gateway="")
+    with pytest.raises(RiftUnavailable) as excinfo:
+        asyncio.run(env.connect_rift())
+    assert "not configured" in str(excinfo.value)
 
 
 class _FakeSession:
@@ -361,4 +434,4 @@ def test_not_ready_message_names_the_missing_cluster(monkeypatch):
     )
     msg = (mod._rift_not_ready_error(_Record()).text or "")
     assert "rift-client is not ready" in msg
-    assert "docker stop" in msg
+    assert "recreated" in msg

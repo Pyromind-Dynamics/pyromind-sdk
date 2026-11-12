@@ -639,84 +639,6 @@ def _marker_holdback(buf: "bytearray", marker: bytes) -> int:
     return 0
 
 
-#: 平台那条 WS 的"结束类"消息。``async for`` 会在这几个类型上直接
-#: ``StopAsyncIteration``（见 :func:`_ws_close_note`），所以必须自己 ``receive()``。
-_WS_END_TYPES = frozenset(
-    {
-        WSMsgType.CLOSE,
-        WSMsgType.CLOSING,
-        WSMsgType.CLOSED,
-        WSMsgType.ERROR,
-    }
-)
-
-
-#: 常用 close code 的人话（2026-10-16 加）。**只加注解，不改原有字段**，
-#: 这样既有 grep 友好的 ``code=NNNN``，也省得每次翻 RFC。
-#:
-#: 1012 是**线上抓到过的真凶**：uvicorn 的 ``WebSocketProtocol.shutdown()``
-#: 在收到 SIGTERM/SIGINT（pod 重启、滚动发布、被驱逐）时对**每条**已握手的
-#: WS 发 ``fail_connection(1012)``（`uvicorn/protocols/websockets/websockets_impl.py:143-149`）。
-#: ⇒ 看到 1012 就是"中间件那个进程在关闭"，不是用户退出、不是网络。
-_WS_CLOSE_HINTS: dict[int, str] = {
-    1000: "normal close by peer app",
-    1001: "peer going away",
-    1006: "no close frame from peer - hard drop or black-hole",
-    1011: "peer keepalive ping timeout",
-    1012: "peer uvicorn is shutting down - pod restart/rollout",
-}
-
-
-def _ws_close_note(ws: Any, msg: Any) -> str:
-    """把"这条 WS 为什么结束了"写成一句能进日志的话（2026-10-16 补）。
-
-    **为什么必须有它**：原先这里是 ``async for msg in ws``，而 aiohttp 的
-    ``ClientWebSocketResponse.__anext__`` 在 ``CLOSE``/``CLOSING``/``CLOSED`` 上
-    直接 ``StopAsyncIteration`` —— **循环体一次都看不到这三个类型**。于是
-    "对端发了关闭帧"和"连接无声无息地断了"在日志里长得**一模一样：什么都没有**。
-    2026-10-15 那次悬案（中间件 19:41:12 已判定客户端 WS 断了，docker-rt 19:57:53
-    才收场，中间 16 分钟零线索）就卡在这个盲区上。
-
-    ``ws.close_code`` 本身就是判据（aiohttp ``client_ws.receive`` 的赋值路径）：
-
-    * ``1006`` ABNORMAL_CLOSURE —— 连接被硬断（RST / 黑洞 / 中间设备静默丢弃）；
-    * ``1000`` OK（``EofStream``）—— 对端只是把 TCP 关了，**没发**关闭帧；
-    * 其它值（1000/1001/1011…）—— 对端**发了**关闭帧，code 就是它给的理由
-      （1001 走了、1011 keepalive ping 超时）。
-
-    ⚠️ **最该找的那一行**：本文件连平台用的是 aiohttp 客户端
-    （``client.ws_connect(url, heartbeat=30)``，见 :func:`_hijack_rift_terminal`；
-    ``pyromind_sdk/terminal.py`` / ``exec_stream.py`` 也是 30），它的客户端心跳是
-    **ping 每 30s、等 PONG 只等 ``heartbeat/2 = 15s``**；等不到就
-    ``_handle_ping_pong_exception`` → ``_close_code = ABNORMAL_CLOSURE(1006)``，
-    并且往 reader 里喂一条 ``WSMessage(ERROR, ServerTimeoutError(...))``
-    （aiohttp 3.14.3 ``client_ws.py:184-223``）。所以"平台那条腿半开（对端进程没了 /
-    中间设备把包吞了，TCP 却还没 RST）"在这套日志里的**指纹**是：
-
-        reason=ws-error ServerTimeoutError('No PONG received after 15.0 seconds') (code=1006)
-
-    看到它就**不用再猜网络**了 —— 是心跳自己判的死刑，且**对端连关闭帧都没给**。
-
-    注意这条消息只有"喂进去时正好有人在 ``receive()``"才拿得到
-    （``_handle_ping_pong_exception`` 里的 ``if self._waiting``）。:func:`pump_out`
-    正常情况下**一直挂着 ``receive()``**，所以能命中；万一没命中，就退化成
-    ``transport-closed-without-close-frame (code=1006)`` —— **code=1006 依然足够**
-    （1006 的含义就是"没有关闭帧的硬断"）。
-    """
-    code = getattr(ws, "close_code", None)
-    reason = (getattr(ws, "close_reason", None) or "").strip()
-    bits = [f"code={code}"]
-    hint = _WS_CLOSE_HINTS.get(code)
-    if hint:  # 见 _WS_CLOSE_HINTS：1012 = 中间件在重启
-        bits.append(hint)
-    if reason:
-        bits.append(f"reason={reason!r}")
-    suffix = "; ".join(bits)
-    if msg.type is WSMsgType.ERROR:
-        return f"ws-error {msg.data!r} ({suffix})"
-    if msg.type is WSMsgType.CLOSE:
-        return f"peer-close-frame ({suffix})"
-    return f"transport-closed-without-close-frame ({suffix})"
 
 
 def _unwrap_handshake_cmd(cmd: list[str] | None) -> list[str] | None:
@@ -1352,9 +1274,9 @@ def _rift_not_ready_error(c: Any) -> web.Response:
     return _err(
         409,
         f"Container {c.id[:12]} is not running: rift-client is not ready. "
-        "If this sandbox was created before rift-gateway was deployed it has no "
-        "route; run `docker stop` + `docker start` (or recreate it) so "
-        "k8s_middleware writes the Pipe.",
+        "rift-client is injected by the platform when the sandbox is created; "
+        "sandboxes created before that change must be recreated (docker rm + "
+        "docker run). If it was just created, wait for the Pod to become Ready.",
     )
 
 
@@ -1900,11 +1822,20 @@ def _to_inspect(c: Any, *, pod_ip: str | None = None) -> dict[str, Any]:
                 "Propagation": "rprivate",
             }
         )
+    # 主进程 argv 的真实口径：只报请求里显式给出的 entrypoint/cmd；都没给时
+    # 最终 argv 由平台按镜像 Entrypoint/Cmd 解析，daemon 不知道，报空而不是编造。
+    _ep = getattr(c, "entrypoint", None)
+    if _ep:
+        _path, _args = _ep[0], list(_ep[1:]) + list(c.cmd)
+    elif c.cmd:
+        _path, _args = c.cmd[0], list(c.cmd[1:])
+    else:
+        _path, _args = "", []
     result = {
         "Id": c.id,
         "Created": _iso(c.created),
-        "Path": c.cmd[0] if c.cmd else "sleep",
-        "Args": c.cmd[1:] if c.cmd else ["2h"],
+        "Path": _path,
+        "Args": _args,
         "State": {
             "Status": state_status,
             "Running": running,
@@ -1958,7 +1889,8 @@ def _to_inspect(c: Any, *, pod_ip: str | None = None) -> dict[str, Any]:
         "Config": {
             "Hostname": hostname,
             "Env": [f"{k}={v}" for k, v in c.env.items()],
-            "Cmd": c.cmd or ["sleep", "2h"],
+            "Cmd": list(c.cmd) if c.cmd else None,
+            "Entrypoint": list(_ep) if _ep is not None else None,
             "Image": c.image,
             "WorkingDir": c.working_dir,
             "Labels": labels,
@@ -2096,6 +2028,10 @@ async def create_container(request: web.Request) -> web.Response:
     cmd = body.get("Cmd") or []
     if isinstance(cmd, str):
         cmd = [cmd]
+    # docker --entrypoint：缺省 None（用镜像 Entrypoint）；显式 [] 表示清空
+    entrypoint = body.get("Entrypoint")
+    if isinstance(entrypoint, str):
+        entrypoint = [entrypoint]
     working_dir = body.get("WorkingDir") or "/"
     labels = dict(body.get("Labels") or {})
     namespace = (
@@ -2146,6 +2082,7 @@ async def create_container(request: web.Request) -> web.Response:
             image=image,
             env=env,
             cmd=list(cmd),
+            entrypoint=entrypoint,
             working_dir=working_dir,
             # `docker run --rm`：CLI 可能把 AutoRemove 放在 HostConfig 里，
             # 也可能放在 create body 顶层 —— **两处都看**（2026-10-15 实测只查
@@ -2273,47 +2210,36 @@ async def _auto_remove_container(app: Any, record: Any) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("foreground --rm failed for %s: %s", record.id[:12], exc)
 
-async def _bootstrap_rift_for_record(record: Any) -> web.Response | None:
-    """Make rift-client ready before the container is reported as Up.
+async def _ensure_rift_for_record(record: Any) -> web.Response | None:
+    """Gate the container on the platform-injected rift-client answering Ping.
 
-    For PyromindSDK containers rift is the only business data plane. Pod
-    Running is just a prerequisite: ``docker start`` must not succeed (and the
-    record must not become RUNNING) until the injected client answers Ping.
-    A failure after the three bootstrap attempts returns 503.
+    For PyromindSDK containers rift is the only business data plane. The
+    binary/token are injected by k8s_middleware at Pod creation (rift-client
+    runs as PID1 with --supervise); docker-rt uploads nothing. Pod Running is
+    just a prerequisite: ``docker start`` must not succeed (and the record
+    must not become RUNNING) until Ping answers. Failure returns 503.
     """
     kube_env = getattr(record, "kube_env", None)
     if not isinstance(kube_env, PyromindSDK):
         return None
     try:
-        await kube_env.bootstrap_rift()
+        await kube_env.connect_rift()
         record.error = None
         return None
     except RiftUnavailable as exc:
         record.error = f"[RIFT_UNAVAILABLE] {exc}"
-        logger.error("rift bootstrap failed id=%s: %s", record.id[:12], exc)
+        logger.error("rift not ready id=%s: %s", record.id[:12], exc)
         return _err(503, record.error)
 
 
-def _rift_version_is_stale(running: str) -> bool:
-    """True when the Pod runs a different build than the one shipped here.
-
-    ``Ping`` returns ``<git describe>+<source sha12>`` (see
-    ``rift/client/Makefile``): the git part alone cannot tell two builds of the
-    same commit apart, the sha suffix can. An empty expected version (package
-    without ``rift-client.version``) keeps the old "any version is fine"
-    behaviour instead of re-injecting on every pass.
-    """
-    expected = load_rift_config().expected_version
-    return bool(expected) and running != expected
-
-
 async def _rift_health_loop(app: web.Application) -> None:
-    """Keep the rift channel alive: ping, then re-bootstrap (3 attempts inside).
+    """Keep the rift channel observable: ping only, never re-inject.
 
-    Repeated failures back off per sandbox (up to 5 minutes). A legacy sandbox
-    without a Pipe can never recover on its own, and retrying it every 30s
-    hammers the same platform API that ``docker run`` needs to start a new
-    sandbox (upload + status polling), which used to stall fresh starts.
+    The platform owns the rift-client lifecycle (PID1 of the Pod). A failed
+    ping means the Pod is gone/restarting or the route is broken; the loop
+    marks the channel unready and re-verifies with Ping once the platform
+    reports Running again. Repeated failures back off per sandbox (up to 5
+    minutes) so a legacy sandbox without injection does not hammer the API.
     """
     interval = load_rift_config().health_interval
     if interval <= 0:
@@ -2324,8 +2250,6 @@ async def _rift_health_loop(app: web.Application) -> None:
     retry_at: dict[str, float] = {}
     loop = asyncio.get_running_loop()
     while True:
-        # Check once immediately: adopted sandboxes are not usable until this
-        # pass injects and starts their rift-client.
         for record in list(store.list(all_containers=False)):
             if record.state != ContainerState.RUNNING:
                 continue
@@ -2334,8 +2258,8 @@ async def _rift_health_loop(app: web.Application) -> None:
                 continue
             if retry_at.get(record.id, 0.0) > loop.time():
                 continue
-            # The same mutex the start/stop paths take: a bootstrap here must
-            # never race the bootstrap `docker start` is already running.
+            # The same mutex the start/stop paths take: a reconnect here must
+            # never race the Ping gate `docker start` is already running.
             lock = record.lock
             if lock.locked():
                 continue
@@ -2345,37 +2269,24 @@ async def _rift_health_loop(app: web.Application) -> None:
                 try:
                     if env.rift_ready:
                         running = await env.ping_rift_version()
-                        if running and not _rift_version_is_stale(running):
+                        if running:
                             ping_misses.pop(record.id, None)
                             failures.pop(record.id, None)
                             retry_at.pop(record.id, None)
                             continue
-                        if running:
+                        # One missed ping is usually a network blip; require
+                        # two in a row before flipping the channel unready.
+                        misses = ping_misses.get(record.id, 0) + 1
+                        ping_misses[record.id] = misses
+                        if misses < 2:
                             logger.warning(
-                                "rift-client is stale id=%s running=%s expected=%s; "
-                                "re-injecting",
+                                "rift ping failed id=%s (%s/2); checking again",
                                 record.id[:12],
-                                running,
-                                load_rift_config().expected_version,
+                                misses,
                             )
-                        else:
-                            # One missed ping is usually a network blip; a
-                            # re-inject restarts rift-client and kills every
-                            # open exec session, so require two in a row.
-                            misses = ping_misses.get(record.id, 0) + 1
-                            ping_misses[record.id] = misses
-                            if misses < 2:
-                                logger.warning(
-                                    "rift ping failed id=%s (%s/2); checking again "
-                                    "before re-injecting",
-                                    record.id[:12],
-                                    misses,
-                                )
-                                continue
+                            continue
                     # A pause/resume transition leaves the Pod Pending for a
-                    # while. Injecting then fails ("Sandbox is not running") and
-                    # competes with the `docker start` that is waiting for the
-                    # same Pod, so only bootstrap once the platform says Running.
+                    # while. Only re-verify once the platform says Running.
                     phase = str(await env.refresh_phase(force=True) or "").strip().lower()
                     if phase not in {"running", "up", "ready"}:
                         # "unknown" means the control plane did not answer (the
@@ -2387,10 +2298,11 @@ async def _rift_health_loop(app: web.Application) -> None:
                         )
                     env.rift_ready = False
                     logger.warning(
-                        "rift channel unhealthy id=%s; re-bootstrapping",
+                        "rift channel unhealthy id=%s; re-verifying with Ping",
                         record.id[:12],
                     )
-                    await env.bootstrap_rift(force=True)
+                    await env.connect_rift()
+                    ping_misses.pop(record.id, None)
                     failures.pop(record.id, None)
                     retry_at.pop(record.id, None)
                 except RiftError as exc:
@@ -2434,7 +2346,7 @@ async def _start_record(
             ):
                 # Adopted/restarted sandbox: heal the data plane before telling
                 # the caller it is already running.
-                rift_error = await _bootstrap_rift_for_record(record)
+                rift_error = await _ensure_rift_for_record(record)
                 if rift_error is not None:
                     return rift_error
             return _empty(304)
@@ -2506,7 +2418,7 @@ async def _start_record(
                 await store.set_state(record, ContainerState.DEAD)
                 logger.exception("port publish failed")
                 return _err(500, format_exception_message(exc))
-            rift_error = await _bootstrap_rift_for_record(record)
+            rift_error = await _ensure_rift_for_record(record)
             if rift_error is not None:
                 try:
                     await _stop_port_forward(record)
@@ -2544,6 +2456,7 @@ async def _start_record(
                 volume_store=request.app.get("volumes"),
                 hostname=hostname,
                 command=list(record.cmd or []),
+                entrypoint=getattr(record, "entrypoint", None),
                 tty=bool(getattr(record, "tty", False)),
                 stdin=bool(
                     getattr(record, "open_stdin", False)
@@ -2670,7 +2583,7 @@ async def _start_record(
                             record.name,
                             exc,
                         )
-                rift_error = await _bootstrap_rift_for_record(record)
+                rift_error = await _ensure_rift_for_record(record)
                 if rift_error is not None:
                     try:
                         await _stop_port_forward(record)
@@ -2913,6 +2826,7 @@ async def restart_container(request: web.Request) -> web.Response:
                 volume_store=request.app.get("volumes"),
                 hostname=hostname,
                 command=list(record.cmd or []),
+                entrypoint=getattr(record, "entrypoint", None),
                 tty=bool(getattr(record, "tty", False)),
                 stdin=bool(
                     getattr(record, "open_stdin", False)
@@ -4525,68 +4439,6 @@ def _client_stdin_eof(protocol: Any) -> bool:
     return bool(event is not None and event.is_set())
 
 
-#: 空闲关门的**兜底**判据：中间件没带 close reason 时（老镜像），只要两条腿都安静
-#: 了这么久，就认定是平台的空闲策略关的。取 1700s 而不是 1800s —— 中间件阈值是
-#: 1800s + 最多 30s 轮询，留点余量，别"刚好卡在边界"时漏报。
-_IDLE_CLOSE_FALLBACK_S = 1700.0
-
-
-def _terminal_close_notice(
-    *,
-    close_code: Any,
-    close_reason: str,
-    last_traffic: float,
-    now: float,
-) -> str:
-    """准备一句"它为什么自己关了"（空串 = 没什么可说）。
-
-    为什么要它（2026-10-16）：平台的**空闲看门狗**和 **pod 重启**都只发普通关闭帧，
-    docker CLI 那边看到的是干净的 EOF —— **屏幕上一个字都不会打**，用户就永远只会
-    觉得"莫名其妙自己断了"。这里把那两种情况翻成人话，写回 CLI 的输出流。
-
-    ⚠️ 只该给 **tty** 会话写（调用方负责判断）：非 tty 的 stdout 是要被管道消费的，
-    掺进去会污染数据。
-    """
-    reason = (close_reason or "").strip().lower()
-    idle_text = "\r\ndocker-rt: session closed after 30m idle (no keystrokes)\r\n"
-    if "idle" in reason:
-        # 精确判据：中间件在关帧里写了 reason=idle-timeout。
-        return idle_text
-    if not reason and close_code == 1000 and (now - last_traffic) >= _IDLE_CLOSE_FALLBACK_S:
-        # 兜底：**老镜像**不带 reason（"两条腿都安静了 28 分钟以上"就认这份）。
-        # 只在 reason 为空时用，免得误伤"用户自己 exit"（那时最后有按键，时间不够）。
-        return idle_text
-    if close_code == 1012:
-        # uvicorn 收到 SIGTERM 时对每条已握手 WS 发的 code = Service Restart。
-        return "\r\ndocker-rt: session closed because k8s_middleware restarted\r\n"
-    return ""
-
-
-def _client_link_state(protocol: Any) -> str:
-    """一句话说清"收尾时客户端那条 hijack 连接还活着吗"（2026-10-16 补日志）。
-
-    和 :func:`_ws_close_note` 一起看就能把"谁先断"钉死，不用再猜：
-
-    * ``client-conn=open`` + ``reason=transport-closed-without-close-frame``
-      ⇒ 是**平台那条 WS** 先没的（网络/中间设备/对端关），客户端这边毫发无损；
-    * ``client-conn=gone|closing`` + ``reason=docker-client-write-failed``
-      ⇒ 是 **docker CLI** 先没的（终端被关、进程被杀、本机网络断）。
-
-    2026-10-15 那次"16 分钟后才收场"正是因为两格都没记，日志里只剩一条
-    事后的 ``No such exec``，根因无从下手。
-    """
-    if protocol is None:
-        return "unknown"
-    transport = getattr(protocol, "transport", None)
-    if transport is None:
-        return "gone"
-    is_closing = getattr(transport, "is_closing", None)
-    if callable(is_closing) and is_closing():
-        return "closing"
-    if _client_stdin_eof(protocol):
-        return "half-closed(client-eof)"
-    return "open"
-
 
 def _take_client_stdin(protocol: Any) -> bytes:
     """取走 101 之后客户端发来的 stdin 字节（非阻塞；没有就是 ``b""``）。
@@ -4893,8 +4745,9 @@ async def attach_container(request: web.Request) -> web.StreamResponse | web.Res
             sandbox_id = getattr(record, "sandbox_id", None) or ""
             where = f" (sandbox {sandbox_id})" if sandbox_id else ""
             message = (
-                "docker-rt: no command given, and the image CMD/ENTRYPOINT is not "
-                f"available here; container {short}{where} is running in the "
+                "docker-rt: no command given; the image's default command runs "
+                "as the container main process, but its output cannot be "
+                f"attached here; container {short}{where} is running in the "
                 "background (same as `docker run -d`). Run commands with: "
                 f"docker exec {short} <cmd>\r\n"
             ).encode("utf-8")
@@ -4939,9 +4792,9 @@ async def attach_container(request: web.Request) -> web.StreamResponse | web.Res
             _force_close_hijack(request, resp)
             return resp
 
-        # Attach to the main process (Cmd is now the Pod entrypoint).
-        # 前台 `docker run`（无 -d/-i/-t）：把容器的 Cmd 传进去，由 exec 跑；
-        # 返回后把退出码记到 record（供 /wait 回给 CLI），`--rm` 则删容器。
+        # 前台 `docker run`（无 -d/-i/-t）：请求给了 Cmd 就用 rift exec 跑一遍
+        # （平台监管的主进程是另一份，输出无法 attach）；返回后把退出码记到
+        # record（供 /wait 回给 CLI），`--rm` 则删容器。
         foreground_cmd = None
         if not stdin and not tty and list(getattr(record, "cmd", None) or []):
             foreground_cmd = list(getattr(record, "cmd", None) or [])
@@ -5200,16 +5053,16 @@ async def _hijack_session(
 
         if not stdin and not tty:
             # `docker run IMG`（没有命令、没有 -i/-t）：
-            # 真 Docker 会用镜像的 CMD/ENTRYPOINT，但 docker-rt **读不到镜像 config**
-            # （inspect 镜像时 Cmd/Entrypoint 恒为 None；平台也不把 Cmd 当主进程），
-            # 所以这里没有命令可跑。容器本身已经起来了（Pod 常驻），按
-            # `docker run -d` 的工作台语义返回 —— 之前这里报
+            # 平台已把镜像 Entrypoint/Cmd 作为 rift-client 监管的主进程在跑，
+            # 但那个进程的输出不走 rift 通道，docker-rt 无法 attach 它，
+            # 所以按 `docker run -d` 的工作台语义返回 —— 之前这里报
             # "this container has no command to run; use -d or -it"，
             # 用户会以为前台 run 根本没被支持（2026-10-21 实测）。
             short = (getattr(session, "id", "") or "")[:12]
             message = (
-                "docker-rt: no command given, and the image CMD/ENTRYPOINT is not "
-                f"available here; container {short} is running in the background "
+                "docker-rt: no command given; the image's default command runs "
+                "as the container main process, but its output cannot be "
+                f"attached here; container {short} is running in the background "
                 "(same as `docker run -d`). Run commands with: "
                 f"docker exec {short} <cmd>\r\n"
             ).encode("utf-8")
@@ -5384,30 +5237,6 @@ async def _hijack_session(
     return resp
 
 
-def _pyromind_terminal_url(
-    kube_env: Any,
-    *,
-    cols: int = 80,
-    rows: int = 24,
-    cmd: list[str] | None = None,
-    cwd: str = "",
-) -> str:
-    # Same resolution as every other data-plane call this daemon makes: the
-    # terminal WebSocket lives on the cluster, and the portal does not proxy
-    # WebSocket at all.
-    from pyromind_sdk.client.base import ENV_API_KEY, resolve_api_base_url
-    from pyromind_sdk.terminal import build_terminal_websocket_url
-
-    api_key = (os.getenv(ENV_API_KEY) or "").strip()
-    return build_terminal_websocket_url(
-        resolve_api_base_url(),
-        kube_env.sandbox_id or "",
-        api_key,
-        cols=cols,
-        rows=rows,
-        command=list(cmd) if cmd else None,
-        cwd=cwd or None,
-    )
 
 
 def _pty_output_for_client(data: bytes, *, tty: bool) -> bytes:
@@ -5605,422 +5434,6 @@ async def _hijack_rift_terminal(
     return resp
 
 
-async def _hijack_pyromind_terminal(
-    request: web.Request,
-    resp: web.StreamResponse,
-    protocol: Any,
-    session: Any,
-    kube_env: PyromindSDK,
-    tty: bool,
-    *,
-    cmd: list[str] | None = None,
-    cwd: str = "",
-    marker: str = "",
-    ack_path: str = "",
-) -> bool:
-    """Bridge a Docker TCP upgrade to the platform terminal WebSocket (a PTY).
-
-    Returns ``True`` once the session has been attempted. ``False`` means the
-    terminal could not be reached *and nothing was written to the hijacked
-    stream*, so the caller may still fall back to the exec-stream channel.
-    """
-    import aiohttp
-
-    cols = int(getattr(session, "tty_cols", 0) or 0) or 80
-    rows = int(getattr(session, "tty_rows", 0) or 0) or 24
-    url = _pyromind_terminal_url(
-        kube_env, cols=cols, rows=rows, cmd=cmd, cwd=cwd
-    )
-    session.running = True
-    logger.info(
-        "pyromind terminal hijack start id=%s sandbox=%s %dx%d cmd=%s",
-        getattr(session, "id", "")[:12],
-        kube_env.sandbox_id,
-        cols,
-        rows,
-        redact(cmd) if cmd else "(login shell)",
-    )
-    # 收尾摘要用的观测点（2026-10-16 补日志）：
-    #   * ``stop``  —— 这条会话**为什么结束**（=`_ws_close_note` 的一句话）；
-    #   * ``stats`` —— 两个方向各搬了多少字节 / 多少帧。
-    # 放在 ``try`` **外面**，这样最外层 ``finally`` 也能读到它们并打一行摘要 ——
-    # 用户要的是"谁先断"，而这件事只能靠"结束原因 + 收尾时客户端连接状态"一起看。
-    started_at = time.monotonic()
-    stop: list[str] = [""]
-    #: 关帧的结构化信息（``_ws_close_note`` 是给别人看的字符串，这里留原始值给
-    #: "该不该给用户打一行说明"的判断用）。
-    stop_info: dict[str, Any] = {"close_code": None, "close_reason": ""}
-    #: ``last_traffic`` 用来判断"是不是闲了很久才被平台关的"（见
-    #: :func:`_terminal_close_notice`）。
-    stats = {
-        "pty_to_cli": 0,
-        "cli_to_pty": 0,
-        "frames_out": 0,
-        "last_traffic": started_at,
-    }
-    try:
-        async with aiohttp.ClientSession() as client:
-            try:
-                ws = await client.ws_connect(
-                    url,
-                    heartbeat=30,
-                    headers={TRACE_ID_HEADER: ensure_trace_id()},
-                )
-                logger.info(
-                    "terminal connected id=%s", getattr(session, "id", "")[:12]
-                )
-            except (aiohttp.ClientError, OSError) as exc:
-                session.running = False
-                if cmd is not None:
-                    # Interactive exec: the caller can still use the command
-                    # channel, so leave the stream untouched.
-                    logger.warning(
-                        "terminal connection failed for id=%s (%s: %s)",
-                        getattr(session, "id", "")[:12],
-                        type(exc).__name__,
-                        exc,
-                    )
-                    return False
-                # Attach: there is no alternative transport. Say so on the
-                # stream instead of leaving an empty terminal behind.
-                await _write_exec_error(
-                    resp,
-                    f"docker-rt: cannot open an interactive session for "
-                    f"{kube_env.sandbox_id}: {redact_text(str(exc))}",
-                    tty=tty,
-                )
-                return True
-
-            session_over = asyncio.Event()
-
-            async def push_resize(width: int, height: int) -> None:
-                await ws.send_str(
-                    json.dumps(
-                        {"type": "resize", "cols": width, "rows": height}
-                    )
-                )
-
-            # ``docker exec -t`` sends its geometry *before* start, but a user
-            # dragging the window afterwards lands here through
-            # ``POST /exec/{id}/resize``.
-            session.resize_hook = push_resize
-
-            async def pump_out() -> None:
-                # 结束标记的滚动缓冲（PTY 是合并流，没有 stderr 通道可分辨）：
-                # 标记可能被拆在两次读取里，所以尾巴要留一截不急着发。
-                #
-                # ⚠️ 这一截必须由 :func:`_marker_holdback` 算（只留"真的可能是标记
-                # 前缀"的字节）。原来无条件留 ``len(marker)+1`` = 47 字节，于是
-                # 交互式 shell 的提示符 ``# ``（2 字节）**一个字节都发不出去** ——
-                # 用户 ``docker exec -it c sh`` 看到的是**全黑屏**，像卡在建连；
-                # 之后每个字符的回显都落后 47 字节，用户猛敲 Enter/Ctrl-C 只会
-                # 看到一串迟到的 ``#`` 涌出来（2026-10-15 用户实测症状）。
-                marker_bytes = marker.encode() if marker else b""
-                filter_buf = bytearray()
-                ack_fired = False
-
-                def _strip_marker(raw: bytes) -> bytes:
-                    """把结束标记摘掉；看到标记立刻落回执（生产者随后才退出）。"""
-                    nonlocal ack_fired
-                    if not marker_bytes:
-                        return raw
-                    filter_buf.extend(raw)
-                    idx = bytes(filter_buf).find(marker_bytes)
-                    if idx >= 0:
-                        if not ack_fired:
-                            ack_fired = True
-                            if ack_path:
-                                asyncio.create_task(kube_env.write_ack(ack_path))
-                        payload = bytes(filter_buf[:idx])
-                        del filter_buf[: idx + len(marker_bytes)]
-                        payload += bytes(filter_buf).lstrip(b"\r\n")
-                        filter_buf.clear()
-                        return payload
-                    hold = _marker_holdback(filter_buf, marker_bytes)
-                    if len(filter_buf) <= hold:
-                        return b""
-                    payload = bytes(filter_buf[: len(filter_buf) - hold])
-                    del filter_buf[: len(filter_buf) - hold]
-                    return payload
-
-                # ⚠️ 显式 ``receive()``，**不要** ``async for``：aiohttp 的
-                # ``__anext__`` 在 CLOSE/CLOSING/CLOSED 上直接 StopAsyncIteration，
-                # 循环体看不到它们 ⇒ 关帧会被静默吞掉（见 :func:`_ws_close_note`）。
-                # 这里每个出口都往 ``stop`` 里写一句"为什么结束"，收尾日志才有的看。
-                while True:
-                    try:
-                        msg = await ws.receive()
-                    except Exception as exc:  # noqa: BLE001 — 记录类型就够了
-                        stop[0] = f"receive-raised {type(exc).__name__}: {exc}"
-                        session_over.set()
-                        break
-                    if session_over.is_set():
-                        # 别的任务先结束了（stdin 侧出错 / 客户端断开被发现）。
-                        stop[0] = stop[0] or "stopped-by-peer-task"
-                        break
-                    if msg.type in _WS_END_TYPES:
-                        stop_info["close_code"] = getattr(ws, "close_code", None)
-                        stop_info["close_reason"] = (
-                            getattr(ws, "close_reason", None) or ""
-                        )
-                        stop[0] = _ws_close_note(ws, msg)
-                        session_over.set()
-                        break
-                    if msg.type == aiohttp.WSMsgType.BINARY:
-                        try:
-                            # 有没有 -t 决定客户端怎么解析：帧头的有无必须跟着它走
-                            # （见 _pty_output_for_client）。
-                            payload = _strip_marker(msg.data)
-                            if not payload:
-                                continue
-                            stats["pty_to_cli"] += len(payload)
-                            stats["last_traffic"] = time.monotonic()
-                            stats["frames_out"] += 1
-                            await resp.write(
-                                _pty_output_for_client(payload, tty=tty)
-                            )
-                            await resp.drain()
-                        except (
-                            ConnectionResetError,
-                            RuntimeError,
-                            ConnectionError,
-                        ) as exc:
-                            # 写不进去 = **docker CLI 那边先没了**（终端被关、
-                            # 进程被杀、本机网络断）。原来这里是静默 break，
-                            # 于是"CLI 先断"和"平台先断"在日志里分不出来。
-                            stop[0] = (
-                                f"docker-client-write-failed "
-                                f"{type(exc).__name__}: {exc}"
-                            )
-                            session_over.set()
-                            break
-                    elif msg.type == aiohttp.WSMsgType.TEXT:
-                        try:
-                            obj = json.loads(msg.data)
-                            if isinstance(obj, dict) and obj.get("type") == "pong":
-                                continue
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-                        try:
-                            payload = msg.data.encode("utf-8", errors="replace")
-                            stats["pty_to_cli"] += len(payload)
-                            stats["last_traffic"] = time.monotonic()
-                            stats["frames_out"] += 1
-                            await resp.write(
-                                payload
-                                if tty
-                                else _pty_output_for_client(payload, tty=False)
-                            )
-                            await resp.drain()
-                        except (
-                            ConnectionResetError,
-                            RuntimeError,
-                            ConnectionError,
-                        ) as exc:
-                            stop[0] = (
-                                f"docker-client-write-failed "
-                                f"{type(exc).__name__}: {exc}"
-                            )
-                            session_over.set()
-                            break
-
-                # 流结束了：把为"标记可能被拆帧"而暂存的尾巴**刷出去**。
-                # 不刷的话最后 ≤len(marker)+1 字节会被永远压在缓冲里丢掉 —— 短输出
-                # （比如 `echo hi`）会整体消失（2026-10-14 本地复现暴露的就是这个）。
-                if marker_bytes and filter_buf:
-                    pending = bytes(filter_buf)
-                    filter_buf.clear()
-                    if pending:
-                        if not ack_fired:
-                            logger.warning(
-                                "pyromind terminal stream ended without the end marker; "
-                                "output may be truncated id=%s (flushing %d buffered bytes)",
-                                getattr(session, "id", "")[:12],
-                                len(pending),
-                            )
-                        try:
-                            await resp.write(
-                                _pty_output_for_client(pending, tty=tty)
-                            )
-                            await resp.drain()
-                        except (
-                            ConnectionResetError,
-                            RuntimeError,
-                            ConnectionError,
-                        ):
-                            session_over.set()
-
-            async def pump_in() -> None:
-                """客户端 stdin → PTY。
-
-                ⚠️ stdin **只**能从 ``protocol._message_tail`` 取（见
-                :func:`_take_client_stdin`）。旧实现在没有 tail 时读
-                ``request.content.readany()`` 并把它的 ``b""`` 当"客户端 stdin 关了"
-                —— 而 upgrade 之后 payload 早已 EOF，``readany()`` 每次都立刻返回
-                ``b""``（2026-10-15 本地实测）：于是**每条 ``docker exec -it`` 一进
-                shell 就给 PTY 发 Ctrl-D**，提示符刚打出来进程就没了 —— 用户报的
-                "进去就退/根本敲不了字"就是这个（keystrokes 全部堆在
-                ``_message_tail``，一个字节都没被搬走）。
-
-                **stdin 半关闭（EOF）≠ 会话结束** —— Docker 的 ``-i`` 语义是
-                「stdin 关了，命令继续跑到自然结束」。真的半关闭由
-                :func:`_keep_transport_after_client_eof` 记成事件；PTY 传不了真 EOF，
-                用 **Ctrl-D（0x04）** 近似（交互 shell 的行规程里它就是 EOF；对一次性
-                命令是多余的无害字节），之后**继续泵输出**，直到 terminal WS 关闭。
-                客户端真正断开由 ``pump_out`` 的 write 失败兜底。
-                """
-                eof_sent = False
-                try:
-                    while not session_over.is_set():
-                        data = _take_client_stdin(protocol)
-                        if data:
-                            stats["cli_to_pty"] += len(data)
-                            stats["last_traffic"] = time.monotonic()
-                            await ws.send_bytes(data)
-                            continue
-                        if not eof_sent and _client_stdin_eof(protocol):
-                            eof_sent = True
-                            try:
-                                await ws.send_bytes(b"\x04")
-                                logger.debug(
-                                    "pyromind terminal stdin EOF -> EOT, draining "
-                                    "output until the command ends"
-                                )
-                            except Exception:
-                                pass
-                            continue
-                        await asyncio.sleep(0.02)
-                except Exception as exc:
-                    logger.debug("pyromind terminal stdin end: %s", exc)
-                    session_over.set()
-
-            async def send_pings() -> None:
-                """每 60 秒发一个应用层 ``{"type":"ping"}``（不是 WS 协议层 PING）。
-
-                ⚠️ 失败**必须记一笔**（2026-10-16 补日志）：原来是
-                ``except Exception: pass``，把"这条 WS 已经写不进去了"整个吞掉，
-                而且它**从不** ``session_over.set()`` —— keepalive 因此完全失去
-                "探活"作用，连接死了只能等内核 TCP 重传超时（Linux 默认
-                ``tcp_retries2=15`` ≈ 924s ≈ 15.4 分钟）才发现。2026-10-15 那次
-                "中间件 19:41:12 判定客户端 WS 已断、docker-rt 19:57:53 才收场"
-                正好就是这个量级。只记**第一次**，避免每分钟刷屏。
-                """
-                logged = False
-                while not session_over.is_set():
-                    try:
-                        await asyncio.sleep(60)
-                        if session_over.is_set():
-                            break
-                        await ws.send_str(json.dumps({"type": "ping"}))
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:  # noqa: BLE001
-                        if not logged:
-                            logged = True
-                            logger.warning(
-                                "pyromind terminal keepalive ping failed id=%s "
-                                "(%s: %s); the platform WS is already gone",
-                                getattr(session, "id", "")[:12],
-                                type(exc).__name__,
-                                exc,
-                            )
-
-            out_task = asyncio.create_task(pump_out())
-            in_task = asyncio.create_task(pump_in())
-            ping_task = asyncio.create_task(send_pings())
-            try:
-                # **只等 pump_out**：会话的终点是"命令输出结束"（terminal WS 关闭）。
-                # 之前是 FIRST_COMPLETED —— stdin 一 EOF（``</dev/null``、或 harness
-                # 提前关 stdin）pump_in 就返回，等待立刻结束，pump_out 连同还没来得及
-                # 传的输出一起被取消 ⇒ ``docker exec -i`` 输出为空。
-                # 客户端真断开时 pump_out 的 write 会失败并 set session_over ✓。
-                await asyncio.wait((out_task,))
-            finally:
-                session_over.set()
-                for task in (out_task, in_task, ping_task):
-                    task.cancel()
-                await asyncio.gather(
-                    out_task,
-                    in_task,
-                    ping_task,
-                    return_exceptions=True,
-                )
-                try:
-                    await ws.close()
-                except Exception:
-                    pass
-    except Exception:
-        # The 101 is already on the wire, so there is no status code left to
-        # report with — and re-raising would tear the server down. Report and
-        # close; never ask the caller to fall back here, the command may
-        # already have run.
-        logger.exception("pyromind terminal hijack failed")
-    finally:
-        session.running = False
-        session.resize_hook = None
-        if session.exit_code is None:
-            # The terminal API has no exit status to relay (the PTY is closed
-            # when the shell ends), so report success rather than a bogus
-            # failure code — ``docker exec -it`` then exits 0, like a shell
-            # that the user quit with ``exit``/Ctrl-D.
-            session.exit_code = 0
-        # 供 attach 路径判断"是 PTY 结束了、还是客户端走了"（见
-        # ``_should_cleanup_foreground_run``）：只有前者才做 `--rm` 删除。
-        session.stop_reason = stop[0] or "unknown"
-        # 给 **tty** 会话留一句人话（见 :func:`_terminal_close_notice`）。平台侧
-        # 主动关门（空闲看门狗 / pod 重启）时客户端看到的是**干净的 EOF**，屏幕上
-        # 一个字都没有 —— 用户只会觉得"莫名其妙自己断了"。必须在
-        # ``_force_close_hijack`` **之前**写，之后就写不出去了。
-        # 非 tty 会话不写：那边 stdout 是要被管道消费的，掺字会污染数据。
-        if getattr(session, "tty", False):
-            notice = _terminal_close_notice(
-                close_code=stop_info.get("close_code"),
-                close_reason=str(stop_info.get("close_reason") or ""),
-                last_traffic=stats["last_traffic"],
-                now=time.monotonic(),
-            )
-            if notice:
-                try:
-                    await resp.write(notice.encode("utf-8"))
-                    await resp.drain()
-                    logger.info(
-                        "pyromind terminal hijack notice id=%s text=%r",
-                        getattr(session, "id", "")[:12],
-                        notice.strip(),
-                    )
-                except Exception as exc:  # noqa: BLE001 — 客户端可能已经走了
-                    logger.debug("terminal close notice not delivered: %s", exc)
-        # ⚠️ ``client-conn`` **必须在这里取样**，不能放到下面 ``_force_close_hijack``
-        # 之后：`_force_close_hijack` 会 ``protocol.force_close()`` + ``transport.close()``，
-        # 采样点一挪，这个字段就恒为 "closing"/"gone"，**永远失去判别能力** ——
-        # 2026-10-16 首版就踩了（线上两条摘要都印 gone，等于没记）。
-        client_link = _client_link_state(protocol)
-        _force_close_hijack(request, resp)
-        # ⭐ 一行说清"这次会话怎么结束的"（2026-10-16 补）。
-        # ``reason`` 与 ``client-conn`` 必须**一起**看，才分得出"谁先断"：
-        #   reason=transport-closed-without-close-frame + client-conn=open
-        #       ⇒ 平台那条 WS 先没的（网络/中间设备），CLI 侧毫发无损；
-        #   reason=docker-client-write-failed + client-conn=gone
-        #       ⇒ docker CLI 先没的（终端关了/进程被杀/本机网络断）。
-        #   reason=peer-close-frame (code=1012) ⇒ **中间件在重启**（见 _ws_close_note）。
-        # 那条 16 分钟悬案就是缺了这一行：只有事后的 ``No such exec``，无因可查。
-        logger.info(
-            "pyromind terminal hijack summary id=%s cmd=%s tty=%s exit=%s "
-            "reason=%s elapsed=%.1fs pty->cli=%dB cli->pty=%dB frames=%d "
-            "client-conn=%s",
-            getattr(session, "id", "")[:12],
-            cmd or "(login shell)",
-            tty,
-            session.exit_code,
-            stop[0] or "unknown",
-            time.monotonic() - started_at,
-            stats["pty_to_cli"],
-            stats["cli_to_pty"],
-            stats["frames_out"],
-            client_link,
-        )
-    logger.info("pyromind terminal hijack end id=%s", getattr(session, "id", "")[:12])
-    return True
 
 
 async def resize_exec(request: web.Request) -> web.Response:

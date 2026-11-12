@@ -1,24 +1,31 @@
 # docker_rt rift data plane
 
-`docker-rt` 的 exec/cp 主通道。沙箱 Running 之后由本模块把 `rift-client` 注入
-Pod，之后所有 `docker exec` / `docker cp` / 交互式 `-it` 都走
-`Gateway -> Service:7500 -> rift-client`，**不再回落平台 exec WebSocket**。
+`docker-rt` 的 exec/cp 主通道。**平台（k8s_middleware）在创建沙箱 Pod 时注入
+`rift-client`**：initContainer 从 `RIFT_CLIENT_IMAGE` 镜像把二进制拷进
+`/opt/rift`（emptyDir），access key 以 per-sandbox Secret 挂载到
+`/opt/rift-token/token`；主容器命令被包成
+`rift-client --supervise -- <用户 argv>`，rift-client 以 PID 1 先监听 7500，
+再 exec 用户进程（镜像 Entrypoint/Cmd + 请求 command/entrypoint，Docker 语义），
+转发信号、收割孤儿、按子进程退出码退出。
+
+docker-rt **不上传、不启动任何东西**：`docker start` 只等 Ping 通。之后所有
+`docker exec` / `docker cp` / 交互式 `-it` 都走
+`Gateway -> Service:7500 -> rift-client`，**不回落平台 exec WebSocket**。
+
+> rift-client 的 Go 源码、Makefile、注入镜像 Dockerfile 都在
+> **`k8s_middleware/rift/`**；本目录只有 daemon 侧的 Python 客户端。
 
 ## 目录结构
 
 | 文件 | 作用 |
 | --- | --- |
-| `config.py` | 读取 `DOCKER_RT_RIFT_*` 环境变量，按架构解析本地二进制。 |
-| `errors.py` | `RiftUnavailable` / `RiftUnauthenticated` / `RiftPermissionDenied` / `RiftBinaryMissing`。 |
+| `config.py` | 读取 `DOCKER_RT_RIFT_*` 环境变量（gateway 与 Ping/健康检查参数）。 |
+| `errors.py` | `RiftUnavailable` / `RiftUnauthenticated` / `RiftPermissionDenied`。 |
 | `rift_client.py` | `grpc.aio` 客户端（daemon 侧）：`ping` / `exec_once` / `open_exec` / `get_archive` / `put_archive`。 |
-| `bootstrap.py` | 按 `uname -m` 选二进制、上传、写入 access key、detached 启动、Ping。 |
 | `pb/` | 由 `rift-gateway/proto/rift.proto` 生成的 Python stub。 |
-| `check_proto.py` | 构建期：两份 proto 与两端生成物一致性检查。 |
-| `source_fingerprint.py` | 构建期：Go 源码指纹，防止打包旧二进制。 |
-| `client/` | **rift-client 的 Go 源码**（module `rift-client`）与 `Makefile`，随 SDK 一起维护。 |
-| `bin/` | `rift-client-linux-{amd64,arm64}`（构建产物，不入库）。 |
+| `check_proto.py` | 构建期：proto 与 Python 生成物一致性检查（Go 端在 k8s_middleware 自查）。 |
 
-> Python 文件只运行在本机 daemon，不会进入 Pod；进 Pod 的只有 `bin/` 里的 Go 二进制。
+> Python 文件只运行在本机 daemon，不会进入 Pod；进 Pod 的只有平台注入的 Go 二进制。
 
 ## 环境变量
 
@@ -27,111 +34,76 @@ Pod，之后所有 `docker exec` / `docker cp` / 交互式 `-it` 都走
 | `DOCKER_RT_RIFT_GATEWAY` | 空 | **默认不用设**：从 `CLUSTER_RESOURCE[PYROMIND_CLUSTER]["rift"][env]` 解析（如 `rift-gateway-us-west-1.pyromind.ai:443`）。只用于本地/测试覆盖。 |
 | `DOCKER_RT_RIFT_GATEWAY_TLS` | 自动 | `:443` 或 `https://` 自动启用（用系统信任链；公司 CA 未装入系统信任库时改用 `DOCKER_RT_RIFT_GATEWAY_CA`），一般不用设。 |
 | `DOCKER_RT_RIFT_GATEWAY_CA` | 空 | 私有 CA 路径；默认取集群 map 的 `rift_ca`，只有在本地覆盖时才设。 |
-| `DOCKER_RT_RIFT_BIN_DIR` | 本目录 `bin/` | 存放 `rift-client-linux-<arch>` 的目录。 |
-| `DOCKER_RT_RIFT_REMOTE_DIR` | `/opt/docker-rt/rift` | Pod 内专属注入目录。默认不用 `/tmp`（tmpfs，可能被镜像/平台清理）；rootfs 只读时再改 `/tmp/.rift`，放到持久卷（如 workspace）可跳过二进制重传。 |
-| `DOCKER_RT_RIFT_RETRY` | `3` | 启动失败重试次数（含首次）。 |
-| `DOCKER_RT_RIFT_RETRY_BACKOFF` | `0.5` | 重试退避基数（秒）。 |
 | `DOCKER_RT_RIFT_PING_TIMEOUT` | `3` | 单次 Ping 超时（秒）。 |
-| `DOCKER_RT_RIFT_PING_ATTEMPTS` | `20` | 启动后探测 rift 就绪的次数。 |
-| `DOCKER_RT_RIFT_PING_INTERVAL` | `0.3` | 探测间隔（秒）。 |
+| `DOCKER_RT_RIFT_PING_ATTEMPTS` | `20` | start 时等待 rift-client 就绪的 Ping 次数。 |
+| `DOCKER_RT_RIFT_PING_INTERVAL` | `0.3` | Ping 间隔（秒）。 |
 | `DOCKER_RT_RIFT_HEALTH_INTERVAL` | `30` | 后台健康检查周期（秒），`0` 关闭。 |
 
 > 公网 gRPC 域名与 API 域名一起维护在 `pyromind_sdk/client/base.py` 的
 > `CLUSTER_RESOURCE[...]["rift"]`，必须与 Gateway Ingress 的 host/TLS 一致；
 > 代码里没有明文 h2c 的公网入口。
 >
-> `docker start` 会在 Pod Running 之后继续等待 rift-client 注入 + Ping；只有 Ping
-> 成功后才把容器标成 `Running`/`Up`。3 次仍失败则 start 返回 503、容器置为 `Dead`。
-> rift 是强制通道，**没有关闭开关**；缺少 `DOCKER_RT_RIFT_GATEWAY` 同样会让 start 失败。
+> `docker start` 会在 Pod Running 之后继续等待 rift-client Ping；只有 Ping
+> 成功后才把容器标成 `Running`/`Up`。次数用尽仍失败则 start 返回 503、容器置为
+> `Dead`。rift 是强制通道，**没有关闭开关**；缺少 gateway 配置同样会让 start 失败。
 >
 > Gateway 用调用方的 access key 与 sandbox Pipe 比对，再把同一个 key 作为
-> `x-rift-token` 转发；bootstrap 把 access key 写进 Pod 内 `token` 文件（0400），
-> rift-client 常量时间比较。不再有公钥/KV/签名。
+> `x-rift-token` 转发；Pod 内从挂载的 Secret 文件 `/opt/rift-token/token` 读取
+> （`0444`，非 root 镜像用户也能读），rift-client 常量时间比较。不再有公钥/KV/签名。
 
-## Bootstrap 时序
+## 就绪门禁与健康检查
 
-1. 确认 sandbox 已 Running（平台状态）；不再调用任何 rift bootstrap 接口。
-2. **一次 exec** 完成 `mkdir -p`、`uname -m`、以及远端已有二进制的 sha 探测。
-3. 本地 sha 与远端一致则**跳过 10MB 二进制上传**；否则 `write_file` 上传。
-   `token` 文件和启动脚本很小，总是重写（access key/脚本更新立即生效）。
-4. **一次 exec** 完成 `chmod 0500/0400`、杀掉旧 pid、detached 启动
-   （`--sandbox-id <id> --token-file <path>`）。
-5. 通过 Gateway `Ping` 直到就绪；失败则读取 `rift.log` 尾部一起报错。
+1. 平台创建 Pod：initContainer 拷二进制、Secret 挂 token、主容器以
+   `--supervise` 启动；readinessProbe 探 7500。
+2. docker-rt `connect_rift()`：经 Gateway `Ping` 直到就绪
+   （`DOCKER_RT_RIFT_PING_ATTEMPTS` × `DOCKER_RT_RIFT_PING_INTERVAL`）。
+   凭据/授权错误（`RiftUnauthenticated` / `RiftPermissionDenied`）不重试，立即失败。
+3. 后台健康检查每 `DOCKER_RT_RIFT_HEALTH_INTERVAL` Ping 一次：连续 2 次失败先核对
+   平台 phase（不在 running/up/ready 就按沙箱状态处理），仍异常则置
+   `rift_ready=False` 并重新走 `connect_rift()`，退避上限 300s。
 
-启动阶段 3 次仍失败：`docker start` 返回 503，容器不进入 Running（置 `Dead`），不会
-对外表现为可用。已经 Running 之后 rift-client 挂掉：健康检查会重试 3 次，期间
-`exec/cp` 返回 `[RIFT_UNAVAILABLE]`；**飞书告警由 Gateway 负责**（连续失败阈值），
-本模块不发通知。
+start 阶段失败：`docker start` 返回 503，容器不进入 Running（置 `Dead`），不会
+对外表现为可用。已经 Running 之后 rift-client 挂掉：健康检查期间 `exec/cp` 返回
+`[RIFT_UNAVAILABLE]`；**飞书告警由 Gateway 负责**（连续失败阈值），本模块不发通知。
+
+**平台注入上线之前创建的沙箱没有 rift-client，无法自愈，必须重建**
+（`docker rm` + `docker run`）。
 
 ## Pause / resume
 
-k8s_middleware 的 pause 是把 StatefulSet 缩到 0，resume 会**新建 Pod**：容器 rootfs、
-注入的二进制、`token` 文件和 rift-client 进程全部丢失。因此：
+k8s_middleware 的 pause 是把 StatefulSet 缩到 0，resume 会**新建 Pod**：容器
+rootfs 与旧进程全部丢失，但注入结构（initContainer/emptyDir/Secret）在 STS 模板里，
+新 Pod 自动重新注入。因此：
 
 - resume 是**新的 Pod**：旧 rift 连接随 Pod 一起消失，`resume()` 里不需要主动关闭，
-  只把 `rift_ready` 置为 false；`_start_record` 在 Running 后重新 `bootstrap_rift`
-  （重新拷贝 + 启动），**进程总是要重新启动**。旧 channel 会在新 client 就绪后由
-  `bootstrap_once` 顺带关闭（best-effort）。
-- 二进制是否重传取决于目录是否在持久卷：默认 `/opt/docker-rt/rift` 在 rootfs，
-  pause/resume 后 `RIFT_SHA` 探测不到，会重新上传；把
-  `DOCKER_RT_RIFT_REMOTE_DIR` 指到持久卷（如 `/workspace/.rift`）且 sha 一致时，
-  只重写 token/脚本并重启进程。
-- 这也是为什么 start 脚本里保留 `kill $(cat pid)`：持久卷上的 pid 文件可能还在，
-  但对应进程已经不存在（或属于旧 Pod），必须先清理再启动。
+  只把 `rift_ready` 置为 false；`_start_record` 在 Running 后重新 `connect_rift()`。
+- 平台在 resume 时会刷新 token Secret（access key 轮换后立即生效）。
 
-## 二进制获取
+## 版本与升级
 
-源码就在本目录旁边（`client/`），直接在 SDK 仓库内构建：
+rift-client 的版本由**平台固定的注入镜像**（`RIFT_CLIENT_IMAGE`）决定，不再随 SDK
+升级。`Ping` 返回版本串（`<git describe>+<源码指纹前 12 位>`，构建时注入），daemon
+日志 `rift ready … version=…` 同源，可用于核对 Pod 里跑的是哪一版。升级 rift-client
+= 平台换镜像 tag + 沙箱重建/resume；SDK 侧不做版本比对，也不会自动重注入。
+
+构建与发布在 k8s_middleware 仓库：
 
 ```bash
-cd pyromind_sdk/rift/client
-make build-linux        # ../bin/rift-client-linux-{amd64,arm64} + ../bin/rift-client.sha256
-                        # + ../bin/rift-client.version (git describe, injected via -X main.version)
-make test               # Go 单测（access key 常量时间比较、exec 帧、tar 校验）
+cd k8s_middleware/rift/client
+make test               # Go 单测（supervise、access key 常量时间比较、exec 帧、tar 校验）
+make build-linux        # 双架构二进制 + sha256 + version（调试用）
+# 注入镜像（在 k8s_middleware 仓库根目录）：
+docker build -f rift/Dockerfile -t pyrominddynamics/rift-client:<version> rift/
 ```
 
-`rift-client.version` 是 bootstrap 判断"Pod 里跑的是不是这份二进制"的依据。版本串是
-**`<git describe>+<源码指纹前 12 位>`**（`make build-linux` 用
-`source_fingerprint.py --print` 注入）：`git describe` 对同一 commit 的不同构建是同一个
-串，只有指纹后缀会变 —— 这正是"新改动到底进没进 Pod"的判据。
-
-`Ping` 返回的版本与它不一致时：
-
-1. `bootstrap_once` 先 **kill 旧进程再上传**（Linux 不允许覆盖正在运行的可执行文件，
-   会 `ETXTBSY`），然后重启、重新 Ping；仍不一致就报
-   `rift-client version mismatch after restart`；
-2. daemon 的后台健康检查每 `DOCKER_RT_RIFT_HEALTH_INTERVAL`（默认 30s）比对一次版本，
-   不一致就自动重新注入 —— **升级 SDK 后，已经 Running 的沙箱会在一个健康周期内自动
-   换上新二进制**，不需要 `docker stop/start`。
-
-确认 Pod 里跑的是哪一版（`<远程目录>` 默认 `/opt/docker-rt/rift`）：
-
-```bash
-# 期望版本（安装包里）
-cat $(python -c 'import pyromind_sdk.rift.config as c; print(c.load_rift_config().bin_dir)')/rift-client.version
-# 实际在跑的版本（Ping 里就是它；daemon 日志 "rift-client ready … version=…" 同源）
-docker exec <cid> sha256sum /opt/docker-rt/rift/rift-client
-```
-
-`rift-client.version` 缺失时只告警、跳过校验（发布脚本会断言它存在）。
-
-`rift-client.source.sha256` 是**源码指纹**：`make build-linux` 对
-`client/*.go`（不含测试）、`pb/`、`go.mod/sum`、`Makefile` 和 `proto/rift.proto` 做哈希
-并写入。构建 wheel **和 sdist** 时（`setup.py` 的 `bdist_wheel` / `sdist`）都会重新
-计算：不一致或缺失就自动重建（有 Go 工具链时），没有 Go 就**直接失败**，避免把旧/
-缺二进制的包发出去。`pytest` 里也有一条同名检查（没有二进制时跳过）。
-
-bootstrap 时若存在 `bin/rift-client.sha256`，会先校验本地二进制再上传。也可以
-把 `DOCKER_RT_RIFT_BIN_DIR` 指向任一包含这两个文件的目录。二进制是 release 产物，
-仓库不提交（已在 `.gitignore`）。
-
-`client/pb/` 与 `rift-gateway` 仓库的 `proto/rift.proto` 是同一份协议的两端；
-改协议时两边一起更新。
+`pb/` 与 `rift-gateway` 仓库的 `proto/rift.proto` 是同一份协议；改协议时
+SDK（Python stub）、k8s_middleware（Go）、rift-gateway 三处一起更新，各自跑
+`check_proto.py`。
 
 ## 请求路由
 
 **PyromindSDK 的业务请求始终走 Gateway，不存在“ready 后切换”**。Pod Running 只是
-前置条件；`docker start` 会继续等 rift-client 注入并 Ping 成功，之后容器才被标记为
+前置条件；`docker start` 会继续等 rift-client Ping 成功，之后容器才被标记为
 Running/Up，`docker exec` / `docker cp` / `attach` 才允许进入：
 
 | 方法 | rift 行为 |
@@ -148,13 +120,11 @@ Running/Up，`docker exec` / `docker cp` / `attach` 才允许进入：
 不可用**，直接返回 409：
 
 ```
-Container <id> is not running: rift-client is not ready. If this sandbox was
-created before rift-gateway was deployed it has no route; run `docker stop` +
-`docker start` (or recreate it) so k8s_middleware writes the Pipe.
+Container <id> is not running: rift-client is not ready. rift-client is injected
+by the platform when the sandbox is created; sandboxes created before that
+change must be recreated (docker rm + docker run). If it was just created, wait
+for the Pod to become Ready.
 ```
-
-rift-gateway 上线**之前**创建的沙箱没有 Pipe，无法自愈：`docker stop` + `docker start`
-（Pod 重建后由 k8s_middleware 重新写 Pipe，再 bootstrap），或直接重建沙箱。
 
 ### `docker cp` 大文件：并行分片
 
@@ -190,7 +160,7 @@ ACK，**不会**重置它们的 per-stream 空闲计时（`grpc_read_timeout` /
 
 | 方向 | 发送方 | 位置 |
 | --- | --- | --- |
-| 上游 → 下游（响应） | `rift-client` | `client/server.go` 的 `execWriter`（tty / pipe 两条路径都覆盖） |
+| 上游 → 下游（响应） | `rift-client` | `k8s_middleware/rift/client/server.go` 的 `execWriter`（tty / pipe 两条路径都覆盖） |
 | 下游 → 上游（请求） | daemon | `aio_server._hijack_rift_terminal`（仅 stdin 空闲时发） |
 
 `ExecFrame.ping` 只是心跳，接收方**必须忽略**；它不是数据，也不重置空闲计时。
@@ -207,36 +177,39 @@ resize；心跳不算）收掉，与平台终端 `WS_IDLE_TIMEOUT_S` 一致。tt
 
 - `exec -d` 只适合“起了就不管”的短任务，不适合守护进程；
 - 需要跨 daemon 重启存活的长驻服务，请在命令里自行 `setsid nohup ... &`（输出重定向
-  到容器内文件），或等 `docker run -d` 的 workload 托管能力上线。
+  到容器内文件）。长驻进程的正确位置是 `docker run -d` 的主进程（由 rift-client
+  监管，随 Pod 存活）。
 
-平台 exec/文件接口只在 **bootstrap 自身**的调用里使用
-（`execute(..., _force_platform=True)`：`mkdir`、`uname -m`、启动脚本），它不是业务
-fallback。若 `rift_ready` 为假（启动中、恢复中、已挂），`start_exec` 直接 503；
-`docker ps` 对未就绪的 PyromindSDK 容器显示 Created 而不是 Up。
+若 `rift_ready` 为假（启动中、恢复中、已挂），`start_exec` 直接 503；
+`docker ps` 对未就绪的 PyromindSDK 容器显示 Created 而不是 Up。平台 exec 接口不再
+被 docker-rt 用于任何业务或注入路径。
 
 ## 安全边界
 
 * k8s_middleware 在 create/edit/resume 时为每个 sandbox 写一个 Pipe
   （`username=sandbox_id`、`authorized_keys_data=base64(access key)`、
-  `to.host=<service>:7500`）。Gateway watch Pipe 后按 sandbox id 命中，并常量时间
-  比对 access key；客户端不能指定上游地址。Pipe 是集群内对象，读 Pipe 等于拿到凭据，需用 RBAC 保护。
+  `to.host=<service>:7500`），并维护同名 token Secret。Gateway watch Pipe 后按
+  sandbox id 命中，并常量时间比对 access key；客户端不能指定上游地址。Pipe/Secret
+  是集群内对象，读它们等于拿到凭据，需用 RBAC 保护。
 * 两道校验，使用同一个 access key：
   * Gateway：调用方的 access key 必须与 Pipe 里的 `authorized_keys_data` 匹配，且
     `username == sandbox_id`；
-  * rift-client：校验 `x-rift-token` 与 Pod 内 `token` 文件（bootstrap 写入，0400）。
-* access key 同时存在于请求头（TLS）、Pipe 和 Pod 内 `token` 文件：能读 Pipe 或进入
-  沙箱就能拿到凭据，靠 RBAC/沙箱隔离控制。`rift-client` 不打进用户镜像。
+  * rift-client：校验 `x-rift-token` 与 `/opt/rift-token/token`（Secret 挂载，0444）。
+* access key 同时存在于请求头（TLS）、Pipe 和 Pod 内 token 文件：能读 Pipe/Secret
+  或进入沙箱就能拿到凭据，靠 RBAC/沙箱隔离控制。`rift-client` 与 token 都不打进
+  用户镜像（kaniko `--ignore-path=/opt/rift --ignore-path=/opt/rift-token`）。
 
 ## 排障
 
 | 现象 | 排查 |
 | --- | --- |
-| `docker start` 503 / `[RIFT_UNAVAILABLE]` | 看 Pod 内 `${DOCKER_RT_RIFT_REMOTE_DIR}/rift.log`；确认 `DOCKER_RT_RIFT_GATEWAY` 可达、Pipe 已创建、Pod 内 `token` 文件与 Pipe 一致。 |
-| `RIFT_BINARY_MISSING` | 未构建/未拷贝对应架构二进制，或 `DOCKER_RT_RIFT_BIN_DIR` 指错。 |
+| `docker start` 503 / `[RIFT_UNAVAILABLE]` | 确认 Pod Ready（readinessProbe 探 7500）、initContainer 成功、`DOCKER_RT_RIFT_GATEWAY` 可达、Pipe 已创建、Secret token 与 Pipe 一致；看 rift-client 容器日志。 |
+| 旧沙箱恒为 Created | 平台注入上线之前创建的沙箱没有 rift-client，`docker rm` + `docker run` 重建。 |
 | `RiftUnauthenticated` | 没有携带 access key；不是 rift-client 的问题。 |
-| `RiftPermissionDenied` | access key 与 Pipe 不一致（例如用户重置过 key）；对该 sandbox 执行一次 edit/resume 刷新路由。 |
+| `RiftPermissionDenied` | access key 与 Pipe 不一致（例如用户重置过 key）；对该 sandbox 执行一次 edit/resume 刷新路由与 Secret。 |
 | `RiftUnavailable` + `sandbox is not running` | Pod 未运行或 rift-client 未启动；Gateway 通过 `7500` 连接结果判定，不查 middleware 状态。 |
-| 注入失败但 Pod 正常 | `/tmp` 可能 noexec，改用 `DOCKER_RT_RIFT_REMOTE_DIR=/workspace/.rift`。 |
+| 创建报 `RIFT_IMAGE_CONFIG_FAILED` | 平台从 registry 读镜像 Entrypoint/Cmd 失败（网络/凭据）；create 直接失败，不会静默换命令。 |
+| 创建报 `RIFT_NO_COMMAND` | 镜像没有 Entrypoint/Cmd 且请求没给 command/entrypoint（等价 docker "No command specified"）。 |
 | 网络不通 | 确认 Gateway 可达、Service 有 `rift:7500`。 |
 | `docker cp` 报 "Successfully copied" 但容器里没有文件 | 这句是 docker CLI 无条件先打的，**不能当结果**（见 `aio_server.put_container_archive` 注释）。现在抽取后 `rift-client` 会逐个成员校验存在性与 size、daemon 会比对 sent/written，任一不符就返回 5xx 并在 daemon 日志留 `archive put done/dst …` 行；老 daemon（2026-10-30 之前）存在"异步 put_archive 被同步调用 → 没写却回 200"的静默失败，需升级。 |
 | `exec -it` 静置约 60s 被断（`RST_STREAM`） | 心跳没生效：确认 Pod 里的 `rift-client` 是本版本（`Ping` 返回版本），以及 daemon 的 `_RIFT_KEEPALIVE_S` 没被调到 ≥ 60s；再看 ingress/LB 的 per-stream 空闲阈值。 |

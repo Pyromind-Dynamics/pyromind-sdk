@@ -56,7 +56,6 @@ pyromind_sdk/
 ├── python_function_to_yaml_cli.py    # Python 转 YAML 命令行工具
 ├── test_run_workflow_cli.py          # 工作流提交命令行工具
 ├── exec_stream.py                    # 沙箱流式执行辅助工具
-└── terminal.py                       # 沙箱交互式终端
 ```
 
 ## 环境要求
@@ -263,10 +262,11 @@ docker rm -f demo
 ### 命令通道（rift）
 
 `docker exec`、`docker cp`、交互式 `docker exec -it` 与 `docker attach` **不走**平台
-的 exec WebSocket。Pod Running 只是前置条件：`docker-rt` 注入 `rift-client`，等它
+的 exec WebSocket。Pod Running 只是前置条件：**平台在创建沙箱 Pod 时注入
+`rift-client`**（initContainer 拷二进制 + per-sandbox token Secret），它以 PID 1
+（`--supervise`）运行并 exec 用户进程。`docker-rt` 不上传任何东西，只等 rift-client
 Ping 通之后才把容器标成 Running/Up。这些调用**始终**经 **rift gateway**（HTTP/2 上的
-gRPC）转发到沙箱 Service 的 `7500` 端口——不是运行时切换，平台 exec 接口只在
-bootstrap 内部使用：
+gRPC）转发到沙箱 Service 的 `7500` 端口——不是运行时切换：
 
 ```text
 docker exec / cp -> docker-rt -> rift gateway（鉴权）-> Service:7500 -> rift-client
@@ -274,26 +274,27 @@ docker exec / cp -> docker-rt -> rift gateway（鉴权）-> Service:7500 -> rift
 
 要求与行为：
 
-- 设置 `DOCKER_RT_RIFT_GATEWAY` 指向可达的 gateway：公网 CA 用
-  `DOCKER_RT_RIFT_GATEWAY_TLS=true`，自签/私有 CA 用
+- 设置 `DOCKER_RT_RIFT_GATEWAY` 指向可达的 gateway（或设 `PYROMIND_CLUSTER`，由
+  SDK 集群表解析）：公网 CA 用 `DOCKER_RT_RIFT_GATEWAY_TLS=true`，自签/私有 CA 用
   `DOCKER_RT_RIFT_GATEWAY_CA=/path/ca.pem`。gateway 侧用 `RIFT_AUTH_URL` 指向平台
   鉴权接口。没有 gateway 时，exec/cp 会直接以 `[RIFT_UNAVAILABLE]` 失败。
-- 对应架构的二进制随 SDK 一起发布（`rift-client-linux-amd64` / `arm64`），可用
-  `DOCKER_RT_RIFT_BIN_DIR` 覆盖目录。
-- `docker start` 在 rift-client 就绪前不会返回：默认重试
-  `DOCKER_RT_RIFT_RETRY` 次（3 次），始终起不来则 start 失败、容器不会显示为
-  Running；已就绪的通道按 `DOCKER_RT_RIFT_HEALTH_INTERVAL` 周期复检。
+- rift-client 的 Go 源码与注入镜像在 `k8s_middleware/rift`；SDK 只带 Python gRPC
+  stubs 与 proto。
+- `docker start` 在 rift-client Ping 通之前不会返回
+  （`DOCKER_RT_RIFT_PING_ATTEMPTS` × `DOCKER_RT_RIFT_PING_INTERVAL`），始终不通则
+  start 失败、容器不会显示为 Running；已就绪的通道按
+  `DOCKER_RT_RIFT_HEALTH_INTERVAL` 周期复检。
 - **刻意不提供**回落到平台 exec 通道的行为：rift 不可用就明确报错，而不是静默换传输。
-- `docker stop` + `docker start` 会重建沙箱 Pod，docker-rt 会重新 bootstrap 并**重启
-  进程**；10MB 二进制只有在注入目录位于持久卷且 sha 一致时才跳过重传
-  （`DOCKER_RT_RIFT_REMOTE_DIR`，默认 `/opt/docker-rt/rift`）。
+- **平台注入上线之前**创建的沙箱没有 rift-client，必须重建（`docker rm` +
+  `docker run`）。`docker stop` + `docker start` 恢复 Pod，平台会在 resume 时刷新
+  token Secret。
 - Gateway 用调用方的 access key 与沙箱 `Pipe` 里的值比对，并把同一个 key 作为
-  `x-rift-token` 转发；Pod 内以 `0400` 文件保存并做常量时间比较。不涉及公钥、KV
-  或签名。
+  `x-rift-token` 转发；Pod 内从挂载的 Secret 文件读取（`0444`，非 root 镜像用户也能
+  读）并做常量时间比较。不涉及公钥、KV 或签名。
 - `rift-client` 不可达的飞书告警由 **gateway** 发出（按 sandbox 统计连续失败），本机
   daemon 不发通知。
 
-完整环境变量表与 bootstrap 时序见
+完整环境变量表见
 [`pyromind_sdk/rift/README.md`](pyromind_sdk/rift/README.md)。
 
 ## 自定义工作流节点
@@ -320,7 +321,6 @@ YAML 格式、节点校验及更多用法见[节点 SDK 文档](pyromind_sdk/REA
 | 命令 | 用途 |
 | --- | --- |
 | `pyromind python-to-yaml <file> <function> --node-name <name>` | 静态分析 Python 函数，并输出或写入 YAML 节点定义。 |
-| `pyromind terminal <sandbox-id>` | 连接运行中的 custom 沙箱交互式终端，需要 API Key 和集群配置。 |
 | `pyromind docker-rt` | 启动下文所述的 Docker 兼容运行时。 |
 
 例如，将节点定义写入文件：

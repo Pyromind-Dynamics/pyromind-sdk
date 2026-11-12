@@ -3,7 +3,6 @@
 Usage:
   python -m pyromind_sdk.cli python-to-yaml <python-file> <function> \
     --node-name <NodeName> --output <yaml>
-  python -m pyromind_sdk.cli terminal <sandbox-id> [--api-key KEY] [--base-url URL]
 
 Notes:
 - This project uses argparse; we expose a `main(argv)` function for pytest.
@@ -48,33 +47,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="python3",
         help="YAML 'python_command'",
-    )
-
-    terminal = subparsers.add_parser(
-        "terminal",
-        add_help=False,
-        help="Open an interactive terminal into a running custom sandbox",
-    )
-    terminal.add_argument("sandbox_id", type=str, help="Sandbox id, e.g. sb-xxxx")
-    terminal.add_argument(
-        "--cluster", type=str, required=False,
-        help=f"Target cluster ({cluster_choices}); defaults to $PYROMIND_CLUSTER",
-    )
-    terminal.add_argument(
-        "--api-key", type=str, default=None,
-        help="API key (defaults to $PYROMIND_API_KEY; optional, falls back to cookie auth)",
-    )
-    terminal.add_argument(
-        "--base-url", type=str, default=None,
-        help=(
-            "Override the API base URL (defaults to resolving from --cluster via "
-            "CLUSTER_RESOURCE; if unset, also reads $PYROMIND_BASE_URL)"
-        ),
-    )
-    terminal.add_argument(
-        "-h", "--help",
-        action="help",
-        help="show this help message and exit",
     )
 
     docker_rt = subparsers.add_parser(
@@ -249,26 +221,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         from pyromind_sdk.docker_rt.register_context import main as docker_rt_context_main
 
         return docker_rt_context_main([])
-
-    if args.command == "terminal":
-        from pyromind_sdk.terminal import run_terminal
-        from pyromind_sdk.client.base import ENV_API_KEY, ENV_CLUSTER
-
-        cluster = args.cluster or os.getenv(ENV_CLUSTER) or ""
-        api_key = args.api_key or os.getenv(ENV_API_KEY) or ""
-        if not cluster or not api_key:
-            print(
-                "Error: --cluster and --api-key are required, or set "
-                f"{ENV_CLUSTER} and {ENV_API_KEY}.",
-                file=sys.stderr,
-            )
-            return 1
-        return run_terminal(
-            args.sandbox_id,
-            cluster=cluster,
-            api_key=api_key,
-            base_url=args.base_url,
-        )
 
     if args.command == "python-to-yaml":
         python_file: Path = args.python_file

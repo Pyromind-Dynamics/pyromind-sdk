@@ -550,7 +550,6 @@ class SandboxClient(PyroMindClient):
         url = build_exec_stream_websocket_url(
             self.base_url,
             sandbox_id,
-            self.api_key,
             self.cluster,
         )
         yield from iter_exec_stream(
@@ -559,6 +558,7 @@ class SandboxClient(PyroMindClient):
             cwd=cwd.strip() if cwd else "",
             timeout=timeout,
             tty=tty,
+            api_key=self.api_key,
         )
 
     # ===================== File Operations (custom sandbox) =====================

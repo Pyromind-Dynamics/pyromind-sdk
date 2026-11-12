@@ -151,13 +151,13 @@ class _FakeBuildSandbox:
         staged_bytes: int | None = None,
         stage_in_error: str = "",
         raise_on_stage_in: Exception | None = None,
-        raise_on_bootstrap: Exception | None = None,
+        raise_on_connect: Exception | None = None,
     ) -> None:
         self.sandbox_id = "sb-build-1"
         self.staged_bytes = staged_bytes
         self.stage_in_error = stage_in_error
         self.raise_on_stage_in = raise_on_stage_in
-        self.raise_on_bootstrap = raise_on_bootstrap
+        self.raise_on_connect = raise_on_connect
         self.stdout = stdout
         self.returncode = returncode
         self.raise_on_exec = raise_on_exec
@@ -173,8 +173,8 @@ class _FakeBuildSandbox:
         self.cleaned = False
         #: kwargs of the create call, filled by ``_install_fake_factory``.
         self.created_with: dict[str, Any] = {}
-        #: rift-client injection is part of "sandbox is usable" now.
-        self.bootstrap_called = False
+        #: The platform injects rift-client; the build still gates on Ping.
+        self.connect_called = False
         self.archives: list[tuple[str, bytes]] = []
         self.argv: list[str] | None = None
         self.exec_timeout: int | None = None
@@ -189,10 +189,10 @@ class _FakeBuildSandbox:
     async def wait_until_running(self) -> None:
         self.waited = True
 
-    async def bootstrap_rift(self) -> None:
-        if self.raise_on_bootstrap is not None:
-            raise self.raise_on_bootstrap
-        self.bootstrap_called = True
+    async def connect_rift(self) -> None:
+        if self.raise_on_connect is not None:
+            raise self.raise_on_connect
+        self.connect_called = True
 
     async def put_archive(self, dest_path: str, tar_bytes: bytes) -> None:
         if self.raise_on_put is not None:
@@ -3930,14 +3930,14 @@ async def test_the_ready_heartbeat_reports_until_the_task_finishes(
 
 
 @pytest.mark.asyncio
-async def test_build_sandbox_gets_rift_and_the_service_port(
+async def test_build_sandbox_idles_and_gates_on_rift(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """构建沙箱必须先注入 rift-client，创建时也要带 7500 端口。
+    """构建沙箱必须显式 sleep infinity（覆盖镜像 ENTRYPOINT），并在 exec 前过 Ping 门禁。
 
-    2026-10-30：af45184 删掉"rift 未就绪回落平台"之后，构建沙箱第一次 exec 就
-    报 `refusing platform exec-stream`；同时 create 只按 port_mappings 建 Service
-    端口（7500 只在 resume/edit 补），所以两件缺一不可。
+    平台现在把镜像 Entrypoint/Cmd 交给 rift-client 监管执行：构建镜像的
+    ENTRYPOINT 是 /kaniko/executor，不显式覆盖就会直接跑 executor。7500 端口
+    由平台模板自带，create 不再传 port_bindings。
     """
     from ..backend import build_sandbox
 
@@ -3957,17 +3957,19 @@ async def test_build_sandbox_gets_rift_and_the_service_port(
     )
 
     assert not any("error" in event for event in events), events
-    assert sandbox.bootstrap_called, "构建沙箱必须先注入 rift-client"
-    assert captured["port_bindings"] == {"7500/tcp": [{"HostPort": "7500"}]}
+    assert sandbox.connect_called, "构建沙箱必须先通过 rift Ping 门禁"
+    assert captured["entrypoint"] == ["sleep", "infinity"]
+    assert "port_bindings" not in captured
     # 真机上 kaniko 看到的是这段脚本里的 argv：忽略目录必须真的下发。
-    assert "--ignore-path=/opt/docker-rt/rift" in _worker_script(sandbox)
+    assert "--ignore-path=/opt/rift" in _worker_script(sandbox)
+    assert "--ignore-path=/opt/rift-token" in _worker_script(sandbox)
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_failure_stops_the_build_before_it_starts(
+async def test_connect_failure_stops_the_build_before_it_starts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """注入失败要立刻判构建失败，而不是跑满几分钟再挂在第一次 exec 上。"""
+    """Ping 门禁失败要立刻判构建失败，而不是跑满几分钟再挂在第一次 exec 上。"""
     from ..backend import build_sandbox
 
     _clear(monkeypatch)
@@ -3977,7 +3979,7 @@ async def test_bootstrap_failure_stops_the_build_before_it_starts(
     monkeypatch.setenv("DOCKER_RT_REGISTRY_PASSWORD", PUSH_PASSWORD)
 
     sandbox = _FakeBuildSandbox(
-        raise_on_bootstrap=RuntimeError("rift gateway is not configured")
+        raise_on_connect=RuntimeError("rift gateway is not configured")
     )
     _install_fake(monkeypatch, sandbox)
 
@@ -3989,18 +3991,13 @@ async def test_bootstrap_failure_stops_the_build_before_it_starts(
 
     errors = [str(event.get("error", "")) for event in events if "error" in event]
     assert any("exec channel" in text for text in errors), events
-    assert sandbox.calls == [], "注入失败后不应再向沙箱发任何 exec"
+    assert sandbox.calls == [], "门禁失败后不应再向沙箱发任何 exec"
 
 
-def test_kaniko_ignores_the_rift_dir(monkeypatch: pytest.MonkeyPatch) -> None:
-    """rift-client 所在目录必须交给 kaniko 忽略（不删、不进镜像）。"""
+def test_kaniko_ignores_the_rift_dirs() -> None:
+    """平台注入目录（二进制 + token）必须交给 kaniko 忽略（不删、不进镜像）。"""
     from ..backend import kaniko
 
-    assert "--ignore-path=/opt/docker-rt/rift" in kaniko.kaniko_args(
-        destinations=["myapp:1"]
-    )
-
-    monkeypatch.setenv("DOCKER_RT_RIFT_REMOTE_DIR", "/workspace/.rift")
-    assert "--ignore-path=/workspace/.rift" in kaniko.kaniko_args(
-        destinations=["myapp:1"]
-    )
+    args = kaniko.kaniko_args(destinations=["myapp:1"])
+    assert "--ignore-path=/opt/rift" in args
+    assert "--ignore-path=/opt/rift-token" in args

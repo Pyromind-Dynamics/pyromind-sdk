@@ -45,8 +45,3 @@ build/
 /skills-lock.json
 /script/sec.txt
 
-
-# rift-client release binaries (built per architecture, not committed)
-pyromind_sdk/rift/bin/rift-client-linux-*
-pyromind_sdk/rift/bin/rift-client.version
-pyromind_sdk/rift/bin/rift-client.source.sha256

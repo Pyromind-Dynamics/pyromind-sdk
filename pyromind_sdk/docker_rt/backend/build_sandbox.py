@@ -36,11 +36,12 @@ used to throw away a kaniko run that had already done the work. Splitting it
 turns both problems into "retry the next poll". ``kaniko.py`` documents the file
 protocol the two halves use to talk to each other.
 
-The builder image's ``ENTRYPOINT`` is never used: the CUSTOM template pins
-``command: ["sleep", "infinity"]``. This matters for which image is usable —
-the default ``kaniko-project/executor`` image is ``FROM scratch`` and has no
-``sleep`` and no shell at all, so the ``-debug`` variant (busybox included) is
-required. See ``docker_rt/builder-image/kaniko/README.md``.
+The builder image's ``ENTRYPOINT`` is never used: the create request pins
+``entrypoint: ["sleep", "infinity"]`` (the platform wraps it with the rift
+supervisor). This matters for which image is usable — the default
+``kaniko-project/executor`` image is ``FROM scratch`` and has no ``sleep`` and
+no shell at all, so the ``-debug`` variant (busybox included) is required.
+See ``docker_rt/builder-image/kaniko/README.md``.
 """
 
 from __future__ import annotations
@@ -119,14 +120,6 @@ def sandbox_cpu_limit() -> str:
     # ("Sandbox CPU:memory must be 1:2") unless the account is admin, so this
     # default must stay paired with sandbox_memory_limit() (8 cpu / 16Gi).
     return _env("DOCKER_RT_BUILD_SANDBOX_CPU", "8")
-
-
-def rift_port() -> int:
-    """Port rift-client listens on inside the sandbox (bootstrap's default)."""
-    try:
-        return int(os.getenv("RIFT_PORT") or 7500)
-    except ValueError:
-        return 7500
 
 
 def sandbox_memory_limit() -> str:
@@ -1816,10 +1809,11 @@ async def _build_once(
                 cpu_limit=cpu_limit or sandbox_cpu_limit(),
                 sandbox_client=sandbox_client,
                 mounts=mounts,
-                # The gateway dials <service>:<rift port> for every sandbox; a
-                # custom sandbox only gets the port when it is asked for (the
-                # middleware adds it on resume/edit, not on create).
-                port_bindings={f"{rift_port()}/tcp": [{"HostPort": str(rift_port())}]},
+                # Idle on purpose: the build itself runs through rift exec.
+                # entrypoint (not command) — the builder image's ENTRYPOINT is
+                # /kaniko/executor, and a bare command would be appended to it.
+                # The rift port comes from the platform template, not a request.
+                entrypoint=["sleep", "infinity"],
             )
 
         def _mounts_for(plan: context_staging.StagingPlan | None) -> list[dict[str, Any]]:
@@ -1884,14 +1878,14 @@ async def _build_once(
             f"Build sandbox ready after {time.monotonic() - ready_started:.1f}s"
         )
 
-        # rift is the only exec/data channel into a sandbox, and a freshly
-        # created build sandbox has no rift-client yet: without this the push
+        # rift is the only exec/data channel into a sandbox. The platform
+        # injects rift-client as PID 1 when it creates the Pod; all docker-rt
+        # does here is wait for it to answer Ping. Without this gate the push
         # probe, the staged-context copy and the final upload all fail with
-        # "rift channel is not ready" after several wasted minutes. Stop here
-        # with the injection error instead of running a build that cannot work.
+        # "rift channel is not ready" after several wasted minutes.
         yield stage("Preparing the sandbox exec channel…")
         try:
-            await sandbox.bootstrap_rift()
+            await sandbox.connect_rift()
         except Exception as exc:  # noqa: BLE001
             yield buildkit.error_event(
                 "cannot open the exec channel into the build sandbox: "

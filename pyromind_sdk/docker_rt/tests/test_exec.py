@@ -405,146 +405,6 @@ async def test_pyromind_exec_transport_routing(monkeypatch, stdin, tty, expected
         assert calls["oneshot"]["stdin_close"] is None
 
 
-@pytest.mark.asyncio
-async def test_pyromind_terminal_bridge_pumps_stdin_and_resize(monkeypatch):
-    """The interactive bridge must forward keystrokes and swallow protocol frames.
-
-    This is the transport `docker exec -it` now uses: raw bytes both ways, no
-    Docker stdio framing, and `{"type":"pong"}` must never leak into the
-    user's terminal as text.
-    """
-    import aiohttp
-
-    from .. import aio_server as mod
-    from ..backend.pyromind_sdk_env import PyromindSDK
-
-    class FakeRequest:
-        def __init__(self, protocol):
-            self.content = None
-            self.transport = None
-            self.protocol = protocol
-
-    class FakeProtocol:
-        def __init__(self):
-            self._message_tail = b"ls -l\r"
-
-        def force_close(self):
-            return None
-
-    class FakeWs:
-        def __init__(self, session_holder):
-            self.sent_bytes: list[bytes] = []
-            self.sent_text: list[str] = []
-            self.closed = False
-            self._session_holder = session_holder
-            self.resize_hook = None
-            self.close_code = None
-            self.close_reason = None
-            self._frames = [
-                SimpleNamespace(type=aiohttp.WSMsgType.BINARY, data=b"total 0\r\n"),
-                SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data='{"type": "pong"}'),
-                SimpleNamespace(type=aiohttp.WSMsgType.CLOSE, data=1000),
-            ]
-
-        async def receive(self):
-            """``pump_out`` 用显式 ``receive()``（``async for`` 会吞掉关帧类型）。"""
-            if not self._frames:
-                self.close_code = 1006
-                return SimpleNamespace(type=aiohttp.WSMsgType.CLOSED, data=None)
-            return self._frames.pop(0)
-
-        async def send_bytes(self, data):
-            self.sent_bytes.append(data)
-            # Capture the hook while the session is still live (the bridge
-            # clears it on the way out).
-            self.live_resize_hook = self._session_holder[0].resize_hook
-
-        async def send_str(self, text):
-            self.sent_text.append(text)
-
-        async def close(self):
-            self.closed = True
-
-    class FakeResp:
-        def __init__(self):
-            self.written: list[bytes] = []
-
-        async def write(self, data):
-            self.written.append(data)
-            # Real suspension point: gives the stdin pump a turn (otherwise the
-            # output task could finish before it ever runs).
-            await asyncio.sleep(0.02)
-
-        async def drain(self):
-            return None
-
-        def force_close(self):
-            return None
-
-    captured: dict = {}
-    session_holder: list = []
-
-    class FakeSession:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return False
-
-        async def ws_connect(self, url, heartbeat=None, **_kwargs):
-            captured["url"] = url
-            captured["ws"] = FakeWs(session_holder)
-            return captured["ws"]
-
-    monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: FakeSession())
-
-    kube_env = PyromindSDK.__new__(PyromindSDK)
-    kube_env.sandbox_id = "sb-terminal"
-    resp = FakeResp()
-    session = SimpleNamespace(
-        id="exec-it", running=False, exit_code=None, tty_cols=100, tty_rows=30
-    )
-    session_holder.append(session)
-    protocol = FakeProtocol()
-
-    handled = await asyncio.wait_for(
-        mod._hijack_pyromind_terminal(
-            FakeRequest(protocol),
-            resp,
-            protocol,
-            session,
-            kube_env,
-            True,
-            cmd=["cat"],
-            cwd="/workspace",
-        ),
-        timeout=5,
-    )
-
-    assert handled is True
-    assert "cols=100&rows=30" in captured["url"]
-    assert "command=cat" in captured["url"]
-    assert "cwd=%2Fworkspace" in captured["url"]
-    # Terminal output goes out verbatim (no Docker stdio framing) ...
-    assert resp.written == [b"total 0\r\n"]
-    # ... and the keep-alive pong is protocol, not terminal output.
-    assert b"pong" not in b"".join(resp.written)
-
-    ws = captured["ws"]
-    # Keystrokes reach the PTY ...
-    assert ws.sent_bytes == [b"ls -l\r"]
-    # ... and a window resize is pushed as the control frame the platform
-    # expects. The hook was captured while the session was live; the bridge
-    # clears it afterwards so a late resize cannot reach a dead PTY.
-    assert ws.live_resize_hook is not None
-    await ws.live_resize_hook(120, 40)
-    assert json.loads(ws.sent_text[-1]) == {
-        "type": "resize",
-        "cols": 120,
-        "rows": 40,
-    }
-    assert session.exit_code == 0
-    assert session.resize_hook is None
 
 
 _MARKER = "__DRT_END_deadbeef__"
@@ -609,547 +469,32 @@ def test_marker_holdback_only_withholds_a_real_marker_prefix(buf, expected):
     assert _marker_holdback(bytearray(buf), _MARKER.encode()) == expected
 
 
-async def _drive_terminal_bridge(
-    monkeypatch,
-    frames,
-    *,
-    marker: str = "",
-    ack_path: str = "",
-    tail: bytes = b"",
-    probe: list | None = None,
-    close_code: int | None = None,
-    close_reason: str | None = None,
-    write_error: BaseException | None = None,
-    client_transport_closing: bool = False,
-    force_close_marks_closing: bool = False,
-    session_tty: bool = True,
-):
-    """跑一遍 ``_hijack_pyromind_terminal``，返回 (resp, ws, session, acked)。
 
-    ``probe`` 给了就会在**每一帧被 pump_out 处理完之后**追加一次
-    ``len(resp.written)`` —— 这样能验证"某个字节是在下一帧到达之前就发出去了"，
-    而不是等到流结束才被兜底刷出来（旧实现正是靠兜底刷，所以只看最终内容分不出）。
 
-    ``close_code`` / ``close_reason`` 用来模拟"关帧里的 code/reason
-    （或静默断线的 1006）"，``write_error`` 让"写给 docker 客户端"直接抛
-    （模拟 CLI 先断开）。``session_tty`` 默认 True —— 这条路径本来就是 tty 会话，
-    而"给用户留一句人话"只在 tty 下写。
 
-    ``force_close_marks_closing`` 让收尾的 ``_force_close_hijack``（它真的会关
-    客户端连接）**改变** ``is_closing()`` 的答案 —— 用来钉死摘要里 ``client-conn``
-    的取样时机必须在那之前。
-    """
-    import aiohttp
 
-    from .. import aio_server as mod
-    from ..backend.pyromind_sdk_env import PyromindSDK
 
-    class FakeRequest:
-        def __init__(self, protocol):
-            self.content = None
-            self.transport = None
-            self.protocol = protocol
 
-    class FakeProtocol:
-        def __init__(self):
-            self._message_tail = tail
-            # 用可变标志而不是闭包常量，这样 ``force_close()`` 能把它翻成 True ——
-            # 收尾时 ``_force_close_hijack`` 真的会关掉客户端连接，摘要里的
-            # ``client-conn`` 必须在**那之前**取样（见
-            # test_terminal_summary_samples_client_state_before_force_close）。
-            self._closing = client_transport_closing
-            self.transport = SimpleNamespace(is_closing=lambda: self._closing)
 
-        def force_close(self):
-            if force_close_marks_closing:
-                self._closing = True
-            return None
 
-    class FakeWs:
-        def __init__(self):
-            self.sent_bytes: list[bytes] = []
-            self.sent_text: list[str] = []
-            self.closed = False
-            self.close_code = close_code
-            self.close_reason = close_reason
-            self._frames = list(frames)
-            self._delivered = 0
 
-        async def receive(self):
-            """显式 ``receive()``（``pump_out`` 现在用它，不用 ``async for``）。
 
-            ⚠️ aiohttp 的 ``__anext__`` 在 CLOSE/CLOSING/CLOSED 上直接
-            ``StopAsyncIteration``，循环体**看不到**关帧类型 ⇒ 关帧会被静默吞掉
-            （见 ``_ws_close_note``），所以生产代码改成了显式 receive；脚手架跟上。
 
-            ``probe`` 的测量点与旧脚手架一致：**处理完第 i 帧之后、取第 i+1 帧
-            之前**（所以 ``probe[0]`` 是"第一帧写完之后已写出的字节数"）。
-            """
-            if probe is not None and self._delivered:
-                probe.append(len(resp.written))
-            if not self._frames:
-                if self.close_code is None:
-                    self.close_code = 1006
-                return SimpleNamespace(type=aiohttp.WSMsgType.CLOSED, data=None)
-            frame_type, data = self._frames.pop(0)
-            self._delivered += 1
-            return SimpleNamespace(type=frame_type, data=data)
 
-        async def send_bytes(self, data):
-            self.sent_bytes.append(data)
 
-        async def send_str(self, text):
-            self.sent_text.append(text)
 
-        async def close(self):
-            self.closed = True
 
-    class FakeResp:
-        def __init__(self):
-            self.written: list[bytes] = []
 
-        async def write(self, data):
-            if write_error is not None:
-                raise write_error
-            self.written.append(data)
-            await asyncio.sleep(0.02)
 
-        async def drain(self):
-            return None
 
-        def force_close(self):
-            return None
 
-    captured: dict = {}
-    acked: list[str] = []
 
-    class FakeSession:
-        async def __aenter__(self):
-            return self
 
-        async def __aexit__(self, *exc):
-            return False
 
-        async def ws_connect(self, url, heartbeat=None, **_kwargs):
-            captured["url"] = url
-            captured["ws"] = FakeWs()
-            return captured["ws"]
 
-    monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: FakeSession())
-    monkeypatch.setattr(mod, "_pyromind_terminal_url", lambda *a, **k: "ws://fake")
 
-    kube_env = PyromindSDK.__new__(PyromindSDK)
-    kube_env.sandbox_id = "sb-terminal"
 
-    async def write_ack(path):
-        acked.append(path)
 
-    kube_env.write_ack = write_ack  # type: ignore[method-assign]
-
-    resp = FakeResp()
-    session = SimpleNamespace(
-        id="exec-it",
-        running=False,
-        exit_code=None,
-        tty_cols=100,
-        tty_rows=30,
-        tty=session_tty,
-    )
-    protocol = FakeProtocol()
-
-    handled = await asyncio.wait_for(
-        mod._hijack_pyromind_terminal(
-            FakeRequest(protocol),
-            resp,
-            protocol,
-            session,
-            kube_env,
-            True,
-            cmd=["sh", "-i"],
-            cwd="/workspace",
-            marker=marker,
-            ack_path=ack_path,
-        ),
-        timeout=5,
-    )
-    assert handled is True
-    # ``create_task(write_ack(...))`` 需要一次调度才跑完。
-    await asyncio.sleep(0.05)
-    return resp, captured["ws"], session, acked
-
-
-@pytest.mark.asyncio
-async def test_terminal_prompt_reaches_the_client_without_waiting(monkeypatch):
-    """带结束标记时，**提示符必须在下一帧到达之前就送到客户端**。
-
-    这是用户 2026-10-15 报的"``docker exec -it`` 卡住、像一直连不上"的回归测试：
-    PTY 第一条输出就是提示符（2 字节），被那个**无条件**的 47 字节 holdback 扣在
-    缓冲里 ⇒ 只要没有别的输出，客户端一个字节也收不到。旧实现只在流结束时靠兜底
-    刷新把它放出来，所以"最终内容"分不出区别 —— ``probe`` 看的是**时机**。
-    """
-    import aiohttp
-
-    probe: list[int] = []
-    resp, _ws, session, acked = await _drive_terminal_bridge(
-        monkeypatch,
-        [
-            (aiohttp.WSMsgType.BINARY, b"# "),
-            (aiohttp.WSMsgType.BINARY, b"$ "),
-            (aiohttp.WSMsgType.CLOSE, None),
-        ],
-        marker=_MARKER,
-        ack_path="/tmp/.drt-ack-test",
-        probe=probe,
-    )
-
-    assert probe[0] == 1, (
-        "提示符被结束标记的 holdback 扣住了 —— 交互式 exec 会表现为全黑屏/卡在建连"
-    )
-    assert resp.written == [b"# ", b"$ "], (
-        "每一小段输出都必须立刻发出去，不能被合并/延迟（旧实现留 47 字节才发）"
-    )
-    # 没出现标记，就不能落回执（否则生产者会提前退出，尾部丢掉）。
-    assert acked == []
-    assert session.exit_code == 0
-
-
-@pytest.mark.asyncio
-async def test_terminal_still_strips_a_marker_split_across_frames(monkeypatch):
-    """收紧 holdback 之后，"标记被拆帧"的保护必须还在。
-
-    标记的前半截留在尾部（不能发出去），下一帧补齐后整体摘掉，并在那一刻落回执。
-    """
-    import aiohttp
-
-    head, tail = _MARKER[:8], _MARKER[8:]
-    resp, _ws, _session, acked = await _drive_terminal_bridge(
-        monkeypatch,
-        [
-            (aiohttp.WSMsgType.BINARY, b"done\r\n" + head.encode()),
-            (aiohttp.WSMsgType.BINARY, tail.encode() + b"\r\n"),
-            (aiohttp.WSMsgType.CLOSE, None),
-        ],
-        marker=_MARKER,
-        ack_path="/tmp/.drt-ack-split",
-    )
-
-    joined = b"".join(resp.written)
-    assert joined == b"done\r\n"
-    assert _MARKER.encode() not in joined, "标记绝不能漏给用户"
-    assert acked == ["/tmp/.drt-ack-split"]
-
-
-@pytest.mark.asyncio
-async def test_terminal_summary_says_the_platform_ws_died_first(monkeypatch, caplog):
-    """收尾摘要必须说清"平台那条 WS 是**静默**断掉的"，而且客户端还活着。
-
-    2026-10-15 的悬案现场：中间件 19:41:12 已经判定客户端 WS 断了，docker-rt 却
-    一直到 19:57:53 才收场，中间 **16 分钟没有任何线索** —— 因为 ``async for`` 在
-    ``CLOSED`` 上直接 StopAsyncIteration，循环体看不到它，
-    "对端发了关闭帧"和"连接无声消失"在日志里长得一模一样（都是什么都没有）。
-
-    静默断线的判据是 ``close_code=1006``（ABNORMAL_CLOSURE）；配合
-    ``client-conn=open`` 就能排除"CLI 先断"，把矛头指向网络/中间设备。
-    """
-    import logging
-
-    import aiohttp
-
-    with caplog.at_level(logging.INFO, logger="docker_rt"):
-        resp, _ws, _session, _acked = await _drive_terminal_bridge(
-            monkeypatch,
-            [
-                (aiohttp.WSMsgType.BINARY, b"# "),
-                (aiohttp.WSMsgType.CLOSED, None),
-            ],
-            close_code=1006,
-        )
-
-    assert resp.written == [b"# "]
-    summary = [r for r in caplog.records if "terminal hijack summary" in r.getMessage()]
-    assert len(summary) == 1, caplog.text
-    text = summary[0].getMessage()
-    assert "transport-closed-without-close-frame" in text
-    assert "code=1006" in text, text
-    assert "client-conn=open" in text, (
-        "客户端这条 hijack 连接是好的 ⇒ 先断的**不是** docker CLI"
-    )
-    assert "pty->cli=2B" in text, text
-
-
-@pytest.mark.asyncio
-async def test_terminal_summary_reports_a_peer_close_frame(monkeypatch, caplog):
-    """对端**发了**关闭帧时，code 要带进日志（1011 = keepalive ping 超时）。"""
-    import logging
-
-    import aiohttp
-
-    with caplog.at_level(logging.INFO, logger="docker_rt"):
-        _resp, _ws, _session, _acked = await _drive_terminal_bridge(
-            monkeypatch,
-            [
-                (aiohttp.WSMsgType.BINARY, b"bye\r\n"),
-                (aiohttp.WSMsgType.CLOSE, 1011),
-            ],
-            close_code=1011,
-        )
-
-    text = "\n".join(
-        r.getMessage()
-        for r in caplog.records
-        if "terminal hijack summary" in r.getMessage()
-    )
-    assert "peer-close-frame" in text, caplog.text
-    assert "code=1011" in text, text
-
-
-@pytest.mark.asyncio
-async def test_terminal_summary_says_the_docker_client_died_first(monkeypatch, caplog):
-    """写给 docker CLI 失败时必须**记一笔**（原来这里是静默 ``break``）。
-
-    这一格就是"CLI 先断"与"平台先断"的分水岭：异常类型 + 客户端连接状态。
-    """
-    import logging
-
-    import aiohttp
-
-    with caplog.at_level(logging.INFO, logger="docker_rt"):
-        _resp, _ws, _session, _acked = await _drive_terminal_bridge(
-            monkeypatch,
-            [(aiohttp.WSMsgType.BINARY, b"# ")],
-            write_error=ConnectionResetError("client went away"),
-            client_transport_closing=True,
-        )
-
-    text = "\n".join(
-        r.getMessage()
-        for r in caplog.records
-        if "terminal hijack summary" in r.getMessage()
-    )
-    assert "docker-client-write-failed" in text, caplog.text
-    assert "ConnectionResetError" in text, text
-    assert "client-conn=closing" in text, text
-
-
-@pytest.mark.asyncio
-async def test_terminal_summary_samples_client_state_before_force_close(
-    monkeypatch, caplog
-):
-    """``client-conn`` 必须在 ``_force_close_hijack`` **之前**取样。
-
-    首版把取样点写在 ``_force_close_hijack`` 后面 —— 而那个函数正是"收尾时把关掉
-    客户端连接"的地方（``protocol.force_close()`` + ``transport.close()``），
-    所以线上两条摘要都印 ``gone``，这个字段**等于没记**（2026-10-16 实况：
-    `summary … client-conn=gone` 出现两次，包括"平台先断"那条）。
-
-    这里用 ``force_close_marks_closing=True`` 让 fake 的 ``force_close()`` 真的把
-    transport 标成 closing：只要有人把取样点挪回 force_close 之后，断言就会看到
-    ``client-conn=closing`` 而挂掉。
-    """
-    import logging
-
-    import aiohttp
-
-    with caplog.at_level(logging.INFO, logger="docker_rt"):
-        await _drive_terminal_bridge(
-            monkeypatch,
-            [
-                (aiohttp.WSMsgType.BINARY, b"# "),
-                (aiohttp.WSMsgType.CLOSED, None),
-            ],
-            close_code=1006,
-            force_close_marks_closing=True,
-        )
-
-    text = "\n".join(
-        r.getMessage()
-        for r in caplog.records
-        if "terminal hijack summary" in r.getMessage()
-    )
-    assert "client-conn=open" in text, (
-        f"取样点被挪到 _force_close_hijack 之后了（那时连接已被自己关掉）：{text}"
-    )
-
-
-@pytest.mark.parametrize(
-    "close_code, close_reason, idle_for, expected",
-    [
-        # 中间件带了标签（新镜像）：精确判据
-        (1000, "idle-timeout", 5.0, "30m idle"),
-        (1000, "kube-stream-ended", 9999.0, ""),
-        # 老镜像不带 reason：靠"两条腿都安静了这么久"兜底
-        (1000, "", 1800.0, "30m idle"),
-        (1000, "", 60.0, ""),
-        # pod 重启（uvicorn 的 1012），无需中间件配合
-        (1012, "", 5.0, "k8s_middleware restarted"),
-        (1012, "", 9999.0, "k8s_middleware restarted"),
-        # 无声无息断线：不猜
-        (1006, "", 9999.0, ""),
-        (None, "", 9999.0, ""),
-    ],
-)
-def test_close_notice_translates_the_platforms_silent_closes(
-    close_code, close_reason, idle_for, expected
-):
-    """平台的两种"自己断"必须能翻成人话，同时**不能**误伤用户自己退出。
-
-    看门狗和 pod 重启都只发普通关闭帧 ⇒ docker CLI 看到干净的 EOF、屏幕上一个字都
-    没有 ⇒ 用户只会觉得"莫名其妙自己断了"（2026-10-16 第三次被问）。
-    """
-    from ..aio_server import _terminal_close_notice
-
-    notice = _terminal_close_notice(
-        close_code=close_code,
-        close_reason=close_reason,
-        last_traffic=1000.0,
-        now=1000.0 + idle_for,
-    )
-    if expected:
-        assert expected in notice, (close_code, close_reason, idle_for, notice)
-        assert notice.startswith("\r\n") and notice.endswith("\r\n"), notice
-        assert "docker-rt:" in notice
-    else:
-        assert notice == "", (close_code, close_reason, idle_for, notice)
-
-
-@pytest.mark.asyncio
-async def test_idle_close_writes_a_plain_explanation_to_the_tty_client(
-    monkeypatch,
-):
-    """空闲超时收尾时，客户端要收到那行人话（而不是什么都看不到）。"""
-    import aiohttp
-
-    resp, _ws, _session, _acked = await _drive_terminal_bridge(
-        monkeypatch,
-        [
-            (aiohttp.WSMsgType.BINARY, b"# "),
-            (aiohttp.WSMsgType.CLOSE, 1000),
-        ],
-        close_code=1000,
-        close_reason="idle-timeout",
-    )
-
-    text = b"".join(resp.written)
-    assert b"# " in text
-    assert b"docker-rt: session closed after 30m idle (no keystrokes)" in text
-
-
-@pytest.mark.asyncio
-async def test_middleware_restart_close_is_explained_too(monkeypatch):
-    """pod 重启（1012）同样要说明 —— 那是另一种"自己断"。"""
-    import aiohttp
-
-    resp, _ws, _session, _acked = await _drive_terminal_bridge(
-        monkeypatch,
-        [(aiohttp.WSMsgType.CLOSE, 1012)],
-        close_code=1012,
-    )
-
-    text = b"".join(resp.written)
-    assert b"k8s_middleware restarted" in text
-
-
-@pytest.mark.asyncio
-async def test_non_tty_sessions_get_no_extra_bytes(monkeypatch):
-    """**非 tty** 会话绝不能掺字：那边的 stdout 是要被管道消费的。"""
-    import aiohttp
-
-    resp, _ws, _session, _acked = await _drive_terminal_bridge(
-        monkeypatch,
-        [
-            (aiohttp.WSMsgType.BINARY, b"payload\n"),
-            (aiohttp.WSMsgType.CLOSE, 1012),
-        ],
-        close_code=1012,
-        session_tty=False,
-    )
-
-    assert b"".join(resp.written) == b"payload\n"
-
-
-@pytest.mark.asyncio
-async def test_normal_user_exit_writes_nothing_extra(monkeypatch):
-    """用户自己退出（1000、刚有流量）不该多出一行 —— 别把正常收尾也搞得像故障。"""
-    import aiohttp
-
-    resp, _ws, _session, _acked = await _drive_terminal_bridge(
-        monkeypatch,
-        [
-            (aiohttp.WSMsgType.BINARY, b"bye\r\n"),
-            (aiohttp.WSMsgType.CLOSE, 1000),
-        ],
-        close_code=1000,
-    )
-
-    assert b"".join(resp.written) == b"bye\r\n"
-
-
-@pytest.mark.asyncio
-async def test_1012_is_decoded_as_a_middleware_restart(monkeypatch, caplog):
-    """``code=1012`` 要直译成"对端 uvicorn 在关闭(pod 重启/滚动)"。
-
-    2026-10-16 实况抓到过：`reason=peer-close-frame (code=1012) elapsed=256.4s` ——
-    这是 uvicorn ``WebSocketProtocol.shutdown()`` 在 SIGTERM 时对所有已握手 WS 发的
-    ``fail_connection(1012)``（`websockets_impl.py:143-149`）。用户当时以为"这次
-    断开是正常的"，其实是被中间件重启掐掉的。译成人话就不用每次翻 RFC。
-    """
-    import logging
-
-    import aiohttp
-
-    with caplog.at_level(logging.INFO, logger="docker_rt"):
-        await _drive_terminal_bridge(
-            monkeypatch,
-            [
-                (aiohttp.WSMsgType.BINARY, b"# "),
-                (aiohttp.WSMsgType.CLOSE, 1012),
-            ],
-            close_code=1012,
-        )
-
-    text = "\n".join(
-        r.getMessage()
-        for r in caplog.records
-        if "terminal hijack summary" in r.getMessage()
-    )
-    assert "peer-close-frame" in text, caplog.text
-    assert "code=1012" in text, text
-    assert "uvicorn is shutting down" in text, (
-        f"1012 必须带上人话注解（否则又要翻 uvicorn 源码）：{text}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_1000_normal_close_does_not_claim_a_restart(monkeypatch, caplog):
-    """``1000`` 是"对端应用自己正常 close"，**不能**被译成重启。
-
-    用户退出（``exit``/^D）之后中间件正常收尾就发 1000 ⇒ 这是**唯一算正常**的
-    收场方式，注解必须与 1012 区分开，否则"正常断开"这个判断就没有依据了。
-    """
-    import logging
-
-    import aiohttp
-
-    with caplog.at_level(logging.INFO, logger="docker_rt"):
-        await _drive_terminal_bridge(
-            monkeypatch,
-            [
-                (aiohttp.WSMsgType.BINARY, b"# "),
-                (aiohttp.WSMsgType.CLOSE, 1000),
-            ],
-            close_code=1000,
-        )
-
-    text = "\n".join(
-        r.getMessage()
-        for r in caplog.records
-        if "terminal hijack summary" in r.getMessage()
-    )
-    assert "code=1000" in text, caplog.text
-    assert "normal close" in text, text
-    assert "shutting down" not in text, (
-        f"1000（正常退出）不许被说成重启：{text}"
-    )
 
 
 @pytest.mark.asyncio
@@ -1724,94 +1069,6 @@ def test_pty_output_is_framed_only_when_the_client_expects_frames():
     assert framed == frame_stdout(b"hello\nworld\n"), "非 TTY 下要加帧头并把 CRLF 折成 LF"
 
 
-@pytest.mark.asyncio
-async def test_exec_with_stdin_and_no_tty_frames_the_terminal_output(monkeypatch):
-    """同上，但走真实的 `pump_out`：断言落到客户端那条流上的字节确实带了帧头。"""
-    import aiohttp
-    from types import SimpleNamespace
-
-    from .. import aio_server as mod
-
-    class _FakeTerminalWS:
-        def __init__(self, frames):
-            self._frames = list(frames)
-            self.close_code = None
-            self.close_reason = None
-
-        async def receive(self):
-            """显式 ``receive()``（``pump_out`` 不用 ``async for`` 了）。"""
-            if not self._frames:
-                self.close_code = 1006
-                return SimpleNamespace(type=aiohttp.WSMsgType.CLOSED, data=None)
-            return self._frames.pop(0)
-
-        async def send_str(self, _data):
-            return None
-
-        async def close(self):
-            return None
-
-    class _FakeSession:
-        def __init__(self, ws, **_kwargs):
-            self._ws = ws
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_exc):
-            return False
-
-        async def ws_connect(self, _url, **_kwargs):
-            return self._ws
-
-    async def _drive(*, tty: bool) -> list[bytes]:
-        ws = _FakeTerminalWS(
-            [SimpleNamespace(type=aiohttp.WSMsgType.BINARY, data=b"hello\r\n")]
-        )
-        monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: _FakeSession(ws, **k))
-        monkeypatch.setattr(mod, "_pyromind_terminal_url", lambda *a, **k: "ws://fake")
-
-        written: list[bytes] = []
-
-        class _Resp:
-            async def write(self, chunk):
-                written.append(chunk)
-
-            async def drain(self):
-                return None
-
-            def force_close(self):
-                return None
-
-        class _Content:
-            async def readany(self):
-                raise asyncio.TimeoutError
-
-        session = SimpleNamespace(
-            id="exec-pty-1",
-            running=False,
-            exit_code=None,
-            resize_hook=None,
-            tty_cols=0,
-            tty_rows=0,
-        )
-        kube_env = SimpleNamespace(sandbox_id="sb-1")
-        request = SimpleNamespace(
-            protocol=None, transport=None, content=_Content()
-        )
-
-        handled = await mod._hijack_pyromind_terminal(
-            request, _Resp(), None, session, kube_env, tty, cmd=["bash"]
-        )
-        assert handled is True
-        return written
-
-    framed = b"".join(await _drive(tty=False))
-    assert framed == mod.frame_stdout(b"hello\n")
-    assert framed[:8] == b"\x01\x00\x00\x00\x00\x00\x00\x06", "8 字节 stdio 帧头"
-
-    raw_bytes = b"".join(await _drive(tty=True))
-    assert raw_bytes == b"hello\r\n", "TTY 下原样透传，不许加帧头"
 
 
 @pytest.mark.asyncio
@@ -2006,134 +1263,6 @@ async def test_exec_create_accepts_the_api_console_size(
     assert (rec.tty_rows, rec.tty_cols) == (0, 0)
 
 
-@pytest.mark.asyncio
-async def test_stdin_eof_does_not_teardown_the_session(monkeypatch):
-    """``-i`` 的 stdin EOF ≠ 会话结束：发 Ctrl-D 近似 EOF，**输出继续泵到命令结束**。
-
-    2026-10-14：``docker exec -i c 'echo hi' </dev/null``（瞬时 EOF）会把整个会话
-    连同还没传的输出一起拆掉 ⇒ 输出为空。Docker 的 ``-i`` 语义是"stdin 关了，
-    命令继续跑到自然结束"。PTY 传不了真 EOF ⇒ 发 Ctrl-D(0x04) 近似，等 WS 关闭。
-
-    ⚠️ 2026-10-15 修正：这里的"EOF"必须是**客户端半关闭**（``eof_received``），
-    **不能**是 ``request.content.readany()`` 的 ``b""`` —— upgrade 之后 payload
-    早就 EOF，``readany()`` 每次调用都立刻返回 ``b""``。拿它当 EOF 信号会让每条
-    ``docker exec -it`` 一进 shell 就收到 Ctrl-D 并立刻退出（用户报的"进去就退"）。
-    """
-    import asyncio
-    import aiohttp
-    from types import SimpleNamespace
-
-    from .. import aio_server as mod
-
-    class _FakeTerminalWS:
-        def __init__(self, frames, tail_wait: float = 0.0):
-            self._frames = list(frames)
-            self._tail_wait = tail_wait
-            self.sent: list[bytes] = []
-            self.close_code = None
-            self.close_reason = None
-
-        async def receive(self):
-            """显式 ``receive()``（``pump_out`` 不用 ``async for`` 了）。"""
-            if not self._frames:
-                if self._tail_wait:
-                    # 模拟"WS 还开着"：给 stdin 泵留出可观察的时间窗
-                    await asyncio.sleep(self._tail_wait)
-                    self._tail_wait = 0.0
-                self.close_code = 1006
-                return SimpleNamespace(type=aiohttp.WSMsgType.CLOSED, data=None)
-            return self._frames.pop(0)
-
-        async def send_str(self, data):
-            self.sent.append(data.encode())
-
-        async def send_bytes(self, data):
-            self.sent.append(data)
-
-        async def close(self):
-            return None
-
-    class _FakeSession:
-        def __init__(self, ws, **_kwargs):
-            self._ws = ws
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_exc):
-            return False
-
-        async def ws_connect(self, _url, **_kwargs):
-            return self._ws
-
-    class _Proto:
-        """最小替身：upgrade 之后客户端字节落在 ``_message_tail``。"""
-
-        _message_tail = b""
-
-        def eof_received(self):  # 会被 docker-rt 的钩子换掉
-            return None
-
-    ws = _FakeTerminalWS(
-        [SimpleNamespace(type=aiohttp.WSMsgType.BINARY, data=b"hello\r\n")],
-        tail_wait=0.4,
-    )
-    monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: _FakeSession(ws, **k))
-    monkeypatch.setattr(mod, "_pyromind_terminal_url", lambda *a, **k: "ws://fake")
-
-    written: list[bytes] = []
-
-    class _Resp:
-        async def write(self, chunk):
-            written.append(chunk)
-
-        async def drain(self):
-            return None
-
-        def force_close(self):
-            return None
-
-    session = SimpleNamespace(
-        id="exec-eof-1",
-        running=False,
-        exit_code=None,
-        resize_hook=None,
-        tty_cols=0,
-        tty_rows=0,
-    )
-    kube_env = SimpleNamespace(sandbox_id="sb-1")
-    protocol = _Proto()
-    # 真实路径里这两步由 _begin_tcp_upgrade 完成
-    mod._keep_transport_after_client_eof(protocol)
-    request = SimpleNamespace(protocol=protocol, transport=None, content=None)
-
-    task = asyncio.create_task(
-        mod._hijack_pyromind_terminal(
-            request, _Resp(), protocol, session, kube_env, False, cmd=["bash"]
-        )
-    )
-
-    async def drive_client() -> None:
-        await asyncio.sleep(0.1)
-        # 用户敲下的字：101 之后的数据只可能出现在 _message_tail
-        protocol._message_tail += b"echo hi\n"
-        await asyncio.sleep(0.15)
-        # 客户端半关闭 stdin（``</dev/null`` 或用户按 Ctrl-D）
-        assert protocol.eof_received() is True
-
-    try:
-        await drive_client()
-        handled = await task
-    finally:
-        mod._client_eof_events.pop(id(protocol), None)
-
-    assert handled is True
-    # 输出没有跟着 EOF 一起被拆掉
-    assert b"hello\n" in b"".join(written)
-    # keystrokes 必须真的被搬到 PTY —— "进去就退/敲不了字" 的回归点
-    assert b"echo hi\n" in ws.sent, f"stdin 没被搬走，实际 sent={ws.sent}"
-    # EOF 时向 PTY 发了 Ctrl-D 近似
-    assert b"\x04" in ws.sent
 
 
 def test_upgraded_stdin_is_taken_from_the_message_tail() -> None:
@@ -2353,14 +1482,11 @@ async def test_foreground_run_without_a_command_keeps_the_container() -> None:
 
 @pytest.mark.asyncio
 async def test_interactive_without_rift_fails_without_platform_fallback(monkeypatch):
-    """terminal 打不开时回落到 exec stream —— 调用必须与真实签名逐字相符。
+    """rift 不可用时交互式 exec 必须明确失败，**没有**平台通道回落。
 
-    2026-08-15 之后的这条路上，调用点曾经多传了一个 ``foreground_cmd=``
-    （``_stream_pyromind_exec`` 根本不接这个参数）。它只在"terminal 打不开、
-    回落到 exec stream"时才走到，于是 ``docker exec -i/-t`` 一旦回落就得到
-    ``TypeError``，用户连"已回落、stdin 不透传"的提示都看不到。
-
-    替身照抄真实签名 ⇒ 多传或漏传一个关键字都会让这条测试失败。
+    平台 terminal/exec-stream 不再是 docker-rt 的交互通道（rift 是唯一路径）：
+    rift 未就绪时回 ``RIFT_UNAVAILABLE``，且绝不偷偷改走 ``_stream_pyromind_exec``
+    （那条路不透传 stdin，用户会以为命令跑了其实没有）。
     """
     from .. import aio_server as mod
     from ..backend.pyromind_sdk_env import PyromindSDK
@@ -2392,9 +1518,6 @@ async def test_interactive_without_rift_fails_without_platform_fallback(monkeypa
     kube_env.sandbox_id = "sb-test"
     kube_env.working_dir = "/"
 
-    async def terminal(*args, **kwargs):
-        return False  # 打不开 ⇒ 必须回落
-
     calls: dict[str, object] = {}
 
     async def stream(
@@ -2413,7 +1536,6 @@ async def test_interactive_without_rift_fails_without_platform_fallback(monkeypa
         calls["stdin_close"] = stdin_close
         return 3
 
-    monkeypatch.setattr(mod, "_hijack_pyromind_terminal", terminal)
     monkeypatch.setattr(mod, "_stream_pyromind_exec", stream)
 
     protocol = _Protocol()
@@ -2578,6 +1700,40 @@ async def test_rift_terminal_idle_notice_is_tty_only(monkeypatch):
     await asyncio.wait_for(run(), timeout=2)
 
     assert b"".join(resp.written) == b""
+
+
+@pytest.mark.asyncio
+async def test_rift_terminal_stdin_eof_keeps_pumping_output(monkeypatch):
+    """stdin 半关闭 ≠ 会话结束：close_stdin 之后输出继续泵到 exit（Docker -i 语义）。
+
+    从旧平台终端路径迁移而来：EOF 判据必须是客户端半关闭（_client_stdin_eof），
+    不能是 payload readany() 的 b"" —— 后者会让每条 exec -it "进去就退"。
+    """
+    from pyromind_sdk.rift.pb import rift_pb2
+
+    mod, stream, resp, session, run = _rift_terminal_calls(monkeypatch, tty=True)
+    monkeypatch.setattr(mod, "_client_stdin_eof", lambda _protocol: True)
+    monkeypatch.setattr(mod, "_RIFT_IDLE_POLL_S", 0.01)
+
+    stdin_closed = asyncio.Event()
+
+    async def close_stdin():
+        stdin_closed.set()
+
+    stream.close_stdin = close_stdin
+
+    async def frames():
+        await stdin_closed.wait()
+        yield rift_pb2.ExecFrame(stdout=b"hi")
+        yield rift_pb2.ExecFrame(exit=rift_pb2.ExecExit(code=0))
+
+    stream.frames = frames
+
+    await asyncio.wait_for(run(), timeout=2)
+
+    assert stdin_closed.is_set(), "EOF 后应半关闭 stdin"
+    assert b"".join(resp.written) == b"hi"
+    assert session.exit_code == 0
 
 
 @pytest.mark.asyncio

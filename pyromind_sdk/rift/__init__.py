@@ -1,9 +1,12 @@
-"""Rift data plane: gateway client, bootstrap, and health helpers."""
+"""Rift data plane: gateway client and health helpers.
+
+rift-client itself is injected by the platform when the sandbox Pod is created;
+this package only speaks to it through the gateway.
+"""
 
 from .rift_client import RiftExecSession, RiftGatewayClient
 from .config import RiftConfig, load_rift_config
 from .errors import (
-    RiftBinaryMissing,
     RiftError,
     RiftPermissionDenied,
     RiftUnauthenticated,
@@ -11,7 +14,6 @@ from .errors import (
 )
 
 __all__ = [
-    "RiftBinaryMissing",
     "RiftConfig",
     "RiftError",
     "RiftExecSession",

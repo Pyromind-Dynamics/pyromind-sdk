@@ -1,19 +1,13 @@
-"""Environment-driven rift configuration."""
+"""Environment-driven rift configuration.
+
+docker-rt 只连数据面：rift-client 由平台在创建 Pod 时注入（PID 1），这里不再
+有任何二进制/注入目录/上传重试的配置。
+"""
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from pathlib import Path
-
-from .errors import RiftBinaryMissing
-
-_ARCH_ALIASES = {
-    "x86_64": "amd64",
-    "amd64": "amd64",
-    "aarch64": "arm64",
-    "arm64": "arm64",
-}
 
 
 def _bool(raw: str | None, default: bool) -> bool:
@@ -41,33 +35,10 @@ class RiftConfig:
     gateway: str
     gateway_tls: bool
     gateway_ca: str | None
-    bin_dir: Path
-    remote_dir: str
-    retry: int
-    retry_backoff: float
     ping_timeout: float
     ping_attempts: int
     ping_interval: float
     health_interval: float
-    # Version baked into the shipped binary (`make build-linux` writes it next
-    # to the binaries). None when the file is missing, which only skips the
-    # stale-binary check.
-    expected_version: str | None
-
-    def binary_for_arch(self, machine: str) -> Path:
-        arch = _ARCH_ALIASES.get(machine.strip().lower())
-        if arch is None:
-            raise RiftBinaryMissing(
-                f"unsupported sandbox architecture {machine!r}; expected x86_64 or aarch64"
-            )
-        path = self.bin_dir / f"rift-client-linux-{arch}"
-        if not path.is_file():
-            raise RiftBinaryMissing(
-                f"rift-client binary not found: {path}. Build it with "
-                "`make build-linux` in pyromind_sdk/rift/client, "
-                "or set DOCKER_RT_RIFT_BIN_DIR."
-            )
-        return path
 
 
 def _resolve_gateway() -> tuple[str, bool, str | None]:
@@ -99,29 +70,14 @@ def _resolve_gateway() -> tuple[str, bool, str | None]:
     return "", _bool(tls_raw, False), ca_env
 
 
-def _expected_version(bin_dir: Path) -> str | None:
-    try:
-        text = (bin_dir / "rift-client.version").read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    return text or None
-
-
 def load_rift_config() -> RiftConfig:
-    default_bin = Path(__file__).resolve().parent / "bin"
-    bin_dir = Path(os.getenv("DOCKER_RT_RIFT_BIN_DIR") or default_bin).expanduser()
     gateway, gateway_tls, gateway_ca = _resolve_gateway()
     return RiftConfig(
         gateway=gateway,
         gateway_tls=gateway_tls,
         gateway_ca=gateway_ca,
-        bin_dir=bin_dir,
-        remote_dir=(os.getenv("DOCKER_RT_RIFT_REMOTE_DIR") or "/opt/docker-rt/rift").strip(),
-        retry=max(1, _int(os.getenv("DOCKER_RT_RIFT_RETRY"), 3)),
-        retry_backoff=max(0.0, _float(os.getenv("DOCKER_RT_RIFT_RETRY_BACKOFF"), 0.5)),
         ping_timeout=max(0.5, _float(os.getenv("DOCKER_RT_RIFT_PING_TIMEOUT"), 3.0)),
         ping_attempts=max(1, _int(os.getenv("DOCKER_RT_RIFT_PING_ATTEMPTS"), 20)),
         ping_interval=max(0.05, _float(os.getenv("DOCKER_RT_RIFT_PING_INTERVAL"), 0.3)),
         health_interval=max(0.0, _float(os.getenv("DOCKER_RT_RIFT_HEALTH_INTERVAL"), 30.0)),
-        expected_version=_expected_version(bin_dir),
     )

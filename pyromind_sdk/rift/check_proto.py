@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Check that ``rift.proto`` and both generated bindings agree.
+"""Check that ``rift.proto`` and the generated Python bindings agree.
 
 The canonical schema lives in ``rift-gateway/proto/rift.proto``; the SDK keeps a
-copy so it can regenerate ``pb/`` without the gateway checkout. Two kinds of
-drift only show up at runtime otherwise:
+copy so it can regenerate ``pb/`` without the gateway checkout. The Go side
+(rift-client) lives in k8s_middleware and runs its own copy of this check.
+Two kinds of drift only show up at runtime otherwise:
 
 * the two proto copies diverge (one repo got a field the other did not);
-* a proto change was not followed by ``protoc`` (Go) / ``grpc_tools`` (Python).
+* a proto change was not followed by ``grpc_tools`` (Python).
 
 Usage::
 
@@ -25,8 +26,6 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 _PROTO = _HERE / "proto" / "rift.proto"
-_GO_PB = _HERE / "client" / "pb" / "rift.pb.go"
-_GO_GRPC = _HERE / "client" / "pb" / "rift_grpc.pb.go"
 _REPO_ROOT = _HERE.parents[1]
 
 
@@ -206,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--skip-gateway",
         action="store_true",
-        help="only check the SDK copy and its bindings",
+        help="only check the SDK copy and its Python bindings",
     )
     args = parser.parse_args(argv)
 
@@ -233,7 +232,6 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
 
-    _check_go(_GO_PB, _GO_GRPC, messages, services, problems)
     _check_python(messages, services, problems)
 
     if problems:

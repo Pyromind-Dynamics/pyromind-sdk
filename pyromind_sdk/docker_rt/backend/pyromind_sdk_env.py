@@ -39,9 +39,8 @@ from pyromind_sdk.client.models import (
 )
 from .archive import validate_tar_file, validate_tar_members
 from .portforward import parse_publish_spec
-from ...rift.bootstrap import bootstrap_once
 from ...rift.config import load_rift_config
-from ...rift.errors import RiftError, RiftUnavailable
+from ...rift.errors import RiftUnavailable, RiftUnauthenticated, RiftPermissionDenied
 from ...rift.rift_client import RiftGatewayClient
 from .runtime import parse_binds
 
@@ -397,6 +396,7 @@ class PyromindSDK:
         obj.env = {}
         obj.working_dir = "/"
         obj.command = []
+        obj.entrypoint = None
         obj.sandbox_status = status or "Unknown"
         obj._terminal_phase = None
         obj._exit_code = 0
@@ -418,10 +418,7 @@ class PyromindSDK:
         obj.screen_size = obj._json_ready(screen_size)
         obj._client = client or get_sandbox_client()
         obj.rift_ready = False
-        obj.rift_degraded = False
-        obj.rift_attempts = 0
         obj.rift_last_error = ""
-        obj.rift_info = None
         obj._rift_client = None
         return obj
 
@@ -434,6 +431,7 @@ class PyromindSDK:
         env: dict[str, str] | None = None,
         working_dir: str = "/",
         command: list[str] | None = None,
+        entrypoint: list[str] | None = None,
         binds: list[str] | None = None,
         mounts: list[dict[str, Any]] | None = None,
         tmpfs: dict[str, str] | None = None,
@@ -457,6 +455,7 @@ class PyromindSDK:
         self.env = dict(env or {})
         self.working_dir = working_dir
         self.command = list(command or [])
+        self.entrypoint = list(entrypoint) if entrypoint is not None else None
         self.sandbox_id: str | None = None
         self.sandbox_status = "Pending"
         self.resources: ResourceConfig | None = None
@@ -485,10 +484,7 @@ class PyromindSDK:
         )
         self._client = client or get_sandbox_client()
         self.rift_ready = False
-        self.rift_degraded = False
-        self.rift_attempts = 0
         self.rift_last_error = ""
-        self.rift_info = None
         self._rift_client = None
 
     @classmethod
@@ -515,13 +511,9 @@ class PyromindSDK:
             # `docker run -e` 的容器环境变量（create 时注入 Pod）
             env=kwargs.get("env"),
             gpu_card=kwargs.get("gpu_card"),
+            command=obj.command,
+            entrypoint=obj.entrypoint,
         )
-        if obj.command and obj.command not in (["sleep"], ["sleep", "2h"]):
-            obj.logger.warning(
-                "k8s_middleware does not accept Cmd yet; "
-                "container will use the image default command. cmd=%s",
-                obj.command,
-            )
         return obj
 
     # ---- construction helpers -------------------------------------------
@@ -560,6 +552,8 @@ class PyromindSDK:
         gpu: str | None,
         gpu_card: str | None,
         env: dict[str, str] | None = None,
+        command: list[str] | None = None,
+        entrypoint: list[str] | None = None,
     ) -> None:
         request = SandboxRequest(
             sandbox_type=SandboxType.CUSTOM,
@@ -580,6 +574,10 @@ class PyromindSDK:
             # `docker run -e`：容器环境变量。以前这里没有这个字段 ⇒ docker-rt 的
             # `docker inspect` 里有 Config.Env、容器里却读不到（`<unset>`）。
             env=dict(env) if env else None,
+            # `docker run IMG cmd` / `--entrypoint`：平台用它们和镜像 config
+            # 解析出最终 argv，交给 rift-client --supervise 当 PID1 执行。
+            command=list(command) if command else None,
+            entrypoint=list(entrypoint) if entrypoint is not None else None,
         )
         try:
             response = await self._client.create(request)
@@ -698,30 +696,14 @@ class PyromindSDK:
         cwd: str = "",
         *,
         timeout: int | None = None,
-        _force_platform: bool = False,
     ) -> dict[str, Any]:
         if not self.sandbox_id:
             raise RuntimeError("sandbox is not started")
-        if not _force_platform:
-            if not self.rift_ready:
-                raise RiftUnavailable(
-                    "rift channel is not ready; refusing platform exec"
-                )
-            return await self._execute_rift(action, cwd, timeout)
-        # _force_platform is only used by bootstrap itself (mkdir/uname/start).
-        command = action.get("command", "")
-        result = await self._client.exec_command(
-            self.sandbox_id,
-            command,
-            cwd=cwd or self.working_dir,
-            timeout=timeout,
-        )
-        return {
-            "output": result.output or "",
-            "stderr": result.stderr or "",
-            "returncode": result.returncode,
-            "exception_info": result.exception_info or "",
-        }
+        if not self.rift_ready:
+            raise RiftUnavailable(
+                "rift channel is not ready; refusing platform exec"
+            )
+        return await self._execute_rift(action, cwd, timeout)
 
     async def _execute_rift(
         self,
@@ -768,83 +750,52 @@ class PyromindSDK:
     async def ping_rift(self) -> bool:
         return bool(await self.ping_rift_version())
 
-    async def bootstrap_rift(self, *, force: bool = False) -> None:
-        """Upload/start rift-client and wait until the gateway can Ping it.
+    async def connect_rift(self) -> None:
+        """Ping 校验平台注入的 rift-client；不可达就硬失败。
 
-        Three attempts by default. On final failure the sandbox is marked
-        degraded and a Feishu alert is sent; callers must surface an error and
-        must not fall back to the platform exec WebSocket.
+        二进制与 token 由 k8s_middleware 在建 Pod 时注入（initContainer +
+        per-sandbox Secret），rift-client 以 --supervise 当 PID1。docker-rt
+        不再上传/启动任何东西：这里只建立网关连接并用 Ping 确认数据面可用。
+        失败抛 RiftUnavailable，调用方不得回退平台 exec 通道。
         """
         cfg = load_rift_config()
-        # Ping first, with a client that costs nothing (no platform API call).
-        # After a daemon restart the Pod usually still runs the previous
-        # rift-client, so this avoids re-uploading/re-writing anything while the
-        # platform API is slow or unreachable.
-        if self._rift_client is None and self.sandbox_id and cfg.gateway:
+        if not cfg.gateway:
+            raise RiftUnavailable("DOCKER_RT_RIFT_GATEWAY is not configured")
+        if not self.sandbox_id:
+            raise RiftUnavailable("sandbox is not started")
+        if self._rift_client is None:
             access_key = str(getattr(self._client, "api_key", "") or "").strip()
-            if access_key:
-                self._rift_client = RiftGatewayClient(
-                    cfg, access_key, self.sandbox_id
-                )
-        running = await self.ping_rift_version()
-        # "Reachable" is not "current": a Pod keeps serving the previous build
-        # until something replaces it. Only a matching build may short-circuit,
-        # otherwise a new SDK would never reach sandboxes that are already up.
-        if running and (not cfg.expected_version or running == cfg.expected_version):
-            self.rift_ready = True
-            self.rift_degraded = False
-            self.rift_last_error = ""
-            self.logger.info(
-                "rift already reachable sandbox=%s; skipping bootstrap",
-                self.sandbox_id,
+            if not access_key:
+                raise RiftUnavailable("PyroMind client has no access key")
+            self._rift_client = RiftGatewayClient(
+                cfg, access_key, self.sandbox_id
             )
-            return
-        if running:
-            self.logger.warning(
-                "rift-client is stale sandbox=%s running=%s expected=%s; re-injecting",
-                self.sandbox_id,
-                running,
-                cfg.expected_version,
-            )
-        self.rift_ready = False
-
         last_error: BaseException | None = None
-        for attempt in range(1, cfg.retry + 1):
-            self.rift_attempts = attempt
+        for _ in range(cfg.ping_attempts):
             try:
-                info = await bootstrap_once(self)
-                self.rift_ready = True
-                self.rift_degraded = False
-                self.rift_last_error = ""
-                self.logger.info(
-                    "rift ready sandbox=%s attempt=%s version=%s",
-                    self.sandbox_id,
-                    attempt,
-                    (info or {}).get("version", "?"),
-                )
-                return
-            except RiftError as exc:
-                last_error = exc
-                self.logger.warning(
-                    "rift bootstrap %s/%s failed: %s",
-                    attempt,
-                    cfg.retry,
-                    exc,
-                )
+                version = await self._rift_client.ping()
+            except (RiftUnauthenticated, RiftPermissionDenied):
+                # 凭据/路由授权问题不会因重试变好，立即失败
+                self.rift_ready = False
+                raise
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
-                self.logger.exception(
-                    "rift bootstrap %s/%s failed", attempt, cfg.retry
-                )
-            if attempt < cfg.retry:
-                await asyncio.sleep(cfg.retry_backoff * attempt)
-
+                await asyncio.sleep(cfg.ping_interval)
+                continue
+            self.rift_ready = True
+            self.rift_last_error = ""
+            self.logger.info(
+                "rift ready sandbox=%s version=%s gateway=%s",
+                self.sandbox_id,
+                version,
+                cfg.gateway,
+            )
+            return
         self.rift_ready = False
-        self.rift_degraded = True
         self.rift_last_error = str(last_error or "unknown")
-        # The gateway owns Feishu alerting: it is the side that keeps observing
-        # rift-client reachability. Here we only mark the sandbox degraded.
-        raise RiftUnavailable(self.rift_last_error)
+        raise RiftUnavailable(
+            f"rift-client did not answer Ping: {self.rift_last_error}"
+        )
 
     async def _close_rift(self) -> None:
         client = getattr(self, "_rift_client", None)
@@ -1192,10 +1143,9 @@ class PyromindSDK:
     async def resume(self) -> None:
         if not self.sandbox_id:
             raise RuntimeError("sandbox is not started")
-        # resume creates a brand-new Pod: the old rift channel is already dead
-        # with it, so there is nothing to close or wait for here. Just mark the
-        # channel unready; _start_record re-runs bootstrap (copy + start).
-        # bootstrap_once closes the stale client after the new one is ready.
+        # resume creates a brand-new Pod: the platform injects rift-client as
+        # PID1 again, so there is nothing to upload here. Mark the channel
+        # unready; _start_record gates on Ping (connect_rift) before Up.
         self.rift_ready = False
         response = await self._client.resume(self.sandbox_id)
         self._bind_response(response)
@@ -1466,6 +1416,11 @@ class PyromindSDK:
             resources=sandbox.resources or self._resources,
             volume_mounts=sandbox.volume_mounts,
             port_mappings=sandbox.port_mappings,
+            # 必须带上：平台的 edit 见到 image 就会按请求里的 command/entrypoint
+            # 重解析 argv。漏了它们，一次 rename 就会把用户的主进程命令悄悄换成
+            # 镜像默认值（Docker 的 rename 绝不改配置）。
+            command=list(self.command) if self.command else None,
+            entrypoint=list(self.entrypoint) if self.entrypoint is not None else None,
         )
 
     async def rename(self, new_name: str) -> None:
