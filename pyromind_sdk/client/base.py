@@ -237,9 +237,14 @@ logger = install_console_logging(
 
 
 class PyroMindAPIError(Exception):
-    """Base exception for PyroMind API errors"""
+    """Base exception for PyroMind API errors.
+
+    The message is redacted here because transport errors quote the request URL
+    (query included) and this text reaches CLI output, application logs and
+    persisted node logs — the logging filter never sees it.
+    """
     def __init__(self, message: str, status_code: Optional[int] = None, response: Optional[Dict] = None, headers: Optional[Dict] = None):
-        self.message = append_trace_id(message, headers)
+        self.message = append_trace_id(redact_text(message), headers)
         self.status_code = status_code
         self.response = response
         self.headers = headers
