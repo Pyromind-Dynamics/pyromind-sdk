@@ -14,7 +14,7 @@ from typing import Optional, Dict, Any
 
 from .base import append_trace_id, extract_trace_id
 from ..log_redaction import redact, redact_text
-from ..token import AsyncHttpTokenCache
+from ..token import AsyncHttpTokenCache, token_base_url
 from .trace import (
     TRACE_ID_HEADER,
     current_trace_id,
@@ -69,6 +69,9 @@ class PyroMindAsyncAPIError(Exception):
 
 
 class PyroMindAsyncClient:
+    #: Profile/account APIs live on portal and still use the long-lived key.
+    USE_TICKET_AUTH = True
+
     """
     Async base client class for PyroMind API
 
@@ -136,6 +139,11 @@ class PyroMindAsyncClient:
             cluster = os.getenv(ENV_CLUSTER) or DEFAULT_CLUSTER
         self.cluster = cluster
 
+        # Data-plane clients: cluster-direct + short-lived token. Profile /
+        # storage clients opt out (portal + long-lived key).
+        if self.USE_TICKET_AUTH:
+            self.base_url = token_base_url(self.base_url, self.cluster)
+
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.max_retries = max_retries
         self.connector_limit = max(1, int(connector_limit))
@@ -145,9 +153,11 @@ class PyroMindAsyncClient:
             else max(1, int(connector_limit_per_host))
         )
 
-        # Every request carries a short-lived token; the API key itself is
-        # only used for the exchange (see token.AsyncHttpTokenCache).
-        self._tokens = AsyncHttpTokenCache(self.base_url, api_key)
+        self._tokens = (
+            AsyncHttpTokenCache(self.base_url, api_key, cluster=self.cluster)
+            if self.USE_TICKET_AUTH
+            else None
+        )
 
         # Session will be created lazily inside the active event loop.
         self._session: Optional[aiohttp.ClientSession] = None
@@ -402,7 +412,11 @@ class PyroMindAsyncClient:
         """
         headers = dict(kwargs.pop("headers", None) or {})
         headers.setdefault(TRACE_ID_HEADER, ensure_trace_id())
-        headers["Authorization"] = f"Bearer {await self._tokens.token()}"
+        headers["Authorization"] = (
+            f"Bearer {await self._tokens.token()}"
+            if self._tokens is not None
+            else f"Bearer {self.api_key}"
+        )
         kwargs["headers"] = headers
         logger.debug("[REQUEST] %s %s", method.upper(), redact_text(url))
         async with session.request(method, url, **kwargs) as response:
@@ -516,7 +530,11 @@ class PyroMindAsyncClient:
         token_retried = False
         while True:
             transport_attempt += 1
-            extra_headers["Authorization"] = f"Bearer {await self._tokens.token()}"
+            extra_headers["Authorization"] = (
+                f"Bearer {await self._tokens.token()}"
+                if self._tokens is not None
+                else f"Bearer {self.api_key}"
+            )
             try:
                 async with session.request(
                     method=method,

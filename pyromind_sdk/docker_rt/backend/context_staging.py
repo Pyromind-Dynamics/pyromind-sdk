@@ -397,7 +397,7 @@ def connect_storage(cluster: str | None = None) -> tuple[Any, str]:
     * **endpoint** — :data:`client.base.CLUSTER_RESOURCE`;
     * **bucket** — ``ProfileClient.get_user_info().user.uid``;
     * **credentials** — the environment, read by ``StorageClient`` itself
-      (``PYROMIND_API_KEY`` + ``PYROMIND_STORAGE_SECRET_KEY``).
+      (``PYROMIND_STORAGE_ACCESS_KEY`` + ``PYROMIND_STORAGE_SECRET_KEY``).
 
     ``/storage_info`` is deliberately **not** consulted: the platform is
     removing it, and its masked credential fields (``X805***NQNN``) were never
@@ -435,8 +435,8 @@ def connect_storage(cluster: str | None = None) -> tuple[Any, str]:
         storage = StorageClient(endpoint=endpoint, cluster=cluster)
     except ValueError as exc:  # missing/invalid secret key lands here
         raise StagingError(
-            "storage connection failed: PYROMIND_STORAGE_SECRET_KEY is missing "
-            "or invalid"
+            "storage connection failed: PYROMIND_STORAGE_ACCESS_KEY / "
+            "PYROMIND_STORAGE_SECRET_KEY is missing or invalid"
         ) from exc
     except Exception as exc:  # noqa: BLE001
         raise StagingError(f"storage connection failed: {exc}") from exc
@@ -1249,7 +1249,8 @@ def sweep_stale_staging(
     now = time.time() if now is None else now
 
     if storage is None and not (
-        _storage_verified or _env("PYROMIND_STORAGE_SECRET_KEY")
+        _storage_verified
+        or (_env("PYROMIND_STORAGE_ACCESS_KEY") and _env("PYROMIND_STORAGE_SECRET_KEY"))
     ):
         # Nothing in this process has used storage and nothing is explicitly
         # configured: do not probe it. Whether storage works only matters to

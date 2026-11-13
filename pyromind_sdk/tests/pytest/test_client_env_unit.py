@@ -3,7 +3,12 @@ from unittest import mock
 
 import pytest
 
-from pyromind_sdk.client.base import PyroMindClient, DEFAULT_API_BASE_URL, DEFAULT_CLUSTER
+from pyromind_sdk.client.base import (
+    PyroMindClient,
+    DEFAULT_API_BASE_URL,
+    DEFAULT_CLUSTER,
+    resolve_base_url_from_cluster,
+)
 from pyromind_sdk.client.models import InferenceJobRequest
 from pyromind_sdk.client.storage import StorageClient
 
@@ -25,7 +30,8 @@ class TestPyroMindClientBaseUrl:
     def test_default_base_url(self, monkeypatch):
         monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
         client = PyroMindClient(api_key="test-key")
-        assert client.base_url == DEFAULT_API_BASE_URL.rstrip("/")
+        # 统一模型：portal 默认地址会解析成集群直连地址
+        assert client.base_url == resolve_base_url_from_cluster(DEFAULT_CLUSTER)
 
     def test_explicit_base_url(self, monkeypatch):
         monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
@@ -40,7 +46,7 @@ class TestPyroMindClientBaseUrl:
     def test_empty_env_var_falls_back(self, monkeypatch):
         monkeypatch.setenv("PYROMIND_BASE_URL", "")
         client = PyroMindClient(api_key="test-key")
-        assert client.base_url == DEFAULT_API_BASE_URL.rstrip("/")
+        assert client.base_url == resolve_base_url_from_cluster(DEFAULT_CLUSTER)
 
 
 class TestPyroMindClientCluster:
@@ -290,6 +296,33 @@ class TestResolveApiBaseUrl:
         monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
         monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2")
 
+        # Profile/账号接口只在 portal 上，保持 portal 地址 + 长期 key
         assert ProfileClient(api_key="test-key").base_url == (
             DEFAULT_API_BASE_URL.rstrip("/")
         )
+
+
+class TestStorageCredentials:
+    """storage 有独立的 AK/SK，平台 API key 不能当 storage AK 用。"""
+
+    def test_access_key_comes_from_the_storage_env(self, monkeypatch):
+        monkeypatch.setenv("PYROMIND_STORAGE_ACCESS_KEY", "storage-ak")
+        monkeypatch.setenv("PYROMIND_STORAGE_SECRET_KEY", "storage-sk")
+        monkeypatch.setenv("PYROMIND_API_KEY", "platform-key")
+
+        client = StorageClient(endpoint="https://storage.example.com")
+
+        assert client.access_key == "storage-ak"
+        assert client.secret_key == "storage-sk"
+
+    def test_platform_key_is_not_used_as_the_storage_access_key(self, monkeypatch):
+        import pytest
+
+        monkeypatch.delenv("PYROMIND_STORAGE_ACCESS_KEY", raising=False)
+        monkeypatch.setenv("PYROMIND_STORAGE_SECRET_KEY", "storage-sk")
+        monkeypatch.setenv("PYROMIND_API_KEY", "platform-key")
+
+        with pytest.raises(ValueError) as exc:
+            StorageClient(endpoint="https://storage.example.com")
+
+        assert "PYROMIND_STORAGE_ACCESS_KEY" in str(exc.value)

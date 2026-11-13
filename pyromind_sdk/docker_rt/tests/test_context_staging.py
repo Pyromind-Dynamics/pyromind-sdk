@@ -664,6 +664,7 @@ def test_sweep_survives_a_storage_client_that_cannot_be_opened(
 
     # Storage must look configured, otherwise the sweep is skipped before it
     # ever tries to connect (see the test below).
+    monkeypatch.setenv("PYROMIND_STORAGE_ACCESS_KEY", "ak")
     monkeypatch.setenv("PYROMIND_STORAGE_SECRET_KEY", "sk")
     monkeypatch.setattr(cs, "connect_storage", boom)
 
@@ -682,6 +683,7 @@ def test_sweep_never_probes_storage_before_a_build_used_it(
     from ..backend import context_staging as cs
 
     monkeypatch.delenv("PYROMIND_STORAGE_BUCKET", raising=False)
+    monkeypatch.delenv("PYROMIND_STORAGE_ACCESS_KEY", raising=False)
     monkeypatch.delenv("PYROMIND_STORAGE_SECRET_KEY", raising=False)
     monkeypatch.setattr(cs, "_storage_verified", False)
 

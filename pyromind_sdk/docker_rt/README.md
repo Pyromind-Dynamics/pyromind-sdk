@@ -168,6 +168,8 @@ The daemon protects its API **only** with the transport. There is no token and n
 
 ### Build and push
 
+> The build context is staged through workspace storage, which needs its own credential pair: `PYROMIND_STORAGE_ACCESS_KEY` + `PYROMIND_STORAGE_SECRET_KEY`. These are separate from the platform API credential (`PYROMIND_API_KEY`) and are not interchangeable.
+
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `DOCKER_RT_BUILD_REGISTRY` | Cluster profile | Registry prefix (with namespace) used to expand short tags. |
@@ -175,7 +177,8 @@ The daemon protects its API **only** with the transport. There is no token and n
 | `DOCKER_RT_BUILD_PUSH_CHECK` | `fail` | Pre-push registry reachability check: `fail`, `warn` or `off`. |
 | `DOCKER_RT_BUILD_IMAGE` | Cluster-specific | Builder sandbox image; must include shell and `sleep` (the `-debug` variant). |
 | `DOCKER_RT_BUILD_CONTEXT_MODE` | `storage` | How the build context reaches the cluster: `storage` (the only default — staged through workspace storage, then copied locally inside the sandbox) or `upload` (the old direct upload, opt-in for environments without storage). **There is no automatic fallback**: a misconfigured storage fails the build instead of quietly taking the slow route. |
-| `PYROMIND_STORAGE_SECRET_KEY` | unset | The storage secret key. `/storage_info` no longer returns it; set it yourself — when it is missing or wrong, the build fails with `storage connection failed`. |
+| `PYROMIND_STORAGE_ACCESS_KEY` | unset | The storage **access key**. Independent of the platform `PYROMIND_API_KEY`; when missing or wrong the build fails with `storage connection failed`. |
+| `PYROMIND_STORAGE_SECRET_KEY` | unset | The storage **secret key**, paired with the access key above. `/storage_info` no longer returns it; set it yourself. |
 | `PYROMIND_STORAGE_ENDPOINT` | per cluster (automatic) | Storage endpoint, taken from `CLUSTER_RESOURCE` (every cluster has one). Normally no need to set it. |
 | `DOCKER_RT_REGISTRY_USERNAME` / `DOCKER_RT_REGISTRY_PASSWORD` | unset | Registry credentials. |
 | `DOCKER_RT_REGISTRY_DOCKERCONFIG` | removed | No longer read. Credentials come only from `DOCKER_RT_REGISTRY_USERNAME` + `DOCKER_RT_REGISTRY_PASSWORD`; there is no config-file fallback. |

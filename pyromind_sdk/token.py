@@ -17,6 +17,7 @@ import asyncio
 import json
 import threading
 import time
+from urllib.parse import urlparse
 from typing import Optional, Tuple
 
 import aiohttp
@@ -31,7 +32,10 @@ PURPOSE_HTTP = "http"
 PURPOSE_WS_TERMINAL = "ws-terminal"
 PURPOSE_WS_EXEC = "ws-exec"
 
-REQUEST_TIMEOUT_S = 30
+REQUEST_TIMEOUT_S = 60
+_EXCHANGE_ATTEMPTS = 3
+_RETRY_DELAY_S = 1.0
+_RETRYABLE_STATUS = (502, 503, 504)
 
 #: Refresh this early so an in-flight request never uses an about-to-expire token.
 REFRESH_SKEW_S = 30
@@ -46,6 +50,20 @@ class TokenError(RuntimeError):
 
 def token_url(base_url: str) -> str:
     return f"{base_url.rstrip('/')}/{TOKEN_PATH}"
+
+
+def token_base_url(base_url: str, cluster: Optional[str] = None) -> str:
+    """Where to exchange tickets: always the cluster-direct API.
+
+    Portal (control plane) addresses do not serve ``/auth/token``; only the
+    per-cluster middleware does.  Mirrors the WebSocket URL resolution.
+    """
+    host = (urlparse(base_url).hostname or "").lower()
+    if "portal" in host and cluster:
+        from .client.base import resolve_base_url_from_cluster
+
+        return resolve_base_url_from_cluster(cluster)
+    return base_url
 
 
 def _request_body(purpose: str, sandbox_id: Optional[str]) -> dict:
@@ -82,17 +100,31 @@ def fetch_token(
         "Accept": "application/json",
         TRACE_ID_HEADER: ensure_trace_id(),
     }
-    try:
-        response = requests.post(
-            url,
-            json=_request_body(purpose, sandbox_id),
-            headers=headers,
-            timeout=timeout,
-        )
-    except requests.RequestException as exc:
+    last_exc = None
+    for attempt in range(_EXCHANGE_ATTEMPTS):
+        try:
+            response = requests.post(
+                url,
+                json=_request_body(purpose, sandbox_id),
+                headers=headers,
+                timeout=timeout,
+            )
+            if (
+                response.status_code in _RETRYABLE_STATUS
+                and attempt + 1 < _EXCHANGE_ATTEMPTS
+            ):
+                time.sleep(_RETRY_DELAY_S)
+                continue
+            last_exc = None
+            break
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt + 1 < _EXCHANGE_ATTEMPTS:
+                time.sleep(_RETRY_DELAY_S)
+    if last_exc is not None:
         raise TokenError(
-            f"token exchange request failed: {type(exc).__name__}: {exc}"
-        ) from exc
+            f"token exchange request failed: {type(last_exc).__name__}: {last_exc}"
+        ) from last_exc
 
     if not response.ok:
         raise TokenError(f"token exchange rejected (HTTP {response.status_code})")
@@ -119,25 +151,46 @@ async def async_fetch_token(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "Accept": "application/json",
+        # aiohttp would otherwise advertise ``br`` and then fail to decode the
+        # response ("Can not decode content-encoding: br" on aiohttp 3.14).
+        "Accept-Encoding": "gzip, deflate",
         TRACE_ID_HEADER: ensure_trace_id(),
     }
     client_timeout = aiohttp.ClientTimeout(total=timeout)
-    try:
-        async with aiohttp.ClientSession(timeout=client_timeout) as session:
-            async with session.post(
-                url, json=_request_body(purpose, sandbox_id), headers=headers
-            ) as response:
-                status = response.status
-                try:
-                    payload = await response.json(content_type=None)
-                except ValueError as exc:
-                    raise TokenError(
-                        f"token exchange failed (HTTP {status}): invalid JSON"
-                    ) from exc
-    except aiohttp.ClientError as exc:
+    last_exc: Optional[BaseException] = None
+    for attempt in range(_EXCHANGE_ATTEMPTS):
+        try:
+            async with aiohttp.ClientSession(timeout=client_timeout) as session:
+                async with session.post(
+                    url, json=_request_body(purpose, sandbox_id), headers=headers
+                ) as response:
+                    status = response.status
+                    if (
+                        status in _RETRYABLE_STATUS
+                        and attempt + 1 < _EXCHANGE_ATTEMPTS
+                    ):
+                        await asyncio.sleep(_RETRY_DELAY_S)
+                        continue
+                    try:
+                        payload = await response.json(content_type=None)
+                    except ValueError as exc:
+                        raise TokenError(
+                            f"token exchange failed (HTTP {status}): invalid JSON"
+                        ) from exc
+            last_exc = None
+            break
+        except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+            last_exc = exc
+            if attempt + 1 < _EXCHANGE_ATTEMPTS:
+                await asyncio.sleep(_RETRY_DELAY_S)
+    if last_exc is not None:
+        # asyncio.TimeoutError has an empty str() — without this the caller
+        # (e.g. docker-rt setup) logs a blank error.
+        if isinstance(last_exc, asyncio.TimeoutError):
+            raise TokenError(f"token exchange timed out after {timeout}s") from last_exc
         raise TokenError(
-            f"token exchange request failed: {type(exc).__name__}: {exc}"
-        ) from exc
+            f"token exchange request failed: {type(last_exc).__name__}: {last_exc}"
+        ) from last_exc
 
     if status >= 400:
         raise TokenError(f"token exchange rejected (HTTP {status})")
@@ -152,9 +205,10 @@ class HttpTokenCache:
         base_url: str,
         api_key: str,
         *,
+        cluster: Optional[str] = None,
         refresh_skew_s: int = REFRESH_SKEW_S,
     ) -> None:
-        self._base_url = base_url
+        self._base_url = token_base_url(base_url, cluster)
         self._api_key = api_key
         self._refresh_skew_s = refresh_skew_s
         self._token: Optional[str] = None
@@ -190,9 +244,10 @@ class AsyncHttpTokenCache:
         base_url: str,
         api_key: str,
         *,
+        cluster: Optional[str] = None,
         refresh_skew_s: int = REFRESH_SKEW_S,
     ) -> None:
-        self._base_url = base_url
+        self._base_url = token_base_url(base_url, cluster)
         self._api_key = api_key
         self._refresh_skew_s = refresh_skew_s
         self._token: Optional[str] = None

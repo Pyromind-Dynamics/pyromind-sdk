@@ -22,7 +22,7 @@ from .trace import (
     set_trace_id,
 )
 from ..log_redaction import redact, redact_text
-from ..token import HttpTokenCache
+from ..token import HttpTokenCache, token_base_url
 
 
 # Constants
@@ -253,6 +253,10 @@ class PyroMindAPIError(Exception):
 
 
 class PyroMindClient:
+    #: Profile/account APIs live on portal and still use the long-lived key;
+    #: every data-plane client keeps this True (cluster-direct + short token).
+    USE_TICKET_AUTH = True
+
     """
     Base client class for PyroMind API
 
@@ -315,6 +319,11 @@ class PyroMindClient:
             cluster = os.getenv(ENV_CLUSTER) or DEFAULT_CLUSTER
         self.cluster = cluster
 
+        # Data-plane clients: cluster-direct + short-lived token. Profile /
+        # storage clients opt out (portal + long-lived key).
+        if self.USE_TICKET_AUTH:
+            self.base_url = token_base_url(self.base_url, self.cluster)
+
         self.timeout = timeout
 
         # Create session with retry strategy
@@ -329,10 +338,11 @@ class PyroMindClient:
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
         
-        # The API key is NOT a default header: every request carries a
-        # short-lived token instead (see ``token.HttpTokenCache``), so a
-        # captured request never exposes the long-lived credential.
-        self._tokens = HttpTokenCache(self.base_url, api_key)
+        self._tokens = (
+            HttpTokenCache(self.base_url, api_key, cluster=self.cluster)
+            if self.USE_TICKET_AUTH
+            else None
+        )
 
         # Set default headers
         self.session.headers.update({
@@ -555,7 +565,11 @@ class PyroMindClient:
         """
         headers = dict(kwargs.pop("headers", None) or {})
         headers.update(self._trace_headers())
-        headers["Authorization"] = f"Bearer {self._tokens.token()}"
+        headers["Authorization"] = (
+            f"Bearer {self._tokens.token()}"
+            if self._tokens is not None
+            else f"Bearer {self.api_key}"
+        )
         kwargs.setdefault("timeout", self.timeout)
         logger.debug("[REQUEST] %s %s", method.upper(), redact_text(url))
         response = self.session.request(
@@ -657,6 +671,8 @@ class PyroMindClient:
             for attempt in (0, 1):
                 extra_headers["Authorization"] = (
                     f"Bearer {self._tokens.token(force_refresh=attempt > 0)}"
+                    if self._tokens is not None
+                    else f"Bearer {self.api_key}"
                 )
                 response = self.session.request(
                     method=method,
@@ -666,7 +682,11 @@ class PyroMindClient:
                     timeout=self.timeout,
                     **kwargs
                 )
-                if response.status_code != 401 or attempt == 1:
+                if (
+                    response.status_code != 401
+                    or attempt == 1
+                    or self._tokens is None
+                ):
                     break
                 logger.info("[AUTH] token rejected, refreshing once: %s", request_context)
 

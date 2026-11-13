@@ -1360,11 +1360,13 @@ async def build_in_sandbox(
     try:
         registry = registry_push.build_registry()
     except RegistryConfigError as exc:
-        # Only a short tag consults the prefix; a fully-qualified ``-t`` carries
-        # its own host, and ``build_prerequisites_error`` has already cleared the
-        # short-tag case, so reaching here with one means it is genuinely broken.
+        # The prefix is only needed when a short tag will actually be pushed.
+        # A plain build (``DOCKER_RT_BUILD_PUSH`` off) must proceed with no
+        # prefix — short tags then resolve to themselves; failing here made
+        # ``docker build -t app:1`` die on profiled clusters that have a host
+        # but no namespace.
         registry = ""
-        if any(not buildkit.looks_fully_qualified(t) for t in tags):
+        if push and any(not buildkit.looks_fully_qualified(t) for t in tags):
             yield buildkit.error_event(str(exc))
             return
 

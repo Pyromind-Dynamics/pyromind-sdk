@@ -3139,3 +3139,35 @@ async def test_a_disabled_sweep_deletes_nothing_and_says_how_to_do_it_by_hand(
     assert client.paused == []
     assert "sweep is off" in caplog.text
     assert "docker rm -f" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_build_without_push_ignores_an_unresolvable_push_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``docker build -t short:1`` (push off) on a host-without-namespace cluster.
+
+    The push prefix must not be resolved for a build that never pushes: doing so
+    made the classic builder fail with ``DOCKER_RT_REGISTRY_NAMESPACE`` on
+    clusters whose profile has a registry host but no namespace.
+    """
+    from ..backend import build_sandbox
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("DOCKER_RT_BUILD_IMAGE", "reg.example.com/rt/kaniko:1-debug")
+    monkeypatch.setenv("DOCKER_RT_REGISTRY_CLUSTER", "us-west-1")
+    monkeypatch.delenv("DOCKER_RT_BUILD_PUSH", raising=False)
+    monkeypatch.delenv("DOCKER_RT_REGISTRY_NAMESPACE", raising=False)
+    monkeypatch.delenv("DOCKER_RT_BUILD_REGISTRY", raising=False)
+
+    sandbox = _FakeBuildSandbox(stdout=f"INFO building\ndocker-rt-digest: {GOOD_DIGEST}\n")
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="custom-user-1"
+        )
+    )
+
+    assert not [event for event in events if event.get("error")], events
+    assert any(event.get("docker_rt") for event in events)
