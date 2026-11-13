@@ -14,6 +14,7 @@ from typing import Optional, Dict, Any
 
 from .base import append_trace_id, extract_trace_id
 from ..log_redaction import redact, redact_text
+from ..token import AsyncHttpTokenCache, token_base_url
 from .trace import (
     TRACE_ID_HEADER,
     current_trace_id,
@@ -52,9 +53,14 @@ logger = logging.getLogger("pyromind_sdk.async")
 
 
 class PyroMindAsyncAPIError(Exception):
-    """Base exception for PyroMind Async API errors"""
+    """Base exception for PyroMind Async API errors.
+
+    The message is redacted here because transport errors quote the request URL
+    (query included) and this text reaches CLI output, application logs and
+    persisted node logs — the logging filter never sees it.
+    """
     def __init__(self, message: str, status_code: Optional[int] = None, response: Optional[Dict] = None, headers: Optional[Dict] = None):
-        self.message = append_trace_id(message, headers)
+        self.message = append_trace_id(redact_text(message), headers)
         self.status_code = status_code
         self.response = response
         self.headers = headers
@@ -63,6 +69,9 @@ class PyroMindAsyncAPIError(Exception):
 
 
 class PyroMindAsyncClient:
+    #: Profile/account APIs live on portal and still use the long-lived key.
+    USE_TICKET_AUTH = True
+
     """
     Async base client class for PyroMind API
 
@@ -130,6 +139,11 @@ class PyroMindAsyncClient:
             cluster = os.getenv(ENV_CLUSTER) or DEFAULT_CLUSTER
         self.cluster = cluster
 
+        # Data-plane clients: cluster-direct + short-lived token. Profile /
+        # storage clients opt out (portal + long-lived key).
+        if self.USE_TICKET_AUTH:
+            self.base_url = token_base_url(self.base_url, self.cluster)
+
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.max_retries = max_retries
         self.connector_limit = max(1, int(connector_limit))
@@ -137,6 +151,12 @@ class PyroMindAsyncClient:
             self.connector_limit
             if connector_limit_per_host is None
             else max(1, int(connector_limit_per_host))
+        )
+
+        self._tokens = (
+            AsyncHttpTokenCache(self.base_url, api_key, cluster=self.cluster)
+            if self.USE_TICKET_AUTH
+            else None
         )
 
         # Session will be created lazily inside the active event loop.
@@ -170,7 +190,8 @@ class PyroMindAsyncClient:
                     timeout=self.timeout,
                     connector=connector,
                     headers={
-                        "Authorization": f"Bearer {self.api_key}",
+                        # The API key is not a session header: each request
+                        # carries a short-lived token instead (see token.py).
                         "Content-Type": "application/json",
                         "Accept": "application/json",
                         # Never advertise ``br``: aiohttp 3.14 + brotli 1.2
@@ -391,6 +412,11 @@ class PyroMindAsyncClient:
         """
         headers = dict(kwargs.pop("headers", None) or {})
         headers.setdefault(TRACE_ID_HEADER, ensure_trace_id())
+        headers["Authorization"] = (
+            f"Bearer {await self._tokens.token()}"
+            if self._tokens is not None
+            else f"Bearer {self.api_key}"
+        )
         kwargs["headers"] = headers
         logger.debug("[REQUEST] %s %s", method.upper(), redact_text(url))
         async with session.request(method, url, **kwargs) as response:
@@ -497,8 +523,18 @@ class PyroMindAsyncClient:
         logger.debug(" | ".join(log_parts))
 
         last_exception = None
-        attempts = max(1, self.max_retries) if retry else 1
-        for attempt in range(attempts):
+        max_attempts = max(1, self.max_retries) if retry else 1
+        transport_attempt = 0
+        # A 401 means the request never ran (token expired / rotated), so one
+        # refresh-and-retry is always safe — even for non-idempotent POST.
+        token_retried = False
+        while True:
+            transport_attempt += 1
+            extra_headers["Authorization"] = (
+                f"Bearer {await self._tokens.token()}"
+                if self._tokens is not None
+                else f"Bearer {self.api_key}"
+            )
             try:
                 async with session.request(
                     method=method,
@@ -519,11 +555,19 @@ class PyroMindAsyncClient:
 
                     # Handle non-2xx responses
                     if not response.ok:
+                        if response.status == 401 and not token_retried:
+                            token_retried = True
+                            await self._tokens.invalidate()
+                            logger.info(
+                                "[AUTH] token rejected, refreshing once: %s",
+                                request_context,
+                            )
+                            continue
                         if (
                             response.status in RETRY_STATUS_CODES
-                            and attempt < attempts - 1
+                            and transport_attempt < max_attempts
                         ):
-                            await asyncio.sleep(0.5 * (2 ** attempt))
+                            await asyncio.sleep(0.5 * (2 ** (transport_attempt - 1)))
                             continue
                         await self._handle_error_response(response, request_context)
 
@@ -535,21 +579,14 @@ class PyroMindAsyncClient:
             except (asyncio.TimeoutError, aiohttp.ClientError) as e:
                 last_exception = e
                 # Log exception
-                logger.error(f"[ERROR] {request_context} - {type(e).__name__}: {str(e)} (attempt {attempt + 1}/{attempts})")
-                if attempt < attempts - 1:
-                    await asyncio.sleep(0.5 * (2 ** attempt))
+                logger.error(f"[ERROR] {request_context} - {type(e).__name__}: {str(e)} (attempt {transport_attempt}/{max_attempts})")
+                if transport_attempt < max_attempts:
+                    await asyncio.sleep(0.5 * (2 ** (transport_attempt - 1)))
                     continue
                 raise PyroMindAsyncAPIError(
                     message=f"{request_context} request failed: {type(e).__name__}: {str(e)}",
                     status_code=None
                 )
-
-        # If we get here, all retries failed
-        logger.error(f"[ERROR] {request_context} - All {attempts} attempts failed")
-        raise PyroMindAsyncAPIError(
-            message=f"{request_context} request failed after {attempts} attempts: {str(last_exception)}",
-            status_code=None
-        )
     
     async def get(self, endpoint: str, params: Optional[Dict[str, Any]] = None, **kwargs) -> Dict[str, Any]:
         """Make an async GET request"""

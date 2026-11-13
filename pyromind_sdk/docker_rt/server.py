@@ -74,8 +74,9 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             # 这次调用是 SDK 发起的：它失败时上下文已还原，用异常上挂的 trace
             # 把这条收尾日志也归到同一条 trace 上（否则是 ``[-]``）
+            message = str(exc).strip() or f"{type(exc).__name__} (no message)"
             with trace_scope(getattr(exc, "trace_id", None)):
-                logger.error("docker-rt setup failed: %s", exc)
+                logger.error("docker-rt setup failed: %s", message)
             return 1
 
     if args.daemon and os.getenv("PYROMIND_DOCKER_RT_DAEMON_CHILD") != "1":

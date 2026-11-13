@@ -206,11 +206,12 @@ def client(api_key, base_url):
 @pytest.fixture(scope="module")
 def storage_client():
     endpoint = os.getenv("PYROMIND_STORAGE_ENDPOINT")
+    access_key = os.getenv("PYROMIND_STORAGE_ACCESS_KEY")
     secret_key = os.getenv("PYROMIND_STORAGE_SECRET_KEY")
     bucket = os.getenv("PYROMIND_STORAGE_BUCKET")
-    if not endpoint or not secret_key or not bucket:
-        pytest.skip("Storage env vars not set (PYROMIND_STORAGE_ENDPOINT, PYROMIND_STORAGE_SECRET_KEY, PYROMIND_STORAGE_BUCKET)")
-    return StorageClient(endpoint=endpoint, secret_key=secret_key, bucket_name=bucket)
+    if not endpoint or not access_key or not secret_key or not bucket:
+        pytest.skip("Storage env vars not set (PYROMIND_STORAGE_ENDPOINT, PYROMIND_STORAGE_ACCESS_KEY, PYROMIND_STORAGE_SECRET_KEY, PYROMIND_STORAGE_BUCKET)")
+    return StorageClient(endpoint=endpoint, access_key=access_key, secret_key=secret_key, bucket_name=bucket)
 
 
 @pytest.fixture(scope="session")
@@ -230,10 +231,11 @@ _cleanup_registered = False
 
 def _get_storage_for_cleanup() -> Optional[StorageClient]:
     endpoint = os.getenv("PYROMIND_STORAGE_ENDPOINT")
+    access_key = os.getenv("PYROMIND_STORAGE_ACCESS_KEY")
     secret_key = os.getenv("PYROMIND_STORAGE_SECRET_KEY")
     bucket = os.getenv("PYROMIND_STORAGE_BUCKET")
-    if endpoint and secret_key and bucket:
-        return StorageClient(endpoint=endpoint, secret_key=secret_key, bucket_name=bucket)
+    if endpoint and access_key and secret_key and bucket:
+        return StorageClient(endpoint=endpoint, access_key=access_key, secret_key=secret_key, bucket_name=bucket)
     return None
 
 

@@ -170,11 +170,12 @@ def _get_storage_client():
     if _storage_client_instance is not None:
         return _storage_client_instance
     endpoint = os.getenv("PYROMIND_STORAGE_ENDPOINT")
+    access_key = os.getenv("PYROMIND_STORAGE_ACCESS_KEY")
     secret_key = os.getenv("PYROMIND_STORAGE_SECRET_KEY")
     bucket = os.getenv("PYROMIND_STORAGE_BUCKET")
-    if not endpoint or not secret_key or not bucket:
-        pytest.skip("Storage env vars not set (PYROMIND_STORAGE_ENDPOINT, PYROMIND_STORAGE_SECRET_KEY, PYROMIND_STORAGE_BUCKET)")
-    _storage_client_instance = StorageClient(endpoint=endpoint, secret_key=secret_key, bucket_name=bucket)
+    if not endpoint or not access_key or not secret_key or not bucket:
+        pytest.skip("Storage env vars not set (PYROMIND_STORAGE_ENDPOINT, PYROMIND_STORAGE_ACCESS_KEY, PYROMIND_STORAGE_SECRET_KEY, PYROMIND_STORAGE_BUCKET)")
+    _storage_client_instance = StorageClient(endpoint=endpoint, access_key=access_key, secret_key=secret_key, bucket_name=bucket)
     return _storage_client_instance
 
 
@@ -249,10 +250,11 @@ _s3_objects: Set[str] = set()
 
 def _get_storage_for_cleanup() -> Optional[StorageClient]:
     endpoint = os.getenv("PYROMIND_STORAGE_ENDPOINT")
+    access_key = os.getenv("PYROMIND_STORAGE_ACCESS_KEY")
     secret_key = os.getenv("PYROMIND_STORAGE_SECRET_KEY")
     bucket = os.getenv("PYROMIND_STORAGE_BUCKET")
-    if endpoint and secret_key and bucket:
-        return StorageClient(endpoint=endpoint, secret_key=secret_key, bucket_name=bucket)
+    if endpoint and access_key and secret_key and bucket:
+        return StorageClient(endpoint=endpoint, access_key=access_key, secret_key=secret_key, bucket_name=bucket)
     return None
 
 
@@ -284,12 +286,13 @@ def _cleanup_all_s3_objects():
     if not _s3_objects:
         return
     endpoint = os.getenv("PYROMIND_STORAGE_ENDPOINT")
+    access_key = os.getenv("PYROMIND_STORAGE_ACCESS_KEY")
     secret_key = os.getenv("PYROMIND_STORAGE_SECRET_KEY")
     bucket = os.getenv("PYROMIND_STORAGE_BUCKET")
-    if not endpoint or not secret_key or not bucket:
+    if not endpoint or not access_key or not secret_key or not bucket:
         print(f"[FINAL_CLEANUP] Storage env vars missing, skipping S3 cleanup for {len(_s3_objects)} object(s)")
         return
-    storage = StorageClient(endpoint=endpoint, secret_key=secret_key, bucket_name=bucket)
+    storage = StorageClient(endpoint=endpoint, access_key=access_key, secret_key=secret_key, bucket_name=bucket)
     print(f"[FINAL_CLEANUP] Starting S3 cleanup for {len(_s3_objects)} object(s)")
     for obj_name in list(_s3_objects):
         try:
