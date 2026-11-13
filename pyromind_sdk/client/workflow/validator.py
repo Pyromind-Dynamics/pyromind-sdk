@@ -4,6 +4,8 @@ import logging
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from ._input_validation import _has_usable_input_value
+
 logger = logging.getLogger(__name__)
 SPECIAL_NODE_TYPES = frozenset({"PrimitiveNode"})
 
@@ -525,16 +527,23 @@ def _validate_xyflow_config(
     for param_name, param_value in config.items():
         if param_name in all_params:
             param_def = all_params[param_name]
-            if param_value == "":
+            is_required = param_name in required_params
+            if param_value == "" or (
+                is_required and not _has_usable_input_value(param_value)
+            ):
                 options = (
                     param_def[1]
                     if isinstance(param_def, (list, tuple)) and len(param_def) > 1
                     else None
                 )
                 default = options.get("default") if isinstance(options, dict) else None
-                if default is not None:
+                default_available = (
+                    _has_usable_input_value(default) if is_required else default is not None
+                )
+                if default_available:
                     # An empty form field uses the server-owned default.
-                    param_value = default
+                    if param_value == "":
+                        param_value = default
                 elif param_name in optional_params and param_name not in required_params:
                     continue
                 else:
@@ -684,6 +693,8 @@ def _validate_standard_node_definition(
                         f"Node {node_id} (type '{node_type}') has unknown default parameter '{name}'"
                     )
                 elif name not in supplied:
+                    if name in required and not _has_usable_input_value(default):
+                        continue
                     # The Xyflow parser fills absent parameters from frontend
                     # defaults, so validate the effective value against the
                     # authoritative server definition.
@@ -695,9 +706,10 @@ def _validate_standard_node_definition(
     for name, spec in required.items():
         if name not in supplied and isinstance(spec, (list, tuple)) and len(spec) >= 2:
             options = spec[1]
-            if isinstance(options, dict) and options.get("default") is not None:
+            default = options.get("default") if isinstance(options, dict) else None
+            if _has_usable_input_value(default):
                 errors.extend(_validate_parameter_constraints(
-                    options["default"], spec, str(node_id), node_type, name
+                    default, spec, str(node_id), node_type, name
                 ))
                 supplied.add(name)
         if name not in supplied:
