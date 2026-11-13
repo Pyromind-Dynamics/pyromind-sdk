@@ -667,6 +667,13 @@ print(f"Secret Key: {storage_info.secret_key}")
 print(f"URL: {storage_info.url}")
 ```
 
+上面的密钥值已脱敏。如需轮换并获取一组新凭证（仅返回一次）：
+
+```python
+new_storage_info = profile_client.reset_storage_credentials()
+# 请安全保存返回值，不要打印或写入日志。
+```
+
 ### 管理 SSH 公钥
 
 ```python
@@ -695,10 +702,14 @@ SDK 提供 `StorageClient` 用于使用 MinIO/S3 兼容存储管理文件存储�
 设置以下环境变量：
 
 ```bash
-export PYROMIND_API_KEY="your-api-key"  # 用作存储访问密钥
+export PYROMIND_STORAGE_ACCESS_KEY="your-storage-access-key"
 export PYROMIND_STORAGE_SECRET_KEY="your-secret-key"
 export PYROMIND_STORAGE_BUCKET="your-bucket-name"  # 可选，可在每个操作中提供
 ```
+
+`PYROMIND_API_KEY` 仍是 API Bearer Key，不再用作 S3 Access Key。可调用
+`ProfileClient.reset_storage_credentials()` 轮换 Storage 的 Access Key 和 Secret Key，
+新凭证只返回一次。`get_storage_info()` 返回脱敏值；请将重置响应安全保存到密钥管理器，不要写入日志。
 
 ### 初始化存储客户端
 

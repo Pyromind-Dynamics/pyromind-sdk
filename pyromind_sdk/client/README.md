@@ -570,10 +570,15 @@ The SDK provides a `StorageClient` for managing file storage operations using Mi
 Set the following environment variables:
 
 ```bash
-export PYROMIND_API_KEY="your-api-key"  # Used as access key for storage
+export PYROMIND_STORAGE_ACCESS_KEY="your-storage-access-key"
 export PYROMIND_STORAGE_SECRET_KEY="your-secret-key"
 export PYROMIND_STORAGE_BUCKET="your-bucket-name"  # Optional, can be provided per operation
 ```
+
+`PYROMIND_API_KEY` remains the API bearer key. It is not used as the S3 Access Key.
+Use `ProfileClient.reset_storage_credentials()` to rotate both Storage keys and
+receive the new pair once. `get_storage_info()` returns masked values; save the
+reset response in a secret manager and do not log it.
 
 ### Initialize Storage Client
 
@@ -828,6 +833,13 @@ storage_info = profile_client.get_storage_info()
 print(f"Access Key: {storage_info.access_key}")
 print(f"Secret Key: {storage_info.secret_key}")
 print(f"URL: {storage_info.url}")
+```
+
+The key values above are masked. To rotate and receive a new pair once:
+
+```python
+new_storage_info = profile_client.reset_storage_credentials()
+# Store the returned values securely; do not print or log them.
 ```
 
 ### Manage SSH public keys

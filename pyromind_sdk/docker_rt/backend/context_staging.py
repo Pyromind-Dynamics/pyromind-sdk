@@ -412,6 +412,10 @@ def connect_storage(cluster: str | None = None) -> tuple[Any, str]:
 
     Raises :class:`StagingError` when the endpoint is unknown, the uid cannot be
     read, or the credentials are missing/rejected.
+
+    The Storage client reads ``PYROMIND_STORAGE_ACCESS_KEY`` and
+    ``PYROMIND_STORAGE_SECRET_KEY`` from the environment. ``/storage_info``
+    supplies bucket metadata only; its credential fields are masked.
     """
     try:
         from ...client.profile import ProfileClient
