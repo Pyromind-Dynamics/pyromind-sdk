@@ -6,10 +6,19 @@ import sys
 from pathlib import Path
 
 from pytest import MonkeyPatch
+import pytest
 
 import pyromind_docker_sdk_timeout_boot as timeout_boot
 
 from .. import site_hooks
+
+
+def test_repo_pth_matches_hook_content() -> None:
+    """The wheel ships this file (see setup.py bdist_wheel hook); keep it in sync."""
+    repo_pth = Path(__file__).resolve().parents[3] / site_hooks.PTH_FILENAME
+    if not repo_pth.exists():
+        pytest.skip("running from an installed package, no repo-root .pth")
+    assert repo_pth.read_text(encoding="utf-8") == site_hooks.PTH_CONTENT
 
 
 def test_timeout_hook_install_and_uninstall(tmp_path) -> None:
