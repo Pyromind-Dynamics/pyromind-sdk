@@ -66,6 +66,12 @@ Portal 在同一请求中认证 API Key、检查源集群和目标集群权限�
 `studio`、`storage` 服务是否已激活；通过后再把创建任务的请求转发到源集群。
 Portal 不会把用户 API Key 发给目标集群。权限或服务未开通时，Portal 会在创建任务前拒绝请求。
 
+`target_path` 应填写目标目录；服务端会对文件和文件夹都追加源名称。例如源路径
+`/workspace/models`、目标目录 `/workspace/sync/`，最终落点是
+`/workspace/sync/models`。若把目标写成 `/workspace/sync/models`，则会落到
+`/workspace/sync/models/models`。单文件的目标目录若恰好与源文件同名，请保留末尾的
+`/`，避免被识别为完整目标文件路径。
+
 请将 SDK 的 `base_url` 指向当前环境的 Portal。SDK 默认使用标准 Portal 地址；
 如果使用其他 Portal 环境，通过 `base_url` 或 `PYROMIND_BASE_URL` 配置即可。
 
