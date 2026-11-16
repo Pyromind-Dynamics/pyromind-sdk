@@ -1,6 +1,9 @@
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from requests.adapters import HTTPAdapter
+from requests.sessions import Session
+from urllib3.util.retry import Retry
 
 from pyromind_sdk.client.async_storage_api import AsyncStorageAPIClient
 from pyromind_sdk.client.storage_api import StorageAPIClient
@@ -116,6 +119,25 @@ def test_file_share_list_fetches_all_pages():
     assert [params["page_number"] for params in calls] == [1, 2]
 
 
+def test_file_share_post_does_not_retry_after_server_failure(monkeypatch):
+    monkeypatch.setattr("pyromind_sdk.client.base.requests.Session", Session)
+    monkeypatch.setattr("pyromind_sdk.client.base.HTTPAdapter", HTTPAdapter)
+    monkeypatch.setattr("pyromind_sdk.client.base.Retry", Retry)
+    client = StorageAPIClient(api_key="test-key", max_retries=3)
+    try:
+        share_retries = client.session.get_adapter(
+            client._build_url("/storage/file_share")
+        ).max_retries
+        transfer_retries = client.session.get_adapter(
+            client._build_url("/storage/transfer")
+        ).max_retries
+        assert not share_retries.is_retry("POST", 503)
+        assert share_retries.is_retry("GET", 503)
+        assert transfer_retries.is_retry("POST", 503)
+    finally:
+        client.close()
+
+
 @pytest.mark.asyncio
 async def test_async_file_share_create_list_and_sender_actions():
     client = AsyncStorageAPIClient(
@@ -162,6 +184,7 @@ async def test_async_file_share_create_list_and_sender_actions():
     client.post.assert_any_await(
         "/storage/file_share",
         json_data={"source_path": "/workspace/model.bin", "target_user_id": 123},
+        retry=False,
     )
     client.post.assert_any_await("/storage/file_share/share-async/cancel")
     client.post.assert_any_await(

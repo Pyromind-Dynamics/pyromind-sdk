@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
-from .base import PyroMindAPIError, PyroMindClient
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from .base import (
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_TIMEOUT,
+    RETRY_ALLOWED_METHODS,
+    RETRY_STATUS_CODES,
+    PyroMindAPIError,
+    PyroMindClient,
+)
 from .models import (
     FileShareCreateResponse,
     FileShareDeleteResponse,
@@ -156,6 +166,37 @@ class StorageAPIClient(PyroMindClient):
     """
 
     _TRANSFER_PREFIX = "/storage/transfer"
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        cluster: str | None = None,
+        timeout: int = DEFAULT_TIMEOUT,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+    ) -> None:
+        super().__init__(
+            api_key=api_key,
+            base_url=base_url,
+            cluster=cluster,
+            timeout=timeout,
+            max_retries=max_retries,
+        )
+        # File-share POSTs have no server-side idempotency key. A response lost
+        # after task creation must not cause this client to create another task.
+        self.session.mount(
+            f"{self.base_url}{FileShareResource._PREFIX}",
+            HTTPAdapter(
+                max_retries=Retry(
+                    total=max_retries,
+                    backoff_factor=1,
+                    status_forcelist=RETRY_STATUS_CODES,
+                    allowed_methods={
+                        method for method in RETRY_ALLOWED_METHODS if method != "POST"
+                    },
+                )
+            ),
+        )
 
     @property
     def file_shares(self) -> FileShareResource:

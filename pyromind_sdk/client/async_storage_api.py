@@ -74,6 +74,7 @@ class AsyncFileShareResource:
         response = await self._storage.post(
             self._PREFIX,
             json_data=payload.model_dump(exclude_none=True),
+            retry=False,
         )
         data = self._storage._extract_file_share_data(response)
         return FileShareCreateResponse(**data)
