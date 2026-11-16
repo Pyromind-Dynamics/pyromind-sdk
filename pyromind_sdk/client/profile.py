@@ -19,6 +19,7 @@ from .models import (
 
 
 class ProfileClient(PyroMindClient):
+    USE_TICKET_AUTH = False
     """
     Client for managing profile-related operations
 

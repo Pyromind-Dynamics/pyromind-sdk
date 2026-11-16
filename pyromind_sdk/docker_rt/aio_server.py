@@ -114,6 +114,8 @@ from pyromind_sdk.client.trace import (  # noqa: E402
     reset_trace_id,
     set_trace_id,
 )
+from pyromind_sdk.token import TokenError  # noqa: E402
+from pyromind_sdk.terminal import async_fetch_terminal_token  # noqa: E402
 
 logger = logging.getLogger("docker_rt")
 
@@ -4908,14 +4910,19 @@ async def _hijack_session(
     return resp
 
 
-def _pyromind_terminal_url(
+def _pyromind_terminal_target(
     kube_env: Any,
     *,
     cols: int = 80,
     rows: int = 24,
     cmd: list[str] | None = None,
     cwd: str = "",
-) -> str:
+) -> tuple[str, str]:
+    """Return ``(url, api_key)`` for the terminal WebSocket.
+
+    The key is kept out of the URL and goes in the ``Authorization`` header at
+    connect time (see ``_hijack_pyromind_terminal``).
+    """
     # Same resolution as every other data-plane call this daemon makes: the
     # terminal WebSocket lives on the cluster, and the portal does not proxy
     # WebSocket at all.
@@ -4923,15 +4930,15 @@ def _pyromind_terminal_url(
     from pyromind_sdk.terminal import build_terminal_websocket_url
 
     api_key = (os.getenv(ENV_API_KEY) or "").strip()
-    return build_terminal_websocket_url(
+    url = build_terminal_websocket_url(
         resolve_api_base_url(),
         kube_env.sandbox_id or "",
-        api_key,
         cols=cols,
         rows=rows,
         command=list(cmd) if cmd else None,
         cwd=cwd or None,
     )
+    return url, api_key
 
 
 def _pty_output_for_client(data: bytes, *, tty: bool) -> bytes:
@@ -4977,7 +4984,7 @@ async def _hijack_pyromind_terminal(
 
     cols = int(getattr(session, "tty_cols", 0) or 0) or 80
     rows = int(getattr(session, "tty_rows", 0) or 0) or 24
-    url = _pyromind_terminal_url(
+    url, api_key = _pyromind_terminal_target(
         kube_env, cols=cols, rows=rows, cmd=cmd, cwd=cwd
     )
     session.running = True
@@ -5010,15 +5017,25 @@ async def _hijack_pyromind_terminal(
     try:
         async with aiohttp.ClientSession() as client:
             try:
+                from pyromind_sdk.client.base import resolve_api_base_url
+
+                token = await async_fetch_terminal_token(
+                    resolve_api_base_url(),
+                    kube_env.sandbox_id or "",
+                    api_key,
+                )
                 ws = await client.ws_connect(
                     url,
                     heartbeat=30,
                     headers={TRACE_ID_HEADER: ensure_trace_id()},
                 )
+                # Short-lived token in the first frame; nothing secret in the
+                # handshake URL or headers.
+                await ws.send_str(json.dumps({"type": "auth", "token": token}))
                 logger.info(
                     "terminal connected id=%s", getattr(session, "id", "")[:12]
                 )
-            except (aiohttp.ClientError, OSError) as exc:
+            except (aiohttp.ClientError, OSError, TokenError) as exc:
                 session.running = False
                 if cmd is not None:
                     # Interactive exec: the caller can still use the command
@@ -5146,7 +5163,12 @@ async def _hijack_pyromind_terminal(
                     elif msg.type == aiohttp.WSMsgType.TEXT:
                         try:
                             obj = json.loads(msg.data)
-                            if isinstance(obj, dict) and obj.get("type") == "pong":
+                            # Control frames (keep-alive pong / handshake auth_ok)
+                            # must never be rendered into the user's terminal.
+                            if isinstance(obj, dict) and obj.get("type") in (
+                                "pong",
+                                "auth_ok",
+                            ):
                                 continue
                         except (json.JSONDecodeError, TypeError):
                             pass

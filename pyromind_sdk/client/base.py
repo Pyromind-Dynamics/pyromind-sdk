@@ -22,6 +22,7 @@ from .trace import (
     set_trace_id,
 )
 from ..log_redaction import redact, redact_text
+from ..token import HttpTokenCache, token_base_url
 
 
 # Constants
@@ -236,9 +237,14 @@ logger = install_console_logging(
 
 
 class PyroMindAPIError(Exception):
-    """Base exception for PyroMind API errors"""
+    """Base exception for PyroMind API errors.
+
+    The message is redacted here because transport errors quote the request URL
+    (query included) and this text reaches CLI output, application logs and
+    persisted node logs — the logging filter never sees it.
+    """
     def __init__(self, message: str, status_code: Optional[int] = None, response: Optional[Dict] = None, headers: Optional[Dict] = None):
-        self.message = append_trace_id(message, headers)
+        self.message = append_trace_id(redact_text(message), headers)
         self.status_code = status_code
         self.response = response
         self.headers = headers
@@ -247,6 +253,10 @@ class PyroMindAPIError(Exception):
 
 
 class PyroMindClient:
+    #: Profile/account APIs live on portal and still use the long-lived key;
+    #: every data-plane client keeps this True (cluster-direct + short token).
+    USE_TICKET_AUTH = True
+
     """
     Base client class for PyroMind API
 
@@ -309,6 +319,11 @@ class PyroMindClient:
             cluster = os.getenv(ENV_CLUSTER) or DEFAULT_CLUSTER
         self.cluster = cluster
 
+        # Data-plane clients: cluster-direct + short-lived token. Profile /
+        # storage clients opt out (portal + long-lived key).
+        if self.USE_TICKET_AUTH:
+            self.base_url = token_base_url(self.base_url, self.cluster)
+
         self.timeout = timeout
 
         # Create session with retry strategy
@@ -323,9 +338,14 @@ class PyroMindClient:
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
         
+        self._tokens = (
+            HttpTokenCache(self.base_url, api_key, cluster=self.cluster)
+            if self.USE_TICKET_AUTH
+            else None
+        )
+
         # Set default headers
         self.session.headers.update({
-            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
             # Same reason as the async client: do not depend on brotli decoding.
@@ -545,6 +565,11 @@ class PyroMindClient:
         """
         headers = dict(kwargs.pop("headers", None) or {})
         headers.update(self._trace_headers())
+        headers["Authorization"] = (
+            f"Bearer {self._tokens.token()}"
+            if self._tokens is not None
+            else f"Bearer {self.api_key}"
+        )
         kwargs.setdefault("timeout", self.timeout)
         logger.debug("[REQUEST] %s %s", method.upper(), redact_text(url))
         response = self.session.request(
@@ -641,15 +666,30 @@ class PyroMindClient:
         kwargs["headers"] = extra_headers
         
         try:
-            response = self.session.request(
-                method=method,
-                url=url,
-                params=params,
-                json=json_data,
-                timeout=self.timeout,
-                **kwargs
-            )
-            
+            # A 401 means the request never ran (expired/rotated token), so one
+            # refresh-and-retry is always safe — even for POST.
+            for attempt in (0, 1):
+                extra_headers["Authorization"] = (
+                    f"Bearer {self._tokens.token(force_refresh=attempt > 0)}"
+                    if self._tokens is not None
+                    else f"Bearer {self.api_key}"
+                )
+                response = self.session.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    json=json_data,
+                    timeout=self.timeout,
+                    **kwargs
+                )
+                if (
+                    response.status_code != 401
+                    or attempt == 1
+                    or self._tokens is None
+                ):
+                    break
+                logger.info("[AUTH] token rejected, refreshing once: %s", request_context)
+
             # Log response (single line)
             resp_log = f"[RESPONSE] {request_context} - Status: {response.status_code}"
             try:

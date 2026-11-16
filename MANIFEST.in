@@ -1,6 +1,7 @@
 include README.md
 include LICENSE
 include pyproject.toml
+include pyromind_docker_sdk_timeout.pth
 recursive-exclude * __pycache__
 recursive-exclude * *.py[co]
 # Exclude build and development files

@@ -32,6 +32,7 @@ from .models import (
 )
 from ..exec_stream import (
     build_exec_stream_websocket_url,
+    fetch_exec_stream_token,
     iter_exec_stream,
 )
 
@@ -550,11 +551,14 @@ class SandboxClient(PyroMindClient):
         url = build_exec_stream_websocket_url(
             self.base_url,
             sandbox_id,
-            self.api_key,
             self.cluster,
+        )
+        token = fetch_exec_stream_token(
+            self.base_url, sandbox_id, self.api_key, self.cluster
         )
         yield from iter_exec_stream(
             url=url,
+            token=token,
             command=command,
             cwd=cwd.strip() if cwd else "",
             timeout=timeout,

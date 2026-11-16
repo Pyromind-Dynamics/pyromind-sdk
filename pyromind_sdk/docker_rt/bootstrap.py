@@ -204,6 +204,12 @@ def prepare_env(
     return result
 
 
+#: Startup probe budget.  The regular client timeout is tuned for API calls,
+#: but the first call on a cold/slow link (token exchange + sandbox list) can
+#: take tens of seconds; failing setup on that is not actionable.
+_CONNECTION_CHECK_TIMEOUT_S = 120
+
+
 async def check_connection(
     api_key: str | None = None,
     cluster: str | None = None,
@@ -221,6 +227,7 @@ async def check_connection(
         # Data plane: check the cluster the daemon will actually talk to,
         # not the portal.
         base_url=resolve_api_base_url(cluster),
+        timeout=_CONNECTION_CHECK_TIMEOUT_S,
     )
     try:
         return len(await client.list())

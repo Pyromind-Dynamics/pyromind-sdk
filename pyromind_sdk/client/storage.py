@@ -34,6 +34,7 @@ DEFAULT_STORAGE_ENDPOINT = "https://storage.pyromind.ai"
 DEFAULT_REGION = "us-east-1"
 DEFAULT_CONTENT_TYPE = "application/octet-stream"
 ENV_STORAGE_ENDPOINT = "PYROMIND_STORAGE_ENDPOINT"
+ENV_STORAGE_ACCESS_KEY = "PYROMIND_STORAGE_ACCESS_KEY"
 ENV_STORAGE_SECRET_KEY = "PYROMIND_STORAGE_SECRET_KEY"
 ENV_STORAGE_BUCKET = "PYROMIND_STORAGE_BUCKET"
 
@@ -54,7 +55,7 @@ class StorageClient:
     
     The client uses MinIO/S3-compatible storage and requires:
     - Storage endpoint URL
-    - Access key (from PYROMIND_API_KEY env var)
+    - Access key (from PYROMIND_STORAGE_ACCESS_KEY env var)
     - Secret key (from PYROMIND_STORAGE_SECRET_KEY env var)
     - Bucket name (from PYROMIND_STORAGE_BUCKET env var, optional)
     """
@@ -77,7 +78,9 @@ class StorageClient:
                     Defaults to cluster-based endpoint if cluster is set,
                     otherwise "https://storage.pyromind.ai"
             access_key: Access key for storage authentication
-                       If not provided, reads from PYROMIND_API_KEY env var
+                       If not provided, reads from
+                       PYROMIND_STORAGE_ACCESS_KEY env var (an independent
+                       storage credential — never the platform API key)
             secret_key: Secret key for storage authentication
                        If not provided, reads from PYROMIND_STORAGE_SECRET_KEY env var
             bucket_name: Default bucket name to use
@@ -101,14 +104,16 @@ class StorageClient:
                 cluster = os.getenv(ENV_CLUSTER, DEFAULT_CLUSTER)
             endpoint = CLUSTER_STORAGE_ENDPOINTS.get(cluster, "https://storage-us-west-2.pyromind.ai")
 
-        # Get access key from parameter or environment variable
+        # Get access key from parameter or environment variable.  Storage has
+        # its own credential pair; the platform API key is NOT used as the
+        # storage access key.
         if access_key is None:
-            access_key = os.getenv(ENV_API_KEY)
+            access_key = os.getenv(ENV_STORAGE_ACCESS_KEY)
 
         if not access_key:
             raise ValueError(
                 f"Storage access key is required. Please provide it either as a parameter "
-                f"or set the {ENV_API_KEY} environment variable."
+                f"or set the {ENV_STORAGE_ACCESS_KEY} environment variable."
             )
 
         # Get secret key from parameter or environment variable

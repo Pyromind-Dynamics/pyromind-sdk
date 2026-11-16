@@ -43,6 +43,13 @@ from pyromind_sdk.client.base import (
 )
 from pyromind_sdk.client.trace import TRACE_ID_HEADER, ensure_trace_id
 from pyromind_sdk.log_redaction import redact_text
+from pyromind_sdk.token import (
+    PURPOSE_WS_TERMINAL,
+    TokenError,
+    async_fetch_token,
+    fetch_token,
+    ws_auth_frame,
+)
 
 logger = logging.getLogger("pyromind_sdk.ws")
 
@@ -58,8 +65,8 @@ _IDLE_TIMEOUT_S = 30 * 60  # 30 minutes
 class TerminalError(RuntimeError):
     """Raised when an interactive terminal session cannot be established.
 
-    Redacted at construction: the WebSocket URL carries ``?token=<api key>`` and
-    aiohttp's connection errors quote it back to ``docker exec`` output.
+    Redacted at construction: aiohttp's connection errors quote the request
+    back to ``docker exec`` output, so anything credential-shaped is masked.
     """
 
     def __init__(self, message: str) -> None:
@@ -69,20 +76,20 @@ class TerminalError(RuntimeError):
 def _websocket_url(
     base_url: str,
     sandbox_id: str,
-    api_key: str,
     cols: int,
     rows: int,
     command: Optional[Sequence[str]] = None,
     cwd: Optional[str] = None,
 ) -> str:
+    # No credential in the URL: a short-lived token travels in the first
+    # WebSocket frame (see ``_run_session``), so nothing secret can end up in
+    # proxy access logs, shell history or process listings.
     base = base_url.rstrip("/")
     for http_scheme, ws_scheme in (("https://", "wss://"), ("http://", "ws://")):
         if base.startswith(http_scheme):
             base = ws_scheme + base[len(http_scheme):]
             break
     qs_params: list[tuple[str, str]] = [("cols", str(cols)), ("rows", str(rows))]
-    if api_key:
-        qs_params.insert(0, ("token", api_key))
     if cwd:
         qs_params.append(("cwd", cwd))
     # Repeated ``command`` params carry the argv the caller asked for. The
@@ -96,7 +103,6 @@ def _websocket_url(
 def build_terminal_websocket_url(
     base_url: str,
     sandbox_id: str,
-    api_key: str = "",
     cols: int = 80,
     rows: int = 24,
     command: Optional[Sequence[str]] = None,
@@ -107,13 +113,40 @@ def build_terminal_websocket_url(
     ``command`` / ``cwd`` are optional: with neither, the server opens its
     usual login shell. ``docker exec -it <cid> <cmd>`` passes them so the PTY
     runs the requested command instead of silently falling back to a shell.
+
+    The URL carries no credential.  Use :func:`fetch_terminal_token` to mint a
+    short-lived token and send it as the first frame after connecting.
     """
     return _websocket_url(
-        base_url, sandbox_id, api_key, cols, rows, command, cwd
+        base_url, sandbox_id, cols, rows, command, cwd
     )
 
 
-async def _run_session(url: str) -> None:
+def fetch_terminal_token(base_url: str, sandbox_id: str, api_key: str) -> str:
+    """Mint the short-lived terminal token (the only credential on the wire)."""
+    token, _ttl = fetch_token(
+        base_url,
+        api_key,
+        purpose=PURPOSE_WS_TERMINAL,
+        sandbox_id=sandbox_id,
+    )
+    return token
+
+
+async def async_fetch_terminal_token(
+    base_url: str, sandbox_id: str, api_key: str
+) -> str:
+    """Async variant of :func:`fetch_terminal_token`."""
+    token, _ttl = await async_fetch_token(
+        base_url,
+        api_key,
+        purpose=PURPOSE_WS_TERMINAL,
+        sandbox_id=sandbox_id,
+    )
+    return token
+
+
+async def _run_session(url: str, token: str) -> None:
     """Pump bytes between the local TTY (already in raw mode) and the WebSocket.
 
     In addition to the stdin writer and stdout reader, two background tasks
@@ -138,6 +171,9 @@ async def _run_session(url: str) -> None:
                 heartbeat=30,
                 headers={TRACE_ID_HEADER: ensure_trace_id()},
             )
+            # First frame carries the short-lived token; the server replies
+            # {"type":"auth_ok"} and only then forwards PTY bytes.
+            await ws.send_str(ws_auth_frame(token))
             logger.debug("[ws] terminal connected %s", redact_text(url))
         except aiohttp.WSServerHandshakeError as e:
             raise TerminalError(
@@ -177,11 +213,15 @@ async def _run_session(url: str) -> None:
                     last_activity[0] = time.monotonic()
                     os.write(stdout_fd, msg.data)
                 elif msg.type == aiohttp.WSMsgType.TEXT:
-                    # Server {"type":"pong"} is keep-alive only — do not render
-                    # it to the terminal and do not reset the idle timer.
+                    # Server control frames ({"type":"pong"} keep-alive and the
+                    # handshake {"type":"auth_ok"}) are not terminal output:
+                    # never render them, never reset the idle timer.
                     try:
                         obj = json.loads(msg.data)
-                        if isinstance(obj, dict) and obj.get("type") == "pong":
+                        if isinstance(obj, dict) and obj.get("type") in (
+                            "pong",
+                            "auth_ok",
+                        ):
                             continue
                     except (json.JSONDecodeError, TypeError):
                         pass
@@ -268,29 +308,32 @@ def run_terminal(
             print(f"Error: {e}", file=sys.stderr)
             return 1
 
-    # 2. Resolve API key (optional; env var fallback; if missing, backend falls back to cookie auth).
+    # 2. Resolve API key — required: it is the only credential that can mint the
+    # short-lived token the WebSocket handshake expects.
     api_key = (api_key or os.getenv(ENV_API_KEY) or "").strip()
     if not api_key:
         print(
-            f"Warning: no API key provided (--api-key or {ENV_API_KEY}). "
-            "Falling back to cookie-based auth (may fail for WS).",
+            f"Error: no API key provided (--api-key or {ENV_API_KEY}); "
+            "a token cannot be minted without it.",
             file=sys.stderr,
         )
+        return 1
 
     if not sys.stdin.isatty():
         print("Error: stdin is not a TTY; run from an interactive shell.", file=sys.stderr)
         return 1
 
     size = os.get_terminal_size(sys.stdout.fileno())
-    url = _websocket_url(base_url, sandbox_id, api_key, size.columns, size.lines)
+    url = _websocket_url(base_url, sandbox_id, size.columns, size.lines)
 
     print(f"Connecting to sandbox {sandbox_id} @ {base_url} ... (exit shell or press Ctrl-D to quit)")
     stdin_fd = sys.stdin.fileno()
     saved_attrs = termios.tcgetattr(stdin_fd)
     tty.setraw(stdin_fd)
     try:
-        asyncio.run(_run_session(url))
-    except TerminalError as e:
+        token = fetch_terminal_token(base_url, sandbox_id, api_key)
+        asyncio.run(_run_session(url, token))
+    except (TerminalError, TokenError) as e:
         termios.tcsetattr(stdin_fd, termios.TCSADRAIN, saved_attrs)
         print(f"Error: {e}", file=sys.stderr)
         return 1

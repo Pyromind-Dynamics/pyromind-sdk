@@ -36,6 +36,7 @@ from .models import (
     SandboxExecStreamChunk,
 )
 from ..exec_stream import (
+    async_fetch_exec_stream_token,
     build_exec_stream_websocket_url,
     iter_exec_stream_async,
 )
@@ -663,11 +664,14 @@ class AsyncSandboxClient(PyroMindAsyncClient):
         url = build_exec_stream_websocket_url(
             self.base_url,
             sandbox_id,
-            self.api_key,
             self.cluster,
+        )
+        token = await async_fetch_exec_stream_token(
+            self.base_url, sandbox_id, self.api_key, self.cluster
         )
         async for chunk in iter_exec_stream_async(
             url=url,
+            token=token,
             command=command,
             cwd=cwd.strip() if cwd else "",
             timeout=timeout,

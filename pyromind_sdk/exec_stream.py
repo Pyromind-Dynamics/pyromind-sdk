@@ -15,7 +15,7 @@ from typing import (
     Optional,
     Union,
 )
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -23,6 +23,12 @@ from .client.base import resolve_base_url_from_cluster
 from .client.models import SandboxExecStreamChunk
 from .client.trace import TRACE_ID_HEADER, ensure_trace_id
 from .log_redaction import redact_text
+from .token import (
+    PURPOSE_WS_EXEC,
+    async_fetch_token,
+    fetch_token,
+    ws_auth_frame,
+)
 
 logger = logging.getLogger("pyromind_sdk.ws")
 
@@ -35,8 +41,8 @@ class SandboxExecStreamError(RuntimeError):
     """Raised when the streaming exec endpoint reports a terminal error.
 
     The message is redacted here, because aiohttp's connection errors quote the
-    full URL — including ``?token=<api key>`` — and this text is shown to the
-    user by ``docker build`` / ``docker exec`` without going through logging.
+    request back and this text is shown to the user by ``docker build`` /
+    ``docker exec`` without going through logging.
     """
 
     def __init__(self, message: str, code: Optional[str] = None) -> None:
@@ -56,20 +62,51 @@ def _resolve_stream_base_url(base_url: str, cluster: Optional[str]) -> str:
 def build_exec_stream_websocket_url(
     base_url: str,
     sandbox_id: str,
-    api_key: str = "",
     cluster: Optional[str] = None,
 ) -> str:
-    """Build the direct per-cluster exec-stream WebSocket URL."""
+    """Build the direct per-cluster exec-stream WebSocket URL.
+
+    The URL carries no credential; use :func:`fetch_exec_stream_token` and send
+    the token as the first frame (see ``_iter_exec_stream_events``).
+    """
     base = _resolve_stream_base_url(base_url, cluster)
     for http_scheme, ws_scheme in (("https://", "wss://"), ("http://", "ws://")):
         if base.startswith(http_scheme):
             base = ws_scheme + base[len(http_scheme):]
             break
-    query = {}
-    if api_key:
-        query["token"] = api_key
-    suffix = f"?{urlencode(query)}" if query else ""
-    return f"{base}/sandboxes/{sandbox_id}/exec-stream{suffix}"
+    return f"{base}/sandboxes/{sandbox_id}/exec-stream"
+
+
+def fetch_exec_stream_token(
+    base_url: str,
+    sandbox_id: str,
+    api_key: str,
+    cluster: Optional[str] = None,
+) -> str:
+    """Mint the short-lived exec-stream token from the cluster-direct host."""
+    token, _ttl = fetch_token(
+        _resolve_stream_base_url(base_url, cluster),
+        api_key,
+        purpose=PURPOSE_WS_EXEC,
+        sandbox_id=sandbox_id,
+    )
+    return token
+
+
+async def async_fetch_exec_stream_token(
+    base_url: str,
+    sandbox_id: str,
+    api_key: str,
+    cluster: Optional[str] = None,
+) -> str:
+    """Async variant of :func:`fetch_exec_stream_token`."""
+    token, _ttl = await async_fetch_token(
+        _resolve_stream_base_url(base_url, cluster),
+        api_key,
+        purpose=PURPOSE_WS_EXEC,
+        sandbox_id=sandbox_id,
+    )
+    return token
 
 
 def _binary_event_from_frame(data: bytes) -> Optional[Dict[str, Any]]:
@@ -136,6 +173,7 @@ async def _cancel_task(task: Optional[asyncio.Task]) -> None:
 async def _iter_exec_stream_events(
     *,
     url: str,
+    token: str,
     command: Union[str, list],
     cwd: str = "",
     timeout: Optional[int] = None,
@@ -158,10 +196,14 @@ async def _iter_exec_stream_events(
     async with aiohttp.ClientSession(timeout=timeout_config) as session:
         try:
             # trace 头一并带上：服务端（中间件）会沿用它，
-            # 这条连接就能和发起它的 docker 命令/请求对上
+            # 这条连接就能和发起它的 docker 命令/请求对上。
+            # 凭据是首帧的短时票据，URL 和握手指针里都没有任何长期 key。
             ws = await session.ws_connect(
-                url, heartbeat=30, headers={TRACE_ID_HEADER: ensure_trace_id()}
+                url,
+                heartbeat=30,
+                headers={TRACE_ID_HEADER: ensure_trace_id()},
             )
+            await ws.send_str(ws_auth_frame(token))
             logger.debug("[ws] exec-stream connected %s", redact_text(url))
         except aiohttp.WSServerHandshakeError as exc:
             raise SandboxExecStreamError(
@@ -342,6 +384,7 @@ async def _iter_exec_stream_events(
 def iter_exec_stream(
     *,
     url: str,
+    token: str,
     command: Union[str, list],
     cwd: str = "",
     timeout: Optional[int] = None,
@@ -375,6 +418,7 @@ def iter_exec_stream(
             try:
                 async for event in _iter_exec_stream_events(
                     url=url,
+                    token=token,
                     command=command,
                     cwd=cwd,
                     timeout=timeout,
@@ -415,6 +459,7 @@ def iter_exec_stream(
 async def iter_exec_stream_async(
     *,
     url: str,
+    token: str,
     command: Union[str, list],
     cwd: str = "",
     timeout: Optional[int] = None,
@@ -425,6 +470,7 @@ async def iter_exec_stream_async(
     """Yield streaming exec events asynchronously."""
     async for event in _iter_exec_stream_events(
         url=url,
+        token=token,
         command=command,
         cwd=cwd,
         timeout=timeout,

@@ -37,6 +37,7 @@ from pyromind_sdk.client.models import (
     VolumeMount,
 )
 from pyromind_sdk.exec_stream import (
+    async_fetch_exec_stream_token,
     build_exec_stream_websocket_url,
     iter_exec_stream_async,
 )
@@ -812,18 +813,30 @@ class PyromindSDK:
         url = build_exec_stream_websocket_url(
             self._client.base_url,
             self.sandbox_id,
-            self._client.api_key,
             self._client.cluster,
         )
-        events = iter_exec_stream_async(
-            url=url,
-            command=list(cmd),
-            cwd=cwd or self.working_dir,
-            timeout=None,
-            tty=tty,
-            stop_event=stop_event,
-        )
-        return _SdkExecStreamWs(events, stop_event, async_events=True)
+
+        async def _events():
+            # Token fetch is async; do it lazily inside the iterator so
+            # ``attach_exec`` (a sync method) never blocks the event loop.
+            token = await async_fetch_exec_stream_token(
+                self._client.base_url,
+                self.sandbox_id,
+                self._client.api_key,
+                self._client.cluster,
+            )
+            async for chunk in iter_exec_stream_async(
+                url=url,
+                token=token,
+                command=list(cmd),
+                cwd=cwd or self.working_dir,
+                timeout=None,
+                tty=tty,
+                stop_event=stop_event,
+            ):
+                yield chunk
+
+        return _SdkExecStreamWs(_events(), stop_event, async_events=True)
 
     async def iter_exec_stream(
         self,
@@ -844,11 +857,17 @@ class PyromindSDK:
         url = build_exec_stream_websocket_url(
             self._client.base_url,
             self.sandbox_id,
+            self._client.cluster,
+        )
+        token = await async_fetch_exec_stream_token(
+            self._client.base_url,
+            self.sandbox_id,
             self._client.api_key,
             self._client.cluster,
         )
         async for chunk in iter_exec_stream_async(
             url=url,
+            token=token,
             command=list(cmd),
             cwd=cwd or self.working_dir,
             timeout=timeout,

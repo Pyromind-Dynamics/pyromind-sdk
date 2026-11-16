@@ -168,6 +168,8 @@ daemon 的 API **只靠传输层**做访问控制，没有 token、也没有 TLS
 
 ### 构建与推送
 
+> 构建上下文经 workspace storage 中转，需要**一对独立的 storage 凭据**：`PYROMIND_STORAGE_ACCESS_KEY` + `PYROMIND_STORAGE_SECRET_KEY`。它们与平台 API 凭据 `PYROMIND_API_KEY` 是两套值，不能互相替代。
+
 | 变量 | 默认值 | 用途 |
 | --- | --- | --- |
 | `DOCKER_RT_BUILD_REGISTRY` | 集群配置 | 补全短镜像标签时使用的仓库前缀（含命名空间）。 |
@@ -175,7 +177,8 @@ daemon 的 API **只靠传输层**做访问控制，没有 token、也没有 TLS
 | `DOCKER_RT_BUILD_PUSH_CHECK` | `fail` | 推送前检查集群到仓库的连通性：`fail`、`warn` 或 `off`。 |
 | `DOCKER_RT_BUILD_IMAGE` | 随集群选择 | 临时构建 Sandbox 使用的镜像；必须包含 shell 和 `sleep`（`-debug` 版本）。 |
 | `DOCKER_RT_BUILD_CONTEXT_MODE` | `storage` | 构建上下文如何进集群：`storage`（唯一默认，经 workspace storage 中转，集群内本地 `cp`）或 `upload`（旧的直传，仅供没有 storage 的环境**显式**选用）。**没有自动回退**：storage 配置错误会直接让构建失败，而不是悄悄走慢速直传。 |
-| `PYROMIND_STORAGE_SECRET_KEY` | 未设置 | storage 的 secret key。`/storage_info` 不再返回，需要用户自行填写；没填或不对时构建直接报 `storage connection failed`。 |
+| `PYROMIND_STORAGE_ACCESS_KEY` | 未设置 | storage 的 **access key**。与平台 `PYROMIND_API_KEY` 无关，是用户从 storage 侧拿到的独立凭据；没填或不对时构建直接报 `storage connection failed`。 |
+| `PYROMIND_STORAGE_SECRET_KEY` | 未设置 | storage 的 **secret key**，与上面的 access key 成对。`/storage_info` 不再返回，需要用户自行填写。 |
 | `PYROMIND_STORAGE_ENDPOINT` | 按集群自动 | storage 端点，取自 `CLUSTER_RESOURCE`（每个集群都有），通常不需要设置。 |
 | `DOCKER_RT_REGISTRY_USERNAME` / `DOCKER_RT_REGISTRY_PASSWORD` | 未设置 | 仓库凭据。 |
 | `DOCKER_RT_REGISTRY_DOCKERCONFIG` | 已移除 | 不再读取。凭证只来自 `DOCKER_RT_REGISTRY_USERNAME` + `DOCKER_RT_REGISTRY_PASSWORD`，没有任何 config 文件回退。 |
