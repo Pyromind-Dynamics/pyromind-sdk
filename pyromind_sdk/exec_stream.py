@@ -22,6 +22,7 @@ import aiohttp
 from .client.base import resolve_base_url_from_cluster
 from .client.models import SandboxExecStreamChunk
 from .client.trace import TRACE_ID_HEADER, ensure_trace_id
+from .log_redaction import redact_text
 
 logger = logging.getLogger("pyromind_sdk.ws")
 
@@ -31,10 +32,15 @@ _STDERR_CHANNEL = 2
 
 
 class SandboxExecStreamError(RuntimeError):
-    """Raised when the streaming exec endpoint reports a terminal error."""
+    """Raised when the streaming exec endpoint reports a terminal error.
+
+    The message is redacted here, because aiohttp's connection errors quote the
+    full URL — including ``?token=<api key>`` — and this text is shown to the
+    user by ``docker build`` / ``docker exec`` without going through logging.
+    """
 
     def __init__(self, message: str, code: Optional[str] = None) -> None:
-        super().__init__(message)
+        super().__init__(redact_text(message))
         self.code = code
 
 
@@ -156,7 +162,7 @@ async def _iter_exec_stream_events(
             ws = await session.ws_connect(
                 url, heartbeat=30, headers={TRACE_ID_HEADER: ensure_trace_id()}
             )
-            logger.debug("[ws] exec-stream connected %s", url)
+            logger.debug("[ws] exec-stream connected %s", redact_text(url))
         except aiohttp.WSServerHandshakeError as exc:
             raise SandboxExecStreamError(
                 f"exec stream connection rejected (HTTP {exc.status})"
@@ -203,6 +209,13 @@ async def _iter_exec_stream_events(
             incoming: "asyncio.Queue[Any]" = asyncio.Queue()
             pump_task = asyncio.ensure_future(_pump_ws_messages(ws, incoming))
             recv_task: Optional[asyncio.Task] = None
+            # ``timeout`` used to be advisory only (sent to the server). If the
+            # platform stops delivering frames without closing — the middleware
+            # wedges, or its relay swallows the command — the caller waited
+            # forever (2026-11-06: `docker build` sat on "Starting kaniko" for
+            # 9+ minutes with START_TIMEOUT_S=60). Enforce it here as a hard
+            # deadline so a stuck stream fails loudly instead.
+            deadline = None if timeout is None else started_at + float(timeout)
             while True:
                 if stop_event is not None and stop_event.is_set():
                     if recv_task is not None:
@@ -216,6 +229,11 @@ async def _iter_exec_stream_events(
                 # 又不会把 CPU 拉起来（20 次/秒的空转，没有新对象）。
                 done, _pending = await asyncio.wait({recv_task}, timeout=0.05)
                 if not done:
+                    if deadline is not None and loop.time() >= deadline:
+                        raise SandboxExecStreamError(
+                            f"exec stream timed out after {timeout}s "
+                            f"({_lost_context()})"
+                        )
                     if stdin_close is not None and stdin_close.is_set():
                         # 读端已确认把输出收完 ⇒ 半关闭容器 stdin（生产者据此退出，
                         # 退出时管道已空 ⇒ 不会丢尾部）。这就是"读完回执"。

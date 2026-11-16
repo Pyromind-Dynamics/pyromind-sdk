@@ -57,12 +57,6 @@ The workflow conversion functionality is part of the core SDK in `pyromind_sdk.w
 ```
 
 
-**Issues with the old ComfyUI format (deprecated):**
-- ❌ Uses integer node IDs
-- ❌ Links are cryptic arrays: `[link_id, source, source_idx, target, target_idx, type]`
-- ❌ Parameters in `widgets_values` arrays (unnamed)
-- ❌ Contains UI metadata (`pos`, `size`, `flags`, `order`, `mode`)
-
 ### Workflow Lite Format (Simple)
 
 ```json
@@ -303,22 +297,9 @@ task = client.training.create(
 
 ## Conversion Details
 
-The universal converter uses multiple strategies for parameter extraction:
-
-### Parameter Extraction Priority
-
-1. **With node_info (Most Accurate)**
-   - Fetches node definitions from API via `get_node_info()`
-   - Maps `widgets_values` to actual input parameter names
-   - Provides accurate parameter names like `model`, `dataset`, `timeout`
-
-2. **With widget definitions**
-   - Uses widget definitions from the workflow file
-   - Maps to widget names if available
-
-3. **Generic fallback (Least Accurate)**
-   - Maps `widgets_values` to input/output names
-   - Uses `param_0`, `param_1`, etc. if no mapping found
+The converter reads parameter values from each Xyflow node's `data.config` and
+connections from `edges`. Supplying `node_info` lets it use server node definitions
+for port names and types when the workflow omits `data.nodeDefinition`.
 
 ### Connection Embedding
 - Connections are embedded directly in node `inputs` as `[source_node, output_name]`
@@ -402,8 +383,7 @@ When asking AI to generate workflows:
 
 - **UI Layout**: Lite format doesn't preserve visual layout (converts to default positions)
 - **Advanced Features**: Some advanced node features may not be supported
-- **Dynamic Links**: Socket indices are simplified in lite format
-- **Parameter Names**: Without `node_info`, parameters may have generic names (param_0, param_1, etc.)
+- **Port Types**: Without `node_info` or `data.nodeDefinition`, port type metadata may be incomplete
 
 ## Future Enhancements
 

@@ -38,6 +38,12 @@ class ProfileClient(PyroMindClient):
         """
         response = self.post("/user_info", json_data={"credit_info": credit_info})
         data = self._extract_data(response)
+        # The endpoint returns the user fields **flat** (``uid``, ``username``,
+        # …); the wrapper shape with ``isLoggedIn``/``user`` is what older
+        # deployments returned. Accept both so a successful call is never turned
+        # into a validation error.
+        if isinstance(data, dict) and "user" not in data:
+            data = {"isLoggedIn": True, "user": data}
         return ProfileUserInfoResponse(**data)
 
     def get_user_clusters(self) -> List[str]:

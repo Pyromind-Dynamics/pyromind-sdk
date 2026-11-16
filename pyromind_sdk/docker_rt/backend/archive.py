@@ -344,21 +344,6 @@ def iter_archive_chunks(kube_env: Any, path: str) -> Iterator[bytes]:
         raise RuntimeError("".join(err) or f"failed to archive {path}")
 
 
-def get_archive(kube_env: Any, path: str) -> tuple[bytes, dict[str, Any]]:
-    """Buffered helper (tests / small files). Prefer ``iter_archive_chunks``."""
-    target = _normalize_path(path)
-    base = target.rsplit("/", 1)[-1]
-    raw = b"".join(iter_archive_chunks(kube_env, path))
-    stat = {
-        "name": base or "/",
-        "size": len(raw),
-        "mode": 0o644,
-        "mtime": "1970-01-01T00:00:00Z",
-        "linkTarget": "",
-    }
-    return raw, stat
-
-
 def path_stat(kube_env: Any, path: str) -> dict[str, Any] | None:
     """Return Docker-style path-stat for ``path``, or ``None`` if missing."""
     assert kube_env.pod_name

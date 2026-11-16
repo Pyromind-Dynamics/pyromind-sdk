@@ -217,7 +217,7 @@ def api_key():
     api_key = os.getenv("PYROMIND_API_KEY")
     if not api_key:
         pytest.skip("PYROMIND_API_KEY not set")
-    print(f"[INFO] Using API key: {api_key[:10]}...{api_key[-4:] if len(api_key) > 14 else '***'}")
+    print("[INFO] Using API key: ***")
     return api_key
 
 

@@ -183,11 +183,10 @@ delete_arch_tags() {
   # 注意 ``|| true`` 必须在命令替换**里面**：管道 + ``set -o pipefail`` 下 curl
   # 一旦失败（断网、代理挂了），整个赋值会带着非零状态返回并让脚本直接退出 ——
   # 而这时候多架构 tag 其实已经推好了，不该让清理步骤把整件事带崩。
-  jwt="$(with_proxy curl -sS -X POST "${DOCKER_HUB_API}/v2/users/login" \
-      -H 'Content-Type: application/json' \
-      --data "$(printf '{"username":"%s","password":"%s"}' \
-        "$(_json_escape "$DOCKER_HUB_USER")" "$(_json_escape "$DOCKER_HUB_PASSWORD")")" \
-      2>/dev/null |
+  jwt="$(printf '{"username":"%s","password":"%s"}' \
+      "$(_json_escape "$DOCKER_HUB_USER")" "$(_json_escape "$DOCKER_HUB_PASSWORD")" |
+    with_proxy curl -sS -X POST "${DOCKER_HUB_API}/v2/users/login" \
+      -H 'Content-Type: application/json' --data @- 2>/dev/null |
     sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' || true)"
 
   if [ -z "$jwt" ]; then

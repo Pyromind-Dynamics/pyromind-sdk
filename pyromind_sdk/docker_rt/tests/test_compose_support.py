@@ -1,4 +1,4 @@
-"""Tests for Compose-oriented APIs: volumes, networks, mounts, buildctl, Service DNS."""
+"""Tests for Compose-oriented APIs: volumes, networks, buildctl, Service DNS."""
 
 from __future__ import annotations
 
@@ -108,34 +108,6 @@ def test_network_store_stub() -> None:
     store.remove(rec.id)
     with pytest.raises(ValueError):
         store.remove("bridge")
-
-
-def test_classify_mounts_named_tmpfs_anonymous(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("DOCKER_RT_JUICEFS_HOST_PREFIXES", "/home/me/ws={uid}")
-    from ..backend.mounts import classify_container_mounts
-    from ..backend.volumes import VolumeStore
-
-    vs = VolumeStore()
-    vs.create(name="db-data")
-    vs.create(name="anonvol", labels={"com.docker.volume.anonymous": "true"})
-
-    plan = classify_container_mounts(
-        binds=["/home/me/ws/proj:/app", "db-data:/var/lib/postgresql/data"],
-        mounts=[
-            {"Type": "volume", "Source": "anonvol", "Target": "/app/node_modules"},
-            {"Type": "tmpfs", "Target": "/tmp/pids"},
-        ],
-        tmpfs={"/run/tmp": "rw"},
-        volume_store=vs,
-        uid="1000001019",
-    )
-    jfs = {m["mount_path"]: m["sub_path"] for m in plan["juicefs_binds"]}
-    assert jfs["/app"] == "1000001019/proj"
-    assert jfs["/var/lib/postgresql/data"].endswith("/.docker-rt/volumes/db-data")
-    ed_paths = {m["mount_path"]: m["medium"] for m in plan["emptydir_mounts"]}
-    assert ed_paths["/app/node_modules"] == ""
-    assert ed_paths["/tmp/pids"] == "Memory"
-    assert ed_paths["/run/tmp"] == "Memory"
 
 
 def test_sanitize_and_resolve_service_name() -> None:
@@ -286,7 +258,6 @@ async def test_build_registers_alias(aiohttp_client: Any, monkeypatch: pytest.Mo
 async def test_create_with_compose_labels_and_mounts(
     aiohttp_client: Any, fake_kube: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("DOCKER_RT_JUICEFS_HOST_PREFIXES", "/workspace={uid}")
     monkeypatch.setenv("DOCKER_RT_NAMESPACE", "custom-user-1000001019")
 
     captured: dict[str, Any] = {}

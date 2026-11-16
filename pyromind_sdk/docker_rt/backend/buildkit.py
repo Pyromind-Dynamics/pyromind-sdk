@@ -40,7 +40,6 @@ _ACR_ILLEGAL = re.compile(r"[^a-z0-9_./-]+")
 _ACR_SEPARATOR_RUN = re.compile(r"[_./-]{2,}")
 _ACR_SEPARATOR_EDGE = re.compile(r"^[_./-]+|[_./-]+$")
 
-ACR_NAME_MIN = 2
 ACR_NAME_MAX = 120
 
 
@@ -123,10 +122,6 @@ def error_event(message: str) -> dict[str, Any]:
     return {"error": message, "errorDetail": {"message": message}}
 
 
-def truthy_query(value: str | None) -> bool:
-    return (value or "").strip().lower() in _TRUTHY
-
-
 def build_registry() -> str:
     """Registry prefix short tags are pushed under (per-cluster aware)."""
     from .registry_push import build_registry as _build_registry
@@ -135,7 +130,18 @@ def build_registry() -> str:
 
 
 def build_push_enabled() -> bool:
-    return (os.getenv("DOCKER_RT_BUILD_PUSH", "true") or "").strip().lower() in _TRUTHY
+    """``DOCKER_RT_BUILD_PUSH`` — push the archive right after a successful build.
+
+    **Off by default.** The build container executes every Dockerfile
+    instruction as root, so a push credential placed inside it is readable by
+    any ``RUN`` step. The executor therefore *always* builds with
+    ``--no-push``; pushing is a separate step that reads the archive after the
+    sandbox is gone, and ``docker push`` triggers it explicitly.
+
+    Setting this to ``true`` does **not** restore credential injection — it only
+    makes that separate push run automatically at the end of ``docker build``.
+    """
+    return (os.getenv("DOCKER_RT_BUILD_PUSH", "false") or "").strip().lower() in _TRUTHY
 
 
 def looks_fully_qualified(ref: str) -> bool:

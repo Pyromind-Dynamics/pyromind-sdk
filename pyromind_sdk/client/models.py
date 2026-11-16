@@ -1225,11 +1225,19 @@ class ProfileAccessKeyResponse(BaseModel):
 
 
 class ProfileStorageInfoResponse(BaseModel):
-    """Profile storage info response model"""
+    """Profile storage info response model.
+
+    Newer deployments mask the credential fields (``credentials_masked``) and
+    report the workspace bucket as ``bucket_name`` instead of ``uid``. Both are
+    modelled: the bucket is what the build needs, and a masked credential is not
+    a credential — callers must fall back to the environment.
+    """
     access_key: str
     secret_key: Optional[str] = None
     url: Optional[str] = None
-    uid: Optional[str] = None
+    uid: Optional[Union[str, int]] = None
+    bucket_name: Optional[str] = None
+    credentials_masked: bool = False
 
 
 class ProfileUserClustersResponse(BaseModel):

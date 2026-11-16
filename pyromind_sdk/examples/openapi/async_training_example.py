@@ -334,7 +334,7 @@ async def wait_for_task_completion(task_id: str, target_status: str = "Succeeded
         await asyncio.sleep(check_interval)
 
 
-def parse_workflow_graph(workflow: dict) -> Tuple[Dict[int, dict], Dict[int, List[Tuple[int, str]]]]:
+def parse_workflow_graph(workflow: dict) -> Tuple[Dict[str, dict], Dict[str, List[Tuple[str, str]]]]:
     """
     Parse workflow JSON to extract node information and connections.
     
@@ -345,34 +345,46 @@ def parse_workflow_graph(workflow: dict) -> Tuple[Dict[int, dict], Dict[int, Lis
         Tuple of (nodes_dict, adjacency_list)
     """
     nodes_dict = {}
-    adjacency_list: Dict[int, List[Tuple[int, str]]] = {}
+    adjacency_list: Dict[str, List[Tuple[str, str]]] = {}
     
     # Parse nodes
     for node in workflow.get("nodes", []):
-        node_id = node.get("id")
-        if node_id is None:
+        node_id = str(node.get("id", ""))
+        if not node_id:
             continue
-        
+
+        data = node.get("data", {})
+        node_type = data.get("nodeType", "Unknown")
+        node_definition = data.get("nodeDefinition") or {}
+        input_defs = node_definition.get("input", {})
+        inputs = []
+        for category in ("required", "optional"):
+            for name, spec in input_defs.get(category, {}).items():
+                input_type = spec[0] if isinstance(spec, list) and spec else "AUTO"
+                inputs.append({"name": name, "type": "COMBO" if isinstance(input_type, list) else input_type})
+        output_names = node_definition.get("output_name", [])
+        output_types = node_definition.get("output", [])
+        outputs = [
+            {"name": name, "type": output_types[index] if index < len(output_types) else "AUTO"}
+            for index, name in enumerate(output_names)
+        ]
         nodes_dict[node_id] = {
             "id": node_id,
-            "type": node.get("type", "Unknown"),
-            "name": node.get("properties", {}).get("Node name for S&R", node.get("type", "Unknown")),
-            "inputs": node.get("inputs", []),
-            "outputs": node.get("outputs", []),
+            "type": node_type,
+            "name": data.get("label", node_type),
+            "inputs": inputs,
+            "outputs": outputs,
         }
         adjacency_list[node_id] = []
     
-    # Parse links to build adjacency list
-    for link in workflow.get("links", []):
-        if len(link) >= 6:
-            source_node_id = link[1]
-            target_node_id = link[3]
-            connection_type = link[5] if len(link) > 5 else "unknown"
-            
-            if source_node_id in adjacency_list and target_node_id in nodes_dict:
-                existing = any(tid == target_node_id for tid, _ in adjacency_list[source_node_id])
-                if not existing:
-                    adjacency_list[source_node_id].append((target_node_id, connection_type))
+    for edge in workflow.get("edges", []):
+        source_node_id = str(edge.get("source", ""))
+        target_node_id = str(edge.get("target", ""))
+        connection_type = edge.get("sourceHandle", "unknown")
+        if source_node_id in adjacency_list and target_node_id in nodes_dict:
+            existing = any(tid == target_node_id for tid, _ in adjacency_list[source_node_id])
+            if not existing:
+                adjacency_list[source_node_id].append((target_node_id, connection_type))
     
     return nodes_dict, adjacency_list
 
@@ -402,9 +414,7 @@ def print_node_io(node_info: dict) -> None:
         for out in outputs:
             out_name = out.get("name", "unnamed")
             out_type = out.get("type", "unknown")
-            links = out.get("links")
-            link_count = len(links) if links else 0
-            print(f"      - {out_name} ({out_type}) [connected to {link_count} node(s)]")
+            print(f"      - {out_name} ({out_type})")
     else:
         print("    Outputs: None")
 
@@ -513,7 +523,7 @@ async def main():
     await get_node_info_example()
     
     # Then process workflow files
-    workflow_files = ["llm_test.json", "join_path.json", "clone.json"]
+    workflow_files = ["clone-xyflow.json", "join-path-xyflow.json"]
     workflows_dir = Path(__file__).parent / "workflows"
     
     for workflow_file in workflow_files:

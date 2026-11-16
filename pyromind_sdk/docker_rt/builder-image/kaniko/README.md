@@ -195,8 +195,8 @@ DOCKER_RT_BUILD_IMAGE=pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind
 DOCKER_RT_BUILD_REGISTRY=pyromind-registry-vpc.cn-shanghai.cr.aliyuncs.com/pyromind
 DOCKER_RT_REGISTRY_USERNAME=<该 registry 的用户名>
 DOCKER_RT_REGISTRY_PASSWORD=<该 registry 的密码 / 临时 token>
-# 上面两行凭据也可以换成二选一的另一条（都不是必填）：
-# DOCKER_RT_REGISTRY_DOCKERCONFIG=<一份已登录该 registry 的 config.json 路径>
+# 凭据只有这两行来源，没有 config.json 回退（DOCKER_RT_REGISTRY_DOCKERCONFIG 已移除）。
+# 推送由 daemon 在构建沙箱销毁之后执行，凭证不进构建容器。
 ```
 
 > 上海集群要设的完整变量清单（含只出归档、跳过检查两种退路）见

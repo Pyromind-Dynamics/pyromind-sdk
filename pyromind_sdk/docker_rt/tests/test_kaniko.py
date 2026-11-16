@@ -79,7 +79,8 @@ def test_kaniko_args_shape(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "--target=builder" in joined
     assert f"--digest-file={kaniko.digest_file_path()}" in joined
     assert "--cache=false" in joined
-    assert "--no-push" not in joined
+    # Every build is archive-only: the push happens outside this container.
+    assert "--no-push" in joined
     assert kaniko.build_workdir().startswith("/kaniko/")
 
 
@@ -97,19 +98,12 @@ def test_kaniko_args_repeats_every_destination(monkeypatch: pytest.MonkeyPatch) 
     assert dests == ["--destination=reg.example.com/rt/a:1", "--destination=reg.example.com/rt/a:2"]
 
 
-def test_kaniko_args_requires_destination_when_pushing(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_kaniko_args_archive_only_writes_a_tarball(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no destination the build still archives — and never pushes."""
     from ..backend import kaniko
 
     _fresh(monkeypatch)
-    with pytest.raises(ValueError):
-        kaniko.kaniko_args(destinations=[], push=True)
-
-
-def test_kaniko_args_no_push_writes_a_tarball(monkeypatch: pytest.MonkeyPatch) -> None:
-    from ..backend import kaniko
-
-    _fresh(monkeypatch)
-    args = kaniko.kaniko_args(destinations=[], push=False, cache=False, new_run=False, insecure=False)
+    args = kaniko.kaniko_args(destinations=[], cache=False, new_run=False, insecure=False)
     joined = " ".join(args)
     assert "--no-push" in joined
     assert f"--tar-path={kaniko.tar_path()}" in joined
@@ -262,12 +256,19 @@ def test_kaniko_extra_flags_with_bad_quotes_is_ignored(monkeypatch: pytest.Monke
     assert all(not a.startswith("--verbosity") for a in args)
 
 
-def test_build_script_writes_config_owner_only(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_build_script_never_carries_registry_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2-vuln-0006: the build container must not hold a push credential.
+
+    kaniko unpacks the ``FROM`` rootfs into this container's root and runs every
+    Dockerfile instruction there as root, so a ``config.json`` written here is
+    readable by any ``RUN`` step. The parameter that used to write it is gone on
+    purpose — passing it must fail loudly rather than silently re-create it.
+    """
     from ..backend import kaniko
 
     _fresh(monkeypatch)
-    payload = '{"auths":{"docker.io":{"username":"my-user","password":"s3cret-pat"}}}'
-    encoded = base64.b64encode(payload.encode()).decode()
     script = kaniko.build_script(
         args=kaniko.kaniko_args(
             destinations=["docker.io/my-user/app:1"],
@@ -276,15 +277,13 @@ def test_build_script_writes_config_owner_only(monkeypatch: pytest.MonkeyPatch) 
             new_run=False,
             insecure=False,
         ),
-        docker_config_b64=encoded,
     )
-    assert "umask 077" in script
-    assert "chmod 600 /kaniko/.docker/config.json" in script
-    assert "export DOCKER_CONFIG=/kaniko/.docker" in script
     assert "/kaniko/executor" in script
-    # Credentials travel base64-encoded, never in plaintext.
-    assert shlex.quote(encoded) in script
-    assert "s3cret-pat" not in script
+    assert "config.json" not in script
+    assert "DOCKER_CONFIG" not in script
+
+    with pytest.raises(TypeError):
+        kaniko.build_script(args=[], docker_config_b64="e30=")  # type: ignore[call-arg]
 
 
 def test_build_script_without_credentials_skips_docker_config(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -319,11 +318,8 @@ def test_kaniko_args_always_skips_the_push_permission_check(
     from ..backend import kaniko
 
     _fresh(monkeypatch)
-    for push in (True, False):
-        joined = " ".join(
-            kaniko.kaniko_args(destinations=["app:dev"], push=push, cache=False)
-        )
-        assert "--skip-push-permission-check" in joined, push
+    joined = " ".join(kaniko.kaniko_args(destinations=["app:dev"], cache=False))
+    assert "--skip-push-permission-check" in joined
 
 
 def test_tar_path_is_the_workspace_images_directory() -> None:
@@ -357,29 +353,28 @@ def test_tar_path_names_are_filesystem_and_shell_safe() -> None:
         assert char not in name, name
 
 
-def test_kaniko_args_archives_with_and_without_push(
+def test_kaniko_args_always_archives_and_never_pushes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`--tar-path` is not tied to `--no-push`: kaniko writes the tarball first.
+    """Archiving is unconditional; pushing never happens in this container.
 
-    Archiving is unconditional, so a build that pushes still leaves its image in
-    the workspace (``DoPush`` writes the tar before the push loop).
+    The archive is the hand-off to ``registry_client``, which pushes it from the
+    daemon *after* the sandbox is gone. That is the whole point: no credential
+    ever exists in a container that executes Dockerfile ``RUN`` steps.
     """
     from ..backend import kaniko
 
     _fresh(monkeypatch)
-    pushing = " ".join(
+    joined = " ".join(
         kaniko.kaniko_args(
-            destinations=["reg.example.com/rt/app:dev"], push=True, cache=False
+            destinations=["reg.example.com/rt/app:dev"], cache=False
         )
     )
-    assert "--no-push" not in pushing
-    assert "--destination=reg.example.com/rt/app:dev" in pushing
-    assert "--tar-path=/workspace/docker_images/reg.example.com_rt_app_dev.tar" in pushing
+    assert "--no-push" in joined
+    assert "--destination=reg.example.com/rt/app:dev" in joined
+    assert "--tar-path=/workspace/docker_images/reg.example.com_rt_app_dev.tar" in joined
 
-    plain = " ".join(
-        kaniko.kaniko_args(destinations=["app:dev"], push=False, cache=False)
-    )
+    plain = " ".join(kaniko.kaniko_args(destinations=["app:dev"], cache=False))
     assert "--no-push" in plain
     assert "--tar-path=/workspace/docker_images/app_dev.tar" in plain
 

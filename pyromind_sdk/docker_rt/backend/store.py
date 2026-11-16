@@ -375,6 +375,14 @@ class ContainerStore:
             | set(self._image_aliases.values())
         )
 
+    def registered_images(self) -> set[str]:
+        """Images the user explicitly pulled/pushed/built.
+
+        Deliberately excludes images referenced only by a container
+        (``c.image``): those live in the cluster and were never local.
+        """
+        return set(self._extra_images)
+
     def register_image(self, name: str) -> None:
         if name:
             self._extra_images.add(name)

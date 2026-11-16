@@ -41,7 +41,10 @@ def _read_tmp_file_if_exists(value: Any) -> Any:
     if not value.startswith("/tmp/"):
         return value
 
-    path = Path(value)
+    tmp_root = Path("/tmp").resolve()
+    path = Path(value).resolve()
+    if tmp_root not in path.parents:
+        return value
     if not path.is_file():
         return value
 

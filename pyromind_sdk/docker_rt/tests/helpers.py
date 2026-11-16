@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 
 class FakeKubeEnv:
-    """In-memory stand-in for ``KubeEnvironment`` (no cluster)."""
+    """内存里的环境替身，接口对齐 ``PyromindSDK``（不需要真集群/真平台）。"""
 
     def __init__(self, pod_name: str = "code-sandbox-deadbeef") -> None:
         import threading
@@ -99,10 +99,11 @@ class FakeKubeEnv:
     ):
         self.last_attach_cmd = list(command)
         self.last_attach_kwargs = {"stdin": stdin, "tty": tty, "mode": "exec", "cwd": cwd}
-        # Mirror real KubeEnvironment wrapping so API tests see final argv.
-        from ..backend.kube.environment import argv_with_cwd
+        # 与生产路径一致：cwd 的 ``cd`` 包装由 docker-rt 自己做
+        # （``exec_utils.argv_with_exec_cwd``），后端只收到最终 argv。
+        from ..backend.exec_utils import argv_with_exec_cwd
 
-        self.last_attach_cmd = argv_with_cwd(list(command), cwd)
+        self.last_attach_cmd = argv_with_exec_cwd(list(command), cwd)
         return self._make_ws()
 
 
