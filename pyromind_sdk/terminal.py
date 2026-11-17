@@ -38,8 +38,6 @@ from pyromind_sdk.client.base import (
     ENV_API_KEY,
     ENV_BASE_URL,
     ENV_CLUSTER,
-    available_clusters,
-    resolve_base_url_from_cluster,
 )
 from pyromind_sdk.client.trace import TRACE_ID_HEADER, ensure_trace_id
 from pyromind_sdk.log_redaction import redact_text
@@ -122,28 +120,40 @@ def build_terminal_websocket_url(
     )
 
 
-def fetch_terminal_token(base_url: str, sandbox_id: str, api_key: str) -> str:
-    """Mint the short-lived terminal token (the only credential on the wire)."""
-    token, _ttl = fetch_token(
+def fetch_terminal_token(
+    base_url: str,
+    sandbox_id: str,
+    api_key: str,
+    cluster: Optional[str] = None,
+) -> tuple[str, str]:
+    """Exchange on the portal; returns ``(token, cluster_direct_base_url)``."""
+    token, _ttl, api_base_url = fetch_token(
         base_url,
         api_key,
         purpose=PURPOSE_WS_TERMINAL,
-        sandbox_id=sandbox_id,
+        resource_type="sandbox",
+        resource_id=sandbox_id,
+        cluster=cluster,
     )
-    return token
+    return token, api_base_url
 
 
 async def async_fetch_terminal_token(
-    base_url: str, sandbox_id: str, api_key: str
-) -> str:
+    base_url: str,
+    sandbox_id: str,
+    api_key: str,
+    cluster: Optional[str] = None,
+) -> tuple[str, str]:
     """Async variant of :func:`fetch_terminal_token`."""
-    token, _ttl = await async_fetch_token(
+    token, _ttl, api_base_url = await async_fetch_token(
         base_url,
         api_key,
         purpose=PURPOSE_WS_TERMINAL,
-        sandbox_id=sandbox_id,
+        resource_type="sandbox",
+        resource_id=sandbox_id,
+        cluster=cluster,
     )
-    return token
+    return token, api_base_url
 
 
 async def _run_session(url: str, token: str) -> None:
@@ -290,23 +300,18 @@ def run_terminal(
         print("Error: interactive terminal requires a POSIX system (macOS/Linux).", file=sys.stderr)
         return 1
 
-    # 1. Resolve base_url: explicit --base-url > $PYROMIND_BASE_URL > resolve from --cluster.
+    # 1. Resolve the exchange base: explicit --base-url > $PYROMIND_BASE_URL >
+    # the portal. The cluster determines which direct address we get back.
     if not base_url:
-        base_url = (os.getenv(ENV_BASE_URL) or "").strip()
+        base_url = (os.getenv(ENV_BASE_URL) or "").strip() or DEFAULT_API_BASE_URL
     cluster = (cluster or os.getenv(ENV_CLUSTER) or "").strip()
-    if not base_url:
-        if not cluster:
-            print(
-                f"Error: --cluster is required ({', '.join(available_clusters())}) "
-                f"or set {ENV_CLUSTER}.",
-                file=sys.stderr,
-            )
-            return 1
-        try:
-            base_url = resolve_base_url_from_cluster(cluster)
-        except ValueError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            return 1
+    if not cluster:
+        print(
+            f"Error: --cluster is required (or set {ENV_CLUSTER}); choose one "
+            "from the portal's resource_map (docker-rt setup lists them).",
+            file=sys.stderr,
+        )
+        return 1
 
     # 2. Resolve API key — required: it is the only credential that can mint the
     # short-lived token the WebSocket handshake expects.
@@ -324,14 +329,16 @@ def run_terminal(
         return 1
 
     size = os.get_terminal_size(sys.stdout.fileno())
-    url = _websocket_url(base_url, sandbox_id, size.columns, size.lines)
 
-    print(f"Connecting to sandbox {sandbox_id} @ {base_url} ... (exit shell or press Ctrl-D to quit)")
     stdin_fd = sys.stdin.fileno()
     saved_attrs = termios.tcgetattr(stdin_fd)
     tty.setraw(stdin_fd)
     try:
-        token = fetch_terminal_token(base_url, sandbox_id, api_key)
+        token, api_base_url = fetch_terminal_token(
+            base_url, sandbox_id, api_key, cluster
+        )
+        url = _websocket_url(api_base_url, sandbox_id, size.columns, size.lines)
+        print(f"Connecting to sandbox {sandbox_id} @ {api_base_url} ... (exit shell or press Ctrl-D to quit)")
         asyncio.run(_run_session(url, token))
     except (TerminalError, TokenError) as e:
         termios.tcsetattr(stdin_fd, termios.TCSADRAIN, saved_attrs)

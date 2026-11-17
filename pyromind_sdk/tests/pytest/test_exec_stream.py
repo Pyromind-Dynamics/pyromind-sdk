@@ -17,23 +17,10 @@ from pyromind_sdk.exec_stream import (
 )
 
 
-def test_build_exec_stream_url_resolves_portal_to_direct_cluster() -> None:
-    url = build_exec_stream_websocket_url(
-        "https://pre-api-portal.pyromind.ai/api/v1",
-        "sb-demo",
-        "us-west-1#pre",
-    )
-
-    assert url == (
-        "wss://pre-api.pyromind.ai/api/v1/sandboxes/sb-demo/exec-stream"
-    )
-
-
-def test_build_exec_stream_url_keeps_direct_base_url() -> None:
+def test_build_exec_stream_url_uses_the_exchanged_base_url() -> None:
     url = build_exec_stream_websocket_url(
         "https://pre-api.pyromind.ai/api/v1",
         "sb-demo",
-        "us-west-1",
     )
 
     assert url == (

@@ -687,6 +687,10 @@ def _ws_close_note(ws: Any, msg: Any) -> str:
     """
     code = getattr(ws, "close_code", None)
     reason = (getattr(ws, "close_reason", None) or "").strip()
+    if not reason and msg.type is WSMsgType.CLOSE:
+        # aiohttp exposes the peer's close reason on the message itself when the
+        # attribute is not populated; without it a 4500 says nothing about why.
+        reason = str(getattr(msg, "extra", "") or "").strip()
     bits = [f"code={code}"]
     hint = _WS_CLOSE_HINTS.get(code)
     if hint:  # 见 _WS_CLOSE_HINTS：1012 = 中间件在重启
@@ -4910,35 +4914,28 @@ async def _hijack_session(
     return resp
 
 
-def _pyromind_terminal_target(
-    kube_env: Any,
-    *,
-    cols: int = 80,
-    rows: int = 24,
-    cmd: list[str] | None = None,
-    cwd: str = "",
-) -> tuple[str, str]:
-    """Return ``(url, api_key)`` for the terminal WebSocket.
+def _pyromind_terminal_exchange() -> tuple[str, str, str]:
+    """Return ``(portal_base, cluster, api_key)`` for the terminal exchange.
 
-    The key is kept out of the URL and goes in the ``Authorization`` header at
-    connect time (see ``_hijack_pyromind_terminal``).
+    The key is kept out of the URL and is only sent to the portal; the token
+    minted there goes in the WebSocket's first auth frame.
     """
-    # Same resolution as every other data-plane call this daemon makes: the
-    # terminal WebSocket lives on the cluster, and the portal does not proxy
-    # WebSocket at all.
-    from pyromind_sdk.client.base import ENV_API_KEY, resolve_api_base_url
-    from pyromind_sdk.terminal import build_terminal_websocket_url
+    from pyromind_sdk.client.base import (
+        DEFAULT_API_BASE_URL,
+        ENV_API_KEY,
+        ENV_BASE_URL,
+        ENV_CLUSTER,
+    )
 
     api_key = (os.getenv(ENV_API_KEY) or "").strip()
-    url = build_terminal_websocket_url(
-        resolve_api_base_url(),
-        kube_env.sandbox_id or "",
-        cols=cols,
-        rows=rows,
-        command=list(cmd) if cmd else None,
-        cwd=cwd or None,
-    )
-    return url, api_key
+    base = (os.getenv(ENV_BASE_URL) or "").strip() or DEFAULT_API_BASE_URL
+    cluster = (os.getenv(ENV_CLUSTER) or "").strip()
+    if not cluster:
+        raise RuntimeError(
+            "PYROMIND_CLUSTER is not set; docker-rt must select a cluster "
+            "from the portal's resource_map before opening a terminal."
+        )
+    return base.rstrip("/"), cluster, api_key
 
 
 def _pty_output_for_client(data: bytes, *, tty: bool) -> bytes:
@@ -4984,9 +4981,7 @@ async def _hijack_pyromind_terminal(
 
     cols = int(getattr(session, "tty_cols", 0) or 0) or 80
     rows = int(getattr(session, "tty_rows", 0) or 0) or 24
-    url, api_key = _pyromind_terminal_target(
-        kube_env, cols=cols, rows=rows, cmd=cmd, cwd=cwd
-    )
+    exchange_base, cluster, api_key = _pyromind_terminal_exchange()
     session.running = True
     logger.info(
         "pyromind terminal hijack start id=%s sandbox=%s %dx%d cmd=%s",
@@ -5017,12 +5012,21 @@ async def _hijack_pyromind_terminal(
     try:
         async with aiohttp.ClientSession() as client:
             try:
-                from pyromind_sdk.client.base import resolve_api_base_url
+                from pyromind_sdk.terminal import build_terminal_websocket_url
 
-                token = await async_fetch_terminal_token(
-                    resolve_api_base_url(),
+                token, api_base_url = await async_fetch_terminal_token(
+                    exchange_base,
                     kube_env.sandbox_id or "",
                     api_key,
+                    cluster,
+                )
+                url = build_terminal_websocket_url(
+                    api_base_url,
+                    kube_env.sandbox_id or "",
+                    cols=cols,
+                    rows=rows,
+                    command=list(cmd) if cmd else None,
+                    cwd=cwd or None,
                 )
                 ws = await client.ws_connect(
                     url,

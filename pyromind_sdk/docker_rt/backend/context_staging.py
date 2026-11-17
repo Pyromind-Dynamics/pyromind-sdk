@@ -372,20 +372,20 @@ def workspace_bucket(profile: Any) -> str:
 
 
 def storage_endpoint_for(cluster: str | None) -> str:
-    """Storage endpoint for a cluster, from :data:`client.base.CLUSTER_RESOURCE`.
+    """Storage endpoint for a cluster, from ``/storage_info``.
 
-    The profile's ``/storage_info`` may omit ``url`` (and the SDK's own
-    ``CLUSTER_STORAGE_ENDPOINTS`` table does not list every cluster), while the
-    cluster table always has it. One table, no second copy to drift.
+    The endpoint ``url`` is returned unmasked; the credential fields are not
+    used here — ``StorageClient`` reads ``PYROMIND_STORAGE_ACCESS_KEY`` /
+    ``PYROMIND_STORAGE_SECRET_KEY`` from the environment, so a masked key in
+    the response cannot silently degrade into a wrong credential.
     """
     try:
-        from ...client.base import CLUSTER_RESOURCE, parse_cluster_code
+        from ...client.storage import get_storage_info
 
-        code, _ = parse_cluster_code(cluster or "")
-        entry = CLUSTER_RESOURCE.get(code) or {}
-        return str(entry.get("storage") or "").strip()
-    except Exception as exc:  # noqa: BLE001 - never let table lookup break a build
-        logger.debug("cluster storage endpoint lookup failed: %s", exc)
+        info = get_storage_info(cluster=cluster)
+        return str(info.get("url") or "").strip()
+    except Exception as exc:  # noqa: BLE001 - never let lookup break a build
+        logger.warning("storage endpoint lookup failed: %s", exc)
         return ""
 
 
@@ -394,14 +394,10 @@ def connect_storage(cluster: str | None = None) -> tuple[Any, str]:
 
     Each piece comes from exactly one place:
 
-    * **endpoint** — :data:`client.base.CLUSTER_RESOURCE`;
+    * **endpoint** — ``POST /storage_info`` (``url`` is never masked);
     * **bucket** — ``ProfileClient.get_user_info().user.uid``;
     * **credentials** — the environment, read by ``StorageClient`` itself
       (``PYROMIND_STORAGE_ACCESS_KEY`` + ``PYROMIND_STORAGE_SECRET_KEY``).
-
-    ``/storage_info`` is deliberately **not** consulted: the platform is
-    removing it, and its masked credential fields (``X805***NQNN``) were never
-    usable anyway.
 
     Called **only from a build or a push** — never at daemon startup. A daemon
     that is merely listening must not probe (or fail on) storage; the check

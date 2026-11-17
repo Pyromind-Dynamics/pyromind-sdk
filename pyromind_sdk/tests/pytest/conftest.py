@@ -23,10 +23,16 @@ def _stub_token_exchange(monkeypatch):
     from pyromind_sdk import token as sdk_token
 
     monkeypatch.setattr(
-        sdk_token, "fetch_token", lambda *args, **kwargs: ("test-token", 900)
+        sdk_token,
+        "fetch_token",
+        lambda *args, **kwargs: (
+            "test-token",
+            900,
+            "https://direct.example/api/v1",
+        ),
     )
 
     async def _async_fetch(*args, **kwargs):
-        return "test-token", 900
+        return "test-token", 900, "https://direct.example/api/v1"
 
     monkeypatch.setattr(sdk_token, "async_fetch_token", _async_fetch)

@@ -14,7 +14,7 @@ from typing import Optional, Dict, Any
 
 from .base import append_trace_id, extract_trace_id
 from ..log_redaction import redact, redact_text
-from ..token import AsyncHttpTokenCache, token_base_url
+from ..token import AsyncHttpTokenCache
 from .trace import (
     TRACE_ID_HEADER,
     current_trace_id,
@@ -27,7 +27,6 @@ from .trace import (
 
 # Constants
 DEFAULT_API_BASE_URL = "https://api-portal.pyromind.ai/api/v1"
-DEFAULT_CLUSTER = "us-west-2"
 DEFAULT_TIMEOUT = 600
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_CONNECTOR_LIMIT = 256
@@ -133,17 +132,20 @@ class PyroMindAsyncClient:
             )
         self.api_key = api_key
         self.base_url = base_url.rstrip('/')
+        #: Portal address used for credential exchange; ``base_url`` switches
+        #: to the cluster-direct address after the first exchange.
+        self.exchange_base_url = self.base_url
 
-        # Get cluster from parameter, environment variable, or use default
-        if not cluster:
-            cluster = os.getenv(ENV_CLUSTER) or DEFAULT_CLUSTER
-        self.cluster = cluster
+        # Cluster selection is explicit: it comes from --cluster, the
+        # environment, or docker-rt setup (which lists the portal's
+        # resource_map). Construction is offline, so an unset cluster only
+        # fails when the first exchange needs it (see ``token.fetch_token``).
+        self.cluster = (cluster or os.getenv(ENV_CLUSTER) or "").strip()
 
-        # Data-plane clients: cluster-direct + short-lived token. Profile /
-        # storage clients opt out (portal + long-lived key).
-        if self.USE_TICKET_AUTH:
-            self.base_url = token_base_url(self.base_url, self.cluster)
-
+        # Data-plane clients exchange the long-lived key on the portal and then
+        # target the cluster-direct ``api_base_url`` returned by the exchange
+        # (see ``_ensure_api_base_url``). Profile / storage clients opt out
+        # (portal + long-lived key).
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.max_retries = max_retries
         self.connector_limit = max(1, int(connector_limit))
@@ -224,6 +226,14 @@ class PyroMindAsyncClient:
         return response
 
     # ========== URL and Request Building ==========
+
+    async def _ensure_api_base_url(self) -> None:
+        """Switch to the cluster-direct base URL returned by the exchange."""
+        if self._tokens is None:
+            return
+        await self._tokens.token()
+        if self._tokens.api_base_url:
+            self.base_url = self._tokens.api_base_url
 
     def _build_url(self, endpoint: str) -> str:
         """Build full URL from endpoint"""
@@ -503,6 +513,7 @@ class PyroMindAsyncClient:
         Raises:
             PyroMindAsyncAPIError: If the request fails
         """
+        await self._ensure_api_base_url()
         url = self._build_url(endpoint)
         request_context = self._build_request_context(method, url)
         session = await self._get_session()

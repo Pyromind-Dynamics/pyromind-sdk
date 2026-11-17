@@ -22,7 +22,7 @@ def _stub_terminal_token(monkeypatch):
     from .. import aio_server as mod
 
     async def fake_token(*_args, **_kwargs):
-        return "test-token"
+        return "test-token", "https://direct.example/api/v1"
 
     monkeypatch.setattr(mod, "async_fetch_terminal_token", fake_token)
 
@@ -533,6 +533,7 @@ async def test_pyromind_terminal_bridge_pumps_stdin_and_resize(monkeypatch):
             return captured["ws"]
 
     monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: FakeSession())
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2")
 
     kube_env = PyromindSDK.__new__(PyromindSDK)
     kube_env.sandbox_id = "sb-terminal"
@@ -772,7 +773,7 @@ async def _drive_terminal_bridge(
             return captured["ws"]
 
     monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: FakeSession())
-    monkeypatch.setattr(mod, "_pyromind_terminal_target", lambda *a, **k: ("ws://fake", ""))
+    monkeypatch.setattr(mod, "_pyromind_terminal_exchange", lambda *a, **k: ("https://portal.example/api/v1", "us-west-2", ""))
 
     kube_env = PyromindSDK.__new__(PyromindSDK)
     kube_env.sandbox_id = "sb-terminal"
@@ -1687,7 +1688,7 @@ async def test_exec_with_stdin_and_no_tty_frames_the_terminal_output(monkeypatch
             [SimpleNamespace(type=aiohttp.WSMsgType.BINARY, data=b"hello\r\n")]
         )
         monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: _FakeSession(ws, **k))
-        monkeypatch.setattr(mod, "_pyromind_terminal_target", lambda *a, **k: ("ws://fake", ""))
+        monkeypatch.setattr(mod, "_pyromind_terminal_exchange", lambda *a, **k: ("https://portal.example/api/v1", "us-west-2", ""))
 
         written: list[bytes] = []
 
@@ -1997,7 +1998,7 @@ async def test_stdin_eof_does_not_teardown_the_session(monkeypatch):
         tail_wait=0.4,
     )
     monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: _FakeSession(ws, **k))
-    monkeypatch.setattr(mod, "_pyromind_terminal_target", lambda *a, **k: ("ws://fake", ""))
+    monkeypatch.setattr(mod, "_pyromind_terminal_exchange", lambda *a, **k: ("https://portal.example/api/v1", "us-west-2", ""))
 
     written: list[bytes] = []
 

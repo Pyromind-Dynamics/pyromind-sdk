@@ -37,6 +37,10 @@ _CYAN = "\033[36m"
 _YELLOW = "\033[33m"
 _RESET = "\033[0m"
 
+#: 预发环境：portal 只对内部用户（user_type=internal/internal_test）下发；
+#: SDK 仅据此给出更明确的拒绝提示
+_PRE_ENVS = ("pre", "pre2")
+
 
 def check_docker_cli(*, stderr: Any | None = None) -> bool:
     """Return True when a Docker CLI binary is available on PATH."""
@@ -83,43 +87,100 @@ def _prompt(
     return input(message).strip()
 
 
-def _cluster_choices() -> list[str]:
-    """Selectable cluster codes — the keys of ``CLUSTER_RESOURCE`` (single source of truth)."""
-    from ..client.base import available_clusters
-
-    return available_clusters()
+def _ask_environment(
+    envs: list[str],
+    *,
+    stdin: Any | None,
+    stdout: Any,
+    color: bool,
+) -> str:
+    env_choices = ", ".join(envs)
+    env_prompt = (
+        f"{_BOLD}{_CYAN}environment ({env_choices}){_RESET}: "
+        if color
+        else f"environment ({env_choices}): "
+    )
+    while True:
+        env = _prompt(env_prompt, stdin=stdin, stdout=stdout)
+        if env in envs:
+            return env
+        stdout.write(f"Unknown environment {env!r}; choose one of: {env_choices}\n")
+        stdout.flush()
 
 
 def _ask_cluster(
     *,
+    api_key: str,
     interactive: bool,
     stdin: Any | None,
     stdout: Any,
     color: bool,
 ) -> str:
-    """Prompt for ``PYROMIND_CLUSTER`` until the answer is one of the configured keys.
+    """Ask the portal which clusters this key may use, then prompt for one.
 
-    The choices are the **cluster keys only** (``CLUSTER_RESOURCE``), so adding a
-    cluster to the table updates the prompt automatically. Blank input falls back
-    to ``DEFAULT_CLUSTER``.
+    The portal's ``resource_map`` drives the choices: every ``<cluster>#<env>``
+    pair the account may use is printed one per line (admin-role accounts see
+    every environment per cluster; other accounts only the current
+    environment).  A bare cluster code is still accepted; when it maps to
+    several environments the environment is asked separately.
     """
-    from ..client.base import DEFAULT_CLUSTER, resolve_base_url_from_cluster
+    from ..client.base import DEFAULT_API_BASE_URL, ENV_BASE_URL
+    from ..token import fetch_resource_map
 
-    choices = ", ".join(_cluster_choices())
-    prompt = f"PYROMIND_CLUSTER ({choices}): "
-    if color:
-        prompt = f"{_BOLD}{_CYAN}PYROMIND_CLUSTER ({choices}):{_RESET} "
+    base = (os.getenv(ENV_BASE_URL) or "").strip() or DEFAULT_API_BASE_URL
+    resource_map = fetch_resource_map(base, api_key)
+    entries = [
+        f"{code}#{env}"
+        for code in sorted(resource_map)
+        for env in sorted(resource_map[code])
+    ]
+    if not entries:
+        raise RuntimeError("no clusters are enabled for this account")
+
+    choices = ", ".join(entries)
+    if not interactive:
+        raise RuntimeError(
+            "PYROMIND_CLUSTER is not set and no interactive terminal is "
+            f"available; available clusters: {choices}"
+        )
+
+    # 组合较多时内联提示太长：选项逐行输出，提示行只留变量名。
+    stdout.write("Available clusters:\n")
+    for entry in entries:
+        stdout.write(f"{entry}\n")
+    stdout.flush()
+
+    prompt = (
+        f"{_BOLD}{_CYAN}PYROMIND_CLUSTER:{_RESET} "
+        if color
+        else "PYROMIND_CLUSTER: "
+    )
     while True:
-        candidate = _prompt(prompt, stdin=stdin, stdout=stdout) or DEFAULT_CLUSTER
-        try:
-            resolve_base_url_from_cluster(candidate)
-        except ValueError as exc:
-            if not interactive:
-                raise RuntimeError(str(exc))
-            stdout.write(f"{exc}\n")
+        candidate = _prompt(prompt, stdin=stdin, stdout=stdout)
+        if candidate in entries:
+            return candidate
+        if candidate in resource_map:
+            envs = sorted(resource_map[candidate])
+            if len(envs) == 1:
+                return f"{candidate}#{envs[0]}"
+            env = _ask_environment(envs, stdin=stdin, stdout=stdout, color=color)
+            return f"{candidate}#{env}"
+        code, _, env = candidate.partition("#")
+        env = env.strip()
+        if env in _PRE_ENVS and code.strip() in resource_map:
+            # 预发只对内部用户下发：portal 已从 resource_map 过滤，这里给出
+            # 明确原因，避免落到含混的 "Unknown cluster"。
+            stdout.write(
+                f"Environment {env!r} requires an internal user; "
+                "choose one of the clusters listed above\n"
+            )
             stdout.flush()
             continue
-        return candidate
+        stdout.write(
+            f"Unknown cluster {candidate!r}; "
+            "choose one of the clusters listed above\n"
+        )
+        stdout.flush()
 
 
 def prepare_env(
@@ -192,6 +253,7 @@ def prepare_env(
                 "available to prompt for it"
             )
         cluster = _ask_cluster(
+            api_key=api_key,
             interactive=interactive,
             stdin=stdin,
             stdout=stdout,
@@ -218,15 +280,15 @@ async def check_connection(
 ) -> int:
     """Verify PyroMind API access and return the number of visible sandboxes."""
     from pyromind_sdk.client.async_sandbox import AsyncSandboxClient
-    from pyromind_sdk.client.base import resolve_api_base_url
+    from pyromind_sdk.client.base import DEFAULT_API_BASE_URL, ENV_BASE_URL
 
     owns_client = client is None
     client = client or AsyncSandboxClient(
         api_key=api_key or os.getenv("PYROMIND_API_KEY"),
         cluster=cluster or os.getenv("PYROMIND_CLUSTER"),
-        # Data plane: check the cluster the daemon will actually talk to,
-        # not the portal.
-        base_url=resolve_api_base_url(cluster),
+        # Every request starts at the portal: it hands back the token and the
+        # cluster-direct address this daemon will talk to afterwards.
+        base_url=(os.getenv(ENV_BASE_URL) or DEFAULT_API_BASE_URL),
         timeout=_CONNECTION_CHECK_TIMEOUT_S,
     )
     try:

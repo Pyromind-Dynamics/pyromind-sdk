@@ -15,11 +15,9 @@ from typing import (
     Optional,
     Union,
 )
-from urllib.parse import urlparse
 
 import aiohttp
 
-from .client.base import resolve_base_url_from_cluster
 from .client.models import SandboxExecStreamChunk
 from .client.trace import TRACE_ID_HEADER, ensure_trace_id
 from .log_redaction import redact_text
@@ -50,26 +48,14 @@ class SandboxExecStreamError(RuntimeError):
         self.code = code
 
 
-def _resolve_stream_base_url(base_url: str, cluster: Optional[str]) -> str:
-    """Resolve a WebSocket-capable direct API URL from portal-style config."""
-    parsed = urlparse(base_url)
-    host = (parsed.hostname or "").lower()
-    if "portal" in host and cluster:
-        return resolve_base_url_from_cluster(cluster)
-    return base_url.rstrip("/")
+def build_exec_stream_websocket_url(api_base_url: str, sandbox_id: str) -> str:
+    """Build the cluster-direct exec-stream WebSocket URL.
 
-
-def build_exec_stream_websocket_url(
-    base_url: str,
-    sandbox_id: str,
-    cluster: Optional[str] = None,
-) -> str:
-    """Build the direct per-cluster exec-stream WebSocket URL.
-
-    The URL carries no credential; use :func:`fetch_exec_stream_token` and send
+    ``api_base_url`` is the direct address returned by the portal exchange; the
+    URL carries no credential.  Use :func:`fetch_exec_stream_token` and send
     the token as the first frame (see ``_iter_exec_stream_events``).
     """
-    base = _resolve_stream_base_url(base_url, cluster)
+    base = api_base_url.rstrip("/")
     for http_scheme, ws_scheme in (("https://", "wss://"), ("http://", "ws://")):
         if base.startswith(http_scheme):
             base = ws_scheme + base[len(http_scheme):]
@@ -82,15 +68,17 @@ def fetch_exec_stream_token(
     sandbox_id: str,
     api_key: str,
     cluster: Optional[str] = None,
-) -> str:
-    """Mint the short-lived exec-stream token from the cluster-direct host."""
-    token, _ttl = fetch_token(
-        _resolve_stream_base_url(base_url, cluster),
+) -> tuple[str, str]:
+    """Exchange on the portal; returns ``(token, cluster_direct_base_url)``."""
+    token, _ttl, api_base_url = fetch_token(
+        base_url,
         api_key,
         purpose=PURPOSE_WS_EXEC,
-        sandbox_id=sandbox_id,
+        resource_type="sandbox",
+        resource_id=sandbox_id,
+        cluster=cluster,
     )
-    return token
+    return token, api_base_url
 
 
 async def async_fetch_exec_stream_token(
@@ -98,15 +86,17 @@ async def async_fetch_exec_stream_token(
     sandbox_id: str,
     api_key: str,
     cluster: Optional[str] = None,
-) -> str:
+) -> tuple[str, str]:
     """Async variant of :func:`fetch_exec_stream_token`."""
-    token, _ttl = await async_fetch_token(
-        _resolve_stream_base_url(base_url, cluster),
+    token, _ttl, api_base_url = await async_fetch_token(
+        base_url,
         api_key,
         purpose=PURPOSE_WS_EXEC,
-        sandbox_id=sandbox_id,
+        resource_type="sandbox",
+        resource_id=sandbox_id,
+        cluster=cluster,
     )
-    return token
+    return token, api_base_url
 
 
 def _binary_event_from_frame(data: bytes) -> Optional[Dict[str, Any]]:

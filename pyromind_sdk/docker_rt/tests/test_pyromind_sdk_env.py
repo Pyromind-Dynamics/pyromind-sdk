@@ -44,7 +44,7 @@ def _stub_exec_stream_token(monkeypatch):
     """Unit tests must not perform a real token exchange for exec-stream."""
 
     async def fake_token(*_args, **_kwargs):
-        return "test-token"
+        return "test-token", "https://direct.example/api/v1"
 
     monkeypatch.setattr(env_mod, "async_fetch_exec_stream_token", fake_token)
 
@@ -96,6 +96,7 @@ def test_shared_async_client_uses_256_connection_pool(
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("PYROMIND_API_KEY", "test-key")
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2")
     client = env_mod.new_sandbox_client()
 
     async def _check() -> None:
@@ -107,17 +108,18 @@ def test_shared_async_client_uses_256_connection_pool(
     asyncio.run(_check())
 
 
-def test_shared_async_client_targets_the_cluster_directly(
+def test_shared_async_client_starts_at_the_portal(
     monkeypatch: MonkeyPatch,
 ) -> None:
-    """``docker cp`` and friends are data plane: never through the portal."""
+    """All requests start at the portal; the exchange returns the direct base."""
     monkeypatch.setenv("PYROMIND_API_KEY", "test-key")
     monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
     monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-1")
 
     client = env_mod.new_sandbox_client()
 
-    assert client.base_url == "https://pre-api.pyromind.ai/api/v1"
+    assert client.base_url == "https://api-portal.pyromind.ai/api/v1"
+    assert client.exchange_base_url == client.base_url
     assert client.cluster == "us-west-1"
 
 
@@ -1176,51 +1178,49 @@ def test_id_filter_uses_docker_id_not_sandbox_id() -> None:
     assert _matches_filters(record, {"id": ["sb-different"]}) is False
 
 
-def test_pyromind_terminal_url_uses_base_url(monkeypatch: MonkeyPatch) -> None:
-    from ..aio_server import _pyromind_terminal_target
-
-    adapter = PyromindSDK.__new__(PyromindSDK)
-    adapter.sandbox_id = "sb-1"
-    monkeypatch.setenv(
-        "PYROMIND_BASE_URL", "https://pre-api.pyromind.ai/api/v1"
-    )
-    monkeypatch.delenv("PYROMIND_API_KEY", raising=False)
-
-    url, api_key = _pyromind_terminal_target(adapter)
-
-    assert url.startswith(
-        "wss://pre-api.pyromind.ai/api/v1/sandboxes/sb-1/terminal?"
-    )
-    assert "cols=80&rows=24" in url
-    assert api_key == ""
-    assert "token=" not in url
-
-
-def test_pyromind_terminal_url_carries_command_and_size(
+def test_pyromind_terminal_exchange_uses_portal_base(
     monkeypatch: MonkeyPatch,
 ) -> None:
+    from ..aio_server import _pyromind_terminal_exchange
+
+    monkeypatch.setenv(
+        "PYROMIND_BASE_URL", "https://api-portal.pyromind.ai/api/v1"
+    )
+    monkeypatch.delenv("PYROMIND_API_KEY", raising=False)
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2")
+
+    base, cluster, api_key = _pyromind_terminal_exchange()
+
+    assert base == "https://api-portal.pyromind.ai/api/v1"
+    assert cluster == "us-west-2"
+    assert api_key == ""
+
+
+def test_pyromind_terminal_url_carries_command_and_size() -> None:
     """``docker exec -it <cid> <cmd>`` must reach the PTY as an argv.
 
     Without this the terminal side would open its login shell and the command
     the user typed would be silently dropped.
     """
-    from ..aio_server import _pyromind_terminal_target
+    from pyromind_sdk.terminal import build_terminal_websocket_url
 
-    adapter = PyromindSDK.__new__(PyromindSDK)
-    adapter.sandbox_id = "sb-1"
-    monkeypatch.setenv(
-        "PYROMIND_BASE_URL", "https://pre-api.pyromind.ai/api/v1"
-    )
-    monkeypatch.delenv("PYROMIND_API_KEY", raising=False)
-
-    url, _api_key = _pyromind_terminal_target(
-        adapter, cols=132, rows=43, cmd=["bash", "-l"], cwd="/workspace"
+    url = build_terminal_websocket_url(
+        "https://api-us-west-2.pyromind.ai/api/v1",
+        "sb-1",
+        cols=132,
+        rows=43,
+        command=["bash", "-l"],
+        cwd="/workspace",
     )
 
+    assert url.startswith(
+        "wss://api-us-west-2.pyromind.ai/api/v1/sandboxes/sb-1/terminal?"
+    )
     assert "cols=132&rows=43" in url
     assert "command=bash" in url
     assert "command=-l" in url
     assert "cwd=%2Fworkspace" in url
+    assert "token=" not in url
 
 
 # ---------------------------------------------------------------------------

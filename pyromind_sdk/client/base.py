@@ -22,12 +22,11 @@ from .trace import (
     set_trace_id,
 )
 from ..log_redaction import redact, redact_text
-from ..token import HttpTokenCache, token_base_url
+from ..token import HttpTokenCache
 
 
 # Constants
 DEFAULT_API_BASE_URL = "https://api-portal.pyromind.ai/api/v1"
-DEFAULT_CLUSTER = "us-west-2"
 DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_RETRIES = 3
 ENV_API_KEY = "PYROMIND_API_KEY"
@@ -37,135 +36,6 @@ ENV_LOG_FORMAT = "PYROMIND_LOG_FORMAT"
 ENV_LOG_LEVEL = "PYROMIND_LOG_LEVEL"
 RETRY_STATUS_CODES = [502, 503, 504]
 RETRY_ALLOWED_METHODS = ["GET", "POST", "PUT", "DELETE"]
-
-# Cluster -> per-env API base URL mapping.
-#
-# The terminal CLI resolves `--cluster <code>` (optionally with an `#env`
-# suffix, e.g. `us-west-1`) to a per-cluster direct API base URL via
-# this table. Portal (`api-portal.pyromind.ai`) does not proxy WebSocket,
-# so terminal connections must use the per-cluster direct domains here.
-CLUSTER_RESOURCE = {
-    "us-west-1": {
-        "http": {
-            "prod": "https://api.pyromind.ai",
-            "pre": "https://pre-api.pyromind.ai",
-            "pre2": "https://pre2-api.pyromind.ai",
-            "dev": "http://localhost:8001",
-        },
-        "storage":"https://storage.pyromind.ai"
-    },
-    "us-west-2": {
-        "http": {
-            "prod": "https://api-us-west-2.pyromind.ai",
-            "pre": "https://pre-api-us-west-2.pyromind.ai",
-            "pre2": "https://pre2-api-us-west-2.pyromind.ai",
-            "dev": "http://localhost:8002",
-        },
-        "storage":"https://storage-us-west-2.pyromind.ai"
-    },
-    "us-west-3": {
-        "http": {
-            "prod": "https://api-us-west-3.pyromind.ai",
-            "pre": "https://pre-api-us-west-3.pyromind.ai",
-            "pre2": "https://pre2-api-us-west-3.pyromind.ai",
-            "dev": "http://localhost:8003",
-        },
-        "storage": "https://storage-us-west-3.pyromind.ai",
-    },
-    "cn-east-1": {
-        "http": {
-            "prod": "https://api-cn-east-1.pyromind-asia.cn",
-            "pre": "https://pre-api-cn-east-1.pyromind-asia.cn",
-            "pre2": "https://pre2-api-cn-east-1.pyromind-asia.cn",
-            "dev": "http://localhost:8002",
-        },
-        "storage": "https://storage-cn-east-1.pyromind-asia.cn"
-    },
-}
-
-
-def available_clusters():
-    """Cluster codes a client / docker-rt can target — the keys of :data:`CLUSTER_RESOURCE`.
-
-    Order follows the table's declaration order (``us-west-1``, ``us-west-2``,
-    ``cn-east-1``) so prompts and ``--help`` read like the config. These keys are
-    the **only** thing exposed to users; per-env addresses stay an implementation
-    detail of the table. Callers that build prompts or help text should use this
-    instead of hard-coding example cluster names.
-    """
-    return list(CLUSTER_RESOURCE)
-
-
-def parse_cluster_code(cluster: str):
-    """Split a cluster identifier into (cluster_code, env).
-
-    Accepted shapes:
-      * "us-west-1"       -> ("us-west-1", "prod")
-      * "us-west-1"   -> ("us-west-1", "pre")
-      * "us-west-12"  -> ("us-west-1", "pre2")
-    """
-    if not cluster:
-        return "", "prod"
-    cluster = cluster.strip()
-    if "#" in cluster:
-        code, env = cluster.split("#", 1)
-        return code.strip(), (env.strip() or "prod")
-    return cluster, "prod"
-
-
-def resolve_base_url_from_cluster(cluster: str) -> str:
-    """Return the per-cluster API base URL (with trailing /api/v1).
-
-    Raises ValueError if the cluster code or env suffix is unknown.
-    """
-    code, env = parse_cluster_code(cluster)
-    cfg = CLUSTER_RESOURCE.get(code)
-    if not cfg:
-        valid = ", ".join(available_clusters())
-        raise ValueError(f"Unknown cluster {code!r}. Valid clusters: {valid}")
-    base = cfg.get("http", {}).get(env)
-    if not base:
-        raise ValueError(f"Unknown env {env!r} for cluster {code!r}")
-    return base.rstrip("/") + "/api/v1"
-
-
-def resolve_api_base_url(cluster: Optional[str] = None) -> str:
-    """Resolve the base URL for a **cluster-direct** (data-plane) client.
-
-    Resolution order:
-
-    1. ``PYROMIND_BASE_URL`` — an explicit override always wins.
-    2. The per-cluster direct address from :data:`CLUSTER_RESOURCE`, keyed by
-       ``cluster`` or ``PYROMIND_CLUSTER`` (``us-west-1`` style suffixes
-       included).
-    3. ``DEFAULT_API_BASE_URL`` — the portal, as a last resort only.
-
-    Sandbox operations (list/get/create, exec, and the file read/write behind
-    ``docker cp``) are data-plane calls and belong on the cluster, not on the
-    portal. The portal is the control plane: ``ProfileClient`` (``/user_info``,
-    ``/storage_info``, access keys) keeps using ``DEFAULT_API_BASE_URL`` and
-    never calls this.
-
-    When neither ``PYROMIND_BASE_URL`` nor a cluster is configured the portal
-    is still returned, so an unconfigured client keeps working exactly as
-    before.
-    """
-    explicit = (os.getenv(ENV_BASE_URL) or "").strip()
-    if explicit:
-        return explicit.rstrip("/")
-    code = (cluster or os.getenv(ENV_CLUSTER) or "").strip()
-    if code:
-        try:
-            return resolve_base_url_from_cluster(code)
-        except ValueError as exc:
-            logger.warning(
-                "cannot resolve a direct base URL for cluster %r (%s); "
-                "falling back to the portal %s",
-                code,
-                exc,
-                DEFAULT_API_BASE_URL,
-            )
-    return DEFAULT_API_BASE_URL.rstrip("/")
 
 ERROR_MESSAGE_MAX_LENGTH = 500
 _TRACE_ID_HEADER_KEYS = {
@@ -313,17 +183,20 @@ class PyroMindClient:
             )
         self.api_key = api_key
         self.base_url = base_url.rstrip('/')
+        #: Portal address used for credential exchange; ``base_url`` switches
+        #: to the cluster-direct address after the first exchange.
+        self.exchange_base_url = self.base_url
 
-        # Get cluster from parameter, environment variable, or use default
-        if not cluster:
-            cluster = os.getenv(ENV_CLUSTER) or DEFAULT_CLUSTER
-        self.cluster = cluster
+        # Cluster selection is explicit: it comes from --cluster, the
+        # environment, or docker-rt setup (which lists the portal's
+        # resource_map). Construction is offline, so an unset cluster only
+        # fails when the first exchange needs it (see ``token.fetch_token``).
+        self.cluster = (cluster or os.getenv(ENV_CLUSTER) or "").strip()
 
-        # Data-plane clients: cluster-direct + short-lived token. Profile /
-        # storage clients opt out (portal + long-lived key).
-        if self.USE_TICKET_AUTH:
-            self.base_url = token_base_url(self.base_url, self.cluster)
-
+        # Data-plane clients exchange the long-lived key on the portal and then
+        # target the cluster-direct ``api_base_url`` returned by the exchange
+        # (see ``_sync_api_base_url``). Profile / storage clients opt out
+        # (portal + long-lived key).
         self.timeout = timeout
 
         # Create session with retry strategy
@@ -373,9 +246,18 @@ class PyroMindClient:
         return response
     
     # ========== URL and Request Building ==========
-    
+
+    def _sync_api_base_url(self) -> None:
+        """Switch to the cluster-direct base URL returned by the exchange."""
+        if self._tokens is None:
+            return
+        self._tokens.token()
+        if self._tokens.api_base_url:
+            self.base_url = self._tokens.api_base_url
+
     def _build_url(self, endpoint: str) -> str:
         """Build full URL from endpoint"""
+        self._sync_api_base_url()
         return f"{self.base_url}/{endpoint.lstrip('/')}"
     
     def _build_request_context(self, method: str, url: str) -> str:

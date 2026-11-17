@@ -548,14 +548,10 @@ class SandboxClient(PyroMindClient):
         """
         if isinstance(command, str):
             command = command.strip()
-        url = build_exec_stream_websocket_url(
-            self.base_url,
-            sandbox_id,
-            self.cluster,
+        token, api_base_url = fetch_exec_stream_token(
+            self.exchange_base_url, sandbox_id, self.api_key, self.cluster
         )
-        token = fetch_exec_stream_token(
-            self.base_url, sandbox_id, self.api_key, self.cluster
-        )
+        url = build_exec_stream_websocket_url(api_base_url, sandbox_id)
         yield from iter_exec_stream(
             url=url,
             token=token,

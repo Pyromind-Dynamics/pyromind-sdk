@@ -695,16 +695,26 @@ def test_sweep_never_probes_storage_before_a_build_used_it(
     assert cs.sweep_stale_staging(dead_pid=1) == []
 
 
-def test_storage_endpoint_comes_from_the_cluster_table() -> None:
-    """One table (``CLUSTER_RESOURCE``), including clusters the SDK map omits."""
+def test_storage_endpoint_comes_from_storage_info(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``url`` from /storage_info is unmasked, so it is the single source now."""
     from ..backend import context_staging as cs
+    import pyromind_sdk.client.storage as storage_mod
 
-    assert (
-        cs.storage_endpoint_for("cn-east-1#pre")
-        == "https://storage-cn-east-1.pyromind-asia.cn"
+    seen = {}
+
+    def fake_info(*, api_key=None, base_url=None, cluster=None):
+        seen["cluster"] = cluster
+        return {"url": "https://storage.example/", "bucket_name": "1000001514"}
+
+    monkeypatch.setattr(storage_mod, "get_storage_info", fake_info)
+
+    assert cs.storage_endpoint_for("cn-east-1#pre") == "https://storage.example/"
+    assert seen["cluster"] == "cn-east-1#pre"
+
+    monkeypatch.setattr(
+        storage_mod, "get_storage_info", lambda **kwargs: {"bucket_name": "u"}
     )
-    assert cs.storage_endpoint_for("us-west-2") == "https://storage-us-west-2.pyromind.ai"
-    assert cs.storage_endpoint_for("not-a-cluster") == ""
+    assert cs.storage_endpoint_for("us-west-2") == ""
 
 
 

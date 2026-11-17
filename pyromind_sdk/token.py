@@ -1,7 +1,8 @@
 """Short-lived tokens: the long-lived API key never rides every request.
 
-The API key is only used to call ``POST /auth/token``.  Everything else puts a
-short-lived, purpose-scoped JWT on the wire:
+All requests start at the portal: ``POST {portal}/auth/token`` exchanges the
+long-lived key for a short-lived, purpose-scoped JWT **and** the cluster-direct
+``api_base_url`` that the following requests must use:
 
   * ``http``        — cached session token for REST calls (refreshed by TTL);
   * ``ws-terminal`` — first WebSocket auth frame for the terminal endpoint;
@@ -17,7 +18,6 @@ import asyncio
 import json
 import threading
 import time
-from urllib.parse import urlparse
 from typing import Optional, Tuple
 
 import aiohttp
@@ -52,36 +52,74 @@ def token_url(base_url: str) -> str:
     return f"{base_url.rstrip('/')}/{TOKEN_PATH}"
 
 
-def token_base_url(base_url: str, cluster: Optional[str] = None) -> str:
-    """Where to exchange tickets: always the cluster-direct API.
-
-    Portal (control plane) addresses do not serve ``/auth/token``; only the
-    per-cluster middleware does.  Mirrors the WebSocket URL resolution.
-    """
-    host = (urlparse(base_url).hostname or "").lower()
-    if "portal" in host and cluster:
-        from .client.base import resolve_base_url_from_cluster
-
-        return resolve_base_url_from_cluster(cluster)
-    return base_url
-
-
-def _request_body(purpose: str, sandbox_id: Optional[str]) -> dict:
+def _request_body(
+    purpose: str,
+    resource_type: Optional[str],
+    resource_id: Optional[str],
+    cluster: Optional[str],
+) -> dict:
     body: dict = {"purpose": purpose}
-    if sandbox_id:
-        body["sandbox_id"] = sandbox_id
+    if resource_type:
+        body["resource_type"] = resource_type
+    if resource_id:
+        body["resource_id"] = resource_id
+    if cluster:
+        body["cluster"] = cluster
     return body
 
 
-def _parse_token_response(payload: object, status: int) -> Tuple[str, int]:
+def _parse_token_response(payload: object, status: int) -> Tuple[str, int, str]:
     if isinstance(payload, dict):
         data = payload.get("data")
         if isinstance(data, dict):
             token = str(data.get("token") or "")
             expires_in = int(data.get("expires_in") or 0)
-            if token and expires_in > 0:
-                return token, expires_in
+            api_base_url = str(data.get("api_base_url") or "").strip()
+            if token and expires_in > 0 and api_base_url:
+                return token, expires_in, api_base_url.rstrip("/")
     raise TokenError(f"token exchange failed (HTTP {status}): malformed response")
+
+
+def fetch_resource_map(base_url: str, api_key: str) -> dict:
+    """Discover the clusters this credential may use, with their API bases.
+
+    This is the same exchange endpoint without a cluster: the portal answers
+    with ``resource_map`` only (no token can be bound before a selection).
+    Admin roles see every environment per cluster; other users see only the
+    portal's current environment.
+    """
+    url = token_url(base_url)
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        TRACE_ID_HEADER: ensure_trace_id(),
+    }
+    try:
+        response = requests.post(
+            url, json={"purpose": PURPOSE_HTTP}, headers=headers,
+            timeout=REQUEST_TIMEOUT_S,
+        )
+    except requests.RequestException as exc:
+        raise TokenError(
+            f"cluster discovery request failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    if not response.ok:
+        raise TokenError(
+            f"cluster discovery rejected (HTTP {response.status_code}) at {url}"
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise TokenError(
+            f"cluster discovery failed (HTTP {response.status_code}): invalid JSON"
+        ) from exc
+    data = payload.get("data") if isinstance(payload, dict) else None
+    resource_map = data.get("resource_map") if isinstance(data, dict) else None
+    if not isinstance(resource_map, dict) or not resource_map:
+        raise TokenError("cluster discovery returned no resource_map")
+    return resource_map
+
 
 
 def fetch_token(
@@ -89,10 +127,24 @@ def fetch_token(
     api_key: str,
     *,
     purpose: str = PURPOSE_HTTP,
-    sandbox_id: Optional[str] = None,
+    resource_type: Optional[str] = None,
+    resource_id: Optional[str] = None,
+    cluster: Optional[str] = None,
     timeout: int = REQUEST_TIMEOUT_S,
-) -> Tuple[str, int]:
-    """Exchange the long-lived key for one token.  Returns ``(token, ttl_s)``."""
+) -> Tuple[str, int, str]:
+    """Exchange the long-lived key on the portal.
+
+    ``resource_type``/``resource_id`` bind a WebSocket token to one object
+    (e.g. ``sandbox`` + ``sb-...``).  Returns ``(token, ttl_s, api_base_url)``
+    where ``api_base_url`` is the cluster-direct base URL every later request
+    must target.
+    """
+    if not cluster:
+        raise TokenError(
+            "cluster is required to exchange a token: choose one from the "
+            "portal's resource_map (docker-rt setup lists them) or set "
+            "PYROMIND_CLUSTER."
+        )
     url = token_url(base_url)
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -105,7 +157,7 @@ def fetch_token(
         try:
             response = requests.post(
                 url,
-                json=_request_body(purpose, sandbox_id),
+                json=_request_body(purpose, resource_type, resource_id, cluster),
                 headers=headers,
                 timeout=timeout,
             )
@@ -127,7 +179,9 @@ def fetch_token(
         ) from last_exc
 
     if not response.ok:
-        raise TokenError(f"token exchange rejected (HTTP {response.status_code})")
+        raise TokenError(
+            f"token exchange rejected (HTTP {response.status_code}) at {url}"
+        )
     try:
         payload = response.json()
     except ValueError as exc:
@@ -142,10 +196,18 @@ async def async_fetch_token(
     api_key: str,
     *,
     purpose: str = PURPOSE_HTTP,
-    sandbox_id: Optional[str] = None,
+    resource_type: Optional[str] = None,
+    resource_id: Optional[str] = None,
+    cluster: Optional[str] = None,
     timeout: int = REQUEST_TIMEOUT_S,
-) -> Tuple[str, int]:
+) -> Tuple[str, int, str]:
     """Async variant of :func:`fetch_token`."""
+    if not cluster:
+        raise TokenError(
+            "cluster is required to exchange a token: choose one from the "
+            "portal's resource_map (docker-rt setup lists them) or set "
+            "PYROMIND_CLUSTER."
+        )
     url = token_url(base_url)
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -162,7 +224,9 @@ async def async_fetch_token(
         try:
             async with aiohttp.ClientSession(timeout=client_timeout) as session:
                 async with session.post(
-                    url, json=_request_body(purpose, sandbox_id), headers=headers
+                    url,
+                    json=_request_body(purpose, resource_type, resource_id, cluster),
+                    headers=headers,
                 ) as response:
                     status = response.status
                     if (
@@ -193,7 +257,7 @@ async def async_fetch_token(
         ) from last_exc
 
     if status >= 400:
-        raise TokenError(f"token exchange rejected (HTTP {status})")
+        raise TokenError(f"token exchange rejected (HTTP {status}) at {url}")
     return _parse_token_response(payload, status)
 
 
@@ -208,12 +272,15 @@ class HttpTokenCache:
         cluster: Optional[str] = None,
         refresh_skew_s: int = REFRESH_SKEW_S,
     ) -> None:
-        self._base_url = token_base_url(base_url, cluster)
+        self._exchange_url = base_url.rstrip("/")
         self._api_key = api_key
+        self._cluster = cluster
         self._refresh_skew_s = refresh_skew_s
         self._token: Optional[str] = None
         self._expires_at = 0.0
         self._lock = threading.Lock()
+        #: Cluster-direct base URL returned by the portal exchange.
+        self.api_base_url: Optional[str] = None
 
     def token(self, *, force_refresh: bool = False) -> str:
         with self._lock:
@@ -223,11 +290,15 @@ class HttpTokenCache:
             )
             if fresh and not force_refresh:
                 return self._token  # type: ignore[return-value]
-            token, ttl = fetch_token(
-                self._base_url, self._api_key, purpose=PURPOSE_HTTP
+            token, ttl, api_base_url = fetch_token(
+                self._exchange_url,
+                self._api_key,
+                purpose=PURPOSE_HTTP,
+                cluster=self._cluster,
             )
             self._token = token
             self._expires_at = time.monotonic() + ttl
+            self.api_base_url = api_base_url
             return token
 
     def invalidate(self) -> None:
@@ -247,12 +318,15 @@ class AsyncHttpTokenCache:
         cluster: Optional[str] = None,
         refresh_skew_s: int = REFRESH_SKEW_S,
     ) -> None:
-        self._base_url = token_base_url(base_url, cluster)
+        self._exchange_url = base_url.rstrip("/")
         self._api_key = api_key
+        self._cluster = cluster
         self._refresh_skew_s = refresh_skew_s
         self._token: Optional[str] = None
         self._expires_at = 0.0
         self._lock: Optional[asyncio.Lock] = None
+        #: Cluster-direct base URL returned by the portal exchange.
+        self.api_base_url: Optional[str] = None
 
     def _get_lock(self) -> asyncio.Lock:
         if self._lock is None:
@@ -267,11 +341,15 @@ class AsyncHttpTokenCache:
             )
             if fresh and not force_refresh:
                 return self._token  # type: ignore[return-value]
-            token, ttl = await async_fetch_token(
-                self._base_url, self._api_key, purpose=PURPOSE_HTTP
+            token, ttl, api_base_url = await async_fetch_token(
+                self._exchange_url,
+                self._api_key,
+                purpose=PURPOSE_HTTP,
+                cluster=self._cluster,
             )
             self._token = token
             self._expires_at = time.monotonic() + ttl
+            self.api_base_url = api_base_url
             return token
 
     async def invalidate(self) -> None:
