@@ -225,6 +225,26 @@ class TestInferenceStartupArgs:
 
 # --- control plane vs data plane ---
 
+class TestNonProdRequiresPortal:
+    def test_pre_cluster_without_base_url_fails_fast(self, monkeypatch):
+        """非 prod 集群 + 未设 PYROMIND_BASE_URL：显式失败，不能落到 prod 门户。"""
+        monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
+        with pytest.raises(ValueError, match="PYROMIND_BASE_URL"):
+            PyroMindClient(api_key="test-key", cluster="us-west-2#pre")
+
+    def test_pre_cluster_with_base_url_is_ok(self, monkeypatch):
+        monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
+        client = PyroMindClient(
+            api_key="test-key",
+            base_url="https://pre-api-portal.pyromind.ai/api/v1",
+            cluster="us-west-2#pre",
+        )
+        try:
+            assert client.exchange_base_url.startswith("https://pre-api-portal")
+        finally:
+            client.close()
+
+
 class TestProfileClientBaseUrl:
     def test_profile_client_stays_on_the_portal(self, monkeypatch):
         from pyromind_sdk.client.base import DEFAULT_API_BASE_URL

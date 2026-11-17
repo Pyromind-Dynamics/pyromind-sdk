@@ -4936,7 +4936,7 @@ def _pyromind_terminal_exchange() -> tuple[str, str, str]:
     if not cluster:
         raise RuntimeError(
             "PYROMIND_CLUSTER is not set; docker-rt must select a cluster "
-            "from the portal's resource_map before opening a terminal."
+            "from the portal's available clusters before opening a terminal."
         )
     return base.rstrip("/"), cluster, api_key
 

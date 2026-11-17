@@ -68,8 +68,10 @@ class PyroMindAsyncAPIError(Exception):
 
 
 class PyroMindAsyncClient:
-    #: Profile/account APIs live on portal and still use the long-lived key.
+    #: 是否用短时 token 换票（数据面客户端都是 True）。
     USE_TICKET_AUTH = True
+    #: 即使换票成功也保持 portal 地址（portal 本地 API 用）。
+    KEEP_PORTAL_BASE = False
 
     """
     Async base client class for PyroMind API
@@ -121,26 +123,28 @@ class PyroMindAsyncClient:
         # Strip whitespace from API key
         api_key = api_key.strip()
 
-        # Get base URL from parameter, environment variable, or use default
-        if not base_url:
-            base_url = os.getenv(ENV_BASE_URL) or DEFAULT_API_BASE_URL
-
-        if not base_url:
-            raise ValueError(
-                f"Base URL is required. Please provide it either as a parameter "
-                f"or set the {ENV_BASE_URL} environment variable."
-            )
+        # 门户地址必须显式提供（参数或 PYROMIND_BASE_URL）；只有全部缺失时才
+        # 落到默认 prod 门户。非 prod 集群 + 默认门户视为配置错误，直接失败，
+        # 不按 cluster/env 猜门户地址。
+        configured_base = (base_url or os.getenv(ENV_BASE_URL) or "").strip()
+        base_url = configured_base or DEFAULT_API_BASE_URL
         self.api_key = api_key
         self.base_url = base_url.rstrip('/')
-        #: Portal address used for credential exchange; ``base_url`` switches
-        #: to the cluster-direct address after the first exchange.
+        #: 换票用门户地址；首次换票后 ``base_url`` 会切到集群直连地址。
         self.exchange_base_url = self.base_url
 
-        # Cluster selection is explicit: it comes from --cluster, the
-        # environment, or docker-rt setup (which lists the portal's
-        # resource_map). Construction is offline, so an unset cluster only
-        # fails when the first exchange needs it (see ``token.fetch_token``).
+        # 集群选择是显式的：--cluster、环境变量或 docker-rt 启动时从门户列表选。
+        # 构造阶段不联网；未设置集群时，第一次换票才报错（见 token.fetch_token）。
         self.cluster = (cluster or os.getenv(ENV_CLUSTER) or "").strip()
+        cluster_env = (
+            self.cluster.partition("#")[2] if "#" in self.cluster else "prod"
+        )
+        if not configured_base and cluster_env != "prod":
+            raise ValueError(
+                f"PYROMIND_CLUSTER={self.cluster!r} targets the "
+                f"{cluster_env!r} environment; set PYROMIND_BASE_URL to that "
+                "environment's portal (the default base URL is the prod portal)."
+            )
 
         # Data-plane clients exchange the long-lived key on the portal and then
         # target the cluster-direct ``api_base_url`` returned by the exchange
@@ -228,10 +232,13 @@ class PyroMindAsyncClient:
     # ========== URL and Request Building ==========
 
     async def _ensure_api_base_url(self) -> None:
-        """Switch to the cluster-direct base URL returned by the exchange."""
+        """切换到换票返回的集群直连地址。"""
         if self._tokens is None:
             return
         await self._tokens.token()
+        if self.KEEP_PORTAL_BASE:
+            # portal 本地 API 不切到集群直连。
+            return
         if self._tokens.api_base_url:
             self.base_url = self._tokens.api_base_url
 
@@ -424,8 +431,8 @@ class PyroMindAsyncClient:
         headers.setdefault(TRACE_ID_HEADER, ensure_trace_id())
         kwargs["headers"] = headers
         logger.debug("[REQUEST] %s %s", method.upper(), redact_text(url))
-        # Same one-shot 401 refresh as the JSON path: a token that rotated
-        # before/while the raw request ran must not fail a whole transfer.
+        # 与 JSON 路径相同的一次 401 换票重试：raw 请求开始前/途中 token
+        # 轮转不应让整个传输失败。
         request_ctx = None
         for attempt in (0, 1):
             headers["Authorization"] = (

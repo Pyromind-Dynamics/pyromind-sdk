@@ -19,7 +19,9 @@ from .models import (
 
 
 class ProfileClient(PyroMindClient):
-    USE_TICKET_AUTH = False
+    #: profile/account 接口由 portal 本地处理：用短时 token，但地址保持在 portal。
+    USE_TICKET_AUTH = True
+    KEEP_PORTAL_BASE = True
     """
     Client for managing profile-related operations
 

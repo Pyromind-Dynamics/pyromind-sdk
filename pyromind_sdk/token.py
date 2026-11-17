@@ -80,13 +80,16 @@ def _parse_token_response(payload: object, status: int) -> Tuple[str, int, str]:
     raise TokenError(f"token exchange failed (HTTP {status}): malformed response")
 
 
-def fetch_resource_map(base_url: str, api_key: str) -> dict:
-    """Discover the clusters this credential may use, with their API bases.
+def fetch_cluster_hosts(base_url: str, api_key: str) -> list[dict]:
+    """发现这份凭据可用的集群。
 
-    This is the same exchange endpoint without a cluster: the portal answers
-    with ``resource_map`` only (no token can be bound before a selection).
-    Admin roles see every environment per cluster; other users see only the
-    portal's current environment.
+    门户用一个不带 cluster 的换票请求应答，实现与 console 的
+    ``/account/user_clusters_list`` 相同：丢弃 ``unapply`` 条目，只保留
+    ``cluster`` + ``host``::
+
+        [{"cluster": "us-west-2#pre", "host": "pre-api-us-west-2.pyromind.ai"}]
+
+    ``cluster`` 已带环境后缀（``code#env``）；选定集群后由门户返回直连地址。
     """
     url = token_url(base_url)
     headers = {
@@ -115,10 +118,21 @@ def fetch_resource_map(base_url: str, api_key: str) -> dict:
             f"cluster discovery failed (HTTP {response.status_code}): invalid JSON"
         ) from exc
     data = payload.get("data") if isinstance(payload, dict) else None
-    resource_map = data.get("resource_map") if isinstance(data, dict) else None
-    if not isinstance(resource_map, dict) or not resource_map:
-        raise TokenError("cluster discovery returned no resource_map")
-    return resource_map
+    raw = data.get("clusters") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        raise TokenError("cluster discovery returned no clusters")
+
+    clusters: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        cluster = str(item.get("cluster") or "").strip()
+        if not cluster:
+            continue
+        clusters.append(
+            {"cluster": cluster, "host": str(item.get("host") or "").strip()}
+        )
+    return clusters
 
 
 
@@ -142,7 +156,7 @@ def fetch_token(
     if not cluster:
         raise TokenError(
             "cluster is required to exchange a token: choose one from the "
-            "portal's resource_map (docker-rt setup lists them) or set "
+            "portal's available clusters (docker-rt setup lists them) or set "
             "PYROMIND_CLUSTER."
         )
     url = token_url(base_url)
@@ -205,7 +219,7 @@ async def async_fetch_token(
     if not cluster:
         raise TokenError(
             "cluster is required to exchange a token: choose one from the "
-            "portal's resource_map (docker-rt setup lists them) or set "
+            "portal's available clusters (docker-rt setup lists them) or set "
             "PYROMIND_CLUSTER."
         )
     url = token_url(base_url)

@@ -305,4 +305,4 @@ def test_cluster_help_points_at_the_portal_resource_map() -> None:
     help_text = prepare_server_parser().format_help()
 
     assert "--cluster" in help_text
-    assert "resource_map" in help_text
+    assert "available clusters" in help_text

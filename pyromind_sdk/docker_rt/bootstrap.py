@@ -116,24 +116,36 @@ def _ask_cluster(
     stdout: Any,
     color: bool,
 ) -> str:
-    """Ask the portal which clusters this key may use, then prompt for one.
+    """向门户查询这份 key 可用的集群，再交互选择一个。
 
-    The portal's ``resource_map`` drives the choices: every ``<cluster>#<env>``
-    pair the account may use is printed one per line (admin-role accounts see
-    every environment per cluster; other accounts only the current
-    environment).  A bare cluster code is still accepted; when it maps to
-    several environments the environment is asked separately.
+    门户发现接口（console ``user_clusters_list`` 背后的实现）返回
+    ``[{"cluster", "host"}]``，``unapply`` 条目已过滤，``cluster`` 自带
+    环境后缀。所有可用组合逐行打印；也接受裸集群代码，多环境时再追问一次。
     """
     from ..client.base import DEFAULT_API_BASE_URL, ENV_BASE_URL
-    from ..token import fetch_resource_map
+    from ..token import fetch_cluster_hosts
 
     base = (os.getenv(ENV_BASE_URL) or "").strip() or DEFAULT_API_BASE_URL
-    resource_map = fetch_resource_map(base, api_key)
-    entries = [
-        f"{code}#{env}"
-        for code in sorted(resource_map)
-        for env in sorted(resource_map[code])
-    ]
+    clusters = fetch_cluster_hosts(base, api_key)
+
+    entries: list[str] = []
+    envs_by_code: dict[str, list[str]] = {}
+    for item in clusters:
+        raw = item.get("cluster") or ""
+        code, _, env = raw.partition("#")
+        code = code.strip()
+        env = env.strip() or "prod"
+        if not code:
+            continue
+        value = f"{code}#{env}"
+        if value in entries:
+            continue
+        entries.append(value)
+        envs_by_code.setdefault(code, []).append(env)
+    entries.sort()
+    for envs in envs_by_code.values():
+        envs.sort()
+
     if not entries:
         raise RuntimeError("no clusters are enabled for this account")
 
@@ -159,17 +171,17 @@ def _ask_cluster(
         candidate = _prompt(prompt, stdin=stdin, stdout=stdout)
         if candidate in entries:
             return candidate
-        if candidate in resource_map:
-            envs = sorted(resource_map[candidate])
+        if candidate in envs_by_code:
+            envs = envs_by_code[candidate]
             if len(envs) == 1:
                 return f"{candidate}#{envs[0]}"
             env = _ask_environment(envs, stdin=stdin, stdout=stdout, color=color)
             return f"{candidate}#{env}"
         code, _, env = candidate.partition("#")
         env = env.strip()
-        if env in _PRE_ENVS and code.strip() in resource_map:
-            # 预发只对内部用户下发：portal 已从 resource_map 过滤，这里给出
-            # 明确原因，避免落到含混的 "Unknown cluster"。
+        if env in _PRE_ENVS and code.strip() in envs_by_code:
+            # 预发只对内部用户下发：portal 已过滤，这里给出明确原因，
+            # 避免落到含混的 "Unknown cluster"。
             stdout.write(
                 f"Environment {env!r} requires an internal user; "
                 "choose one of the clusters listed above\n"

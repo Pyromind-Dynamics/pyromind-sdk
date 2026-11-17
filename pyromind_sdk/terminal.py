@@ -72,7 +72,7 @@ class TerminalError(RuntimeError):
 
 
 class TerminalAuthExpired(TerminalError):
-    """The short-lived WS token was rejected before the session produced data."""
+    """短时 WS token 在会话产生任何输出之前被拒绝。"""
 
 
 def _websocket_url(
@@ -298,8 +298,8 @@ async def _run_session(url: str, token: str) -> None:
             await asyncio.gather(sender, receiver, pinger, watchdog, return_exceptions=True)
             await ws.close()
 
-        # 4001 before any PTY byte = the server rejected the token (not a shell
-        # exit). Surface it so the caller can mint a fresh token and retry once.
+        # 一个 PTY 字节都没收到就 4001：是服务端拒绝 token（不是 shell 退出）。
+        # 抛出去，让调用方换一张新票并重试一次。
         if ws.close_code == 4001 and not saw_data[0]:
             raise TerminalAuthExpired(
                 "terminal auth token rejected (close code 4001)"
@@ -328,7 +328,7 @@ def run_terminal(
     if not cluster:
         print(
             f"Error: --cluster is required (or set {ENV_CLUSTER}); choose one "
-            "from the portal's resource_map (docker-rt setup lists them).",
+            "from the portal's available clusters (docker-rt setup lists them).",
             file=sys.stderr,
         )
         return 1
@@ -381,7 +381,7 @@ def run_terminal(
             except TerminalAuthExpired as e:
                 if attempt == 1:
                     raise
-                # 60s WS token may have expired on a slow link: mint once more.
+                # 60s 的 WS token 在慢链路上可能已过期：再换一次。
                 logger.warning(
                     "terminal token rejected, minting a fresh one: %s", e
                 )

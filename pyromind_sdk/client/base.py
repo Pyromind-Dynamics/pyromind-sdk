@@ -123,9 +123,10 @@ class PyroMindAPIError(Exception):
 
 
 class PyroMindClient:
-    #: Profile/account APIs live on portal and still use the long-lived key;
-    #: every data-plane client keeps this True (cluster-direct + short token).
+    #: 是否用短时 token 换票（数据面客户端都是 True）。
     USE_TICKET_AUTH = True
+    #: 即使换票成功也保持 portal 地址（profile/account 这类 portal 本地 API）。
+    KEEP_PORTAL_BASE = False
 
     """
     Base client class for PyroMind API
@@ -172,26 +173,28 @@ class PyroMindClient:
         # Strip whitespace from API key
         api_key = api_key.strip()
 
-        # Get base URL from parameter, environment variable, or use default
-        if not base_url:
-            base_url = os.getenv(ENV_BASE_URL) or DEFAULT_API_BASE_URL
-
-        if not base_url:
-            raise ValueError(
-                f"Base URL is required. Please provide it either as a parameter "
-                f"or set the {ENV_BASE_URL} environment variable."
-            )
+        # 门户地址必须显式提供（参数或 PYROMIND_BASE_URL）；只有全部缺失时才
+        # 落到默认 prod 门户。非 prod 集群 + 默认门户视为配置错误，直接失败，
+        # 不按 cluster/env 猜门户地址。
+        configured_base = (base_url or os.getenv(ENV_BASE_URL) or "").strip()
+        base_url = configured_base or DEFAULT_API_BASE_URL
         self.api_key = api_key
         self.base_url = base_url.rstrip('/')
-        #: Portal address used for credential exchange; ``base_url`` switches
-        #: to the cluster-direct address after the first exchange.
+        #: 换票用门户地址；首次换票后 ``base_url`` 会切到集群直连地址。
         self.exchange_base_url = self.base_url
 
-        # Cluster selection is explicit: it comes from --cluster, the
-        # environment, or docker-rt setup (which lists the portal's
-        # resource_map). Construction is offline, so an unset cluster only
-        # fails when the first exchange needs it (see ``token.fetch_token``).
+        # 集群选择是显式的：--cluster、环境变量或 docker-rt 启动时从门户列表选。
+        # 构造阶段不联网；未设置集群时，第一次换票才报错（见 token.fetch_token）。
         self.cluster = (cluster or os.getenv(ENV_CLUSTER) or "").strip()
+        cluster_env = (
+            self.cluster.partition("#")[2] if "#" in self.cluster else "prod"
+        )
+        if not configured_base and cluster_env != "prod":
+            raise ValueError(
+                f"PYROMIND_CLUSTER={self.cluster!r} targets the "
+                f"{cluster_env!r} environment; set PYROMIND_BASE_URL to that "
+                "environment's portal (the default base URL is the prod portal)."
+            )
 
         # Data-plane clients exchange the long-lived key on the portal and then
         # target the cluster-direct ``api_base_url`` returned by the exchange
@@ -248,18 +251,21 @@ class PyroMindClient:
     # ========== URL and Request Building ==========
 
     def _sync_api_base_url(self) -> None:
-        """Exchange once (cached) and switch to the cluster-direct base URL."""
+        """换票一次（有缓存）并切换到集群直连地址。"""
         if self._tokens is None:
             return
         self._tokens.token()
+        if self.KEEP_PORTAL_BASE:
+            # profile/account 这类接口在 portal 本地处理，不能切到集群直连。
+            return
         if self._tokens.api_base_url:
             self.base_url = self._tokens.api_base_url
 
     def _build_url(self, endpoint: str) -> str:
-        """Build full URL from endpoint — no I/O.
+        """按 endpoint 拼完整 URL，**不做任何 I/O**。
 
-        Callers must have run :meth:`_sync_api_base_url` first; request entry
-        points do it explicitly so URL building stays a pure function.
+        调用方必须先执行 :meth:`_sync_api_base_url`；请求入口会显式调用，
+        这样 URL 构建始终是纯函数。
         """
         return f"{self.base_url}/{endpoint.lstrip('/')}"
     
@@ -453,9 +459,8 @@ class PyroMindClient:
         kwargs["headers"] = headers
         kwargs.setdefault("timeout", self.timeout)
         logger.debug("[REQUEST] %s %s", method.upper(), redact_text(url))
-        # Raw calls (file read/write, chunked upload) need the same one-shot
-        # 401 refresh as the JSON path: a token that rotated mid-transfer must
-        # not fail the whole operation.
+        # 文件读写/分块上传也要和 JSON 路径一样做一次 401 换票重试：
+        # 传输途中 token 轮转不应让整个操作失败。
         for attempt in (0, 1):
             headers["Authorization"] = (
                 f"Bearer {self._tokens.token(force_refresh=attempt > 0)}"

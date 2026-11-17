@@ -306,7 +306,7 @@ def prepare_server_parser() -> Any:
     parser.add_argument(
         "--cluster",
         default=None,
-        help="Target cluster from your account resource_map (docker-rt setup lists them); defaults to $PYROMIND_CLUSTER",
+        help="Target cluster from your account's available clusters (docker-rt setup lists them); defaults to $PYROMIND_CLUSTER",
     )
     parser.add_argument(
         "--ready-timeout",

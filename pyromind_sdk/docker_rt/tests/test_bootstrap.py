@@ -26,14 +26,21 @@ _TEST_MAP = {
 
 
 @pytest.fixture(autouse=True)
-def _stub_resource_map(monkeypatch: MonkeyPatch):
+def _stub_cluster_hosts(monkeypatch: MonkeyPatch):
     """Cluster choices come from the portal, not from a local table."""
     import pyromind_sdk.token as token_mod
 
+    def _hosts(resource_map):
+        return [
+            {"cluster": f"{code}#{env}", "host": f"{code}-{env}.example"}
+            for code in resource_map
+            for env in resource_map[code]
+        ]
+
     monkeypatch.setattr(
         token_mod,
-        "fetch_resource_map",
-        lambda base_url, api_key: _TEST_MAP,
+        "fetch_cluster_hosts",
+        lambda base_url, api_key: _hosts(_TEST_MAP),
     )
 
 
@@ -130,8 +137,8 @@ def test_prepare_env_does_not_create_backend_env(monkeypatch: MonkeyPatch) -> No
     assert os.getenv("DOCKER_RT_BACKEND") is None
 
 
-def test_cluster_prompt_lists_the_portal_resource_map(monkeypatch: MonkeyPatch) -> None:
-    """Choices come from the portal's resource_map, one ``cluster#env`` per line."""
+def test_cluster_prompt_lists_the_portal_clusters(monkeypatch: MonkeyPatch) -> None:
+    """Choices come from the portal cluster list, one ``cluster#env`` per line."""
     monkeypatch.setenv("PYROMIND_API_KEY", "existing-key")
     monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
 
@@ -172,10 +179,10 @@ def test_pre_is_rejected_when_the_portal_hides_it(monkeypatch: MonkeyPatch) -> N
 
     monkeypatch.setattr(
         token_mod,
-        "fetch_resource_map",
-        lambda base_url, api_key: {
-            "us-west-2": {"prod": "https://prod-west2.example/api/v1"},
-        },
+        "fetch_cluster_hosts",
+        lambda base_url, api_key: [
+            {"cluster": "us-west-2#prod", "host": "prod-west2.example"},
+        ],
     )
     monkeypatch.setenv("PYROMIND_API_KEY", "existing-key")
     monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)

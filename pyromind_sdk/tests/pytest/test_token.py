@@ -263,13 +263,15 @@ def test_http_cache_exchanges_at_the_portal_and_keeps_the_direct_base(
     assert cache.api_base_url == _DIRECT
 
 
-def test_profile_client_stays_on_portal_with_the_long_lived_key(monkeypatch) -> None:
-    """Profile/account APIs stay on portal; they never exchange tokens."""
+def test_profile_client_uses_portal_token_but_stays_on_portal(monkeypatch) -> None:
+    """profile/account 接口由 portal 本地处理：带短时 token，但地址不切到集群。"""
     from pyromind_sdk.client.profile import ProfileClient
 
     calls = []
     monkeypatch.setattr(
-        sdk_token, "fetch_token", lambda *a, **k: calls.append(1) or ("t", 900, _DIRECT)
+        sdk_token,
+        "fetch_token",
+        lambda *a, **k: calls.append(1) or ("portal-token", 900, _DIRECT),
     )
     client = ProfileClient(
         api_key="long-term-key",
@@ -294,8 +296,8 @@ def test_profile_client_stays_on_portal_with_the_long_lived_key(monkeypatch) -> 
     client._request("GET", "/user_info")
 
     assert seen["url"].startswith("https://api-portal.pyromind.ai/api/v1/")
-    assert seen["auth"] == "Bearer long-term-key"
-    assert calls == []
+    assert seen["auth"] == "Bearer portal-token"
+    assert calls == [1], "profile 也要先换票，只用短时 token 调 portal"
 
 
 def test_direct_client_uses_the_short_lived_token_and_direct_base(

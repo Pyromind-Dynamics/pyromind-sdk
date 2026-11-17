@@ -32,10 +32,9 @@ def apply_timeout(
     docker_constants: Any,
     timeout: int,
 ) -> None:
-    """Patch the timeout defaults used by Docker SDK client creation.
+    """修改 Docker SDK 创建 client 时使用的默认超时。
 
-    Only modules that actually expose the attribute are touched so a newer or
-    trimmed docker SDK cannot make interpreter startup fail.
+    只改真正暴露该属性的模块，避免新版/裁剪版 docker SDK 让解释器启动失败。
     """
     for module in (docker_constants, docker_client, docker_api_client):
         if hasattr(module, "DEFAULT_TIMEOUT_SECONDS"):
@@ -43,11 +42,10 @@ def apply_timeout(
 
 
 def install() -> bool:
-    """Patch the official Docker SDK when it is available.
+    """官方 Docker SDK 存在时修改它的超时默认值。
 
-    This runs from a ``.pth`` file, i.e. on **every** Python start in the
-    environment. A failure here must never take the interpreter down, so every
-    step is guarded and only existing attributes are touched.
+    该函数由 ``.pth`` 文件调用，即环境中**每个** Python 进程启动都会执行；
+    任何失败都不能带崩解释器，因此每一步都有兜底，且只改已存在的属性。
     """
     try:
         import docker.api.client

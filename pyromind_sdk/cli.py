@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     terminal.add_argument("sandbox_id", type=str, help="Sandbox id, e.g. sb-xxxx")
     terminal.add_argument(
         "--cluster", type=str, required=False,
-        help="Target cluster from your account resource_map (docker-rt setup lists them); defaults to $PYROMIND_CLUSTER",
+        help="Target cluster from your account's available clusters (docker-rt setup lists them); defaults to $PYROMIND_CLUSTER",
     )
     terminal.add_argument(
         "--api-key", type=str, default=None,
@@ -104,7 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
     docker_rt.add_argument(
         "--cluster",
         default=None,
-        help="Target cluster from your account resource_map (docker-rt setup lists them); defaults to $PYROMIND_CLUSTER",
+        help="Target cluster from your account's available clusters (docker-rt setup lists them); defaults to $PYROMIND_CLUSTER",
     )
 
     docker_rt_context = subparsers.add_parser(

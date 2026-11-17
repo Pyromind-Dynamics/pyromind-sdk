@@ -372,16 +372,14 @@ def workspace_bucket(profile: Any) -> str:
 
 
 def storage_endpoint_for(cluster: str | None) -> str:
-    """Storage endpoint for a cluster, from ``/storage_info``.
+    """从 ``/storage_info`` 取集群的 storage endpoint。
 
-    The endpoint ``url`` is returned unmasked; the credential fields are not
-    used here — ``StorageClient`` reads ``PYROMIND_STORAGE_ACCESS_KEY`` /
-    ``PYROMIND_STORAGE_SECRET_KEY`` from the environment, so a masked key in
-    the response cannot silently degrade into a wrong credential.
+    只使用返回的 ``url``（不打码）；凭据字段不使用 —— ``StorageClient`` 读取
+    环境变量 ``PYROMIND_STORAGE_ACCESS_KEY`` / ``PYROMIND_STORAGE_SECRET_KEY``，
+    响应里被打码的 key 不会悄悄变成错误凭据。
 
-    Fails loudly: an empty endpoint must never fall back to ``StorageClient``'s
-    default (``us-west-2``), which would stage a build context into the wrong
-    cluster's bucket.
+    失败要响亮：endpoint 为空时绝不能回退到 ``StorageClient`` 的默认值
+    （``us-west-2``），否则构建上下文会被传到错误集群的 bucket。
     """
     try:
         from ...client.storage import get_storage_info

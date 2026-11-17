@@ -51,9 +51,9 @@ class SandboxExecStreamError(RuntimeError):
 
 
 class SandboxExecStreamAuthExpired(SandboxExecStreamError):
-    """The WS token was rejected (close 4001) before any output was produced.
+    """WS token 在产生任何输出之前被拒（close 4001）。
 
-    Safe to retry with a freshly minted token: the command never ran.
+    命令尚未执行，可以用新换的 token 安全重试一次。
     """
 
 
@@ -448,7 +448,7 @@ def iter_exec_stream(
                 except SandboxExecStreamAuthExpired:
                     if attempt == 1 or refresh_token is None:
                         raise
-                    # Auth rejected before any output: safe to re-mint once.
+                    # 输出前鉴权被拒：可以安全地重新换票一次。
                     current = refresh_token()
 
         try:
@@ -490,10 +490,10 @@ async def iter_exec_stream_async(
     stdin_close: Optional[threading.Event] = None,
     refresh_token: Optional[Callable[[], Awaitable[str]]] = None,
 ) -> AsyncIterator[SandboxExecStreamChunk]:
-    """Yield streaming exec events asynchronously.
+    """异步产出 exec-stream 事件。
 
-    ``refresh_token`` is called at most once when the server rejects the token
-    (close 4001) before any output; the command is safe to resend then.
+    服务端在产生输出前拒绝 token（close 4001）时，最多调用一次
+    ``refresh_token`` 重新换票；此时命令尚未执行，可以安全重发。
     """
     current = token
     for attempt in (0, 1):
