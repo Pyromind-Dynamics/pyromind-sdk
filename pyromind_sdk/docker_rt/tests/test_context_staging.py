@@ -714,7 +714,9 @@ def test_storage_endpoint_comes_from_storage_info(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(
         storage_mod, "get_storage_info", lambda **kwargs: {"bucket_name": "u"}
     )
-    assert cs.storage_endpoint_for("us-west-2") == ""
+    # 没有 url 必须响亮失败，不能回退到 StorageClient 的默认集群端点。
+    with pytest.raises(cs.StagingError):
+        cs.storage_endpoint_for("us-west-2")
 
 
 

@@ -248,7 +248,7 @@ class PyroMindClient:
     # ========== URL and Request Building ==========
 
     def _sync_api_base_url(self) -> None:
-        """Switch to the cluster-direct base URL returned by the exchange."""
+        """Exchange once (cached) and switch to the cluster-direct base URL."""
         if self._tokens is None:
             return
         self._tokens.token()
@@ -256,8 +256,11 @@ class PyroMindClient:
             self.base_url = self._tokens.api_base_url
 
     def _build_url(self, endpoint: str) -> str:
-        """Build full URL from endpoint"""
-        self._sync_api_base_url()
+        """Build full URL from endpoint — no I/O.
+
+        Callers must have run :meth:`_sync_api_base_url` first; request entry
+        points do it explicitly so URL building stays a pure function.
+        """
         return f"{self.base_url}/{endpoint.lstrip('/')}"
     
     def _build_request_context(self, method: str, url: str) -> str:
@@ -447,16 +450,31 @@ class PyroMindClient:
         """
         headers = dict(kwargs.pop("headers", None) or {})
         headers.update(self._trace_headers())
-        headers["Authorization"] = (
-            f"Bearer {self._tokens.token()}"
-            if self._tokens is not None
-            else f"Bearer {self.api_key}"
-        )
+        kwargs["headers"] = headers
         kwargs.setdefault("timeout", self.timeout)
         logger.debug("[REQUEST] %s %s", method.upper(), redact_text(url))
-        response = self.session.request(
-            method=method, url=url, headers=headers, **kwargs
-        )
+        # Raw calls (file read/write, chunked upload) need the same one-shot
+        # 401 refresh as the JSON path: a token that rotated mid-transfer must
+        # not fail the whole operation.
+        for attempt in (0, 1):
+            headers["Authorization"] = (
+                f"Bearer {self._tokens.token(force_refresh=attempt > 0)}"
+                if self._tokens is not None
+                else f"Bearer {self.api_key}"
+            )
+            response = self.session.request(
+                method=method, url=url, **kwargs
+            )
+            if (
+                response.status_code != 401
+                or attempt == 1
+                or self._tokens is None
+            ):
+                break
+            logger.info(
+                "[AUTH] token rejected on raw request, refreshing once: %s",
+                redact_text(url),
+            )
         logger.debug(
             "[RESPONSE] %s %s -> %s (%s bytes)",
             method.upper(),
@@ -527,6 +545,7 @@ class PyroMindClient:
         Raises:
             PyroMindAPIError: If the request fails
         """
+        self._sync_api_base_url()
         url = self._build_url(endpoint)
         request_context = self._build_request_context(method, url)
         

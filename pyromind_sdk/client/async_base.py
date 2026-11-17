@@ -422,21 +422,41 @@ class PyroMindAsyncClient:
         """
         headers = dict(kwargs.pop("headers", None) or {})
         headers.setdefault(TRACE_ID_HEADER, ensure_trace_id())
-        headers["Authorization"] = (
-            f"Bearer {await self._tokens.token()}"
-            if self._tokens is not None
-            else f"Bearer {self.api_key}"
-        )
         kwargs["headers"] = headers
         logger.debug("[REQUEST] %s %s", method.upper(), redact_text(url))
-        async with session.request(method, url, **kwargs) as response:
-            logger.debug(
-                "[RESPONSE] %s %s -> %s",
-                method.upper(),
-                redact_text(url),
-                response.status,
+        # Same one-shot 401 refresh as the JSON path: a token that rotated
+        # before/while the raw request ran must not fail a whole transfer.
+        request_ctx = None
+        for attempt in (0, 1):
+            headers["Authorization"] = (
+                f"Bearer {await self._tokens.token(force_refresh=attempt > 0)}"
+                if self._tokens is not None
+                else f"Bearer {self.api_key}"
             )
+            request_ctx = session.request(method, url, **kwargs)
+            response = await request_ctx.__aenter__()
+            if (
+                response.status != 401
+                or attempt == 1
+                or self._tokens is None
+            ):
+                break
+            await request_ctx.__aexit__(None, None, None)
+            logger.info(
+                "[AUTH] token rejected on raw request, refreshing once: %s",
+                redact_text(url),
+            )
+        logger.debug(
+            "[RESPONSE] %s %s -> %s",
+            method.upper(),
+            redact_text(url),
+            response.status,
+        )
+        try:
             yield response
+        finally:
+            if request_ctx is not None:
+                await request_ctx.__aexit__(None, None, None)
 
     # ========== Main Request Method ==========
 
@@ -566,7 +586,11 @@ class PyroMindAsyncClient:
 
                     # Handle non-2xx responses
                     if not response.ok:
-                        if response.status == 401 and not token_retried:
+                        if (
+                            response.status == 401
+                            and not token_retried
+                            and self._tokens is not None
+                        ):
                             token_retried = True
                             await self._tokens.invalidate()
                             logger.info(

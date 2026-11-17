@@ -484,6 +484,13 @@ async def test_pyromind_terminal_bridge_pumps_stdin_and_resize(monkeypatch):
 
         async def receive(self):
             """``pump_out`` 用显式 ``receive()``（``async for`` 会吞掉关帧类型）。"""
+            if not getattr(self, "_handshaken", False):
+                # 桥接现在先等 auth_ok 才开泵（token 过期可重试），
+                # 握手帧不计入脚本帧序列。
+                self._handshaken = True
+                return SimpleNamespace(
+                    type=aiohttp.WSMsgType.TEXT, data='{"type": "auth_ok"}'
+                )
             if not self._frames:
                 self.close_code = 1006
                 return SimpleNamespace(type=aiohttp.WSMsgType.CLOSED, data=None)
@@ -722,6 +729,11 @@ async def _drive_terminal_bridge(
             ``probe`` 的测量点与旧脚手架一致：**处理完第 i 帧之后、取第 i+1 帧
             之前**（所以 ``probe[0]`` 是"第一帧写完之后已写出的字节数"）。
             """
+            if not getattr(self, "_handshaken", False):
+                self._handshaken = True
+                return SimpleNamespace(
+                    type=aiohttp.WSMsgType.TEXT, data='{"type": "auth_ok"}'
+                )
             if probe is not None and self._delivered:
                 probe.append(len(resp.written))
             if not self._frames:
@@ -1659,6 +1671,11 @@ async def test_exec_with_stdin_and_no_tty_frames_the_terminal_output(monkeypatch
 
         async def receive(self):
             """显式 ``receive()``（``pump_out`` 不用 ``async for`` 了）。"""
+            if not getattr(self, "_handshaken", False):
+                self._handshaken = True
+                return SimpleNamespace(
+                    type=aiohttp.WSMsgType.TEXT, data='{"type": "auth_ok"}'
+                )
             if not self._frames:
                 self.close_code = 1006
                 return SimpleNamespace(type=aiohttp.WSMsgType.CLOSED, data=None)
@@ -1731,6 +1748,128 @@ async def test_exec_with_stdin_and_no_tty_frames_the_terminal_output(monkeypatch
 
     raw_bytes = b"".join(await _drive(tty=True))
     assert raw_bytes == b"hello\r\n", "TTY 下原样透传，不许加帧头"
+
+
+@pytest.mark.asyncio
+async def test_terminal_bridge_retries_once_when_the_token_is_rejected(monkeypatch):
+    """首帧鉴权被 4001 拒绝时，重换一次 token 再连（daemon 侧）。"""
+    import aiohttp
+    from types import SimpleNamespace
+
+    from .. import aio_server as mod
+
+    class _RetryWs:
+        def __init__(self, *, reject: bool, frames=None):
+            self._reject = reject
+            self._frames = list(frames or [])
+            self._handshaken = False
+            self.sent_text: list[str] = []
+            self.close_code = None
+            self.close_reason = None
+
+        async def receive(self):
+            if not self._handshaken:
+                self._handshaken = True
+                if self._reject:
+                    return SimpleNamespace(
+                        type=aiohttp.WSMsgType.CLOSE, data=4001
+                    )
+                return SimpleNamespace(
+                    type=aiohttp.WSMsgType.TEXT, data='{"type": "auth_ok"}'
+                )
+            if not self._frames:
+                return SimpleNamespace(
+                    type=aiohttp.WSMsgType.CLOSED, data=None
+                )
+            return self._frames.pop(0)
+
+        async def send_str(self, data):
+            self.sent_text.append(data)
+
+        async def close(self):
+            return None
+
+    first = _RetryWs(reject=True)
+    second = _RetryWs(
+        reject=False,
+        frames=[
+            SimpleNamespace(type=aiohttp.WSMsgType.BINARY, data=b"ok\r\n"),
+            SimpleNamespace(type=aiohttp.WSMsgType.CLOSE, data=1000),
+        ],
+    )
+
+    class _Session:
+        def __init__(self):
+            self._sockets = [first, second]
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def ws_connect(self, _url, **_kwargs):
+            return self._sockets.pop(0)
+
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: _Session())
+    monkeypatch.setattr(
+        mod,
+        "_pyromind_terminal_exchange",
+        lambda *a, **k: ("https://portal.example/api/v1", "us-west-2", ""),
+    )
+
+    minted: list[str] = []
+
+    async def fake_token(*_a, **_k):
+        minted.append(f"token-{len(minted) + 1}")
+        return minted[-1], "https://direct.example/api/v1"
+
+    monkeypatch.setattr(mod, "async_fetch_terminal_token", fake_token)
+
+    written: list[bytes] = []
+
+    class _Resp:
+        async def write(self, chunk):
+            written.append(chunk)
+
+        async def drain(self):
+            return None
+
+        def force_close(self):
+            return None
+
+    class _Content:
+        async def readany(self):
+            raise asyncio.TimeoutError
+
+    session = SimpleNamespace(
+        id="exec-retry",
+        running=False,
+        exit_code=None,
+        resize_hook=None,
+        tty_cols=0,
+        tty_rows=0,
+    )
+    request = SimpleNamespace(
+        protocol=None, transport=None, content=_Content()
+    )
+
+    handled = await asyncio.wait_for(
+        mod._hijack_pyromind_terminal(
+            request,
+            _Resp(),
+            None,
+            session,
+            SimpleNamespace(sandbox_id="sb-1"),
+            True,
+            cmd=["bash"],
+        ),
+        timeout=5,
+    )
+
+    assert handled is True
+    assert minted == ["token-1", "token-2"], "401 后必须且只重换一次"
+    assert b"ok\r\n" in b"".join(written)
 
 
 @pytest.mark.asyncio
@@ -1954,6 +2093,11 @@ async def test_stdin_eof_does_not_teardown_the_session(monkeypatch):
 
         async def receive(self):
             """显式 ``receive()``（``pump_out`` 不用 ``async for`` 了）。"""
+            if not getattr(self, "_handshaken", False):
+                self._handshaken = True
+                return SimpleNamespace(
+                    type=aiohttp.WSMsgType.TEXT, data='{"type": "auth_ok"}'
+                )
             if not self._frames:
                 if self._tail_wait:
                     # 模拟"WS 还开着"：给 stdin 泵留出可观察的时间窗

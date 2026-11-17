@@ -10,6 +10,8 @@ import threading
 from typing import (
     Any,
     AsyncIterator,
+    Awaitable,
+    Callable,
     Dict,
     Iterator,
     Optional,
@@ -46,6 +48,13 @@ class SandboxExecStreamError(RuntimeError):
     def __init__(self, message: str, code: Optional[str] = None) -> None:
         super().__init__(redact_text(message))
         self.code = code
+
+
+class SandboxExecStreamAuthExpired(SandboxExecStreamError):
+    """The WS token was rejected (close 4001) before any output was produced.
+
+    Safe to retry with a freshly minted token: the command never ran.
+    """
 
 
 def build_exec_stream_websocket_url(api_base_url: str, sandbox_id: str) -> str:
@@ -196,6 +205,10 @@ async def _iter_exec_stream_events(
             await ws.send_str(ws_auth_frame(token))
             logger.debug("[ws] exec-stream connected %s", redact_text(url))
         except aiohttp.WSServerHandshakeError as exc:
+            if exc.status == 401:
+                raise SandboxExecStreamAuthExpired(
+                    "exec stream rejected the token (HTTP 401)"
+                ) from exc
             raise SandboxExecStreamError(
                 f"exec stream connection rejected (HTTP {exc.status})"
             ) from exc
@@ -348,6 +361,18 @@ async def _iter_exec_stream_events(
                     if stop_event is not None and stop_event.is_set():
                         break
                     if message.type == aiohttp.WSMsgType.CLOSE:
+                        if (
+                            message.data == 4001
+                            and stdout_bytes == 0
+                            and stderr_bytes == 0
+                        ):
+                            # Token rejected before the command produced output:
+                            # the caller may mint a new token and retry once.
+                            raise SandboxExecStreamAuthExpired(
+                                "exec stream rejected the auth token "
+                                "(close code 4001)",
+                                "4001",
+                            )
                         raise SandboxExecStreamError(
                             "exec stream closed by server before any exit "
                             "event — the command did not run to completion "
@@ -380,6 +405,7 @@ def iter_exec_stream(
     timeout: Optional[int] = None,
     tty: bool = False,
     stop_event: Optional[threading.Event] = None,
+    refresh_token: Optional[Callable[[], str]] = None,
 ) -> Iterator[SandboxExecStreamChunk]:
     """Yield streaming exec events synchronously."""
     events: "queue.Queue[tuple[str, Any]]" = queue.Queue(
@@ -405,26 +431,32 @@ def iter_exec_stream(
 
     def runner() -> None:
         async def run() -> None:
-            try:
-                async for event in _iter_exec_stream_events(
-                    url=url,
-                    token=token,
-                    command=command,
-                    cwd=cwd,
-                    timeout=timeout,
-                    tty=tty,
-                    stop_event=stop_event,
-                ):
-                    put_event("event", event)
-            except BaseException as exc:
-                put_event("error", exc)
-            finally:
-                put_event("end", None, terminal=True)
+            current = token
+            for attempt in (0, 1):
+                try:
+                    async for event in _iter_exec_stream_events(
+                        url=url,
+                        token=current,
+                        command=command,
+                        cwd=cwd,
+                        timeout=timeout,
+                        tty=tty,
+                        stop_event=stop_event,
+                    ):
+                        put_event("event", event)
+                    return
+                except SandboxExecStreamAuthExpired:
+                    if attempt == 1 or refresh_token is None:
+                        raise
+                    # Auth rejected before any output: safe to re-mint once.
+                    current = refresh_token()
 
         try:
-            asyncio.run(run())
-        except BaseException as exc:
-            put_event("error", exc)
+            try:
+                asyncio.run(run())
+            except BaseException as exc:
+                put_event("error", exc)
+        finally:
             put_event("end", None, terminal=True)
 
     thread = threading.Thread(target=runner, daemon=True)
@@ -456,16 +488,29 @@ async def iter_exec_stream_async(
     tty: bool = False,
     stop_event: Optional[threading.Event] = None,
     stdin_close: Optional[threading.Event] = None,
+    refresh_token: Optional[Callable[[], Awaitable[str]]] = None,
 ) -> AsyncIterator[SandboxExecStreamChunk]:
-    """Yield streaming exec events asynchronously."""
-    async for event in _iter_exec_stream_events(
-        url=url,
-        token=token,
-        command=command,
-        cwd=cwd,
-        timeout=timeout,
-        tty=tty,
-        stop_event=stop_event,
-        stdin_close=stdin_close,
-    ):
-        yield SandboxExecStreamChunk(**event)
+    """Yield streaming exec events asynchronously.
+
+    ``refresh_token`` is called at most once when the server rejects the token
+    (close 4001) before any output; the command is safe to resend then.
+    """
+    current = token
+    for attempt in (0, 1):
+        try:
+            async for event in _iter_exec_stream_events(
+                url=url,
+                token=current,
+                command=command,
+                cwd=cwd,
+                timeout=timeout,
+                tty=tty,
+                stop_event=stop_event,
+                stdin_close=stdin_close,
+            ):
+                yield SandboxExecStreamChunk(**event)
+            return
+        except SandboxExecStreamAuthExpired:
+            if attempt == 1 or refresh_token is None:
+                raise
+            current = await refresh_token()

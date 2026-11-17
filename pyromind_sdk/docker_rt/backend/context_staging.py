@@ -378,15 +378,23 @@ def storage_endpoint_for(cluster: str | None) -> str:
     used here — ``StorageClient`` reads ``PYROMIND_STORAGE_ACCESS_KEY`` /
     ``PYROMIND_STORAGE_SECRET_KEY`` from the environment, so a masked key in
     the response cannot silently degrade into a wrong credential.
+
+    Fails loudly: an empty endpoint must never fall back to ``StorageClient``'s
+    default (``us-west-2``), which would stage a build context into the wrong
+    cluster's bucket.
     """
     try:
         from ...client.storage import get_storage_info
 
         info = get_storage_info(cluster=cluster)
-        return str(info.get("url") or "").strip()
-    except Exception as exc:  # noqa: BLE001 - never let lookup break a build
-        logger.warning("storage endpoint lookup failed: %s", exc)
-        return ""
+    except Exception as exc:  # noqa: BLE001 - surface the reason, fail the build
+        raise StagingError(
+            f"storage endpoint lookup failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    endpoint = str(info.get("url") or "").strip()
+    if not endpoint:
+        raise StagingError("storage endpoint lookup returned no url")
+    return endpoint
 
 
 def connect_storage(cluster: str | None = None) -> tuple[Any, str]:

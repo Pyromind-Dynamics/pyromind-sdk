@@ -665,6 +665,13 @@ class AsyncSandboxClient(PyroMindAsyncClient):
             self.exchange_base_url, sandbox_id, self.api_key, self.cluster
         )
         url = build_exec_stream_websocket_url(api_base_url, sandbox_id)
+
+        async def _refresh_token() -> str:
+            refreshed, _ = await async_fetch_exec_stream_token(
+                self.exchange_base_url, sandbox_id, self.api_key, self.cluster
+            )
+            return refreshed
+
         async for chunk in iter_exec_stream_async(
             url=url,
             token=token,
@@ -672,6 +679,7 @@ class AsyncSandboxClient(PyroMindAsyncClient):
             cwd=cwd.strip() if cwd else "",
             timeout=timeout,
             tty=tty,
+            refresh_token=_refresh_token,
         ):
             yield chunk
 

@@ -282,24 +282,33 @@ class HttpTokenCache:
         #: Cluster-direct base URL returned by the portal exchange.
         self.api_base_url: Optional[str] = None
 
+    def _fresh_token(self) -> Optional[str]:
+        """Cached token still inside its validity window (no I/O, no lock)."""
+        if (
+            self._token is not None
+            and time.monotonic() < self._expires_at - self._refresh_skew_s
+        ):
+            return self._token
+        return None
+
     def token(self, *, force_refresh: bool = False) -> str:
+        if not force_refresh:
+            cached = self._fresh_token()
+            if cached is not None:
+                return cached
+        # 网络交换放在锁外：刷新期间其他线程仍能读到旧值，不会整段阻塞；
+        # 并发刷新最多多换一次票，写入用锁保证不撕裂。
+        token, ttl, api_base_url = fetch_token(
+            self._exchange_url,
+            self._api_key,
+            purpose=PURPOSE_HTTP,
+            cluster=self._cluster,
+        )
         with self._lock:
-            fresh = (
-                self._token is not None
-                and time.monotonic() < self._expires_at - self._refresh_skew_s
-            )
-            if fresh and not force_refresh:
-                return self._token  # type: ignore[return-value]
-            token, ttl, api_base_url = fetch_token(
-                self._exchange_url,
-                self._api_key,
-                purpose=PURPOSE_HTTP,
-                cluster=self._cluster,
-            )
             self._token = token
             self._expires_at = time.monotonic() + ttl
             self.api_base_url = api_base_url
-            return token
+        return token
 
     def invalidate(self) -> None:
         with self._lock:
@@ -308,7 +317,13 @@ class HttpTokenCache:
 
 
 class AsyncHttpTokenCache:
-    """Async cache of the short-lived HTTP session token."""
+    """Async cache of the short-lived HTTP session token.
+
+    No ``asyncio.Lock`` on purpose: clients are sometimes used from more than
+    one event loop (``asyncio.run`` per call), and a lock bound to the first
+    loop raises "bound to a different event loop". Concurrent refreshes are
+    allowed — the last write wins and both tokens are valid.
+    """
 
     def __init__(
         self,
@@ -324,38 +339,36 @@ class AsyncHttpTokenCache:
         self._refresh_skew_s = refresh_skew_s
         self._token: Optional[str] = None
         self._expires_at = 0.0
-        self._lock: Optional[asyncio.Lock] = None
         #: Cluster-direct base URL returned by the portal exchange.
         self.api_base_url: Optional[str] = None
 
-    def _get_lock(self) -> asyncio.Lock:
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-        return self._lock
+    def _fresh_token(self) -> Optional[str]:
+        if (
+            self._token is not None
+            and time.monotonic() < self._expires_at - self._refresh_skew_s
+        ):
+            return self._token
+        return None
 
     async def token(self, *, force_refresh: bool = False) -> str:
-        async with self._get_lock():
-            fresh = (
-                self._token is not None
-                and time.monotonic() < self._expires_at - self._refresh_skew_s
-            )
-            if fresh and not force_refresh:
-                return self._token  # type: ignore[return-value]
-            token, ttl, api_base_url = await async_fetch_token(
-                self._exchange_url,
-                self._api_key,
-                purpose=PURPOSE_HTTP,
-                cluster=self._cluster,
-            )
-            self._token = token
-            self._expires_at = time.monotonic() + ttl
-            self.api_base_url = api_base_url
-            return token
+        if not force_refresh:
+            cached = self._fresh_token()
+            if cached is not None:
+                return cached
+        token, ttl, api_base_url = await async_fetch_token(
+            self._exchange_url,
+            self._api_key,
+            purpose=PURPOSE_HTTP,
+            cluster=self._cluster,
+        )
+        self._token = token
+        self._expires_at = time.monotonic() + ttl
+        self.api_base_url = api_base_url
+        return token
 
     async def invalidate(self) -> None:
-        async with self._get_lock():
-            self._token = None
-            self._expires_at = 0.0
+        self._token = None
+        self._expires_at = 0.0
 
 
 def ws_auth_frame(token: str) -> str:

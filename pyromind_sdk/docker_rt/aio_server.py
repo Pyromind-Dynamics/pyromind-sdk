@@ -648,6 +648,9 @@ _WS_CLOSE_HINTS: dict[int, str] = {
     1012: "peer uvicorn is shutting down - pod restart/rollout",
 }
 
+#: 等待首帧 ``auth_ok`` 的上限；超时视为握手失败，可换票重试一次。
+_TERMINAL_AUTH_TIMEOUT_S = 10.0
+
 
 def _ws_close_note(ws: Any, msg: Any) -> str:
     """把"这条 WS 为什么结束了"写成一句能进日志的话（2026-10-16 补）。
@@ -5011,9 +5014,18 @@ async def _hijack_pyromind_terminal(
     }
     try:
         async with aiohttp.ClientSession() as client:
-            try:
-                from pyromind_sdk.terminal import build_terminal_websocket_url
+            from pyromind_sdk.terminal import (
+                TerminalAuthExpired,
+                TerminalError,
+                build_terminal_websocket_url,
+            )
 
+            async def _open_terminal():
+                """换票 + 连接 + 鉴权握手上报，返回已 ``auth_ok`` 的 ws。
+
+                等 ``auth_ok`` 再返回，这样 token 过期/被拒能在开始泵数据之前
+                识别出来并重试一次，而不是让用户看到一次莫名的断开。
+                """
                 token, api_base_url = await async_fetch_terminal_token(
                     exchange_base,
                     kube_env.sandbox_id or "",
@@ -5028,18 +5040,85 @@ async def _hijack_pyromind_terminal(
                     command=list(cmd) if cmd else None,
                     cwd=cwd or None,
                 )
-                ws = await client.ws_connect(
-                    url,
-                    heartbeat=30,
-                    headers={TRACE_ID_HEADER: ensure_trace_id()},
-                )
+                try:
+                    ws_local = await client.ws_connect(
+                        url,
+                        heartbeat=30,
+                        headers={TRACE_ID_HEADER: ensure_trace_id()},
+                    )
+                except aiohttp.WSServerHandshakeError as exc:
+                    if exc.status == 401:
+                        raise TerminalAuthExpired(
+                            "terminal handshake rejected (HTTP 401)"
+                        ) from exc
+                    raise
                 # Short-lived token in the first frame; nothing secret in the
                 # handshake URL or headers.
-                await ws.send_str(json.dumps({"type": "auth", "token": token}))
+                await ws_local.send_str(
+                    json.dumps({"type": "auth", "token": token})
+                )
+                try:
+                    first = await asyncio.wait_for(
+                        ws_local.receive(),
+                        timeout=_TERMINAL_AUTH_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError as exc:
+                    await ws_local.close()
+                    raise TerminalError(
+                        "terminal auth handshake timed out"
+                    ) from exc
+
+                if first.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        obj = json.loads(first.data)
+                    except (json.JSONDecodeError, TypeError):
+                        obj = {}
+                    if isinstance(obj, dict) and obj.get("type") == "auth_ok":
+                        return ws_local
+                    await ws_local.close()
+                    raise TerminalError(
+                        f"terminal auth handshake returned {first.data!r}"
+                    )
+                if first.type in (
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.ERROR,
+                ):
+                    close_code = ws_local.close_code or (
+                        first.data if first.type == aiohttp.WSMsgType.CLOSE else None
+                    )
+                    await ws_local.close()
+                    if close_code == 4001:
+                        raise TerminalAuthExpired(
+                            "terminal auth token rejected (close code 4001)"
+                        )
+                    raise TerminalError(
+                        f"terminal closed during auth (code={close_code})"
+                    )
+                await ws_local.close()
+                raise TerminalError(
+                    "terminal auth handshake returned an unexpected frame"
+                )
+
+            try:
+                try:
+                    ws = await _open_terminal()
+                except TerminalAuthExpired:
+                    # 60s WS token 在慢链路上可能已过期；只重换一次。
+                    logger.warning(
+                        "terminal auth token rejected, retrying once id=%s",
+                        getattr(session, "id", "")[:12],
+                    )
+                    ws = await _open_terminal()
                 logger.info(
                     "terminal connected id=%s", getattr(session, "id", "")[:12]
                 )
-            except (aiohttp.ClientError, OSError, TokenError) as exc:
+            except (
+                aiohttp.ClientError,
+                OSError,
+                TokenError,
+                TerminalError,
+            ) as exc:
                 session.running = False
                 if cmd is not None:
                     # Interactive exec: the caller can still use the command

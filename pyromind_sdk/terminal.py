@@ -71,6 +71,10 @@ class TerminalError(RuntimeError):
         super().__init__(redact_text(message))
 
 
+class TerminalAuthExpired(TerminalError):
+    """The short-lived WS token was rejected before the session produced data."""
+
+
 def _websocket_url(
     base_url: str,
     sandbox_id: str,
@@ -172,6 +176,9 @@ async def _run_session(url: str, token: str) -> None:
     session_over = asyncio.Event()
     # Shared mutable timestamp — only *real* I/O resets it.
     last_activity = [time.monotonic()]
+    #: Did the PTY produce anything? A 4001 before any output means the token
+    #: was rejected, not that the user's shell exited.
+    saw_data = [False]
 
     async with aiohttp.ClientSession() as session:
         try:
@@ -186,6 +193,10 @@ async def _run_session(url: str, token: str) -> None:
             await ws.send_str(ws_auth_frame(token))
             logger.debug("[ws] terminal connected %s", redact_text(url))
         except aiohttp.WSServerHandshakeError as e:
+            if e.status == 401:
+                raise TerminalAuthExpired(
+                    "Connection rejected (HTTP 401): token expired or invalid."
+                ) from e
             raise TerminalError(
                 f"Connection rejected (HTTP {e.status}). Check the API key and sandbox id."
             ) from e
@@ -221,6 +232,7 @@ async def _run_session(url: str, token: str) -> None:
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.BINARY:
                     last_activity[0] = time.monotonic()
+                    saw_data[0] = True
                     os.write(stdout_fd, msg.data)
                 elif msg.type == aiohttp.WSMsgType.TEXT:
                     # Server control frames ({"type":"pong"} keep-alive and the
@@ -236,6 +248,7 @@ async def _run_session(url: str, token: str) -> None:
                     except (json.JSONDecodeError, TypeError):
                         pass
                     last_activity[0] = time.monotonic()
+                    saw_data[0] = True
                     os.write(stdout_fd, msg.data.encode("utf-8", errors="replace"))
                 elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
                     break
@@ -285,6 +298,13 @@ async def _run_session(url: str, token: str) -> None:
             await asyncio.gather(sender, receiver, pinger, watchdog, return_exceptions=True)
             await ws.close()
 
+        # 4001 before any PTY byte = the server rejected the token (not a shell
+        # exit). Surface it so the caller can mint a fresh token and retry once.
+        if ws.close_code == 4001 and not saw_data[0]:
+            raise TerminalAuthExpired(
+                "terminal auth token rejected (close code 4001)"
+            )
+
 
 def run_terminal(
     sandbox_id: str,
@@ -330,18 +350,43 @@ def run_terminal(
 
     size = os.get_terminal_size(sys.stdout.fileno())
 
+    def _mint() -> tuple[str, str, str]:
+        token, api_base_url = fetch_terminal_token(
+            base_url, sandbox_id, api_key, cluster
+        )
+        url = _websocket_url(
+            api_base_url, sandbox_id, size.columns, size.lines
+        )
+        return token, api_base_url, url
+
+    # 先换票再进 raw 模式：换票失败/被 Ctrl-C 都不会把终端留在 raw 状态。
+    try:
+        token, api_base_url, url = _mint()
+    except (TerminalError, TokenError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
     stdin_fd = sys.stdin.fileno()
     saved_attrs = termios.tcgetattr(stdin_fd)
     tty.setraw(stdin_fd)
     try:
-        token, api_base_url = fetch_terminal_token(
-            base_url, sandbox_id, api_key, cluster
+        print(
+            f"Connecting to sandbox {sandbox_id} @ {api_base_url} ... "
+            "(exit shell or press Ctrl-D to quit)"
         )
-        url = _websocket_url(api_base_url, sandbox_id, size.columns, size.lines)
-        print(f"Connecting to sandbox {sandbox_id} @ {api_base_url} ... (exit shell or press Ctrl-D to quit)")
-        asyncio.run(_run_session(url, token))
+        for attempt in (0, 1):
+            try:
+                asyncio.run(_run_session(url, token))
+                break
+            except TerminalAuthExpired as e:
+                if attempt == 1:
+                    raise
+                # 60s WS token may have expired on a slow link: mint once more.
+                logger.warning(
+                    "terminal token rejected, minting a fresh one: %s", e
+                )
+                token, api_base_url, url = _mint()
     except (TerminalError, TokenError) as e:
-        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, saved_attrs)
         print(f"Error: {e}", file=sys.stderr)
         return 1
     finally:

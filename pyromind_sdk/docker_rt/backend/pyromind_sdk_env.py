@@ -825,6 +825,16 @@ class PyromindSDK:
                 self._client.cluster,
             )
             url = build_exec_stream_websocket_url(api_base_url, self.sandbox_id)
+
+            async def _refresh_token() -> str:
+                refreshed, _ = await async_fetch_exec_stream_token(
+                    self._client.exchange_base_url,
+                    self.sandbox_id,
+                    self._client.api_key,
+                    self._client.cluster,
+                )
+                return refreshed
+
             async for chunk in iter_exec_stream_async(
                 url=url,
                 token=token,
@@ -833,6 +843,7 @@ class PyromindSDK:
                 timeout=None,
                 tty=tty,
                 stop_event=stop_event,
+                refresh_token=_refresh_token,
             ):
                 yield chunk
 
@@ -861,6 +872,16 @@ class PyromindSDK:
             self._client.cluster,
         )
         url = build_exec_stream_websocket_url(api_base_url, self.sandbox_id)
+
+        async def _refresh_token() -> str:
+            refreshed, _ = await async_fetch_exec_stream_token(
+                self._client.exchange_base_url,
+                self.sandbox_id,
+                self._client.api_key,
+                self._client.cluster,
+            )
+            return refreshed
+
         async for chunk in iter_exec_stream_async(
             url=url,
             token=token,
@@ -869,6 +890,7 @@ class PyromindSDK:
             timeout=timeout,
             tty=tty,
             stdin_close=stdin_close,
+            refresh_token=_refresh_token,
         ):
             yield chunk
 
