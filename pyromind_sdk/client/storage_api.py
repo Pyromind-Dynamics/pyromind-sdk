@@ -5,6 +5,7 @@ from __future__ import annotations
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from . import storage_endpoints as endpoints
 from .base import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_TIMEOUT,
@@ -32,8 +33,6 @@ from .models import (
 
 class FileShareResource:
     """Same-cluster sharing operations exposed by the storage API."""
-
-    _PREFIX = "/storage/file_share"
 
     def __init__(self, storage: StorageAPIClient):
         self._storage = storage
@@ -82,7 +81,7 @@ class FileShareResource:
             target_user_id=target_user_id,
         )
         response = self._storage.post(
-            self._PREFIX,
+            endpoints.FILE_SHARE_CREATE_URL,
             json_data=payload.model_dump(exclude_none=True),
         )
         data = self._storage._extract_file_share_data(response)
@@ -97,7 +96,7 @@ class FileShareResource:
         if not isinstance(query, FileShareListQuery):
             query = FileShareListQuery(**query)
         response = self._storage.get(
-            f"{self._PREFIX}/list",
+            endpoints.FILE_SHARE_LIST_URL,
             params=query.to_params(),
         )
         data = self._storage._extract_file_share_data(response) or {}
@@ -131,13 +130,17 @@ class FileShareResource:
     def get(self, biz_no: str) -> FileShareTask:
         """Fetch one share task visible to the current participant."""
 
-        response = self._storage.get(f"{self._PREFIX}/{biz_no}")
+        response = self._storage.get(
+            endpoints.FILE_SHARE_GET_URL.format(biz_no=biz_no)
+        )
         return FileShareTask(**self._storage._extract_file_share_data(response))
 
     def cancel(self, biz_no: str) -> FileShareTask:
         """Cancel a pending share invitation created by the current user."""
 
-        response = self._storage.post(f"{self._PREFIX}/{biz_no}/cancel")
+        response = self._storage.post(
+            endpoints.FILE_SHARE_CANCEL_URL.format(biz_no=biz_no)
+        )
         return FileShareTask(**self._storage._extract_file_share_data(response))
 
     def delete(self, biz_nos: str | list[str]) -> FileShareDeleteResponse:
@@ -145,7 +148,7 @@ class FileShareResource:
 
         selected = [biz_nos] if isinstance(biz_nos, str) else biz_nos
         response = self._storage.post(
-            f"{self._PREFIX}/delete",
+            endpoints.FILE_SHARE_DELETE_URL,
             json_data={"biz_nos": selected},
         )
         return FileShareDeleteResponse(
@@ -165,8 +168,6 @@ class StorageAPIClient(PyroMindClient):
     MinIO/S3-compatible object storage and requires storage credentials.
     """
 
-    _TRANSFER_PREFIX = "/storage/transfer"
-
     def __init__(
         self,
         api_key: str | None = None,
@@ -185,7 +186,7 @@ class StorageAPIClient(PyroMindClient):
         # File-share POSTs have no server-side idempotency key. A response lost
         # after task creation must not cause this client to create another task.
         self.session.mount(
-            f"{self.base_url}{FileShareResource._PREFIX}",
+            self._build_url(endpoints.FILE_SHARE_CREATE_URL),
             HTTPAdapter(
                 max_retries=Retry(
                     total=max_retries,
@@ -298,7 +299,7 @@ class StorageAPIClient(PyroMindClient):
             overwrite=overwrite,
         )
         response = self.post(
-            self._TRANSFER_PREFIX,
+            endpoints.TRANSFER_SUBMIT_URL,
             json_data=payload.model_dump(exclude_none=True),
         )
         return TransferCreateResponse(**self._extract_transfer_data(response))
@@ -310,7 +311,7 @@ class StorageAPIClient(PyroMindClient):
         if not isinstance(query, TransferListQuery):
             query = TransferListQuery(**query)
         response = self.get(
-            f"{self._TRANSFER_PREFIX}/list",
+            endpoints.TRANSFER_LIST_URL,
             params=query.to_params(),
         )
         data = self._extract_transfer_data(response) or {}
@@ -340,18 +341,22 @@ class StorageAPIClient(PyroMindClient):
     def cancel(self, transfer_id: int) -> TransferActionResponse:
         """Cancel an active transfer task."""
 
-        response = self.post(f"{self._TRANSFER_PREFIX}/{transfer_id}/cancel")
+        response = self.post(
+            endpoints.TRANSFER_CANCEL_URL.format(transfer_id=transfer_id)
+        )
         return TransferActionResponse(**self._extract_transfer_data(response))
 
     def delete(self, transfer_id: int) -> TransferActionResponse:
         """Delete a cancelled or finished transfer task."""
 
-        response = self._request("DELETE", f"{self._TRANSFER_PREFIX}/{transfer_id}")
+        response = self._request(
+            "DELETE", endpoints.TRANSFER_DELETE_URL.format(transfer_id=transfer_id)
+        )
         return TransferActionResponse(**self._extract_transfer_data(response))
 
     def clear_finished(self, ids: list[int] | None = None) -> TransferClearResponse:
         """Delete finished tasks; pass ``ids`` to delete only selected tasks."""
 
         body = {"ids": ids} if ids is not None else None
-        response = self.post(f"{self._TRANSFER_PREFIX}/clear", json_data=body)
+        response = self.post(endpoints.TRANSFER_CLEAR_URL, json_data=body)
         return TransferClearResponse(**self._extract_transfer_data(response))

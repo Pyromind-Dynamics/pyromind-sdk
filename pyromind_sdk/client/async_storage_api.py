@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from . import storage_endpoints as endpoints
 from .async_base import PyroMindAsyncAPIError, PyroMindAsyncClient
 from .models import (
     FileShareCreateResponse,
@@ -22,8 +23,6 @@ from .models import (
 
 class AsyncFileShareResource:
     """Async same-cluster sharing operations exposed by storage."""
-
-    _PREFIX = "/storage/file_share"
 
     def __init__(self, storage: AsyncStorageAPIClient):
         self._storage = storage
@@ -72,7 +71,7 @@ class AsyncFileShareResource:
             target_user_id=target_user_id,
         )
         response = await self._storage.post(
-            self._PREFIX,
+            endpoints.FILE_SHARE_CREATE_URL,
             json_data=payload.model_dump(exclude_none=True),
             retry=False,
         )
@@ -88,7 +87,7 @@ class AsyncFileShareResource:
         if not isinstance(query, FileShareListQuery):
             query = FileShareListQuery(**query)
         response = await self._storage.get(
-            f"{self._PREFIX}/list",
+            endpoints.FILE_SHARE_LIST_URL,
             params=query.to_params(),
         )
         data = self._storage._extract_file_share_data(response) or {}
@@ -122,13 +121,17 @@ class AsyncFileShareResource:
     async def get(self, biz_no: str) -> FileShareTask:
         """Fetch one share task visible to the current participant."""
 
-        response = await self._storage.get(f"{self._PREFIX}/{biz_no}")
+        response = await self._storage.get(
+            endpoints.FILE_SHARE_GET_URL.format(biz_no=biz_no)
+        )
         return FileShareTask(**self._storage._extract_file_share_data(response))
 
     async def cancel(self, biz_no: str) -> FileShareTask:
         """Cancel a pending share invitation created by the current user."""
 
-        response = await self._storage.post(f"{self._PREFIX}/{biz_no}/cancel")
+        response = await self._storage.post(
+            endpoints.FILE_SHARE_CANCEL_URL.format(biz_no=biz_no)
+        )
         return FileShareTask(**self._storage._extract_file_share_data(response))
 
     async def delete(self, biz_nos: str | list[str]) -> FileShareDeleteResponse:
@@ -136,7 +139,7 @@ class AsyncFileShareResource:
 
         selected = [biz_nos] if isinstance(biz_nos, str) else biz_nos
         response = await self._storage.post(
-            f"{self._PREFIX}/delete",
+            endpoints.FILE_SHARE_DELETE_URL,
             json_data={"biz_nos": selected},
         )
         return FileShareDeleteResponse(
@@ -145,8 +148,6 @@ class AsyncFileShareResource:
 
 class AsyncStorageAPIClient(PyroMindAsyncClient):
     """Async client for storage APIs, transfers, and same-cluster file sharing."""
-
-    _TRANSFER_PREFIX = "/storage/transfer"
 
     @property
     def file_shares(self) -> AsyncFileShareResource:
@@ -248,7 +249,7 @@ class AsyncStorageAPIClient(PyroMindAsyncClient):
             overwrite=overwrite,
         )
         response = await self.post(
-            self._TRANSFER_PREFIX,
+            endpoints.TRANSFER_SUBMIT_URL,
             json_data=payload.model_dump(exclude_none=True),
         )
         return TransferCreateResponse(**self._extract_transfer_data(response))
@@ -262,7 +263,7 @@ class AsyncStorageAPIClient(PyroMindAsyncClient):
         if not isinstance(query, TransferListQuery):
             query = TransferListQuery(**query)
         response = await self.get(
-            f"{self._TRANSFER_PREFIX}/list",
+            endpoints.TRANSFER_LIST_URL,
             params=query.to_params(),
         )
         data = self._extract_transfer_data(response) or {}
@@ -296,14 +297,16 @@ class AsyncStorageAPIClient(PyroMindAsyncClient):
     async def cancel(self, transfer_id: int) -> TransferActionResponse:
         """Cancel an active transfer task."""
 
-        response = await self.post(f"{self._TRANSFER_PREFIX}/{transfer_id}/cancel")
+        response = await self.post(
+            endpoints.TRANSFER_CANCEL_URL.format(transfer_id=transfer_id)
+        )
         return TransferActionResponse(**self._extract_transfer_data(response))
 
     async def delete(self, transfer_id: int) -> TransferActionResponse:
         """Delete a cancelled or finished transfer task."""
 
         response = await self._request(
-            "DELETE", f"{self._TRANSFER_PREFIX}/{transfer_id}"
+            "DELETE", endpoints.TRANSFER_DELETE_URL.format(transfer_id=transfer_id)
         )
         return TransferActionResponse(**self._extract_transfer_data(response))
 
@@ -313,5 +316,5 @@ class AsyncStorageAPIClient(PyroMindAsyncClient):
         """Delete finished tasks; pass ``ids`` to delete only selected tasks."""
 
         body = {"ids": ids} if ids is not None else None
-        response = await self.post(f"{self._TRANSFER_PREFIX}/clear", json_data=body)
+        response = await self.post(endpoints.TRANSFER_CLEAR_URL, json_data=body)
         return TransferClearResponse(**self._extract_transfer_data(response))
