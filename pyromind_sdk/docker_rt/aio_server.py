@@ -96,7 +96,12 @@ from .backend.pyromind_sdk_env import (  # noqa: E402
     get_sandbox_client,
 )
 from ..rift.config import load_rift_config  # noqa: E402
-from ..rift.errors import RiftError, RiftUnavailable  # noqa: E402
+from ..rift.errors import (  # noqa: E402
+    RiftError,
+    RiftPermissionDenied,
+    RiftUnauthenticated,
+    RiftUnavailable,
+)
 from .bootstrap import check_connection, print_connected  # noqa: E402
 from .register_context import (  # noqa: E402
     ensure_docker_rt_context,
@@ -2227,6 +2232,12 @@ async def _ensure_rift_for_record(record: Any) -> web.Response | None:
         await kube_env.connect_rift()
         record.error = None
         return None
+    except (RiftUnauthenticated, RiftPermissionDenied) as exc:
+        # per-sandbox 密码与 Pipe/Secret 不一致（未 resume 的老沙箱、凭据轮换
+        # 窗口）：属于凭据侧问题，按 503 处理，不回落平台 exec。
+        record.error = f"[RIFT_UNAUTHORIZED] {exc}"
+        logger.error("rift auth failed id=%s: %s", record.id[:12], exc)
+        return _err(503, record.error)
     except RiftUnavailable as exc:
         record.error = f"[RIFT_UNAVAILABLE] {exc}"
         logger.error("rift not ready id=%s: %s", record.id[:12], exc)

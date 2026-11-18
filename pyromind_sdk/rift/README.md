@@ -2,8 +2,8 @@
 
 `docker-rt` 的 exec/cp 主通道。**平台（k8s_middleware）在创建沙箱 Pod 时注入
 `rift-client`**：initContainer 从 `RIFT_CLIENT_IMAGE` 镜像把二进制拷进
-`/opt/rift`（emptyDir），access key 以 per-sandbox Secret 挂载到
-`/opt/rift-token/token`；主容器命令被包成
+`/opt/rift`（emptyDir），per-sandbox rift 密码以 per-sandbox Secret 挂载到
+`/opt/rift/rift-token/token`；主容器命令被包成
 `rift-client --supervise -- <用户 argv>`，rift-client 以 PID 1 先监听 7500，
 再 exec 用户进程（镜像 Entrypoint/Cmd + 请求 command/entrypoint，Docker 语义），
 转发信号、收割孤儿、按子进程退出码退出。
@@ -12,8 +12,9 @@ docker-rt **不上传、不启动任何东西**：`docker start` 只等 Ping 通
 `docker exec` / `docker cp` / 交互式 `-it` 都走
 `Gateway -> Service:7500 -> rift-client`，**不回落平台 exec WebSocket**。
 
-> rift-client 的 Go 源码、Makefile、注入镜像 Dockerfile 都在
-> **`k8s_middleware/rift/`**；本目录只有 daemon 侧的 Python 客户端。
+> rift-client 的 Go 源码、Makefile、注入镜像 Dockerfile 都在独立仓库
+> **`rift-client`**（`Pyromind-Dynamics/rift-client`）；本目录只有 daemon 侧的 Python
+> 客户端。
 
 ## 目录结构
 
@@ -23,7 +24,7 @@ docker-rt **不上传、不启动任何东西**：`docker start` 只等 Ping 通
 | `errors.py` | `RiftUnavailable` / `RiftUnauthenticated` / `RiftPermissionDenied`。 |
 | `rift_client.py` | `grpc.aio` 客户端（daemon 侧）：`ping` / `exec_once` / `open_exec` / `get_archive` / `put_archive`。 |
 | `pb/` | 由 `rift-gateway/proto/rift.proto` 生成的 Python stub。 |
-| `check_proto.py` | 构建期：proto 与 Python 生成物一致性检查（Go 端在 k8s_middleware 自查）。 |
+| `check_proto.py` | 构建期：proto 与 Python 生成物一致性检查（Go 端用 rift-client 仓库的 `tools/checkproto`）。 |
 
 > Python 文件只运行在本机 daemon，不会进入 Pod；进 Pod 的只有平台注入的 Go 二进制。
 
@@ -47,17 +48,21 @@ docker-rt **不上传、不启动任何东西**：`docker start` 只等 Ping 通
 > 成功后才把容器标成 `Running`/`Up`。次数用尽仍失败则 start 返回 503、容器置为
 > `Dead`。rift 是强制通道，**没有关闭开关**；缺少 gateway 配置同样会让 start 失败。
 >
-> Gateway 用调用方的 access key 与 sandbox Pipe 比对，再把同一个 key 作为
-> `x-rift-token` 转发；Pod 内从挂载的 Secret 文件 `/opt/rift-token/token` 读取
-> （`0444`，非 root 镜像用户也能读），rift-client 常量时间比较。不再有公钥/KV/签名。
+> Gateway 用 **per-sandbox 密码**（`get_sandbox` 返回的 `rift_password`）与 sandbox
+> Pipe 比对，再把同一个密码作为 `x-rift-token` 转发；Pod 内从挂载的 Secret 文件
+> `/opt/rift/rift-token/token` 读取（`0444`，非 root 镜像用户也能读），rift-client
+> 常量时间比较。密码由平台按 sandbox 生成，**不是用户的长期 access key**；拿不到
+> 密码直接失败，不回落 access key。不再有公钥/KV/签名。
 
 ## 就绪门禁与健康检查
 
 1. 平台创建 Pod：initContainer 拷二进制、Secret 挂 token、主容器以
    `--supervise` 启动；readinessProbe 探 7500。
-2. docker-rt `connect_rift()`：经 Gateway `Ping` 直到就绪
+2. docker-rt `connect_rift()`：先从平台 detail 取该 sandbox 的 `rift_password`，
+   再经 Gateway `Ping` 直到就绪
    （`DOCKER_RT_RIFT_PING_ATTEMPTS` × `DOCKER_RT_RIFT_PING_INTERVAL`）。
-   凭据/授权错误（`RiftUnauthenticated` / `RiftPermissionDenied`）不重试，立即失败。
+   凭据/授权错误（`RiftUnauthenticated` / `RiftPermissionDenied`）会重新拉取一次
+   密码并重建连接（resume/edit 可能已轮换），仍失败则立即失败。
 3. 后台健康检查每 `DOCKER_RT_RIFT_HEALTH_INTERVAL` Ping 一次：连续 2 次失败先核对
    平台 phase（不在 running/up/ready 就按沙箱状态处理），仍异常则置
    `rift_ready=False` 并重新走 `connect_rift()`，退避上限 300s。
@@ -75,30 +80,34 @@ k8s_middleware 的 pause 是把 StatefulSet 缩到 0，resume 会**新建 Pod**�
 rootfs 与旧进程全部丢失，但注入结构（initContainer/emptyDir/Secret）在 STS 模板里，
 新 Pod 自动重新注入。因此：
 
-- resume 是**新的 Pod**：旧 rift 连接随 Pod 一起消失，`resume()` 里不需要主动关闭，
-  只把 `rift_ready` 置为 false；`_start_record` 在 Running 后重新 `connect_rift()`。
-- 平台在 resume 时会刷新 token Secret（access key 轮换后立即生效）。
+- resume 是**新的 Pod**：旧 rift 连接随 Pod 一起消失，`resume()` 会主动关闭旧
+  channel（密码可能已轮换），`_start_record` 在 Running 后重新取密码并
+  `connect_rift()`。
+- 平台在 resume 时会用库里的 per-sandbox 密码重写 token Secret 与 Pipe（老沙箱
+  首次 resume 时补发密码），不是按用户 access key 轮换。
 
 ## 版本与升级
 
 rift-client 的版本由**平台固定的注入镜像**（`RIFT_CLIENT_IMAGE`）决定，不再随 SDK
-升级。`Ping` 返回版本串（`<git describe>+<源码指纹前 12 位>`，构建时注入），daemon
+升级。`Ping` 返回版本串（`<git describe>`，构建时注入），daemon
 日志 `rift ready … version=…` 同源，可用于核对 Pod 里跑的是哪一版。升级 rift-client
 = 平台换镜像 tag + 沙箱重建/resume；SDK 侧不做版本比对，也不会自动重注入。
 
-构建与发布在 k8s_middleware 仓库：
+构建与发布在独立的 `rift-client` 仓库：
 
 ```bash
-cd k8s_middleware/rift/client
-make test               # Go 单测（supervise、access key 常量时间比较、exec 帧、tar 校验）
-make build-linux        # 双架构二进制 + sha256 + version（调试用）
-# 注入镜像（在 k8s_middleware 仓库根目录）：
-docker build -f rift/Dockerfile -t pyrominddynamics/rift-client:<version> rift/
+cd rift-client
+make test               # Go 单测（supervise、密码常量时间比较、exec 帧、tar 校验）
+make build-linux        # 双架构二进制 + sha256（调试用）
+# 注入镜像（多平台 buildx）
+docker buildx build --platform linux/amd64,linux/arm64 \
+  --build-arg VERSION="$(git describe --tags --always --dirty)" \
+  -t pyrominddynamics/rift-client:<version> --push .
 ```
 
 `pb/` 与 `rift-gateway` 仓库的 `proto/rift.proto` 是同一份协议；改协议时
-SDK（Python stub）、k8s_middleware（Go）、rift-gateway 三处一起更新，各自跑
-`check_proto.py`。
+SDK（Python stub）、rift-client（Go）、rift-gateway 三处一起更新，并各自跑一致性
+校验（SDK 用 `check_proto.py`，rift-client 用 `tools/checkproto`）。
 
 ## 请求路由
 
@@ -160,7 +169,7 @@ ACK，**不会**重置它们的 per-stream 空闲计时（`grpc_read_timeout` /
 
 | 方向 | 发送方 | 位置 |
 | --- | --- | --- |
-| 上游 → 下游（响应） | `rift-client` | `k8s_middleware/rift/client/server.go` 的 `execWriter`（tty / pipe 两条路径都覆盖） |
+| 上游 → 下游（响应） | `rift-client` | rift-client 仓库 `server.go` 的 `execWriter`（tty / pipe 两条路径都覆盖） |
 | 下游 → 上游（请求） | daemon | `aio_server._hijack_rift_terminal`（仅 stdin 空闲时发） |
 
 `ExecFrame.ping` 只是心跳，接收方**必须忽略**；它不是数据，也不重置空闲计时。
@@ -187,17 +196,18 @@ resize；心跳不算）收掉，与平台终端 `WS_IDLE_TIMEOUT_S` 一致。tt
 ## 安全边界
 
 * k8s_middleware 在 create/edit/resume 时为每个 sandbox 写一个 Pipe
-  （`username=sandbox_id`、`authorized_keys_data=base64(access key)`、
-  `to.host=<service>:7500`），并维护同名 token Secret。Gateway watch Pipe 后按
-  sandbox id 命中，并常量时间比对 access key；客户端不能指定上游地址。Pipe/Secret
-  是集群内对象，读它们等于拿到凭据，需用 RBAC 保护。
-* 两道校验，使用同一个 access key：
-  * Gateway：调用方的 access key 必须与 Pipe 里的 `authorized_keys_data` 匹配，且
+  （`username=sandbox_id`、`authorized_keys_data=base64(per-sandbox 密码)`、
+  `to.host=<service>:7500`），并维护同名 token Secret。密码按 sandbox 生成并落库
+  （instance feature `rift_password`），detail 接口返回给 docker-rt。Gateway watch
+  Pipe 后按 sandbox id 命中，并常量时间比对密码；客户端不能指定上游地址。Pipe/Secret
+  是集群内对象，读某条 Pipe 只影响对应沙箱，但仍需用 RBAC 保护。
+* 两道校验，使用同一个 per-sandbox 密码：
+  * Gateway：调用方的密码必须与 Pipe 里的 `authorized_keys_data` 匹配，且
     `username == sandbox_id`；
-  * rift-client：校验 `x-rift-token` 与 `/opt/rift-token/token`（Secret 挂载，0444）。
-* access key 同时存在于请求头（TLS）、Pipe 和 Pod 内 token 文件：能读 Pipe/Secret
-  或进入沙箱就能拿到凭据，靠 RBAC/沙箱隔离控制。`rift-client` 与 token 都不打进
-  用户镜像（kaniko `--ignore-path=/opt/rift --ignore-path=/opt/rift-token`）。
+  * rift-client：校验 `x-rift-token` 与 `/opt/rift/rift-token/token`（Secret 挂载，0444）。
+* 密码同时存在于请求头（TLS）、Pipe 和 Pod 内 token 文件；它**不是**用户的长期
+  access key，泄漏影响面限于该 sandbox。`rift-client` 与 token 都不打进
+  用户镜像（kaniko `--ignore-path=/opt/rift` 覆盖二进制与 token 目录）。
 
 ## 排障
 

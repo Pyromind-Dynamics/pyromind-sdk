@@ -45,6 +45,7 @@ SANDBOX_API_DATA = {
     "status": "running",
     "created_at": "2026-10-10T08:00:00+08:00",
     "uid": "pod-uid-888",
+    "rift_password": "rift-pwd-1",
 }
 
 
@@ -90,6 +91,16 @@ class TestSandboxFieldMapping:
     def test_uid_is_kept(self, converter):
         res = SandboxResponse(**converter(None, dict(SANDBOX_API_DATA)))
         assert res.uid == "pod-uid-888"
+
+    @pytest.mark.parametrize(
+        "converter",
+        [SandboxClient._convert_sandbox_data, AsyncSandboxClient._convert_sandbox_data],
+        ids=["sync", "async"],
+    )
+    def test_rift_password_is_kept(self, converter):
+        """docker-rt 用该字段做网关认证，白名单漏掉会静默变成 None。"""
+        res = SandboxResponse(**converter(None, dict(SANDBOX_API_DATA)))
+        assert res.rift_password == "rift-pwd-1"
 
 
 def test_inference_job_response_keeps_inf_sk():

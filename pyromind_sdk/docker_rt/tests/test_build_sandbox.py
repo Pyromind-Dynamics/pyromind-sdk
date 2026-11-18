@@ -3960,9 +3960,10 @@ async def test_build_sandbox_idles_and_gates_on_rift(
     assert sandbox.connect_called, "构建沙箱必须先通过 rift Ping 门禁"
     assert captured["entrypoint"] == ["sleep", "infinity"]
     assert "port_bindings" not in captured
-    # 真机上 kaniko 看到的是这段脚本里的 argv：忽略目录必须真的下发。
+    # 真机上 kaniko 看到的是这段脚本里的 argv：忽略目录必须真的下发
+    # （token 在 /opt/rift/rift-token，已被 /opt/rift 覆盖）。
     assert "--ignore-path=/opt/rift" in _worker_script(sandbox)
-    assert "--ignore-path=/opt/rift-token" in _worker_script(sandbox)
+    assert "--ignore-path=/opt/rift-token" not in _worker_script(sandbox)
 
 
 @pytest.mark.asyncio
@@ -3995,12 +3996,12 @@ async def test_connect_failure_stops_the_build_before_it_starts(
 
 
 def test_kaniko_ignores_the_rift_dirs() -> None:
-    """平台注入目录（二进制 + token）必须交给 kaniko 忽略（不删、不进镜像）。"""
+    """平台注入目录（二进制 + token 都在 /opt/rift 下）必须交给 kaniko 忽略。"""
     from ..backend import kaniko
 
     args = kaniko.kaniko_args(destinations=["myapp:1"])
     assert "--ignore-path=/opt/rift" in args
-    assert "--ignore-path=/opt/rift-token" in args
+    assert "--ignore-path=/opt/rift-token" not in args
 @pytest.mark.asyncio
 async def test_build_without_push_ignores_an_unresolvable_push_prefix(
     monkeypatch: pytest.MonkeyPatch,

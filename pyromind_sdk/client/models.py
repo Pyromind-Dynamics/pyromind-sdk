@@ -402,6 +402,14 @@ class SandboxResponse(BaseModel):
             "mounted under /public/<dir>."
         ),
     )
+    rift_password: Optional[str] = Field(
+        default=None,
+        description=(
+            "Per-sandbox rift data-plane password used by docker-rt to "
+            "authenticate against rift-gateway. Sandbox-scoped; never the "
+            "account access key."
+        ),
+    )
 
 
 

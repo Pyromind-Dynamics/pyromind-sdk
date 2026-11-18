@@ -282,8 +282,8 @@ Requirements and behaviour:
   `DOCKER_RT_RIFT_GATEWAY_CA=/path/ca.pem` for a private CA. The gateway itself
   is configured with `RIFT_AUTH_URL` pointing at the platform authorizer.
   Without a gateway, exec/cp fail with `[RIFT_UNAVAILABLE]`.
-- The rift-client Go sources and the injection image live in
-  `k8s_middleware/rift`; the SDK ships only the Python gRPC stubs and the proto.
+- The rift-client Go sources and the injection image live in the standalone
+  `rift-client` repo; the SDK ships only the Python gRPC stubs and the proto.
 - `docker start` does not return until rift-client answers Ping
   (`DOCKER_RT_RIFT_PING_ATTEMPTS` × `DOCKER_RT_RIFT_PING_INTERVAL`); if the
   channel never comes up, start fails and the container is not reported as
@@ -295,10 +295,12 @@ Requirements and behaviour:
 - Sandboxes created **before** platform-side injection have no rift-client and
   must be recreated (`docker rm` + `docker run`). `docker stop` + `docker start`
   resumes the Pod; the platform refreshes the token Secret on resume.
-- The gateway compares the caller's access key against the sandbox `Pipe` and
-  forwards the same key as `x-rift-token`; the pod reads it from the mounted
-  Secret file (`0444`, so non-root image users can read it too) and compares it
-  in constant time. No public key, KV or signing is involved.
+- The gateway compares the sandbox's per-sandbox rift password (from the
+  platform `get_sandbox` detail, never the account access key) against the
+  sandbox `Pipe` and forwards the same password as `x-rift-token`; the pod
+  reads it from the mounted Secret file (`0444`, so non-root image users can
+  read it too) and compares it in constant time. No public key, KV or signing
+  is involved.
 - Feishu alerts for an unreachable `rift-client` are emitted by the gateway
   (it counts consecutive failures per sandbox), not by the local daemon.
 

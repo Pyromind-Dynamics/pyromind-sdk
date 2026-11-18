@@ -168,12 +168,12 @@ class RiftExecSession:
 class RiftGatewayClient:
     """A per-sandbox client. Auth is carried in gRPC metadata on every RPC."""
 
-    def __init__(self, cfg: RiftConfig, api_key: str, sandbox_id: str) -> None:
+    def __init__(self, cfg: RiftConfig, credential: str, sandbox_id: str) -> None:
         self.cfg = cfg
-        self._api_key = api_key
+        self._credential = credential
         self.sandbox_id = sandbox_id
         self._metadata = (
-            ("authorization", f"Bearer {api_key}"),
+            ("authorization", f"Bearer {credential}"),
             ("x-sandbox-id", sandbox_id),
         )
         self._channel: Optional[grpc.aio.Channel] = None

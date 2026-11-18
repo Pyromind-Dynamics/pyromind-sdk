@@ -115,6 +115,7 @@ class SandboxClient(PyroMindClient):
             "port_mappings": sandbox_data.get("port_mappings"),
             "uid": sandbox_data.get("uid"),
             "mount_public_dir": sandbox_data.get("mount_public_dir"),
+            "rift_password": sandbox_data.get("rift_password"),
         }
         
         # Convert screen_size to screen_resolution if present

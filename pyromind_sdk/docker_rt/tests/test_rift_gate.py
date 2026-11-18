@@ -95,7 +95,19 @@ def test_list_item_state_matches_status_while_not_ready() -> None:
     assert item["State"] == "running"
 
 
-def _connect_env(monkeypatch, client, *, gateway="gw.example:443", attempts=2):
+def _connect_env(
+    monkeypatch,
+    *,
+    ping=None,
+    password="pwd-1",
+    gateway="gw.example:443",
+    attempts=2,
+):
+    """Build an env whose platform client returns a per-sandbox rift password.
+
+    ``ping`` receives the fake RiftGatewayClient and returns/raises; the
+    monkeypatched RiftGatewayClient records every credential it was built with.
+    """
     import logging
 
     from ..backend import pyromind_sdk_env as mod
@@ -107,26 +119,52 @@ def _connect_env(monkeypatch, client, *, gateway="gw.example:443", attempts=2):
             gateway=gateway, ping_attempts=attempts, ping_interval=0
         ),
     )
+
+    async def _ok(_client):
+        return "v0.1.0+abc123"
+
+    ping = ping or _ok
+    clients: list = []
+
+    class _PlatformClient:
+        async def get_sandbox(self, sandbox_id, *, timeout=None, retry=True):
+            value = password() if callable(password) else password
+            return SimpleNamespace(rift_password=value)
+
+    class _RiftClient:
+        def __init__(self, cfg, credential, sandbox_id):
+            self.credential = credential
+            self.calls = 0
+            clients.append(self)
+
+        async def ping(self) -> str:
+            self.calls += 1
+            return await ping(self)
+
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(mod, "RiftGatewayClient", _RiftClient)
+
     env = PyromindSDK.__new__(PyromindSDK)
     env.sandbox_id = "sb-1"
     env.rift_ready = False
     env.rift_last_error = ""
-    env._rift_client = client
+    env._rift_client = None
+    env._client = _PlatformClient()
     env.logger = logging.getLogger("test.connect_rift")
-    return env
+    return env, clients
 
 
-def test_connect_rift_marks_ready_on_ping(monkeypatch) -> None:
+def test_connect_rift_uses_per_sandbox_password(monkeypatch) -> None:
     import asyncio
 
-    class _Client:
-        async def ping(self) -> str:
-            return "v0.1.0+abc123"
-
-    env = _connect_env(monkeypatch, _Client())
+    env, clients = _connect_env(monkeypatch)
     asyncio.run(env.connect_rift())
     assert env.rift_ready is True
     assert env.rift_last_error == ""
+    assert [c.credential for c in clients] == ["pwd-1"]
+    assert clients[0].calls == 1
 
 
 def test_connect_rift_fails_loudly_after_retries(monkeypatch) -> None:
@@ -135,42 +173,70 @@ def test_connect_rift_fails_loudly_after_retries(monkeypatch) -> None:
 
     from ...rift.errors import RiftUnavailable
 
-    class _Client:
-        def __init__(self):
-            self.calls = 0
+    async def _fail(_client):
+        raise RiftUnavailable("sandbox not found")
 
-        async def ping(self) -> str:
-            self.calls += 1
-            raise RiftUnavailable("sandbox not found")
-
-    client = _Client()
-    env = _connect_env(monkeypatch, client, attempts=3)
+    env, clients = _connect_env(monkeypatch, ping=_fail, attempts=3)
     with pytest.raises(RiftUnavailable) as excinfo:
         asyncio.run(env.connect_rift())
     assert "did not answer Ping" in str(excinfo.value)
-    assert client.calls == 3
+    assert len(clients) == 1
+    assert clients[0].calls == 3
     assert env.rift_ready is False
 
 
-def test_connect_rift_auth_failure_is_not_retried(monkeypatch) -> None:
+def test_connect_rift_refetches_password_once_on_auth_failure(monkeypatch) -> None:
+    """鉴权失败时换一次新密码再试；仍失败直接抛，不无限重试。"""
     import asyncio
 
     from ...rift.errors import RiftUnauthenticated
 
-    class _Client:
-        def __init__(self):
-            self.calls = 0
+    async def _deny(_client):
+        raise RiftUnauthenticated("bad password")
 
-        async def ping(self) -> str:
-            self.calls += 1
-            raise RiftUnauthenticated("bad key")
-
-    client = _Client()
-    env = _connect_env(monkeypatch, client, attempts=5)
+    passwords = iter(["pwd-old", "pwd-new"])
+    env, clients = _connect_env(
+        monkeypatch,
+        ping=_deny,
+        password=lambda: next(passwords),
+        attempts=5,
+    )
     with pytest.raises(RiftUnauthenticated):
         asyncio.run(env.connect_rift())
-    assert client.calls == 1
+    assert [c.credential for c in clients] == ["pwd-old", "pwd-new"]
+    assert [c.calls for c in clients] == [1, 1]
     assert env.rift_ready is False
+
+
+def test_connect_rift_recovers_after_password_rotation(monkeypatch) -> None:
+    import asyncio
+
+    from ...rift.errors import RiftUnauthenticated
+
+    async def _first_deny_then_ok(_client):
+        if len(clients) == 1:
+            raise RiftUnauthenticated("stale password")
+        return "v0.1.0+abc123"
+
+    passwords = iter(["pwd-old", "pwd-new"])
+    env, clients = _connect_env(
+        monkeypatch, ping=_first_deny_then_ok, password=lambda: next(passwords)
+    )
+    asyncio.run(env.connect_rift())
+    assert env.rift_ready is True
+    assert [c.credential for c in clients] == ["pwd-old", "pwd-new"]
+
+
+def test_connect_rift_requires_a_sandbox_password(monkeypatch) -> None:
+    import asyncio
+
+    from ...rift.errors import RiftUnavailable
+
+    env, clients = _connect_env(monkeypatch, password=None)
+    with pytest.raises(RiftUnavailable) as excinfo:
+        asyncio.run(env.connect_rift())
+    assert "rift_password" in str(excinfo.value)
+    assert clients == []
 
 
 def test_connect_rift_requires_a_gateway(monkeypatch) -> None:
@@ -178,7 +244,7 @@ def test_connect_rift_requires_a_gateway(monkeypatch) -> None:
 
     from ...rift.errors import RiftUnavailable
 
-    env = _connect_env(monkeypatch, None, gateway="")
+    env, _ = _connect_env(monkeypatch, gateway="")
     with pytest.raises(RiftUnavailable) as excinfo:
         asyncio.run(env.connect_rift())
     assert "not configured" in str(excinfo.value)

@@ -754,32 +754,30 @@ class PyromindSDK:
     async def ping_rift(self) -> bool:
         return bool(await self.ping_rift_version())
 
-    async def connect_rift(self) -> None:
-        """Ping 校验平台注入的 rift-client；不可达就硬失败。
+    async def _fetch_rift_password(self) -> str:
+        """从平台 detail 取该 sandbox 的 rift 密码。
 
-        二进制与 token 由 k8s_middleware 在建 Pod 时注入（initContainer +
-        per-sandbox Secret），rift-client 以 --supervise 当 PID1。docker-rt
-        不再上传/启动任何东西：这里只建立网关连接并用 Ping 确认数据面可用。
-        失败抛 RiftUnavailable，调用方不得回退平台 exec 通道。
+        认证值是每个 sandbox 独立的随机密码（类似 JupyterLab 的 per-instance
+        密码），不再使用用户的长期 api_key；拿不到就硬失败，不回落。
         """
-        cfg = load_rift_config()
-        if not cfg.gateway:
-            raise RiftUnavailable("DOCKER_RT_RIFT_GATEWAY is not configured")
-        if not self.sandbox_id:
-            raise RiftUnavailable("sandbox is not started")
-        if self._rift_client is None:
-            access_key = str(getattr(self._client, "api_key", "") or "").strip()
-            if not access_key:
-                raise RiftUnavailable("PyroMind client has no access key")
-            self._rift_client = RiftGatewayClient(
-                cfg, access_key, self.sandbox_id
+        sandbox = await self._client.get_sandbox(
+            self.sandbox_id, timeout=10, retry=False
+        )
+        password = str(getattr(sandbox, "rift_password", "") or "").strip()
+        if not password:
+            raise RiftUnavailable(
+                "sandbox has no rift_password (created before the per-sandbox "
+                "credential upgrade); resume the sandbox to issue one"
             )
+        return password
+
+    async def _ping_rift_until_ready(self, cfg) -> None:
         last_error: BaseException | None = None
         for _ in range(cfg.ping_attempts):
             try:
                 version = await self._rift_client.ping()
             except (RiftUnauthenticated, RiftPermissionDenied):
-                # 凭据/路由授权问题不会因重试变好，立即失败
+                # 凭据/路由授权问题不会因重试变好，交给调用方决定是否换密码
                 self.rift_ready = False
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -800,6 +798,32 @@ class PyromindSDK:
         raise RiftUnavailable(
             f"rift-client did not answer Ping: {self.rift_last_error}"
         )
+
+    async def connect_rift(self) -> None:
+        """Ping 校验平台注入的 rift-client；不可达就硬失败。
+
+        二进制与 token 由 k8s_middleware 在建 Pod 时注入（initContainer +
+        per-sandbox Secret），rift-client 以 --supervise 当 PID1。docker-rt
+        不再上传/启动任何东西：这里只建立网关连接并用 Ping 确认数据面可用。
+        网关认证用 get_sandbox 返回的 per-sandbox 密码；鉴权失败时重新拉取
+        一次密码再试（resume/edit 可能换了密码），仍失败直接抛。
+        失败抛 RiftUnavailable，调用方不得回退平台 exec 通道。
+        """
+        cfg = load_rift_config()
+        if not cfg.gateway:
+            raise RiftUnavailable("DOCKER_RT_RIFT_GATEWAY is not configured")
+        if not self.sandbox_id:
+            raise RiftUnavailable("sandbox is not started")
+        password = await self._fetch_rift_password()
+        self._rift_client = RiftGatewayClient(cfg, password, self.sandbox_id)
+        try:
+            await self._ping_rift_until_ready(cfg)
+            return
+        except (RiftUnauthenticated, RiftPermissionDenied):
+            await self._close_rift()
+        password = await self._fetch_rift_password()
+        self._rift_client = RiftGatewayClient(cfg, password, self.sandbox_id)
+        await self._ping_rift_until_ready(cfg)
 
     async def _close_rift(self) -> None:
         client = getattr(self, "_rift_client", None)
@@ -1148,8 +1172,10 @@ class PyromindSDK:
         if not self.sandbox_id:
             raise RuntimeError("sandbox is not started")
         # resume creates a brand-new Pod: the platform injects rift-client as
-        # PID1 again, so there is nothing to upload here. Mark the channel
-        # unready; _start_record gates on Ping (connect_rift) before Up.
+        # PID1 again, so there is nothing to upload here. The old gateway
+        # channel holds a possibly rotated per-sandbox password; drop it and
+        # let _start_record re-fetch credentials via connect_rift.
+        await self._close_rift()
         self.rift_ready = False
         response = await self._client.resume(self.sandbox_id)
         self._bind_response(response)

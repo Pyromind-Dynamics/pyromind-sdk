@@ -278,7 +278,7 @@ docker exec / cp -> docker-rt -> rift gateway（鉴权）-> Service:7500 -> rift
   SDK 集群表解析）：公网 CA 用 `DOCKER_RT_RIFT_GATEWAY_TLS=true`，自签/私有 CA 用
   `DOCKER_RT_RIFT_GATEWAY_CA=/path/ca.pem`。gateway 侧用 `RIFT_AUTH_URL` 指向平台
   鉴权接口。没有 gateway 时，exec/cp 会直接以 `[RIFT_UNAVAILABLE]` 失败。
-- rift-client 的 Go 源码与注入镜像在 `k8s_middleware/rift`；SDK 只带 Python gRPC
+- rift-client 的 Go 源码与注入镜像在独立仓库 `rift-client`；SDK 只带 Python gRPC
   stubs 与 proto。
 - `docker start` 在 rift-client Ping 通之前不会返回
   （`DOCKER_RT_RIFT_PING_ATTEMPTS` × `DOCKER_RT_RIFT_PING_INTERVAL`），始终不通则
@@ -288,7 +288,8 @@ docker exec / cp -> docker-rt -> rift gateway（鉴权）-> Service:7500 -> rift
 - **平台注入上线之前**创建的沙箱没有 rift-client，必须重建（`docker rm` +
   `docker run`）。`docker stop` + `docker start` 恢复 Pod，平台会在 resume 时刷新
   token Secret。
-- Gateway 用调用方的 access key 与沙箱 `Pipe` 里的值比对，并把同一个 key 作为
+- Gateway 用该 sandbox 自己的 rift 密码（取自平台 `get_sandbox` 的 `rift_password`，
+  不是用户 access key）与沙箱 `Pipe` 里的值比对，并把同一个密码作为
   `x-rift-token` 转发；Pod 内从挂载的 Secret 文件读取（`0444`，非 root 镜像用户也能
   读）并做常量时间比较。不涉及公钥、KV 或签名。
 - `rift-client` 不可达的飞书告警由 **gateway** 发出（按 sandbox 统计连续失败），本机
