@@ -300,6 +300,10 @@ class PyroMindClient:
         msg = err.get('message', '')
         if code or msg:
             return f"{code}: {msg}" if code else msg
+        # Portal 的本地校验走 FastAPI HTTPException，body 是 {"detail": ...}
+        detail = error_data.get('detail')
+        if isinstance(detail, str) and detail.strip():
+            return detail.strip()
         return "Bad Request (400)"
     
     def _format_401_error(self, error_data: Dict[str, Any]) -> str:
