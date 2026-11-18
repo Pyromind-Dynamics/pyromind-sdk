@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import types
 
@@ -16,24 +17,10 @@ from pyromind_sdk.exec_stream import (
 )
 
 
-def test_build_exec_stream_url_resolves_portal_to_direct_cluster() -> None:
-    url = build_exec_stream_websocket_url(
-        "https://pre-api-portal.pyromind.ai/api/v1",
-        "sb-demo",
-        # Bare `us-west-1` means prod; the env suffix selects pre.
-        "us-west-1#pre",
-    )
-
-    assert url == (
-        "wss://pre-api.pyromind.ai/api/v1/sandboxes/sb-demo/exec-stream"
-    )
-
-
-def test_build_exec_stream_url_keeps_direct_base_url() -> None:
+def test_build_exec_stream_url_uses_the_exchanged_base_url() -> None:
     url = build_exec_stream_websocket_url(
         "https://pre-api.pyromind.ai/api/v1",
         "sb-demo",
-        "us-west-1",
     )
 
     assert url == (
@@ -41,19 +28,34 @@ def test_build_exec_stream_url_keeps_direct_base_url() -> None:
     )
 
 
-def test_exec_stream_auth_headers_carry_bearer_key_not_url() -> None:
-    """vuln-0016: the access key travels in the Authorization header only."""
-    from pyromind_sdk.exec_stream import exec_stream_auth_headers
+def test_ws_auth_frame_carries_only_the_token() -> None:
+    from pyromind_sdk.token import ws_auth_frame
 
-    url = build_exec_stream_websocket_url(
-        "https://pre-api.pyromind.ai/api/v1", "sb-demo"
-    )
-    assert "token" not in url and "key-123" not in url
+    frame = json.loads(ws_auth_frame("token-abc"))
+    assert frame == {"type": "auth", "token": "token-abc"}
 
-    headers = exec_stream_auth_headers("key-123")
-    assert headers["Authorization"] == "Bearer key-123"
 
-    assert "Authorization" not in exec_stream_auth_headers("")
+def test_exec_stream_sends_the_auth_frame_before_the_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The server only reads the command frame after the token frame."""
+    messages = [
+        types.SimpleNamespace(
+            type=aiohttp.WSMsgType.TEXT,
+            data=json.dumps({"type": "exit", "returncode": 0}),
+        )
+    ]
+    ws = _FakeWS(messages)
+    _install_fake_ws(monkeypatch, ws)
+
+    list(_collect(command=["echo", "hi"]))
+
+    first = json.loads(ws.sent[0])
+    second = json.loads(ws.sent[1])
+    assert first == {"type": "auth", "token": "test-token"}
+    assert second["command"] == ["echo", "hi"]
+
+
 
 
 def test_iter_exec_stream_yields_events(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -69,6 +71,7 @@ def test_iter_exec_stream_yields_events(monkeypatch: pytest.MonkeyPatch) -> None
     chunks = list(
         iter_exec_stream(
             url="wss://example.test/exec-stream",
+            token="test-token",
             command="echo hello",
         )
     )
@@ -156,6 +159,8 @@ def _install_fake_ws(monkeypatch: pytest.MonkeyPatch, ws: _FakeWS) -> None:
 
 
 def _collect(**kwargs):
+    kwargs.setdefault("token", "test-token")
+
     async def run():
         return [
             event
@@ -318,7 +323,7 @@ def test_polling_timeout_never_drops_ws_frames(
     async def collect():
         out = []
         async for chunk in iter_exec_stream_async(
-            url="ws://fake/exec", command=["echo", "hi"]
+            url="ws://fake/exec", token="test-token", command=["echo", "hi"]
         ):
             out.append(chunk)
         return out
@@ -378,7 +383,7 @@ def test_slow_consumer_still_keeps_receiving(
     async def collect():
         out = []
         async for chunk in iter_exec_stream_async(
-            url="ws://fake/exec", command=["echo", "hi"]
+            url="ws://fake/exec", token="test-token", command=["echo", "hi"]
         ):
             out.append(chunk)
             if chunk.type == "stdout":

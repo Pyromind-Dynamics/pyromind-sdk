@@ -16,6 +16,8 @@ from .models import (
 
 class AsyncStorageAPIClient(PyroMindAsyncClient):
     """Async client for storage-related REST APIs and cross-cluster transfer."""
+    #: 跨集群 transfer 接口在 portal 本地处理：用短时 token，但地址保持在 portal。
+    KEEP_PORTAL_BASE = True
 
     _TRANSFER_PREFIX = "/storage/transfer"
 

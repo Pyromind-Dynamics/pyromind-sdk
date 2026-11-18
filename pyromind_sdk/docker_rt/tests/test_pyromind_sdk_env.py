@@ -83,6 +83,7 @@ def test_shared_async_client_uses_256_connection_pool(
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("PYROMIND_API_KEY", "test-key")
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2")
     client = env_mod.new_sandbox_client()
 
     async def _check() -> None:
@@ -94,17 +95,19 @@ def test_shared_async_client_uses_256_connection_pool(
     asyncio.run(_check())
 
 
-def test_shared_async_client_targets_the_cluster_directly(
+def test_shared_async_client_starts_at_the_portal(
     monkeypatch: MonkeyPatch,
 ) -> None:
-    """``docker cp`` and friends are data plane: never through the portal."""
+    """All requests start at the portal; the exchange returns the direct base."""
     monkeypatch.setenv("PYROMIND_API_KEY", "test-key")
     monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
     monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-1#pre")
 
     client = env_mod.new_sandbox_client()
 
-    assert client.base_url == "https://pre-api.pyromind.ai/api/v1"
+    assert client.base_url == "https://api-portal.pyromind.ai/api/v1"
+    assert client.exchange_base_url == client.base_url
+    # token 交换需要环境后缀（中间件按 #pre 选集群），原样保留
     assert client.cluster == "us-west-1#pre"
 
 

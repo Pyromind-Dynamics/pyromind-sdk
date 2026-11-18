@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 """
-Regression tests for tmp heredoc indirection:
+Regression tests for Python node input staging:
 
-- `build_command_template` should write string inputs to `/tmp/<input_name>` via heredoc
-  and pass `/tmp/<input_name>` paths through `--inputs`.
-- `function_call_wrapper` should resolve `/tmp/*` file paths back into real string content
-  before calling the user function.
+- `build_command_template` should pass values as argv and write the legacy
+  /tmp/<name> files without putting values in shell source.
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import importlib.util
+import inspect
+import shlex
+import uuid
 from pathlib import Path
 
 import pytest
 
-from pyromind_sdk.nodes.command_executor import prepare_command_template
+from pyromind_sdk.nodes.command_executor import execute_command_template, prepare_command_template
 from pyromind_sdk.nodes.function_call_wrapper import function_call_wrapper, load_python_module
 from pyromind_sdk.nodes.python_function_executor import build_command_template
 
@@ -25,16 +27,18 @@ from pyromind_sdk.nodes.python_function_executor import build_command_template
 def _load_nodes_module(module_filename: str):
     """Load a nodes module directly from source file path."""
     module_file = Path(__file__).resolve().parents[2] / "nodes" / module_filename
-    spec = importlib.util.spec_from_file_location(f"nodes_{module_filename}", module_file)
+    spec = importlib.util.spec_from_file_location(
+        f"pyromind_sdk.nodes._isolated_{module_filename.replace('.', '_')}", module_file
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-def test_build_command_template_uses_tmp_heredoc_for_string_inputs(tmp_path: Path) -> None:
+def test_build_command_template_passes_string_inputs_as_argv(tmp_path: Path) -> None:
     """
-    Ensure command_template preserves heredoc syntax and passes `/tmp/<input>` paths.
+    Input content must never be interpolated into shell source.
     """
     dummy_py = tmp_path / "dummy_node_module.py"
     dummy_py.write_text(
@@ -55,47 +59,131 @@ def test_build_command_template_uses_tmp_heredoc_for_string_inputs(tmp_path: Pat
     assert command_template[1] == "-c"
     script = command_template[2]
 
-    assert "cat > /tmp/system_prompt" in script
-    assert "<<'PYROMIND_" in script
-    assert "/tmp/system_prompt" in script
+    assert '-c "import pyromind_sdk" 2>/dev/null ||' in script
+    assert "pip install pyromind-sdk -q" in script
+    assert "os.O_EXCL|os.O_NOFOLLOW" in script
+    assert '"${1}"' in script
+    assert '"system_prompt": "/tmp/system_prompt"' in script
+    assert "__pyromind_input_file__" not in script
+    assert "--input-dir" not in script
+    assert "input_dir" not in inspect.signature(function_call_wrapper).parameters
+    assert "{{system_prompt}}" not in script
+    assert command_template[3:] == ["pyromind-node", "{{system_prompt}}"]
 
-    # Ensure prepare_command_template doesn't shlex.split() and therefore doesn't damage heredoc.
+    # Shell source must not be split into command-line words.
     prepared_parts, _output_file_paths, _input_placeholders, _output_placeholders = prepare_command_template(
         command_template, inputs={"system_prompt": "IGNORED"}, output_names=["out"]
     )
     assert prepared_parts[2] == script
 
 
-def test_function_call_wrapper_reads_tmp_files(tmp_path: Path) -> None:
-    """
-    Ensure `/tmp/*` string inputs are treated as file paths and read back as text.
-    """
-    dummy_py = tmp_path / "dummy_wrapped_module.py"
-    dummy_py.write_text(
-        "def f(system_prompt: str) -> dict:\n"
-        "    return {'out': system_prompt}\n",
+def test_conda_activation_does_not_receive_node_inputs(tmp_path: Path) -> None:
+    """Bash source must not inherit the input argv passed to bash -c."""
+    command = build_command_template(
+        python_code=str(tmp_path / "node.py"),
+        function_name="run",
+        input_types={
+            "required": {name: ("STRING", {}) for name in ("prompt", "question", "answer")},
+            "optional": {},
+        },
+        output_names=[],
+        conda_env="training",
+    )
+    activation = next(
+        line for line in command[2].splitlines()
+        if "source /workspace/.conda/bin/activate" in line
+    )
+    fake_activate = tmp_path / "activate"
+    args_file = tmp_path / "activation_args"
+    fake_activate.write_text(
+        'printf "%s\\n" "$@" > "$ACTIVATION_ARGS_FILE"\nconda() { :; }\n',
         encoding="utf-8",
     )
-
-    # pytest tmp_path is usually under /tmp, and wrapper resolves only `/tmp/*`.
-    tmp_prompt_file = tmp_path / "system_prompt.txt"
-    content = "line1\n\"double\" and 'single'\n\\\\boxed{}"
-    tmp_prompt_file.write_text(content, encoding="utf-8")
-
-    out_file = tmp_path / "out.txt"
-
-    function_call_wrapper(
-        python_code=str(dummy_py),
-        function_name="f",
-        inputs={"system_prompt": str(tmp_prompt_file)},
-        input_types={"required": {"system_prompt": ("STRING", {})}, "optional": {}},
-        output_paths={"out": str(out_file)},
-        return_types=["STRING"],
-        return_names=["out"],
+    activation = activation.replace("[ -x /root/.local/bin/micromamba ]", "false")
+    activation = activation.replace("command -v micromamba >/dev/null 2>&1", "false")
+    activation = activation.replace(
+        "/workspace/.conda/bin/activate", shlex.quote(str(fake_activate))
     )
+    subprocess.run(
+        ["bash", "-c", activation, "pyromind-node", "input", "question", "answer"],
+        env={**os.environ, "ACTIVATION_ARGS_FILE": str(args_file)},
+        check=True,
+    )
+    assert args_file.read_text(encoding="utf-8").splitlines() == ["base"]
 
-    assert out_file.exists()
-    assert out_file.read_text(encoding="utf-8") == content
+
+def test_input_files_preserve_values_after_ninth_argument(tmp_path: Path) -> None:
+    prefix = uuid.uuid4().hex
+    names = [f"test_{prefix}_{index}" for index in range(1, 13)]
+    values = ["/workspace/models/checkpoints/grpo0610", *map(str, range(2, 10)), "0", "", "2"]
+    command = build_command_template(
+        python_code=str(tmp_path / "node.py"),
+        function_name="run",
+        input_types={"required": {name: ("STRING", {}) for name in names}},
+        output_names=[],
+        conda_env="",
+    )
+    paths = [Path("/tmp") / name for name in names]
+    assert all(not path.exists() for path in paths)
+    lines = command[2].splitlines()
+    start = next(i for i, line in enumerate(lines) if " -c 'import os,sys" in line)
+    end = next(i for i, line in enumerate(lines[start:], start) if ' -c "import pyromind_sdk"' in line)
+    try:
+        subprocess.run(
+            ["bash", "-c", "\n".join(lines[start:end]), "pyromind-node", *values],
+            check=True,
+        )
+        assert [path.read_text(encoding="utf-8") for path in paths] == values
+    finally:
+        for path in paths:
+            path.unlink(missing_ok=True)
+
+
+def test_input_staging_does_not_follow_existing_symlink(tmp_path: Path) -> None:
+    name = f"test_{uuid.uuid4().hex}"
+    target = tmp_path / "target"
+    target.write_text("untouched", encoding="utf-8")
+    link = Path("/tmp") / name
+    assert not os.path.lexists(link)
+    link.symlink_to(target)
+    command = build_command_template(
+        python_code=str(tmp_path / "node.py"),
+        function_name="run",
+        input_types={"required": {name: ("STRING", {})}},
+        output_names=[],
+        conda_env="",
+    )
+    lines = command[2].splitlines()
+    end = next(i for i, line in enumerate(lines) if ' -c "import pyromind_sdk"' in line)
+    stage_script = "\n".join(lines[:end])
+    try:
+        result = subprocess.run(
+            ["bash", "-c", stage_script, "pyromind-node", "unsafe write"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode != 0
+        assert target.read_text(encoding="utf-8") == "untouched"
+    finally:
+        link.unlink()
+
+
+def test_command_uses_installed_sdk_without_forcing_an_update(tmp_path: Path) -> None:
+    command = build_command_template(
+        python_code=str(tmp_path / "node.py"),
+        function_name="run",
+        input_types={"required": {}, "optional": {}},
+        output_names=[],
+        conda_env="",
+    )
+    script = command[2]
+    assert '-c "import pyromind_sdk" 2>/dev/null ||' in script
+    assert '-m pip install pyromind-sdk -q' in script
+    assert '--upgrade' not in script
+    assert 'test.pypi.org' not in script
+    assert 'pypi.org/pypi/' not in script
+    assert 'PYTHONPATH=' not in script
 
 
 def test_load_python_module_imports_sibling_package_and_restores_sys_path(tmp_path: Path) -> None:
@@ -150,8 +238,7 @@ def test_load_python_module_imports_sibling_package_and_restores_sys_path(tmp_pa
 
 def test_build_command_template_accelerate_mode_uses_accelerate_config_input(tmp_path: Path) -> None:
     """ACCELERATE_CONFIG input should be written to tmp config file and passed by --config_file."""
-    python_executor_module = _load_nodes_module("python_function_executor.py")
-    build_template = python_executor_module.build_command_template
+    build_template = build_command_template
 
     dummy_py = tmp_path / "dummy_accelerate_module.py"
     dummy_py.write_text(
@@ -176,11 +263,15 @@ def test_build_command_template_accelerate_mode_uses_accelerate_config_input(tmp
     )
 
     script = command_template[2]
+    assert "pip install" not in script
+    assert "pip download" not in script
     assert "accelerate launch --config_file /tmp/accelerate_config" in script
-    assert "cat > /tmp/accelerate_config" in script
-    assert "{{accelerate_config}}" in script
-    assert "--inputs '{\"system_prompt\": \"/tmp/system_prompt\"}'" in script
-    assert "\"accelerate_config\": \"/tmp/accelerate_config\"" not in script
+    assert "'accelerate_config'" in script
+    assert '"${2}"' in script
+    assert "{{accelerate_config}}" not in script
+    assert command_template[-2:] == ["{{system_prompt}}", "{{accelerate_config}}"]
+    assert '"system_prompt": "/tmp/system_prompt"' in script
+    assert '__pyromind_input_file__' not in script
     assert "pyromind_sdk.nodes.function_call_wrapper" in script
 
 
@@ -205,7 +296,7 @@ def test_build_command_template_accelerate_mode_without_declared_config_input(tm
         python_command="accelerate",
     )
     script = command_template[2]
-    assert "{{accelerate_config}}" in script
+    assert command_template[-1] == "{{accelerate_config}}"
     assert "accelerate launch --config_file /tmp/accelerate_config" in script
 
 
@@ -225,18 +316,15 @@ def test_build_command_template_accelerate_prefix_not_special_mode(tmp_path: Pat
         encoding="utf-8",
     )
 
-    command_template = build_template(
-        python_code=str(dummy_py),
-        function_name="f",
-        input_types={"required": {"system_prompt": ("STRING", {})}, "optional": {}},
-        output_names=["out"],
-        return_types=["STRING"],
-        python_command="accelerate launch --num_processes 4",
-    )
-
-    script = command_template[2]
-    assert "accelerate launch --num_processes 4 -m pyromind_sdk.nodes.function_call_wrapper" in script
-    assert "--config_file /tmp/accelerate_config_" not in script
+    with pytest.raises(ValueError, match="Python executable with supported options"):
+        build_template(
+            python_code=str(dummy_py),
+            function_name="f",
+            input_types={"required": {"system_prompt": ("STRING", {})}, "optional": {}},
+            output_names=["out"],
+            return_types=["STRING"],
+            python_command="accelerate launch --num_processes 4",
+        )
 
 
 def test_yaml_loader_rejects_accelerate_without_gpu_base_class(tmp_path: Path) -> None:

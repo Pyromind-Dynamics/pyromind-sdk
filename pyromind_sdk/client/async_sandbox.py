@@ -36,6 +36,7 @@ from .models import (
     SandboxExecStreamChunk,
 )
 from ..exec_stream import (
+    async_fetch_exec_stream_token,
     build_exec_stream_websocket_url,
     iter_exec_stream_async,
 )
@@ -660,18 +661,25 @@ class AsyncSandboxClient(PyroMindAsyncClient):
         """Execute a command and yield raw stdout/stderr byte chunks as they arrive."""
         if isinstance(command, str):
             command = command.strip()
-        url = build_exec_stream_websocket_url(
-            self.base_url,
-            sandbox_id,
-            self.cluster,
+        token, api_base_url = await async_fetch_exec_stream_token(
+            self.exchange_base_url, sandbox_id, self.api_key, self.cluster
         )
+        url = build_exec_stream_websocket_url(api_base_url, sandbox_id)
+
+        async def _refresh_token() -> str:
+            refreshed, _ = await async_fetch_exec_stream_token(
+                self.exchange_base_url, sandbox_id, self.api_key, self.cluster
+            )
+            return refreshed
+
         async for chunk in iter_exec_stream_async(
             url=url,
+            token=token,
             command=command,
             cwd=cwd.strip() if cwd else "",
             timeout=timeout,
             tty=tty,
-            api_key=self.api_key,
+            refresh_token=_refresh_token,
         ):
             yield chunk
 
@@ -720,6 +728,7 @@ class AsyncSandboxClient(PyroMindAsyncClient):
             File content as bytes
         """
         import aiohttp as _aiohttp
+        await self._ensure_api_base_url()
         url = self._build_url(f"/sandboxes/{sandbox_id}/files/read")
         session = await self._get_session()
         request_context = f"GET {url}"
@@ -743,6 +752,7 @@ class AsyncSandboxClient(PyroMindAsyncClient):
         disk use this instead; writes are pushed to a worker thread so the
         event loop is not blocked.
         """
+        await self._ensure_api_base_url()
         url = self._build_url(f"/sandboxes/{sandbox_id}/files/read")
         session = await self._get_session()
         request_context = f"GET {url}"
@@ -813,6 +823,7 @@ class AsyncSandboxClient(PyroMindAsyncClient):
 
         chunk_size = self._CHUNK_SIZE
         total_chunks = math.ceil(size / chunk_size)
+        await self._ensure_api_base_url()
         base_url = self._build_url(f"/sandboxes/{sandbox_id}/files/chunks")
         session = await self._get_session()
         request_context = f"chunked PUT /sandboxes/{sandbox_id}/files/write"

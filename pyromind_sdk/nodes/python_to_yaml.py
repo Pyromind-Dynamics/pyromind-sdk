@@ -8,6 +8,7 @@ import logging
 import yaml
 import ast
 import inspect
+import keyword
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional, Union
 from dataclasses import dataclass, field
@@ -600,15 +601,19 @@ def yaml_to_python_code(yaml_path: str, output_path: Optional[str] = None) -> st
 
     # Generate Python code
     code_lines = []
-    code_lines.append(f'"""')
-    code_lines.append(f'{node_config.get("description", "Node")}')
-    code_lines.append(f'"""')
+    if not isinstance(node_config, dict):
+        raise ValueError("YAML node must be an object")
+    code_lines.append(repr(str(node_config.get("description", "Node"))))
     code_lines.append("")
 
     # Import statements
     base_classes = node_config.get("base_class", [])
     if isinstance(base_classes, str):
         base_classes = [base_classes]
+    if not isinstance(base_classes, list) or any(
+        not isinstance(base, str) or base not in CLASS_TO_NAME_MAP for base in base_classes
+    ):
+        raise ValueError("Invalid base_class")
 
     imports = set()
     for base in base_classes:
@@ -622,44 +627,47 @@ def yaml_to_python_code(yaml_path: str, output_path: Optional[str] = None) -> st
 
     # Class definition
     class_name = node_config.get("name", "Node")
+    if not isinstance(class_name, str) or not class_name.isidentifier() or keyword.iskeyword(class_name):
+        raise ValueError("Invalid node class name")
     if len(base_classes) == 1:
         base_str = base_classes[0]
     else:
         base_str = ", ".join(base_classes)
 
     code_lines.append(f"class {class_name}({base_str}):")
+    code_lines.append("    pass")
 
     # Class attributes
     if node_config.get("description"):
-        code_lines.append(f'    DESCRIPTION = "{node_config["description"]}"')
+        code_lines.append(f'    DESCRIPTION = {node_config["description"]!r}')
     if node_config.get("display_name"):
-        code_lines.append(f'    DISPLAY_NAME = "{node_config["display_name"]}"')
+        code_lines.append(f'    DISPLAY_NAME = {node_config["display_name"]!r}')
     if node_config.get("return_types"):
         return_types = node_config["return_types"]
-        code_lines.append(f'    RETURN_TYPES = {return_types}')
+        code_lines.append(f'    RETURN_TYPES = {return_types!r}')
     if node_config.get("return_names"):
         return_names = node_config["return_names"]
-        code_lines.append(f'    RETURN_NAMES = {return_names}')
+        code_lines.append(f'    RETURN_NAMES = {return_names!r}')
 
     # Resource limits
     resources = node_config.get("resources", {})
     if resources:
         code_lines.append("")
         if "memory_limit" in resources:
-            code_lines.append(f'    MEMORY_LIMIT = {resources["memory_limit"]}')
+            code_lines.append(f'    MEMORY_LIMIT = {resources["memory_limit"]!r}')
         if "cpu_limit" in resources:
-            code_lines.append(f'    CPU_LIMIT = {resources["cpu_limit"]}')
+            code_lines.append(f'    CPU_LIMIT = {resources["cpu_limit"]!r}')
         if "gpu_min_count" in resources:
-            code_lines.append(f'    GPU_MIN_COUNT = {resources["gpu_min_count"]}')
+            code_lines.append(f'    GPU_MIN_COUNT = {resources["gpu_min_count"]!r}')
         if "gpu_max_count" in resources:
-            code_lines.append(f'    GPU_MAX_COUNT = {resources["gpu_max_count"]}')
+            code_lines.append(f'    GPU_MAX_COUNT = {resources["gpu_max_count"]!r}')
 
     # Command template
     if node_config.get("command_template"):
         code_lines.append("")
         code_lines.append("    COMMAND_TEMPLATE = [")
         for cmd in node_config["command_template"]:
-            code_lines.append(f'        "{cmd}",')
+            code_lines.append(f'        {cmd!r},')
         code_lines.append("    ]")
 
     # BASE_INPUT_TYPES method
@@ -677,11 +685,11 @@ def yaml_to_python_code(yaml_path: str, output_path: Optional[str] = None) -> st
                 options = {k: v for k, v in config.items() if k != "type"}
                 if options:
                     code_lines.append(
-                        f'                "{name}": ({repr(type_spec)}, {options}),'
+                        f'                {name!r}: ({type_spec!r}, {options!r}),'
                     )
                 else:
                     code_lines.append(
-                        f'                "{name}": ({repr(type_spec)},),'
+                        f'                {name!r}: ({type_spec!r},),'
                     )
             code_lines.append("            },")
 
@@ -692,11 +700,11 @@ def yaml_to_python_code(yaml_path: str, output_path: Optional[str] = None) -> st
                 options = {k: v for k, v in config.items() if k != "type"}
                 if options:
                     code_lines.append(
-                        f'                "{name}": ({repr(type_spec)}, {options}),'
+                        f'                {name!r}: ({type_spec!r}, {options!r}),'
                     )
                 else:
                     code_lines.append(
-                        f'                "{name}": ({repr(type_spec)},),'
+                        f'                {name!r}: ({type_spec!r},),'
                     )
             code_lines.append("            },")
         else:
@@ -713,7 +721,7 @@ def yaml_to_python_code(yaml_path: str, output_path: Optional[str] = None) -> st
         code_lines.append("        Define which inputs are for customer use")
         code_lines.append('        """')
         customer_inputs = node_config["customer_inputs"]
-        code_lines.append(f"        return {set(customer_inputs)}")
+        code_lines.append(f"        return {set(customer_inputs)!r}")
 
     code = "\n".join(code_lines)
 

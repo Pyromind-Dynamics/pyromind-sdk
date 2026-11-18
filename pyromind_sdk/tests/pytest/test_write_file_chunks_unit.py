@@ -25,6 +25,7 @@ class _FakeClient(AsyncSandboxClient):
     def __init__(self, *, fail_part=None):
         self.calls = []
         self.fail_part = fail_part
+        self._tokens = None  # 跳过真实换票：测试只关心分片顺序
         self.in_flight = 0
         self.max_in_flight = 0
 

@@ -28,7 +28,11 @@ from pyromind_sdk.client.async_base import (
     PyroMindAsyncAPIError,
 )
 from pyromind_sdk.client.async_sandbox import AsyncSandboxClient
-from pyromind_sdk.client.base import PyroMindAPIError, resolve_api_base_url
+from pyromind_sdk.client.base import (
+    DEFAULT_API_BASE_URL,
+    ENV_BASE_URL,
+    PyroMindAPIError,
+)
 from pyromind_sdk.client.models import (
     PortMapping,
     ResourceConfig,
@@ -190,13 +194,13 @@ async def _per_sandbox_pod_ips(
 def new_sandbox_client() -> AsyncSandboxClient:
     """Create the daemon's shared sandbox client.
 
-    Everything this client does is data-plane work — list/get/create, exec,
-    the file read/write behind ``docker cp``, and the internal-IP batch
-    lookup — so it talks to the cluster **directly** instead of going through
-    the portal. Only the profile/storage lookup stays on the portal.
+    Every request starts at the portal: the client exchanges the long-lived
+    key for a token **and** the cluster-direct address, then targets that
+    address for the rest of the session. Only profile/storage lookups stay on
+    the portal with the long-lived key.
     """
     return AsyncSandboxClient(
-        base_url=resolve_api_base_url(),
+        base_url=(os.getenv(ENV_BASE_URL) or DEFAULT_API_BASE_URL),
         connector_limit=DEFAULT_CONNECTOR_LIMIT,
         connector_limit_per_host=DEFAULT_CONNECTOR_LIMIT,
     )

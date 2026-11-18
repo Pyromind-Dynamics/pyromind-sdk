@@ -306,14 +306,14 @@ parameters:
 
 | Format   | Use case              | Structure |
 |----------|------------------------|-----------|
-| Standard | Platform/UI, API submit | `nodes` (list), `links` (array), `widgets_values` per node |
+| Xyflow   | Platform/UI, API submit | `nodes` (list, each with `data.nodeType` and `data.config`), `edges` (named `sourceHandle` and `targetHandle`) |
 | Lite     | Editing, AI, readability | `nodes` as `{name: {type, inputs, outputs, index}}`; connections in `inputs` as `{node_id, output_name}` |
 
-Rules: In standard format, only **connected** inputs appear in the node `inputs` array; unconnected values are in `widgets_values`. `last_node_id` and `last_link_id` are the maximum ID, not the count.
+Rules: In Xyflow, direct input values belong in `data.config`; connected inputs use named `edges`. Node IDs are preserved by `workflow_lite` in each node's `index` field.
 
 ## Integration notes
 
-- To submit a workflow via API, convert lite → standard with `to_workflow_standard(lite)` then send the result.
+- To submit a workflow via API, convert lite → Xyflow with `to_workflow_standard(lite)` then send the result.
 - For strict validation (required params, types, options), pass `node_info` from your platform API to `validate_lite_format` / `validate_standard_format` and use `WorkflowLiteConverter(node_info=node_info)` for round-trip.
 - Examples and more workflow samples: `pyromind_sdk/examples/openapi/workflows/`.
 

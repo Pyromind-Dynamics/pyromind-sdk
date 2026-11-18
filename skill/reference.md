@@ -73,4 +73,4 @@ client.close()
 ## Workflow format summary
 
 - **Lite**: `nodes` = `{ "node_name": { "type", "inputs", "outputs", "index" } }`; connection = `{"node_id": N, "output_name": "out"}`.
-- **Standard**: `nodes` = list, `links` = list of `[link_id, src_id, src_idx, tgt_id, tgt_idx, type]`; unconnected values in `widgets_values`.
+- **Xyflow**: `nodes` = list with each node's business type in `data.nodeType` and direct values in `data.config`; `edges` connect named `sourceHandle` and `targetHandle` ports.

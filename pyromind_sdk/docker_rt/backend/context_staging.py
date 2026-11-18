@@ -439,21 +439,27 @@ def workspace_bucket(profile: Any) -> str:
 
 
 def storage_endpoint_for(cluster: str | None) -> str:
-    """Storage endpoint for a cluster, from :data:`client.base.CLUSTER_RESOURCE`.
+    """从 ``/storage_info`` 取集群的 storage endpoint。
 
-    The profile's ``/storage_info`` may omit ``url`` (and the SDK's own
-    ``CLUSTER_STORAGE_ENDPOINTS`` table does not list every cluster), while the
-    cluster table always has it. One table, no second copy to drift.
+    只使用返回的 ``url``（不打码）；凭据字段不使用 —— ``StorageClient`` 读取
+    环境变量 ``PYROMIND_STORAGE_ACCESS_KEY`` / ``PYROMIND_STORAGE_SECRET_KEY``，
+    响应里被打码的 key 不会悄悄变成错误凭据。
+
+    失败要响亮：endpoint 为空时绝不能回退到 ``StorageClient`` 的默认值
+    （``us-west-2``），否则构建上下文会被传到错误集群的 bucket。
     """
     try:
-        from ...client.base import CLUSTER_RESOURCE, parse_cluster_code
+        from ...client.storage import get_storage_info
 
-        code, _ = parse_cluster_code(cluster or "")
-        entry = CLUSTER_RESOURCE.get(code) or {}
-        return str(entry.get("storage") or "").strip()
-    except Exception as exc:  # noqa: BLE001 - never let table lookup break a build
-        logger.debug("cluster storage endpoint lookup failed: %s", exc)
-        return ""
+        info = get_storage_info(cluster=cluster)
+    except Exception as exc:  # noqa: BLE001 - surface the reason, fail the build
+        raise StagingError(
+            f"storage endpoint lookup failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    endpoint = str(info.get("url") or "").strip()
+    if not endpoint:
+        raise StagingError("storage endpoint lookup returned no url")
+    return endpoint
 
 
 def connect_storage(cluster: str | None = None) -> tuple[Any, str]:
@@ -461,14 +467,10 @@ def connect_storage(cluster: str | None = None) -> tuple[Any, str]:
 
     Each piece comes from exactly one place:
 
-    * **endpoint** — :data:`client.base.CLUSTER_RESOURCE`;
+    * **endpoint** — ``POST /storage_info`` (``url`` is never masked);
     * **bucket** — ``ProfileClient.get_user_info().user.uid``;
     * **credentials** — the environment, read by ``StorageClient`` itself
-      (``PYROMIND_API_KEY`` + ``PYROMIND_STORAGE_SECRET_KEY``).
-
-    ``/storage_info`` is deliberately **not** consulted: the platform is
-    removing it, and its masked credential fields (``X805***NQNN``) were never
-    usable anyway.
+      (``PYROMIND_STORAGE_ACCESS_KEY`` + ``PYROMIND_STORAGE_SECRET_KEY``).
 
     Called **only from a build or a push** — never at daemon startup. A daemon
     that is merely listening must not probe (or fail on) storage; the check
@@ -502,8 +504,8 @@ def connect_storage(cluster: str | None = None) -> tuple[Any, str]:
         storage = StorageClient(endpoint=endpoint, cluster=cluster)
     except ValueError as exc:  # missing/invalid secret key lands here
         raise StagingError(
-            "storage connection failed: PYROMIND_STORAGE_SECRET_KEY is missing "
-            "or invalid"
+            "storage connection failed: PYROMIND_STORAGE_ACCESS_KEY / "
+            "PYROMIND_STORAGE_SECRET_KEY is missing or invalid"
         ) from exc
     except Exception as exc:  # noqa: BLE001
         raise StagingError(f"storage connection failed: {exc}") from exc
@@ -1320,7 +1322,8 @@ def sweep_stale_staging(
     now = time.time() if now is None else now
 
     if storage is None and not (
-        _storage_verified or _env("PYROMIND_STORAGE_SECRET_KEY")
+        _storage_verified
+        or (_env("PYROMIND_STORAGE_ACCESS_KEY") and _env("PYROMIND_STORAGE_SECRET_KEY"))
     ):
         # Nothing in this process has used storage and nothing is explicitly
         # configured: do not probe it. Whether storage works only matters to

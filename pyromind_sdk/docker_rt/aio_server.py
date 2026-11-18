@@ -118,6 +118,7 @@ from pyromind_sdk.client.trace import (  # noqa: E402
     reset_trace_id,
     set_trace_id,
 )
+from pyromind_sdk.token import TokenError  # noqa: E402
 
 logger = logging.getLogger("docker_rt")
 
@@ -5237,6 +5238,16 @@ async def _hijack_session(
     return resp
 
 
+
+    api_key = (os.getenv(ENV_API_KEY) or "").strip()
+    base = (os.getenv(ENV_BASE_URL) or "").strip() or DEFAULT_API_BASE_URL
+    cluster = (os.getenv(ENV_CLUSTER) or "").strip()
+    if not cluster:
+        raise RuntimeError(
+            "PYROMIND_CLUSTER is not set; docker-rt must select a cluster "
+            "from the portal's available clusters before opening a terminal."
+        )
+    return base.rstrip("/"), cluster, api_key
 
 
 def _pty_output_for_client(data: bytes, *, tty: bool) -> bytes:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check standard -> lite -> standard round-trip consistency."""
+"""Check Xyflow -> lite -> Xyflow round-trip consistency."""
 
 from __future__ import annotations
 
@@ -23,13 +23,13 @@ def _save_json(path: Path, data: Dict[str, Any]) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Round-trip check for standard workflow.")
-    parser.add_argument("input", type=Path, help="Input standard workflow JSON.")
+    parser = argparse.ArgumentParser(description="Round-trip check for Xyflow workflow.")
+    parser.add_argument("input", type=Path, help="Input Xyflow workflow JSON.")
     parser.add_argument(
         "--output",
         type=Path,
         default=None,
-        help="Optional output path for regenerated standard workflow.",
+        help="Optional output path for regenerated Xyflow workflow.",
     )
     args = parser.parse_args()
 
@@ -39,8 +39,8 @@ def main() -> int:
 
     src_nodes = len(source.get("nodes", []))
     new_nodes = len(regenerated.get("nodes", []))
-    src_edges = len(source.get("edges", source.get("links", [])))
-    new_edges = len(regenerated.get("edges", regenerated.get("links", [])))
+    src_edges = len(source.get("edges", []))
+    new_edges = len(regenerated.get("edges", []))
 
     print(f"Nodes: {src_nodes} -> {new_nodes}")
     print(f"Edges: {src_edges} -> {new_edges}")

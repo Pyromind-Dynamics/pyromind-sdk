@@ -1,6 +1,7 @@
 include README.md
 include LICENSE
 include pyproject.toml
+include pyromind_docker_sdk_timeout.pth
 # rift data plane: proto only — rift-client Go sources/binaries live in
 # k8s_middleware/rift (the platform injects them; the SDK ships Python stubs).
 recursive-include pyromind_sdk/rift/proto *.proto

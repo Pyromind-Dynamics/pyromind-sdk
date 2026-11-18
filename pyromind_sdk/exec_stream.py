@@ -10,19 +10,25 @@ import threading
 from typing import (
     Any,
     AsyncIterator,
+    Awaitable,
+    Callable,
     Dict,
     Iterator,
     Optional,
     Union,
 )
-from urllib.parse import urlparse
 
 import aiohttp
 
-from .client.base import resolve_base_url_from_cluster
 from .client.models import SandboxExecStreamChunk
 from .client.trace import TRACE_ID_HEADER, ensure_trace_id
 from .log_redaction import redact_text
+from .token import (
+    PURPOSE_WS_EXEC,
+    async_fetch_token,
+    fetch_token,
+    ws_auth_frame,
+)
 
 logger = logging.getLogger("pyromind_sdk.ws")
 
@@ -34,10 +40,9 @@ _STDERR_CHANNEL = 2
 class SandboxExecStreamError(RuntimeError):
     """Raised when the streaming exec endpoint reports a terminal error.
 
-    The message is redacted here as defense in depth: aiohttp's connection
-    errors quote the full URL back to the user (``docker build`` / ``docker
-    exec`` show it without going through logging). The access key itself
-    travels in the Authorization header, never in the URL (vuln-0016).
+    The message is redacted here, because aiohttp's connection errors quote the
+    request back and this text is shown to the user by ``docker build`` /
+    ``docker exec`` without going through logging.
     """
 
     def __init__(self, message: str, code: Optional[str] = None) -> None:
@@ -45,27 +50,21 @@ class SandboxExecStreamError(RuntimeError):
         self.code = code
 
 
-def _resolve_stream_base_url(base_url: str, cluster: Optional[str]) -> str:
-    """Resolve a WebSocket-capable direct API URL from portal-style config."""
-    parsed = urlparse(base_url)
-    host = (parsed.hostname or "").lower()
-    if "portal" in host and cluster:
-        return resolve_base_url_from_cluster(cluster)
-    return base_url.rstrip("/")
+class SandboxExecStreamAuthExpired(SandboxExecStreamError):
+    """WS token 在产生任何输出之前被拒（close 4001）。
 
-
-def build_exec_stream_websocket_url(
-    base_url: str,
-    sandbox_id: str,
-    cluster: Optional[str] = None,
-) -> str:
-    """Build the direct per-cluster exec-stream WebSocket URL.
-
-    The URL carries no credentials: the access key goes in the Authorization
-    header at connect time (vuln-0016 — query-string keys leak into access
-    logs, shell history and process listings).
+    命令尚未执行，可以用新换的 token 安全重试一次。
     """
-    base = _resolve_stream_base_url(base_url, cluster)
+
+
+def build_exec_stream_websocket_url(api_base_url: str, sandbox_id: str) -> str:
+    """Build the cluster-direct exec-stream WebSocket URL.
+
+    ``api_base_url`` is the direct address returned by the portal exchange; the
+    URL carries no credential.  Use :func:`fetch_exec_stream_token` and send
+    the token as the first frame (see ``_iter_exec_stream_events``).
+    """
+    base = api_base_url.rstrip("/")
     for http_scheme, ws_scheme in (("https://", "wss://"), ("http://", "ws://")):
         if base.startswith(http_scheme):
             base = ws_scheme + base[len(http_scheme):]
@@ -73,12 +72,40 @@ def build_exec_stream_websocket_url(
     return f"{base}/sandboxes/{sandbox_id}/exec-stream"
 
 
-def exec_stream_auth_headers(api_key: str) -> Dict[str, str]:
-    """Connect-time headers: trace id plus Bearer auth when a key is present."""
-    headers = {TRACE_ID_HEADER: ensure_trace_id()}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    return headers
+def fetch_exec_stream_token(
+    base_url: str,
+    sandbox_id: str,
+    api_key: str,
+    cluster: Optional[str] = None,
+) -> tuple[str, str]:
+    """Exchange on the portal; returns ``(token, cluster_direct_base_url)``."""
+    token, _ttl, api_base_url = fetch_token(
+        base_url,
+        api_key,
+        purpose=PURPOSE_WS_EXEC,
+        resource_type="sandbox",
+        resource_id=sandbox_id,
+        cluster=cluster,
+    )
+    return token, api_base_url
+
+
+async def async_fetch_exec_stream_token(
+    base_url: str,
+    sandbox_id: str,
+    api_key: str,
+    cluster: Optional[str] = None,
+) -> tuple[str, str]:
+    """Async variant of :func:`fetch_exec_stream_token`."""
+    token, _ttl, api_base_url = await async_fetch_token(
+        base_url,
+        api_key,
+        purpose=PURPOSE_WS_EXEC,
+        resource_type="sandbox",
+        resource_id=sandbox_id,
+        cluster=cluster,
+    )
+    return token, api_base_url
 
 
 def _binary_event_from_frame(data: bytes) -> Optional[Dict[str, Any]]:
@@ -145,6 +172,7 @@ async def _cancel_task(task: Optional[asyncio.Task]) -> None:
 async def _iter_exec_stream_events(
     *,
     url: str,
+    token: str,
     command: Union[str, list],
     cwd: str = "",
     timeout: Optional[int] = None,
@@ -152,7 +180,6 @@ async def _iter_exec_stream_events(
     stop_event: Optional[threading.Event] = None,
     ping_interval_s: float = 10.0,
     stdin_close: Optional[threading.Event] = None,
-    api_key: str = "",
 ) -> AsyncIterator[Dict[str, Any]]:
     # Output-only channel: the server refused stdin support here (see the
     # docker_rt README). Interactive sessions use the terminal WebSocket.
@@ -169,12 +196,19 @@ async def _iter_exec_stream_events(
         try:
             # trace 头一并带上：服务端（中间件）会沿用它，
             # 这条连接就能和发起它的 docker 命令/请求对上。
-            # access key 走 Authorization 头，不进 URL（vuln-0016）。
+            # 凭据是首帧的短时票据，URL 和握手指针里都没有任何长期 key。
             ws = await session.ws_connect(
-                url, heartbeat=30, headers=exec_stream_auth_headers(api_key)
+                url,
+                heartbeat=30,
+                headers={TRACE_ID_HEADER: ensure_trace_id()},
             )
+            await ws.send_str(ws_auth_frame(token))
             logger.debug("[ws] exec-stream connected %s", redact_text(url))
         except aiohttp.WSServerHandshakeError as exc:
+            if exc.status == 401:
+                raise SandboxExecStreamAuthExpired(
+                    "exec stream rejected the token (HTTP 401)"
+                ) from exc
             raise SandboxExecStreamError(
                 f"exec stream connection rejected (HTTP {exc.status})"
             ) from exc
@@ -251,13 +285,6 @@ async def _iter_exec_stream_events(
                         stdin_close.clear()
                         await ws.send_str('{"type":"stdin_close"}')
                     if loop.time() - last_ping >= ping_interval_s:
-                        # Application-level keepalive. Must be well under any
-                        # intermediary idle timeout: the middleware itself allows
-                        # 300s (and closes with an explicit EXEC_IDLE_TIMEOUT
-                        # frame), but ingress/LB/NAT in front of it commonly cut
-                        # idle WebSockets at ~30s with no close frame — which the
-                        # client can only report as "connection lost". 60s was too
-                        # slow and produced exactly that failure during bootstrap.
                         await ws.send_str('{"type":"ping"}')
                         last_ping = loop.time()
                     continue
@@ -334,6 +361,18 @@ async def _iter_exec_stream_events(
                     if stop_event is not None and stop_event.is_set():
                         break
                     if message.type == aiohttp.WSMsgType.CLOSE:
+                        if (
+                            message.data == 4001
+                            and stdout_bytes == 0
+                            and stderr_bytes == 0
+                        ):
+                            # Token rejected before the command produced output:
+                            # the caller may mint a new token and retry once.
+                            raise SandboxExecStreamAuthExpired(
+                                "exec stream rejected the auth token "
+                                "(close code 4001)",
+                                "4001",
+                            )
                         raise SandboxExecStreamError(
                             "exec stream closed by server before any exit "
                             "event — the command did not run to completion "
@@ -360,12 +399,13 @@ async def _iter_exec_stream_events(
 def iter_exec_stream(
     *,
     url: str,
+    token: str,
     command: Union[str, list],
     cwd: str = "",
     timeout: Optional[int] = None,
     tty: bool = False,
     stop_event: Optional[threading.Event] = None,
-    api_key: str = "",
+    refresh_token: Optional[Callable[[], str]] = None,
 ) -> Iterator[SandboxExecStreamChunk]:
     """Yield streaming exec events synchronously."""
     events: "queue.Queue[tuple[str, Any]]" = queue.Queue(
@@ -391,26 +431,32 @@ def iter_exec_stream(
 
     def runner() -> None:
         async def run() -> None:
-            try:
-                async for event in _iter_exec_stream_events(
-                    url=url,
-                    command=command,
-                    cwd=cwd,
-                    timeout=timeout,
-                    tty=tty,
-                    stop_event=stop_event,
-                    api_key=api_key,
-                ):
-                    put_event("event", event)
-            except BaseException as exc:
-                put_event("error", exc)
-            finally:
-                put_event("end", None, terminal=True)
+            current = token
+            for attempt in (0, 1):
+                try:
+                    async for event in _iter_exec_stream_events(
+                        url=url,
+                        token=current,
+                        command=command,
+                        cwd=cwd,
+                        timeout=timeout,
+                        tty=tty,
+                        stop_event=stop_event,
+                    ):
+                        put_event("event", event)
+                    return
+                except SandboxExecStreamAuthExpired:
+                    if attempt == 1 or refresh_token is None:
+                        raise
+                    # 输出前鉴权被拒：可以安全地重新换票一次。
+                    current = refresh_token()
 
         try:
-            asyncio.run(run())
-        except BaseException as exc:
-            put_event("error", exc)
+            try:
+                asyncio.run(run())
+            except BaseException as exc:
+                put_event("error", exc)
+        finally:
             put_event("end", None, terminal=True)
 
     thread = threading.Thread(target=runner, daemon=True)
@@ -435,23 +481,36 @@ def iter_exec_stream(
 async def iter_exec_stream_async(
     *,
     url: str,
+    token: str,
     command: Union[str, list],
     cwd: str = "",
     timeout: Optional[int] = None,
     tty: bool = False,
     stop_event: Optional[threading.Event] = None,
     stdin_close: Optional[threading.Event] = None,
-    api_key: str = "",
+    refresh_token: Optional[Callable[[], Awaitable[str]]] = None,
 ) -> AsyncIterator[SandboxExecStreamChunk]:
-    """Yield streaming exec events asynchronously."""
-    async for event in _iter_exec_stream_events(
-        url=url,
-        command=command,
-        cwd=cwd,
-        timeout=timeout,
-        tty=tty,
-        stop_event=stop_event,
-        stdin_close=stdin_close,
-        api_key=api_key,
-    ):
-        yield SandboxExecStreamChunk(**event)
+    """异步产出 exec-stream 事件。
+
+    服务端在产生输出前拒绝 token（close 4001）时，最多调用一次
+    ``refresh_token`` 重新换票；此时命令尚未执行，可以安全重发。
+    """
+    current = token
+    for attempt in (0, 1):
+        try:
+            async for event in _iter_exec_stream_events(
+                url=url,
+                token=current,
+                command=command,
+                cwd=cwd,
+                timeout=timeout,
+                tty=tty,
+                stop_event=stop_event,
+                stdin_close=stdin_close,
+            ):
+                yield SandboxExecStreamChunk(**event)
+            return
+        except SandboxExecStreamAuthExpired:
+            if attempt == 1 or refresh_token is None:
+                raise
+            current = await refresh_token()
