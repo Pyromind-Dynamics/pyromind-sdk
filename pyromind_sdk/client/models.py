@@ -1371,6 +1371,288 @@ class TransferClearResponse(BaseModel):
     deleted: int = 0
 
 
+class FileShareRequest(BaseModel):
+    """Request model for sharing a workspace file or directory with a user."""
+
+    source_path: str = Field(
+        ...,
+        min_length=1,
+        max_length=1024,
+        description="File or directory path under /workspace on the selected cluster.",
+    )
+    target_user_input: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=320,
+        description="Recipient UID or email address.",
+    )
+    target_user_id: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description="Recipient user ID (alternative to target_user_input).",
+    )
+
+    @model_validator(mode="after")
+    def validate_recipient(self) -> "FileShareRequest":
+        if bool(self.target_user_input) == (self.target_user_id is not None):
+            raise ValueError(
+                "provide exactly one of target_user_input or target_user_id"
+            )
+        return self
+
+
+class FileShareLocation(BaseModel):
+    """Source or destination location for a same-cluster share."""
+
+    cluster: Optional[str] = None
+    path: Optional[str] = None
+
+
+class FileShareStatus(str, Enum):
+    """Raw lifecycle status returned by the file-share API."""
+
+    PENDING_CONFIRMATION = "pending_confirmation"
+    QUEUED = "queued"
+    ACCEPTED = "accepted"
+    CLONING = "cloning"
+    SUCCESS = "success"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
+_FILE_SHARE_STATUS_PRESENTATION = {
+    "sent": {
+        "pending_confirmation": ("pending", "Pending", "待接受"),
+        "queued": ("sharing", "Sharing", "分享中"),
+        "accepted": ("sharing", "Sharing", "分享中"),
+        "cloning": ("sharing", "Sharing", "分享中"),
+        "success": ("completed", "Completed", "分享完成"),
+        "rejected": ("rejected", "Rejected", "对方已拒绝"),
+        "cancelled": ("cancelled", "Cancelled", "已取消"),
+        "expired": ("failed", "Failed", "分享失败"),
+        "failed": ("failed", "Failed", "分享失败"),
+    },
+    "received": {
+        "queued": ("accepted", "Accepted", "已接受"),
+        "accepted": ("sharing", "Sharing", "分享中"),
+        "cloning": ("sharing", "Sharing", "分享中"),
+        "success": ("completed", "Completed", "分享完成"),
+        "failed": ("failed", "Failed", "分享失败"),
+    },
+}
+_FILE_SHARE_TERMINAL_STATUSES = frozenset(
+    {"success", "rejected", "expired", "cancelled", "failed"}
+)
+
+
+def _normalize_workspace_display_path(path: Optional[str]) -> str:
+    """Format a share path the same way the Console task table does."""
+    parts = [part for part in str(path or "").replace("\\", "/").split("/") if part]
+    if not parts:
+        return "-"
+    if parts[0] == "workspace":
+        return "/" + "/".join(parts)
+    return "/workspace/" + "/".join(parts)
+
+
+def _format_file_share_size(size_bytes: Optional[int]) -> str:
+    """Format bytes like the Console storage task table."""
+    if size_bytes is None:
+        return "-"
+    if size_bytes == 0:
+        return "0 Bytes"
+    units = ("Bytes", "KB", "MB", "GB", "TB", "PB")
+    unit_index = 0
+    value = float(size_bytes)
+    while value >= 1024 and unit_index < len(units) - 1:
+        value /= 1024
+        unit_index += 1
+    rounded = round(value, 2)
+    text = str(int(rounded)) if rounded.is_integer() else str(rounded)
+    return f"{text} {units[unit_index]}"
+
+
+class FileShareTaskDisplay(BaseModel):
+    """Presentation-ready values matching the Console Shared/Accepted tables.
+
+    The raw :class:`FileShareTask` remains unchanged; this view only normalizes
+    the values and labels that the Console derives for display.
+    """
+
+    biz_no: Optional[str] = None
+    direction: Optional[Literal["sent", "received"]] = None
+    source_kind: Optional[Literal["file", "directory"]] = None
+    shared_path: str = "-"
+    item_name: str = "-"
+    save_location: str = "-"
+    counterparty_primary: str = "-"
+    counterparty_secondary: Optional[str] = None
+    size_bytes: Optional[int] = None
+    size_display: str = "-"
+    status: Optional[str] = None
+    status_key: str = "unknown"
+    status_label: str = "-"
+    created_at: Optional[str] = None
+    accepted_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    can_cancel: bool = False
+    can_delete: bool = False
+
+
+class FileShareTask(BaseModel):
+    """Same-cluster file-share task; status is the raw backend lifecycle value."""
+
+    biz_no: Optional[str] = None
+    direction: Optional[Literal["sent", "received"]] = None
+    counterparty_user_id: Optional[int] = None
+    counterparty_uid: Optional[str] = None
+    counterparty_email: Optional[str] = None
+    source_kind: Optional[Literal["file", "directory"]] = None
+    source: Optional[FileShareLocation] = None
+    target: Optional[FileShareLocation] = None
+    status: Optional[str] = None
+    transfer_env: Optional[str] = None
+    result_code: Optional[str] = None
+    error_code: Optional[str] = None
+    target_user_input: Optional[str] = None
+    confirmation_required: bool = False
+    can_cancel: bool = False
+    accepted_at: Optional[str] = None
+    file_count: Optional[int] = None
+    dir_count: Optional[int] = None
+    size_bytes: Optional[int] = None
+    error: Optional[str] = None
+    created_at: Optional[str] = None
+    finished_at: Optional[str] = None
+
+    def to_display(self, locale: str = "en") -> FileShareTaskDisplay:
+        """Return a table view aligned with the Console file-share task list.
+
+        ``status`` and all source fields on this model retain their raw backend
+        values. Use this adapter when rendering the Shared or Accepted task
+        table; ``locale`` accepts Chinese (``zh``/``zh-CN``) or English.
+        """
+        direction = self.direction or "sent"
+        raw_status = str(self.status or "")
+        status_values = _FILE_SHARE_STATUS_PRESENTATION.get(direction, {})
+        status_info = status_values.get(raw_status)
+        if status_info is None:
+            status_key, status_label = "unknown", raw_status or "-"
+        else:
+            status_key, english_label, chinese_label = status_info
+            status_label = (
+                chinese_label if locale.lower().replace("_", "-").startswith("zh")
+                else english_label
+            )
+
+        source_path = self.source.path if self.source else None
+        normalized_source = _normalize_workspace_display_path(source_path)
+        source_parts = [
+            part
+            for part in str(source_path or "").replace("\\", "/").split("/")
+            if part
+        ]
+        item_name = source_parts[-1] if source_parts else "-"
+
+        target_path = self.target.path if self.target else None
+        normalized_target = _normalize_workspace_display_path(target_path)
+        if normalized_target == "-":
+            save_location = "-"
+        elif normalized_target == "/workspace":
+            save_location = "/workspace"
+        else:
+            save_location = normalized_target.rsplit("/", 1)[0] or "/workspace"
+
+        email = self.counterparty_email
+        entered_value = str(self.target_user_input or "")
+        if self.direction == "sent" and "@" in entered_value:
+            email = email or entered_value
+        uid = self.counterparty_uid
+        if (
+            not uid
+            and self.direction == "sent"
+            and entered_value
+            and "@" not in entered_value
+        ):
+            uid = entered_value
+        primary = f"UID {uid}" if uid else (email or "-")
+        secondary = email if uid and email else None
+
+        return FileShareTaskDisplay(
+            biz_no=self.biz_no,
+            direction=self.direction,
+            source_kind=self.source_kind,
+            shared_path=normalized_source,
+            item_name=item_name,
+            save_location=save_location,
+            counterparty_primary=primary,
+            counterparty_secondary=secondary,
+            size_bytes=self.size_bytes,
+            size_display=_format_file_share_size(self.size_bytes),
+            status=self.status,
+            status_key=status_key,
+            status_label=status_label,
+            created_at=self.created_at,
+            accepted_at=self.accepted_at,
+            finished_at=self.finished_at,
+            can_cancel=self.can_cancel,
+            can_delete=raw_status in _FILE_SHARE_TERMINAL_STATUSES,
+        )
+
+
+class FileShareCreateResponse(BaseModel):
+    """Response returned after a share invitation is created."""
+
+    biz_no: str
+    status: str
+    notification_sent: Optional[bool] = None
+    task: Optional[FileShareTask] = None
+
+
+class FileShareListQuery(BaseModel):
+    """Filters and pagination for sent or received share tasks."""
+
+    direction: Literal["sent", "received"] = "sent"
+    page_number: int = Field(default=1, ge=1)
+    page_size: int = Field(default=20, ge=1, le=100)
+    transfer_env: Optional[str] = None
+
+    def to_params(self) -> Dict[str, Any]:
+        params: Dict[str, Any] = {
+            "direction": self.direction,
+            "page_number": self.page_number,
+            "page_size": self.page_size,
+        }
+        if self.transfer_env:
+            params["transfer_env"] = self.transfer_env
+        return params
+
+
+class FileSharePage(BaseModel):
+    """One page of file share tasks."""
+
+    tasks: List[FileShareTask] = Field(default_factory=list)
+    total: int = 0
+    page_number: int = 1
+    page_size: int = 20
+
+
+class FileShareDeleteFailure(BaseModel):
+    """One share task that could not be hidden from the current user's list."""
+
+    biz_no: str
+    error_code: Optional[str] = None
+
+
+class FileShareDeleteResponse(BaseModel):
+    """Result of hiding terminal share tasks from the current user's list."""
+
+    deleted: int = 0
+    failed: List[FileShareDeleteFailure] = Field(default_factory=list)
+
+
 class TrainingTaskEventType(str, Enum):
     """Training task event type enumeration"""
     TRAINING_TASK_STATUS_CHANGED = "training_task_status_changed"
