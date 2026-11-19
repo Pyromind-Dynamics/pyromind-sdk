@@ -167,6 +167,8 @@ class StorageAPIClient(PyroMindClient):
     This class is separate from :class:`StorageClient`, which manages
     MinIO/S3-compatible object storage and requires storage credentials.
     """
+    #: 跨集群 transfer 接口在 portal 本地处理：用短时 token，但地址保持在 portal。
+    KEEP_PORTAL_BASE = True
 
     def __init__(
         self,

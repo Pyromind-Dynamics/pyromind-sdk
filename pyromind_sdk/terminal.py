@@ -38,11 +38,16 @@ from pyromind_sdk.client.base import (
     ENV_API_KEY,
     ENV_BASE_URL,
     ENV_CLUSTER,
-    available_clusters,
-    resolve_base_url_from_cluster,
 )
 from pyromind_sdk.client.trace import TRACE_ID_HEADER, ensure_trace_id
 from pyromind_sdk.log_redaction import redact_text
+from pyromind_sdk.token import (
+    PURPOSE_WS_TERMINAL,
+    TokenError,
+    async_fetch_token,
+    fetch_token,
+    ws_auth_frame,
+)
 
 logger = logging.getLogger("pyromind_sdk.ws")
 
@@ -58,31 +63,35 @@ _IDLE_TIMEOUT_S = 30 * 60  # 30 minutes
 class TerminalError(RuntimeError):
     """Raised when an interactive terminal session cannot be established.
 
-    Redacted at construction: the WebSocket URL carries ``?token=<api key>`` and
-    aiohttp's connection errors quote it back to ``docker exec`` output.
+    Redacted at construction: aiohttp's connection errors quote the request
+    back to ``docker exec`` output, so anything credential-shaped is masked.
     """
 
     def __init__(self, message: str) -> None:
         super().__init__(redact_text(message))
 
 
+class TerminalAuthExpired(TerminalError):
+    """短时 WS token 在会话产生任何输出之前被拒绝。"""
+
+
 def _websocket_url(
     base_url: str,
     sandbox_id: str,
-    api_key: str,
     cols: int,
     rows: int,
     command: Optional[Sequence[str]] = None,
     cwd: Optional[str] = None,
 ) -> str:
+    # No credential in the URL: a short-lived token travels in the first
+    # WebSocket frame (see ``_run_session``), so nothing secret can end up in
+    # proxy access logs, shell history or process listings.
     base = base_url.rstrip("/")
     for http_scheme, ws_scheme in (("https://", "wss://"), ("http://", "ws://")):
         if base.startswith(http_scheme):
             base = ws_scheme + base[len(http_scheme):]
             break
     qs_params: list[tuple[str, str]] = [("cols", str(cols)), ("rows", str(rows))]
-    if api_key:
-        qs_params.insert(0, ("token", api_key))
     if cwd:
         qs_params.append(("cwd", cwd))
     # Repeated ``command`` params carry the argv the caller asked for. The
@@ -96,7 +105,6 @@ def _websocket_url(
 def build_terminal_websocket_url(
     base_url: str,
     sandbox_id: str,
-    api_key: str = "",
     cols: int = 80,
     rows: int = 24,
     command: Optional[Sequence[str]] = None,
@@ -107,13 +115,52 @@ def build_terminal_websocket_url(
     ``command`` / ``cwd`` are optional: with neither, the server opens its
     usual login shell. ``docker exec -it <cid> <cmd>`` passes them so the PTY
     runs the requested command instead of silently falling back to a shell.
+
+    The URL carries no credential.  Use :func:`fetch_terminal_token` to mint a
+    short-lived token and send it as the first frame after connecting.
     """
     return _websocket_url(
-        base_url, sandbox_id, api_key, cols, rows, command, cwd
+        base_url, sandbox_id, cols, rows, command, cwd
     )
 
 
-async def _run_session(url: str) -> None:
+def fetch_terminal_token(
+    base_url: str,
+    sandbox_id: str,
+    api_key: str,
+    cluster: Optional[str] = None,
+) -> tuple[str, str]:
+    """Exchange on the portal; returns ``(token, cluster_direct_base_url)``."""
+    token, _ttl, api_base_url = fetch_token(
+        base_url,
+        api_key,
+        purpose=PURPOSE_WS_TERMINAL,
+        resource_type="sandbox",
+        resource_id=sandbox_id,
+        cluster=cluster,
+    )
+    return token, api_base_url
+
+
+async def async_fetch_terminal_token(
+    base_url: str,
+    sandbox_id: str,
+    api_key: str,
+    cluster: Optional[str] = None,
+) -> tuple[str, str]:
+    """Async variant of :func:`fetch_terminal_token`."""
+    token, _ttl, api_base_url = await async_fetch_token(
+        base_url,
+        api_key,
+        purpose=PURPOSE_WS_TERMINAL,
+        resource_type="sandbox",
+        resource_id=sandbox_id,
+        cluster=cluster,
+    )
+    return token, api_base_url
+
+
+async def _run_session(url: str, token: str) -> None:
     """Pump bytes between the local TTY (already in raw mode) and the WebSocket.
 
     In addition to the stdin writer and stdout reader, two background tasks
@@ -129,6 +176,9 @@ async def _run_session(url: str) -> None:
     session_over = asyncio.Event()
     # Shared mutable timestamp — only *real* I/O resets it.
     last_activity = [time.monotonic()]
+    #: Did the PTY produce anything? A 4001 before any output means the token
+    #: was rejected, not that the user's shell exited.
+    saw_data = [False]
 
     async with aiohttp.ClientSession() as session:
         try:
@@ -138,8 +188,15 @@ async def _run_session(url: str) -> None:
                 heartbeat=30,
                 headers={TRACE_ID_HEADER: ensure_trace_id()},
             )
+            # First frame carries the short-lived token; the server replies
+            # {"type":"auth_ok"} and only then forwards PTY bytes.
+            await ws.send_str(ws_auth_frame(token))
             logger.debug("[ws] terminal connected %s", redact_text(url))
         except aiohttp.WSServerHandshakeError as e:
+            if e.status == 401:
+                raise TerminalAuthExpired(
+                    "Connection rejected (HTTP 401): token expired or invalid."
+                ) from e
             raise TerminalError(
                 f"Connection rejected (HTTP {e.status}). Check the API key and sandbox id."
             ) from e
@@ -175,17 +232,23 @@ async def _run_session(url: str) -> None:
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.BINARY:
                     last_activity[0] = time.monotonic()
+                    saw_data[0] = True
                     os.write(stdout_fd, msg.data)
                 elif msg.type == aiohttp.WSMsgType.TEXT:
-                    # Server {"type":"pong"} is keep-alive only — do not render
-                    # it to the terminal and do not reset the idle timer.
+                    # Server control frames ({"type":"pong"} keep-alive and the
+                    # handshake {"type":"auth_ok"}) are not terminal output:
+                    # never render them, never reset the idle timer.
                     try:
                         obj = json.loads(msg.data)
-                        if isinstance(obj, dict) and obj.get("type") == "pong":
+                        if isinstance(obj, dict) and obj.get("type") in (
+                            "pong",
+                            "auth_ok",
+                        ):
                             continue
                     except (json.JSONDecodeError, TypeError):
                         pass
                     last_activity[0] = time.monotonic()
+                    saw_data[0] = True
                     os.write(stdout_fd, msg.data.encode("utf-8", errors="replace"))
                 elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
                     break
@@ -235,6 +298,13 @@ async def _run_session(url: str) -> None:
             await asyncio.gather(sender, receiver, pinger, watchdog, return_exceptions=True)
             await ws.close()
 
+        # 一个 PTY 字节都没收到就 4001：是服务端拒绝 token（不是 shell 退出）。
+        # 抛出去，让调用方换一张新票并重试一次。
+        if ws.close_code == 4001 and not saw_data[0]:
+            raise TerminalAuthExpired(
+                "terminal auth token rejected (close code 4001)"
+            )
+
 
 def run_terminal(
     sandbox_id: str,
@@ -250,48 +320,73 @@ def run_terminal(
         print("Error: interactive terminal requires a POSIX system (macOS/Linux).", file=sys.stderr)
         return 1
 
-    # 1. Resolve base_url: explicit --base-url > $PYROMIND_BASE_URL > resolve from --cluster.
+    # 1. Resolve the exchange base: explicit --base-url > $PYROMIND_BASE_URL >
+    # the portal. The cluster determines which direct address we get back.
     if not base_url:
-        base_url = (os.getenv(ENV_BASE_URL) or "").strip()
+        base_url = (os.getenv(ENV_BASE_URL) or "").strip() or DEFAULT_API_BASE_URL
     cluster = (cluster or os.getenv(ENV_CLUSTER) or "").strip()
-    if not base_url:
-        if not cluster:
-            print(
-                f"Error: --cluster is required ({', '.join(available_clusters())}) "
-                f"or set {ENV_CLUSTER}.",
-                file=sys.stderr,
-            )
-            return 1
-        try:
-            base_url = resolve_base_url_from_cluster(cluster)
-        except ValueError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            return 1
+    if not cluster:
+        print(
+            f"Error: --cluster is required (or set {ENV_CLUSTER}); choose one "
+            "from the portal's available clusters (docker-rt setup lists them).",
+            file=sys.stderr,
+        )
+        return 1
 
-    # 2. Resolve API key (optional; env var fallback; if missing, backend falls back to cookie auth).
+    # 2. Resolve API key — required: it is the only credential that can mint the
+    # short-lived token the WebSocket handshake expects.
     api_key = (api_key or os.getenv(ENV_API_KEY) or "").strip()
     if not api_key:
         print(
-            f"Warning: no API key provided (--api-key or {ENV_API_KEY}). "
-            "Falling back to cookie-based auth (may fail for WS).",
+            f"Error: no API key provided (--api-key or {ENV_API_KEY}); "
+            "a token cannot be minted without it.",
             file=sys.stderr,
         )
+        return 1
 
     if not sys.stdin.isatty():
         print("Error: stdin is not a TTY; run from an interactive shell.", file=sys.stderr)
         return 1
 
     size = os.get_terminal_size(sys.stdout.fileno())
-    url = _websocket_url(base_url, sandbox_id, api_key, size.columns, size.lines)
 
-    print(f"Connecting to sandbox {sandbox_id} @ {base_url} ... (exit shell or press Ctrl-D to quit)")
+    def _mint() -> tuple[str, str, str]:
+        token, api_base_url = fetch_terminal_token(
+            base_url, sandbox_id, api_key, cluster
+        )
+        url = _websocket_url(
+            api_base_url, sandbox_id, size.columns, size.lines
+        )
+        return token, api_base_url, url
+
+    # 先换票再进 raw 模式：换票失败/被 Ctrl-C 都不会把终端留在 raw 状态。
+    try:
+        token, api_base_url, url = _mint()
+    except (TerminalError, TokenError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
     stdin_fd = sys.stdin.fileno()
     saved_attrs = termios.tcgetattr(stdin_fd)
     tty.setraw(stdin_fd)
     try:
-        asyncio.run(_run_session(url))
-    except TerminalError as e:
-        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, saved_attrs)
+        print(
+            f"Connecting to sandbox {sandbox_id} @ {api_base_url} ... "
+            "(exit shell or press Ctrl-D to quit)"
+        )
+        for attempt in (0, 1):
+            try:
+                asyncio.run(_run_session(url, token))
+                break
+            except TerminalAuthExpired as e:
+                if attempt == 1:
+                    raise
+                # 60s 的 WS token 在慢链路上可能已过期：再换一次。
+                logger.warning(
+                    "terminal token rejected, minting a fresh one: %s", e
+                )
+                token, api_base_url, url = _mint()
+    except (TerminalError, TokenError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
     finally:

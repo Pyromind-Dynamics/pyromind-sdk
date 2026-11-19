@@ -298,13 +298,11 @@ def test_loopback_hosts_are_recognised() -> None:
     assert not _is_loopback_host("10.0.0.5")
 
 
-def test_cluster_help_lists_every_configured_cluster() -> None:
-    """``--cluster`` 的可选项来自 ``CLUSTER_RESOURCE``，不是写死的示例。"""
-    from ...client.base import CLUSTER_RESOURCE
+def test_cluster_help_points_at_the_portal_resource_map() -> None:
+    """No static cluster table: the choices come from the portal at setup time."""
     from ..daemon import prepare_server_parser
 
     help_text = prepare_server_parser().format_help()
 
     assert "--cluster" in help_text
-    for code in CLUSTER_RESOURCE:
-        assert code in help_text, (code, help_text)
+    assert "available clusters" in help_text

@@ -22,11 +22,12 @@ from .trace import (
     set_trace_id,
 )
 from ..log_redaction import redact, redact_text
+from ..sdk_version import SDK_VERSION_HEADER, get_sdk_version
+from ..token import HttpTokenCache
 
 
 # Constants
 DEFAULT_API_BASE_URL = "https://api-portal.pyromind.ai/api/v1"
-DEFAULT_CLUSTER = "us-west-2"
 DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_RETRIES = 3
 ENV_API_KEY = "PYROMIND_API_KEY"
@@ -36,135 +37,6 @@ ENV_LOG_FORMAT = "PYROMIND_LOG_FORMAT"
 ENV_LOG_LEVEL = "PYROMIND_LOG_LEVEL"
 RETRY_STATUS_CODES = [502, 503, 504]
 RETRY_ALLOWED_METHODS = ["GET", "POST", "PUT", "DELETE"]
-
-# Cluster -> per-env API base URL mapping.
-#
-# The terminal CLI resolves `--cluster <code>` (optionally with an `#env`
-# suffix, e.g. `us-west-1`) to a per-cluster direct API base URL via
-# this table. Portal (`api-portal.pyromind.ai`) does not proxy WebSocket,
-# so terminal connections must use the per-cluster direct domains here.
-CLUSTER_RESOURCE = {
-    "us-west-1": {
-        "http": {
-            "prod": "https://api.pyromind.ai",
-            "pre": "https://pre-api.pyromind.ai",
-            "pre2": "https://pre2-api.pyromind.ai",
-            "dev": "http://localhost:8001",
-        },
-        "storage":"https://storage.pyromind.ai"
-    },
-    "us-west-2": {
-        "http": {
-            "prod": "https://api-us-west-2.pyromind.ai",
-            "pre": "https://pre-api-us-west-2.pyromind.ai",
-            "pre2": "https://pre2-api-us-west-2.pyromind.ai",
-            "dev": "http://localhost:8002",
-        },
-        "storage":"https://storage-us-west-2.pyromind.ai"
-    },
-    "us-west-3": {
-        "http": {
-            "prod": "https://api-us-west-3.pyromind.ai",
-            "pre": "https://pre-api-us-west-3.pyromind.ai",
-            "pre2": "https://pre2-api-us-west-3.pyromind.ai",
-            "dev": "http://localhost:8003",
-        },
-        "storage": "https://storage-us-west-3.pyromind.ai",
-    },
-    "cn-east-1": {
-        "http": {
-            "prod": "https://api-cn-east-1.pyromind-asia.cn",
-            "pre": "https://pre-api-cn-east-1.pyromind-asia.cn",
-            "pre2": "https://pre2-api-cn-east-1.pyromind-asia.cn",
-            "dev": "http://localhost:8002",
-        },
-        "storage": "https://storage-cn-east-1.pyromind-asia.cn"
-    },
-}
-
-
-def available_clusters():
-    """Cluster codes a client / docker-rt can target — the keys of :data:`CLUSTER_RESOURCE`.
-
-    Order follows the table's declaration order (``us-west-1``, ``us-west-2``,
-    ``cn-east-1``) so prompts and ``--help`` read like the config. These keys are
-    the **only** thing exposed to users; per-env addresses stay an implementation
-    detail of the table. Callers that build prompts or help text should use this
-    instead of hard-coding example cluster names.
-    """
-    return list(CLUSTER_RESOURCE)
-
-
-def parse_cluster_code(cluster: str):
-    """Split a cluster identifier into (cluster_code, env).
-
-    Accepted shapes:
-      * "us-west-1"       -> ("us-west-1", "prod")
-      * "us-west-1"   -> ("us-west-1", "pre")
-      * "us-west-12"  -> ("us-west-1", "pre2")
-    """
-    if not cluster:
-        return "", "prod"
-    cluster = cluster.strip()
-    if "#" in cluster:
-        code, env = cluster.split("#", 1)
-        return code.strip(), (env.strip() or "prod")
-    return cluster, "prod"
-
-
-def resolve_base_url_from_cluster(cluster: str) -> str:
-    """Return the per-cluster API base URL (with trailing /api/v1).
-
-    Raises ValueError if the cluster code or env suffix is unknown.
-    """
-    code, env = parse_cluster_code(cluster)
-    cfg = CLUSTER_RESOURCE.get(code)
-    if not cfg:
-        valid = ", ".join(available_clusters())
-        raise ValueError(f"Unknown cluster {code!r}. Valid clusters: {valid}")
-    base = cfg.get("http", {}).get(env)
-    if not base:
-        raise ValueError(f"Unknown env {env!r} for cluster {code!r}")
-    return base.rstrip("/") + "/api/v1"
-
-
-def resolve_api_base_url(cluster: Optional[str] = None) -> str:
-    """Resolve the base URL for a **cluster-direct** (data-plane) client.
-
-    Resolution order:
-
-    1. ``PYROMIND_BASE_URL`` — an explicit override always wins.
-    2. The per-cluster direct address from :data:`CLUSTER_RESOURCE`, keyed by
-       ``cluster`` or ``PYROMIND_CLUSTER`` (``us-west-1`` style suffixes
-       included).
-    3. ``DEFAULT_API_BASE_URL`` — the portal, as a last resort only.
-
-    Sandbox operations (list/get/create, exec, and the file read/write behind
-    ``docker cp``) are data-plane calls and belong on the cluster, not on the
-    portal. The portal is the control plane: ``ProfileClient`` (``/user_info``,
-    ``/storage_info``, access keys) keeps using ``DEFAULT_API_BASE_URL`` and
-    never calls this.
-
-    When neither ``PYROMIND_BASE_URL`` nor a cluster is configured the portal
-    is still returned, so an unconfigured client keeps working exactly as
-    before.
-    """
-    explicit = (os.getenv(ENV_BASE_URL) or "").strip()
-    if explicit:
-        return explicit.rstrip("/")
-    code = (cluster or os.getenv(ENV_CLUSTER) or "").strip()
-    if code:
-        try:
-            return resolve_base_url_from_cluster(code)
-        except ValueError as exc:
-            logger.warning(
-                "cannot resolve a direct base URL for cluster %r (%s); "
-                "falling back to the portal %s",
-                code,
-                exc,
-                DEFAULT_API_BASE_URL,
-            )
-    return DEFAULT_API_BASE_URL.rstrip("/")
 
 ERROR_MESSAGE_MAX_LENGTH = 500
 _TRACE_ID_HEADER_KEYS = {
@@ -236,9 +108,14 @@ logger = install_console_logging(
 
 
 class PyroMindAPIError(Exception):
-    """Base exception for PyroMind API errors"""
+    """Base exception for PyroMind API errors.
+
+    The message is redacted here because transport errors quote the request URL
+    (query included) and this text reaches CLI output, application logs and
+    persisted node logs — the logging filter never sees it.
+    """
     def __init__(self, message: str, status_code: Optional[int] = None, response: Optional[Dict] = None, headers: Optional[Dict] = None):
-        self.message = append_trace_id(message, headers)
+        self.message = append_trace_id(redact_text(message), headers)
         self.status_code = status_code
         self.response = response
         self.headers = headers
@@ -247,6 +124,11 @@ class PyroMindAPIError(Exception):
 
 
 class PyroMindClient:
+    #: 是否用短时 token 换票（数据面客户端都是 True）。
+    USE_TICKET_AUTH = True
+    #: 即使换票成功也保持 portal 地址（profile/account 这类 portal 本地 API）。
+    KEEP_PORTAL_BASE = False
+
     """
     Base client class for PyroMind API
 
@@ -292,23 +174,33 @@ class PyroMindClient:
         # Strip whitespace from API key
         api_key = api_key.strip()
 
-        # Get base URL from parameter, environment variable, or use default
-        if not base_url:
-            base_url = os.getenv(ENV_BASE_URL) or DEFAULT_API_BASE_URL
-
-        if not base_url:
-            raise ValueError(
-                f"Base URL is required. Please provide it either as a parameter "
-                f"or set the {ENV_BASE_URL} environment variable."
-            )
+        # 门户地址必须显式提供（参数或 PYROMIND_BASE_URL）；只有全部缺失时才
+        # 落到默认 prod 门户。非 prod 集群 + 默认门户视为配置错误，直接失败，
+        # 不按 cluster/env 猜门户地址。
+        configured_base = (base_url or os.getenv(ENV_BASE_URL) or "").strip()
+        base_url = configured_base or DEFAULT_API_BASE_URL
         self.api_key = api_key
         self.base_url = base_url.rstrip('/')
+        #: 换票用门户地址；首次换票后 ``base_url`` 会切到集群直连地址。
+        self.exchange_base_url = self.base_url
 
-        # Get cluster from parameter, environment variable, or use default
-        if not cluster:
-            cluster = os.getenv(ENV_CLUSTER) or DEFAULT_CLUSTER
-        self.cluster = cluster
+        # 集群选择是显式的：--cluster、环境变量或 docker-rt 启动时从门户列表选。
+        # 构造阶段不联网；未设置集群时，第一次换票才报错（见 token.fetch_token）。
+        self.cluster = (cluster or os.getenv(ENV_CLUSTER) or "").strip()
+        cluster_env = (
+            self.cluster.partition("#")[2] if "#" in self.cluster else "prod"
+        )
+        if not configured_base and cluster_env != "prod":
+            raise ValueError(
+                f"PYROMIND_CLUSTER={self.cluster!r} targets the "
+                f"{cluster_env!r} environment; set PYROMIND_BASE_URL to that "
+                "environment's portal (the default base URL is the prod portal)."
+            )
 
+        # Data-plane clients exchange the long-lived key on the portal and then
+        # target the cluster-direct ``api_base_url`` returned by the exchange
+        # (see ``_sync_api_base_url``). Profile / storage clients opt out
+        # (portal + long-lived key).
         self.timeout = timeout
 
         # Create session with retry strategy
@@ -323,11 +215,17 @@ class PyroMindClient:
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
         
+        self._tokens = (
+            HttpTokenCache(self.base_url, api_key, cluster=self.cluster)
+            if self.USE_TICKET_AUTH
+            else None
+        )
+
         # Set default headers
         self.session.headers.update({
-            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
+            SDK_VERSION_HEADER: get_sdk_version(),
             # Same reason as the async client: do not depend on brotli decoding.
             "Accept-Encoding": "gzip, deflate",
             "X-Cluster": self.cluster,
@@ -353,9 +251,24 @@ class PyroMindClient:
         return response
     
     # ========== URL and Request Building ==========
-    
+
+    def _sync_api_base_url(self) -> None:
+        """换票一次（有缓存）并切换到集群直连地址。"""
+        if self._tokens is None:
+            return
+        self._tokens.token()
+        if self.KEEP_PORTAL_BASE:
+            # profile/account 这类接口在 portal 本地处理，不能切到集群直连。
+            return
+        if self._tokens.api_base_url:
+            self.base_url = self._tokens.api_base_url
+
     def _build_url(self, endpoint: str) -> str:
-        """Build full URL from endpoint"""
+        """按 endpoint 拼完整 URL，**不做任何 I/O**。
+
+        调用方必须先执行 :meth:`_sync_api_base_url`；请求入口会显式调用，
+        这样 URL 构建始终是纯函数。
+        """
         return f"{self.base_url}/{endpoint.lstrip('/')}"
     
     def _build_request_context(self, method: str, url: str) -> str:
@@ -389,6 +302,10 @@ class PyroMindClient:
         msg = err.get('message', '')
         if code or msg:
             return f"{code}: {msg}" if code else msg
+        # Portal 的本地校验走 FastAPI HTTPException，body 是 {"detail": ...}
+        detail = error_data.get('detail')
+        if isinstance(detail, str) and detail.strip():
+            return detail.strip()
         return "Bad Request (400)"
     
     def _format_401_error(self, error_data: Dict[str, Any]) -> str:
@@ -545,11 +462,30 @@ class PyroMindClient:
         """
         headers = dict(kwargs.pop("headers", None) or {})
         headers.update(self._trace_headers())
+        kwargs["headers"] = headers
         kwargs.setdefault("timeout", self.timeout)
         logger.debug("[REQUEST] %s %s", method.upper(), redact_text(url))
-        response = self.session.request(
-            method=method, url=url, headers=headers, **kwargs
-        )
+        # 文件读写/分块上传也要和 JSON 路径一样做一次 401 换票重试：
+        # 传输途中 token 轮转不应让整个操作失败。
+        for attempt in (0, 1):
+            headers["Authorization"] = (
+                f"Bearer {self._tokens.token(force_refresh=attempt > 0)}"
+                if self._tokens is not None
+                else f"Bearer {self.api_key}"
+            )
+            response = self.session.request(
+                method=method, url=url, **kwargs
+            )
+            if (
+                response.status_code != 401
+                or attempt == 1
+                or self._tokens is None
+            ):
+                break
+            logger.info(
+                "[AUTH] token rejected on raw request, refreshing once: %s",
+                redact_text(url),
+            )
         logger.debug(
             "[RESPONSE] %s %s -> %s (%s bytes)",
             method.upper(),
@@ -620,6 +556,7 @@ class PyroMindClient:
         Raises:
             PyroMindAPIError: If the request fails
         """
+        self._sync_api_base_url()
         url = self._build_url(endpoint)
         request_context = self._build_request_context(method, url)
         
@@ -641,15 +578,30 @@ class PyroMindClient:
         kwargs["headers"] = extra_headers
         
         try:
-            response = self.session.request(
-                method=method,
-                url=url,
-                params=params,
-                json=json_data,
-                timeout=self.timeout,
-                **kwargs
-            )
-            
+            # A 401 means the request never ran (expired/rotated token), so one
+            # refresh-and-retry is always safe — even for POST.
+            for attempt in (0, 1):
+                extra_headers["Authorization"] = (
+                    f"Bearer {self._tokens.token(force_refresh=attempt > 0)}"
+                    if self._tokens is not None
+                    else f"Bearer {self.api_key}"
+                )
+                response = self.session.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    json=json_data,
+                    timeout=self.timeout,
+                    **kwargs
+                )
+                if (
+                    response.status_code != 401
+                    or attempt == 1
+                    or self._tokens is None
+                ):
+                    break
+                logger.info("[AUTH] token rejected, refreshing once: %s", request_context)
+
             # Log response (single line)
             resp_log = f"[RESPONSE] {request_context} - Status: {response.status_code}"
             try:

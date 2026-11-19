@@ -148,6 +148,8 @@ class AsyncFileShareResource:
 
 class AsyncStorageAPIClient(PyroMindAsyncClient):
     """Async client for storage APIs, transfers, and same-cluster file sharing."""
+    #: 跨集群 transfer 接口在 portal 本地处理：用短时 token，但地址保持在 portal。
+    KEEP_PORTAL_BASE = True
 
     @property
     def file_shares(self) -> AsyncFileShareResource:

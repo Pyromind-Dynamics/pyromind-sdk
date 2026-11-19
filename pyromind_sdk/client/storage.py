@@ -23,8 +23,10 @@ except ImportError:
         "Please install it with: pip install minio"
     )
 
-from pyromind_sdk.client.base import PyroMindAPIError, DEFAULT_API_BASE_URL, DEFAULT_CLUSTER, ENV_API_KEY, ENV_BASE_URL, ENV_CLUSTER
+from pyromind_sdk.client.base import PyroMindAPIError, DEFAULT_API_BASE_URL, ENV_API_KEY, ENV_BASE_URL, ENV_CLUSTER
 from pyromind_sdk.client.trace import TRACE_ID_HEADER, ensure_trace_id
+from pyromind_sdk.sdk_version import SDK_VERSION_HEADER, get_sdk_version
+from pyromind_sdk.token import HttpTokenCache
 
 logger = logging.getLogger("pyromind_sdk.storage")
 
@@ -34,6 +36,7 @@ DEFAULT_STORAGE_ENDPOINT = "https://storage.pyromind.ai"
 DEFAULT_REGION = "us-east-1"
 DEFAULT_CONTENT_TYPE = "application/octet-stream"
 ENV_STORAGE_ENDPOINT = "PYROMIND_STORAGE_ENDPOINT"
+ENV_STORAGE_ACCESS_KEY = "PYROMIND_STORAGE_ACCESS_KEY"
 ENV_STORAGE_SECRET_KEY = "PYROMIND_STORAGE_SECRET_KEY"
 ENV_STORAGE_BUCKET = "PYROMIND_STORAGE_BUCKET"
 
@@ -54,7 +57,7 @@ class StorageClient:
     
     The client uses MinIO/S3-compatible storage and requires:
     - Storage endpoint URL
-    - Access key (from PYROMIND_API_KEY env var)
+    - Access key (from PYROMIND_STORAGE_ACCESS_KEY env var)
     - Secret key (from PYROMIND_STORAGE_SECRET_KEY env var)
     - Bucket name (from PYROMIND_STORAGE_BUCKET env var, optional)
     """
@@ -77,7 +80,9 @@ class StorageClient:
                     Defaults to cluster-based endpoint if cluster is set,
                     otherwise "https://storage.pyromind.ai"
             access_key: Access key for storage authentication
-                       If not provided, reads from PYROMIND_API_KEY env var
+                       If not provided, reads from
+                       PYROMIND_STORAGE_ACCESS_KEY env var (an independent
+                       storage credential — never the platform API key)
             secret_key: Secret key for storage authentication
                        If not provided, reads from PYROMIND_STORAGE_SECRET_KEY env var
             bucket_name: Default bucket name to use
@@ -98,17 +103,19 @@ class StorageClient:
 
         if not endpoint:
             if cluster is None:
-                cluster = os.getenv(ENV_CLUSTER, DEFAULT_CLUSTER)
+                cluster = os.getenv(ENV_CLUSTER, "")
             endpoint = CLUSTER_STORAGE_ENDPOINTS.get(cluster, "https://storage-us-west-2.pyromind.ai")
 
-        # Get access key from parameter or environment variable
+        # Get access key from parameter or environment variable.  Storage has
+        # its own credential pair; the platform API key is NOT used as the
+        # storage access key.
         if access_key is None:
-            access_key = os.getenv(ENV_API_KEY)
+            access_key = os.getenv(ENV_STORAGE_ACCESS_KEY)
 
         if not access_key:
             raise ValueError(
                 f"Storage access key is required. Please provide it either as a parameter "
-                f"or set the {ENV_API_KEY} environment variable."
+                f"or set the {ENV_STORAGE_ACCESS_KEY} environment variable."
             )
 
         # Get secret key from parameter or environment variable
@@ -744,15 +751,21 @@ class StorageClient:
         self.close()
 
 
-def get_storage_info() -> Dict[str, Any]:
+def get_storage_info(
+    *,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    cluster: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Get storage information from the API.
 
     Calls the /storage_info endpoint to retrieve storage credentials and usage information.
-    Uses environment variables for configuration:
-    - PYROMIND_API_KEY: API key for authentication
-    - PYROMIND_BASE_URL: Base URL for the API (optional)
-    - PYROMIND_CLUSTER: Target cluster identifier (optional)
+
+    Authentication follows the platform contract: exchange the long-lived key
+    for a short-lived token on the portal, then call the cluster-direct
+    middleware. ``url`` is returned unmasked; the credential fields may be
+    masked, so callers must still read the storage keys from the environment.
 
     Returns:
         Dictionary containing storage information:
@@ -769,54 +782,65 @@ def get_storage_info() -> Dict[str, Any]:
         PyroMindAPIError: If the API request fails
         ValueError: If API key is not available
     """
-    api_key = os.getenv(ENV_API_KEY)
+    api_key = (api_key or os.getenv(ENV_API_KEY) or "").strip()
     if not api_key:
         raise ValueError(
             f"API key is required. Please set the {ENV_API_KEY} environment variable."
         )
 
-    base_url = os.getenv(ENV_BASE_URL, DEFAULT_API_BASE_URL)
-    cluster = os.getenv(ENV_CLUSTER, DEFAULT_CLUSTER)
-
-    base_url = base_url.rstrip('/')
-    url = f"{base_url}/storage_info"
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "X-Cluster": cluster,
-        # 存储服务也是平台侧：带上 trace，日志能跟上层的 docker 命令对上
-        TRACE_ID_HEADER: ensure_trace_id(),
-    }
-
-    try:
-        response = requests.post(url, headers=headers, timeout=30)
-        logger.debug(
-            "[RESPONSE] POST %s -> %s", url, response.status_code
+    base = (base_url or os.getenv(ENV_BASE_URL) or DEFAULT_API_BASE_URL).rstrip("/")
+    cluster = (cluster or os.getenv(ENV_CLUSTER) or "").strip()
+    if not cluster:
+        raise ValueError(
+            f"A cluster is required to look up storage: pass cluster= or set {ENV_CLUSTER}."
         )
-        response.raise_for_status()
+
+    tokens = HttpTokenCache(base, api_key, cluster=cluster)
+    for attempt in (0, 1):
+        token = tokens.token(force_refresh=attempt > 0)
+        api_base = (tokens.api_base_url or base).rstrip("/")
+        url = f"{api_base}/storage_info"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            SDK_VERSION_HEADER: get_sdk_version(),
+            # 存储服务也是平台侧：带上 trace，日志能跟上层的 docker 命令对上
+            TRACE_ID_HEADER: ensure_trace_id(),
+        }
+        try:
+            response = requests.post(url, headers=headers, timeout=30)
+        except requests.exceptions.RequestException as e:
+            raise PyroMindAPIError(
+                message=f"Failed to get storage info: {type(e).__name__}: {str(e)}",
+                status_code=None,
+            ) from e
+
+        logger.debug("[RESPONSE] POST %s -> %s", url, response.status_code)
+        # A 401 means the token was stale/rotated before the request ran; one
+        # refresh-and-retry is safe for this read-only call.
+        if response.status_code == 401 and attempt == 0:
+            tokens.invalidate()
+            continue
+        if not response.ok:
+            error_data: Dict[str, Any] = {}
+            try:
+                error_data = response.json()
+            except Exception:
+                error_data = {"message": response.text}
+            error_message = error_data.get("message", f"HTTP {response.status_code}")
+            raise PyroMindAPIError(
+                message=f"Failed to get storage info: {error_message}",
+                status_code=response.status_code,
+                response=error_data,
+            )
 
         result = response.json()
         if isinstance(result, dict) and "data" in result:
             return result["data"]
         return result
 
-    except requests.exceptions.HTTPError as e:
-        error_data = {}
-        try:
-            error_data = e.response.json()
-        except Exception:
-            error_data = {"message": e.response.text if e.response else str(e)}
-
-        error_message = error_data.get("message", str(e))
-        raise PyroMindAPIError(
-            message=f"Failed to get storage info: {error_message}",
-            status_code=e.response.status_code if e.response else None,
-            response=error_data
-        )
-    except requests.exceptions.RequestException as e:
-        raise PyroMindAPIError(
-            message=f"Failed to get storage info: {type(e).__name__}: {str(e)}",
-            status_code=None
-        )
+    raise PyroMindAPIError(
+        message="Failed to get storage info: unauthorized after token refresh",
+        status_code=401,
+    )

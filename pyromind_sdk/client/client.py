@@ -95,9 +95,10 @@ class PyroMindAPIClient:
                 "or set the PYROMIND_API_KEY environment variable."
             )
         
-        # Get base URL from parameter, environment variable, or use default
+        # 门户地址只认参数或环境变量；都不给时交给 PyroMindClient 处理
+        # （非 prod 集群 + 默认门户会在那里显式失败，不能在这里先填默认值）。
         if not base_url:
-            base_url = os.getenv("PYROMIND_BASE_URL",DEFAULT_API_BASE_URL)
+            base_url = os.getenv("PYROMIND_BASE_URL") or None
         
         self._base_client = PyroMindClient(
             api_key=api_key,

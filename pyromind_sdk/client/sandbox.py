@@ -32,6 +32,7 @@ from .models import (
 )
 from ..exec_stream import (
     build_exec_stream_websocket_url,
+    fetch_exec_stream_token,
     iter_exec_stream,
 )
 
@@ -73,7 +74,7 @@ class SandboxClient(PyroMindClient):
     Provides methods for creating, listing, getting, deleting sandboxes,
     executing actions, and managing VNC connections.
     """
-    
+
     def _convert_sandbox_data(self, sandbox_data: dict, default_id: str = "") -> dict:
         """
         Convert API response format to SDK format.
@@ -547,18 +548,20 @@ class SandboxClient(PyroMindClient):
         """
         if isinstance(command, str):
             command = command.strip()
-        url = build_exec_stream_websocket_url(
-            self.base_url,
-            sandbox_id,
-            self.api_key,
-            self.cluster,
+        token, api_base_url = fetch_exec_stream_token(
+            self.exchange_base_url, sandbox_id, self.api_key, self.cluster
         )
+        url = build_exec_stream_websocket_url(api_base_url, sandbox_id)
         yield from iter_exec_stream(
             url=url,
+            token=token,
             command=command,
             cwd=cwd.strip() if cwd else "",
             timeout=timeout,
             tty=tty,
+            refresh_token=lambda: fetch_exec_stream_token(
+                self.exchange_base_url, sandbox_id, self.api_key, self.cluster
+            )[0],
         )
 
     # ===================== File Operations (custom sandbox) =====================
@@ -617,6 +620,7 @@ class SandboxClient(PyroMindClient):
             PyroMindAPIError: On non-2xx response (INVALID_SANDBOX_TYPE,
                 FILE_READ_ERROR, FILE_READ_FAILED, SANDBOX_NOT_FOUND)
         """
+        self._sync_api_base_url()
         url = self._build_url(f"/sandboxes/{sandbox_id}/files/read")
         # Bypass _request() because the response body is raw bytes, not JSON.
         response = self._raw_request(
@@ -686,6 +690,7 @@ class SandboxClient(PyroMindClient):
 
         chunk_size = self._CHUNK_SIZE
         total_chunks = math.ceil(size / chunk_size)
+        self._sync_api_base_url()
         base_url = self._build_url(f"/sandboxes/{sandbox_id}/files/chunks")
         request_context = f"write_file /sandboxes/{sandbox_id}"
 

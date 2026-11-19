@@ -27,7 +27,11 @@ from pyromind_sdk.client.async_base import (
     PyroMindAsyncAPIError,
 )
 from pyromind_sdk.client.async_sandbox import AsyncSandboxClient
-from pyromind_sdk.client.base import PyroMindAPIError, resolve_api_base_url
+from pyromind_sdk.client.base import (
+    DEFAULT_API_BASE_URL,
+    ENV_BASE_URL,
+    PyroMindAPIError,
+)
 from pyromind_sdk.client.models import (
     PortMapping,
     ResourceConfig,
@@ -37,6 +41,7 @@ from pyromind_sdk.client.models import (
     VolumeMount,
 )
 from pyromind_sdk.exec_stream import (
+    async_fetch_exec_stream_token,
     build_exec_stream_websocket_url,
     iter_exec_stream_async,
 )
@@ -171,13 +176,13 @@ async def _per_sandbox_pod_ips(
 def new_sandbox_client() -> AsyncSandboxClient:
     """Create the daemon's shared sandbox client.
 
-    Everything this client does is data-plane work — list/get/create, exec,
-    the file read/write behind ``docker cp``, and the internal-IP batch
-    lookup — so it talks to the cluster **directly** instead of going through
-    the portal. Only the profile/storage lookup stays on the portal.
+    Every request starts at the portal: the client exchanges the long-lived
+    key for a token **and** the cluster-direct address, then targets that
+    address for the rest of the session. Only profile/storage lookups stay on
+    the portal with the long-lived key.
     """
     return AsyncSandboxClient(
-        base_url=resolve_api_base_url(),
+        base_url=(os.getenv(ENV_BASE_URL) or DEFAULT_API_BASE_URL),
         connector_limit=DEFAULT_CONNECTOR_LIMIT,
         connector_limit_per_host=DEFAULT_CONNECTOR_LIMIT,
     )
@@ -809,21 +814,40 @@ class PyromindSDK:
         # Docker's -i/-it flags select this path, but stdin is intentionally not
         # forwarded to the sandbox.
         stop_event = threading.Event()
-        url = build_exec_stream_websocket_url(
-            self._client.base_url,
-            self.sandbox_id,
-            self._client.api_key,
-            self._client.cluster,
-        )
-        events = iter_exec_stream_async(
-            url=url,
-            command=list(cmd),
-            cwd=cwd or self.working_dir,
-            timeout=None,
-            tty=tty,
-            stop_event=stop_event,
-        )
-        return _SdkExecStreamWs(events, stop_event, async_events=True)
+
+        async def _events():
+            # Token fetch is async; do it lazily inside the iterator so
+            # ``attach_exec`` (a sync method) never blocks the event loop.
+            token, api_base_url = await async_fetch_exec_stream_token(
+                self._client.exchange_base_url,
+                self.sandbox_id,
+                self._client.api_key,
+                self._client.cluster,
+            )
+            url = build_exec_stream_websocket_url(api_base_url, self.sandbox_id)
+
+            async def _refresh_token() -> str:
+                refreshed, _ = await async_fetch_exec_stream_token(
+                    self._client.exchange_base_url,
+                    self.sandbox_id,
+                    self._client.api_key,
+                    self._client.cluster,
+                )
+                return refreshed
+
+            async for chunk in iter_exec_stream_async(
+                url=url,
+                token=token,
+                command=list(cmd),
+                cwd=cwd or self.working_dir,
+                timeout=None,
+                tty=tty,
+                stop_event=stop_event,
+                refresh_token=_refresh_token,
+            ):
+                yield chunk
+
+        return _SdkExecStreamWs(_events(), stop_event, async_events=True)
 
     async def iter_exec_stream(
         self,
@@ -841,19 +865,32 @@ class PyromindSDK:
         """
         if not self.sandbox_id:
             raise RuntimeError("sandbox is not started")
-        url = build_exec_stream_websocket_url(
-            self._client.base_url,
+        token, api_base_url = await async_fetch_exec_stream_token(
+            self._client.exchange_base_url,
             self.sandbox_id,
             self._client.api_key,
             self._client.cluster,
         )
+        url = build_exec_stream_websocket_url(api_base_url, self.sandbox_id)
+
+        async def _refresh_token() -> str:
+            refreshed, _ = await async_fetch_exec_stream_token(
+                self._client.exchange_base_url,
+                self.sandbox_id,
+                self._client.api_key,
+                self._client.cluster,
+            )
+            return refreshed
+
         async for chunk in iter_exec_stream_async(
             url=url,
+            token=token,
             command=list(cmd),
             cwd=cwd or self.working_dir,
             timeout=timeout,
             tty=tty,
             stdin_close=stdin_close,
+            refresh_token=_refresh_token,
         ):
             yield chunk
 

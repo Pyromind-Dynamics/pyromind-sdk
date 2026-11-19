@@ -3,7 +3,10 @@ from unittest import mock
 
 import pytest
 
-from pyromind_sdk.client.base import PyroMindClient, DEFAULT_API_BASE_URL, DEFAULT_CLUSTER
+from pyromind_sdk.client.base import (
+    PyroMindClient,
+    DEFAULT_API_BASE_URL,
+)
 from pyromind_sdk.client.models import InferenceJobRequest
 from pyromind_sdk.client.storage import StorageClient
 
@@ -24,30 +27,35 @@ def mock_networking():
 class TestPyroMindClientBaseUrl:
     def test_default_base_url(self, monkeypatch):
         monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
-        client = PyroMindClient(api_key="test-key")
+        client = PyroMindClient(api_key="test-key", cluster="us-west-2")
+        # Exchange starts at the portal; the direct URL comes from its answer.
         assert client.base_url == DEFAULT_API_BASE_URL.rstrip("/")
 
     def test_explicit_base_url(self, monkeypatch):
         monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
-        client = PyroMindClient(api_key="test-key", base_url="https://custom.example.com/api")
+        client = PyroMindClient(
+            api_key="test-key",
+            cluster="us-west-2",
+            base_url="https://custom.example.com/api",
+        )
         assert client.base_url == "https://custom.example.com/api"
 
     def test_env_var_base_url(self, monkeypatch):
         monkeypatch.setenv("PYROMIND_BASE_URL", "https://env.example.com/api")
-        client = PyroMindClient(api_key="test-key")
+        client = PyroMindClient(api_key="test-key", cluster="us-west-2")
         assert client.base_url == "https://env.example.com/api"
 
     def test_empty_env_var_falls_back(self, monkeypatch):
         monkeypatch.setenv("PYROMIND_BASE_URL", "")
-        client = PyroMindClient(api_key="test-key")
+        client = PyroMindClient(api_key="test-key", cluster="us-west-2")
         assert client.base_url == DEFAULT_API_BASE_URL.rstrip("/")
 
 
 class TestPyroMindClientCluster:
-    def test_default_cluster(self, monkeypatch):
+    def test_unset_cluster_is_allowed_until_exchange(self, monkeypatch):
         monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
         client = PyroMindClient(api_key="test-key")
-        assert client.cluster == DEFAULT_CLUSTER
+        assert client.cluster == ""
 
     def test_explicit_cluster(self, monkeypatch):
         monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
@@ -59,10 +67,10 @@ class TestPyroMindClientCluster:
         client = PyroMindClient(api_key="test-key")
         assert client.cluster == "us-west-1"
 
-    def test_empty_env_var_falls_back(self, monkeypatch):
+    def test_empty_env_var_is_allowed_until_exchange(self, monkeypatch):
         monkeypatch.setenv("PYROMIND_CLUSTER", "")
         client = PyroMindClient(api_key="test-key")
-        assert client.cluster == DEFAULT_CLUSTER
+        assert client.cluster == ""
 
 
 # --- PyroMindAPIClient ---
@@ -70,6 +78,7 @@ class TestPyroMindClientCluster:
 class TestPyroMindAPIClientBaseUrl:
     def test_empty_env_var_falls_back(self, monkeypatch):
         monkeypatch.setenv("PYROMIND_BASE_URL", "")
+        monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2")
         with (
             mock.patch("pyromind_sdk.client.client.PyroMindClient"),
             mock.patch("pyromind_sdk.client.client.SandboxClient"),
@@ -84,7 +93,7 @@ class TestPyroMindAPIClientBaseUrl:
 
 
 class TestPyroMindAPIClientCluster:
-    def test_empty_env_var_falls_back(self, monkeypatch):
+    def test_empty_env_var_constructs_without_a_cluster(self, monkeypatch):
         monkeypatch.setenv("PYROMIND_CLUSTER", "")
         with (
             mock.patch("pyromind_sdk.client.client.PyroMindClient"),
@@ -96,15 +105,16 @@ class TestPyroMindAPIClientCluster:
             mock.patch("pyromind_sdk.client.client.ProfileClient"),
         ):
             from pyromind_sdk import PyroMindAPIClient
-            client = PyroMindAPIClient(api_key="test-key")
+            PyroMindAPIClient(api_key="test-key")
 
 
-def test_async_client_default_timeout_is_600_seconds():
+def test_async_client_default_timeout_is_600_seconds(monkeypatch):
     from pyromind_sdk.client.async_base import (
         DEFAULT_TIMEOUT,
         PyroMindAsyncClient,
     )
 
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2")
     client = PyroMindAsyncClient(api_key="test-key")
 
     assert DEFAULT_TIMEOUT == 600
@@ -213,76 +223,29 @@ class TestInferenceStartupArgs:
         assert request.startup_args == ["--max-length", "12323"]
 
 
-# --- cluster-direct base URL resolution (data plane vs control plane) ---
+# --- control plane vs data plane ---
 
-class TestResolveApiBaseUrl:
-    """Data-plane clients must talk to the cluster, not to the portal.
-
-    Portal is the control plane: only ``ProfileClient`` (``/user_info``,
-    ``/storage_info``, access keys) keeps ``DEFAULT_API_BASE_URL``. Everything
-    else — sandbox CRUD, exec, and the file read/write behind ``docker cp`` —
-    resolves through :data:`CLUSTER_RESOURCE`.
-    """
-
-    def test_cluster_env_resolves_to_the_direct_address(self, monkeypatch):
-        from pyromind_sdk.client.base import resolve_api_base_url
-
+class TestNonProdRequiresPortal:
+    def test_pre_cluster_without_base_url_fails_fast(self, monkeypatch):
+        """非 prod 集群 + 未设 PYROMIND_BASE_URL：显式失败，不能落到 prod 门户。"""
         monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
-        monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2")
+        with pytest.raises(ValueError, match="PYROMIND_BASE_URL"):
+            PyroMindClient(api_key="test-key", cluster="us-west-2#pre")
 
-        assert resolve_api_base_url() == "https://api-us-west-2.pyromind.ai/api/v1"
-
-    def test_env_suffix_picks_the_matching_environment(self, monkeypatch):
-        from pyromind_sdk.client.base import resolve_api_base_url
-
+    def test_pre_cluster_with_base_url_is_ok(self, monkeypatch):
         monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
-        monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-1")
-
-        assert resolve_api_base_url() == "https://pre-api.pyromind.ai/api/v1"
-
-    def test_explicit_cluster_argument_is_used(self, monkeypatch):
-        from pyromind_sdk.client.base import (
-            resolve_api_base_url,
-            resolve_base_url_from_cluster,
+        client = PyroMindClient(
+            api_key="test-key",
+            base_url="https://pre-api-portal.pyromind.ai/api/v1",
+            cluster="us-west-2#pre",
         )
+        try:
+            assert client.exchange_base_url.startswith("https://pre-api-portal")
+        finally:
+            client.close()
 
-        monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
-        # A *different* cluster in the environment, so the assertion below can
-        # tell "the argument won" apart from "the env var was read".
-        monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2")
 
-        resolved = resolve_api_base_url("cn-east-1#prod")
-
-        # Deliberately not hardcoding the domain: the cluster -> URL mapping
-        # lives in CLUSTER_RESOURCE and is edited independently of this test.
-        assert resolved == resolve_base_url_from_cluster("cn-east-1#prod")
-        assert resolved != resolve_base_url_from_cluster("us-west-2")
-        assert resolved != DEFAULT_API_BASE_URL.rstrip("/")
-
-    def test_explicit_base_url_wins_over_the_cluster(self, monkeypatch):
-        from pyromind_sdk.client.base import resolve_api_base_url
-
-        monkeypatch.setenv("PYROMIND_BASE_URL", "https://self-hosted.example.com/api/v1")
-        monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2")
-
-        assert resolve_api_base_url() == "https://self-hosted.example.com/api/v1"
-
-    def test_without_a_cluster_it_keeps_the_portal_default(self, monkeypatch):
-        from pyromind_sdk.client.base import resolve_api_base_url
-
-        monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
-        monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
-
-        assert resolve_api_base_url() == DEFAULT_API_BASE_URL.rstrip("/")
-
-    def test_unknown_cluster_falls_back_to_the_portal(self, monkeypatch):
-        from pyromind_sdk.client.base import resolve_api_base_url
-
-        monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
-        monkeypatch.setenv("PYROMIND_CLUSTER", "not-a-real-cluster")
-
-        assert resolve_api_base_url() == DEFAULT_API_BASE_URL.rstrip("/")
-
+class TestProfileClientBaseUrl:
     def test_profile_client_stays_on_the_portal(self, monkeypatch):
         from pyromind_sdk.client.base import DEFAULT_API_BASE_URL
         from pyromind_sdk.client.profile import ProfileClient
@@ -290,6 +253,33 @@ class TestResolveApiBaseUrl:
         monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
         monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2")
 
+        # Profile/账号接口只在 portal 上，保持 portal 地址 + 长期 key
         assert ProfileClient(api_key="test-key").base_url == (
             DEFAULT_API_BASE_URL.rstrip("/")
         )
+
+
+class TestStorageCredentials:
+    """storage 有独立的 AK/SK，平台 API key 不能当 storage AK 用。"""
+
+    def test_access_key_comes_from_the_storage_env(self, monkeypatch):
+        monkeypatch.setenv("PYROMIND_STORAGE_ACCESS_KEY", "storage-ak")
+        monkeypatch.setenv("PYROMIND_STORAGE_SECRET_KEY", "storage-sk")
+        monkeypatch.setenv("PYROMIND_API_KEY", "platform-key")
+
+        client = StorageClient(endpoint="https://storage.example.com")
+
+        assert client.access_key == "storage-ak"
+        assert client.secret_key == "storage-sk"
+
+    def test_platform_key_is_not_used_as_the_storage_access_key(self, monkeypatch):
+        import pytest
+
+        monkeypatch.delenv("PYROMIND_STORAGE_ACCESS_KEY", raising=False)
+        monkeypatch.setenv("PYROMIND_STORAGE_SECRET_KEY", "storage-sk")
+        monkeypatch.setenv("PYROMIND_API_KEY", "platform-key")
+
+        with pytest.raises(ValueError) as exc:
+            StorageClient(endpoint="https://storage.example.com")
+
+        assert "PYROMIND_STORAGE_ACCESS_KEY" in str(exc.value)

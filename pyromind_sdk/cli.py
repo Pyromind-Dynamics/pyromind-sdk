@@ -23,10 +23,6 @@ from pyromind_sdk.nodes.python_to_yaml import python_function_to_yaml
 
 
 def build_parser() -> argparse.ArgumentParser:
-    from pyromind_sdk.client.base import available_clusters
-
-    # 可选集群 = CLUSTER_RESOURCE 的 key（唯一来源，新增集群不用改帮助文本）
-    cluster_choices = ", ".join(available_clusters())
     parser = argparse.ArgumentParser(description="PyroMind SDK unified CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -58,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     terminal.add_argument("sandbox_id", type=str, help="Sandbox id, e.g. sb-xxxx")
     terminal.add_argument(
         "--cluster", type=str, required=False,
-        help=f"Target cluster ({cluster_choices}); defaults to $PYROMIND_CLUSTER",
+        help="Target cluster from your account's available clusters (docker-rt setup lists them); defaults to $PYROMIND_CLUSTER",
     )
     terminal.add_argument(
         "--api-key", type=str, default=None,
@@ -67,8 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
     terminal.add_argument(
         "--base-url", type=str, default=None,
         help=(
-            "Override the API base URL (defaults to resolving from --cluster via "
-            "CLUSTER_RESOURCE; if unset, also reads $PYROMIND_BASE_URL)"
+            "Override the exchange base URL (defaults to the portal; also "
+            "reads $PYROMIND_BASE_URL)"
         ),
     )
     terminal.add_argument(
@@ -108,7 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
     docker_rt.add_argument(
         "--cluster",
         default=None,
-        help=f"Target cluster ({cluster_choices}); defaults to $PYROMIND_CLUSTER",
+        help="Target cluster from your account's available clusters (docker-rt setup lists them); defaults to $PYROMIND_CLUSTER",
     )
 
     docker_rt_context = subparsers.add_parser(

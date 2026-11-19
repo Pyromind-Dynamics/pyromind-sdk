@@ -32,28 +32,41 @@ def apply_timeout(
     docker_constants: Any,
     timeout: int,
 ) -> None:
-    """Patch the timeout defaults used by Docker SDK client creation."""
-    docker_constants.DEFAULT_TIMEOUT_SECONDS = timeout
-    docker_client.DEFAULT_TIMEOUT_SECONDS = timeout
-    docker_api_client.DEFAULT_TIMEOUT_SECONDS = timeout
+    """修改 Docker SDK 创建 client 时使用的默认超时。
+
+    只改真正暴露该属性的模块，避免新版/裁剪版 docker SDK 让解释器启动失败。
+    """
+    for module in (docker_constants, docker_client, docker_api_client):
+        if hasattr(module, "DEFAULT_TIMEOUT_SECONDS"):
+            module.DEFAULT_TIMEOUT_SECONDS = timeout
 
 
 def install() -> bool:
-    """Patch the official Docker SDK when it is available."""
+    """官方 Docker SDK 存在时修改它的超时默认值。
+
+    该函数由 ``.pth`` 文件调用，即环境中**每个** Python 进程启动都会执行；
+    任何失败都不能带崩解释器，因此每一步都有兜底，且只改已存在的属性。
+    """
     try:
         import docker.api.client
         import docker.client
         import docker.constants
-    except ImportError:
+    except Exception:  # noqa: BLE001 - docker SDK absent/broken is not fatal
         return False
 
-    apply_timeout(
-        docker.client,
-        docker.api.client,
-        docker.constants,
-        get_timeout_seconds(),
-    )
+    try:
+        apply_timeout(
+            docker.client,
+            docker.api.client,
+            docker.constants,
+            get_timeout_seconds(),
+        )
+    except Exception:  # noqa: BLE001 - unexpected docker SDK layout
+        return False
     return True
 
 
-install()
+try:
+    install()
+except Exception:  # noqa: BLE001 - startup hook must never break Python
+    pass

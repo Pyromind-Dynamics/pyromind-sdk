@@ -114,6 +114,8 @@ from pyromind_sdk.client.trace import (  # noqa: E402
     reset_trace_id,
     set_trace_id,
 )
+from pyromind_sdk.token import TokenError  # noqa: E402
+from pyromind_sdk.terminal import async_fetch_terminal_token  # noqa: E402
 
 logger = logging.getLogger("docker_rt")
 
@@ -646,6 +648,9 @@ _WS_CLOSE_HINTS: dict[int, str] = {
     1012: "peer uvicorn is shutting down - pod restart/rollout",
 }
 
+#: 等待首帧 ``auth_ok`` 的上限；超时视为握手失败，可换票重试一次。
+_TERMINAL_AUTH_TIMEOUT_S = 10.0
+
 
 def _ws_close_note(ws: Any, msg: Any) -> str:
     """把"这条 WS 为什么结束了"写成一句能进日志的话（2026-10-16 补）。
@@ -685,6 +690,10 @@ def _ws_close_note(ws: Any, msg: Any) -> str:
     """
     code = getattr(ws, "close_code", None)
     reason = (getattr(ws, "close_reason", None) or "").strip()
+    if not reason and msg.type is WSMsgType.CLOSE:
+        # aiohttp exposes the peer's close reason on the message itself when the
+        # attribute is not populated; without it a 4500 says nothing about why.
+        reason = str(getattr(msg, "extra", "") or "").strip()
     bits = [f"code={code}"]
     hint = _WS_CLOSE_HINTS.get(code)
     if hint:  # 见 _WS_CLOSE_HINTS：1012 = 中间件在重启
@@ -4908,30 +4917,28 @@ async def _hijack_session(
     return resp
 
 
-def _pyromind_terminal_url(
-    kube_env: Any,
-    *,
-    cols: int = 80,
-    rows: int = 24,
-    cmd: list[str] | None = None,
-    cwd: str = "",
-) -> str:
-    # Same resolution as every other data-plane call this daemon makes: the
-    # terminal WebSocket lives on the cluster, and the portal does not proxy
-    # WebSocket at all.
-    from pyromind_sdk.client.base import ENV_API_KEY, resolve_api_base_url
-    from pyromind_sdk.terminal import build_terminal_websocket_url
+def _pyromind_terminal_exchange() -> tuple[str, str, str]:
+    """Return ``(portal_base, cluster, api_key)`` for the terminal exchange.
+
+    The key is kept out of the URL and is only sent to the portal; the token
+    minted there goes in the WebSocket's first auth frame.
+    """
+    from pyromind_sdk.client.base import (
+        DEFAULT_API_BASE_URL,
+        ENV_API_KEY,
+        ENV_BASE_URL,
+        ENV_CLUSTER,
+    )
 
     api_key = (os.getenv(ENV_API_KEY) or "").strip()
-    return build_terminal_websocket_url(
-        resolve_api_base_url(),
-        kube_env.sandbox_id or "",
-        api_key,
-        cols=cols,
-        rows=rows,
-        command=list(cmd) if cmd else None,
-        cwd=cwd or None,
-    )
+    base = (os.getenv(ENV_BASE_URL) or "").strip() or DEFAULT_API_BASE_URL
+    cluster = (os.getenv(ENV_CLUSTER) or "").strip()
+    if not cluster:
+        raise RuntimeError(
+            "PYROMIND_CLUSTER is not set; docker-rt must select a cluster "
+            "from the portal's available clusters before opening a terminal."
+        )
+    return base.rstrip("/"), cluster, api_key
 
 
 def _pty_output_for_client(data: bytes, *, tty: bool) -> bytes:
@@ -4977,9 +4984,7 @@ async def _hijack_pyromind_terminal(
 
     cols = int(getattr(session, "tty_cols", 0) or 0) or 80
     rows = int(getattr(session, "tty_rows", 0) or 0) or 24
-    url = _pyromind_terminal_url(
-        kube_env, cols=cols, rows=rows, cmd=cmd, cwd=cwd
-    )
+    exchange_base, cluster, api_key = _pyromind_terminal_exchange()
     session.running = True
     logger.info(
         "pyromind terminal hijack start id=%s sandbox=%s %dx%d cmd=%s",
@@ -5009,16 +5014,111 @@ async def _hijack_pyromind_terminal(
     }
     try:
         async with aiohttp.ClientSession() as client:
-            try:
-                ws = await client.ws_connect(
-                    url,
-                    heartbeat=30,
-                    headers={TRACE_ID_HEADER: ensure_trace_id()},
+            from pyromind_sdk.terminal import (
+                TerminalAuthExpired,
+                TerminalError,
+                build_terminal_websocket_url,
+            )
+
+            async def _open_terminal():
+                """换票 + 连接 + 鉴权握手上报，返回已 ``auth_ok`` 的 ws。
+
+                等 ``auth_ok`` 再返回，这样 token 过期/被拒能在开始泵数据之前
+                识别出来并重试一次，而不是让用户看到一次莫名的断开。
+                """
+                token, api_base_url = await async_fetch_terminal_token(
+                    exchange_base,
+                    kube_env.sandbox_id or "",
+                    api_key,
+                    cluster,
                 )
+                url = build_terminal_websocket_url(
+                    api_base_url,
+                    kube_env.sandbox_id or "",
+                    cols=cols,
+                    rows=rows,
+                    command=list(cmd) if cmd else None,
+                    cwd=cwd or None,
+                )
+                try:
+                    ws_local = await client.ws_connect(
+                        url,
+                        heartbeat=30,
+                        headers={TRACE_ID_HEADER: ensure_trace_id()},
+                    )
+                except aiohttp.WSServerHandshakeError as exc:
+                    if exc.status == 401:
+                        raise TerminalAuthExpired(
+                            "terminal handshake rejected (HTTP 401)"
+                        ) from exc
+                    raise
+                # Short-lived token in the first frame; nothing secret in the
+                # handshake URL or headers.
+                await ws_local.send_str(
+                    json.dumps({"type": "auth", "token": token})
+                )
+                try:
+                    first = await asyncio.wait_for(
+                        ws_local.receive(),
+                        timeout=_TERMINAL_AUTH_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError as exc:
+                    await ws_local.close()
+                    raise TerminalError(
+                        "terminal auth handshake timed out"
+                    ) from exc
+
+                if first.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        obj = json.loads(first.data)
+                    except (json.JSONDecodeError, TypeError):
+                        obj = {}
+                    if isinstance(obj, dict) and obj.get("type") == "auth_ok":
+                        return ws_local
+                    await ws_local.close()
+                    raise TerminalError(
+                        f"terminal auth handshake returned {first.data!r}"
+                    )
+                if first.type in (
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.ERROR,
+                ):
+                    close_code = ws_local.close_code or (
+                        first.data if first.type == aiohttp.WSMsgType.CLOSE else None
+                    )
+                    await ws_local.close()
+                    if close_code == 4001:
+                        raise TerminalAuthExpired(
+                            "terminal auth token rejected (close code 4001)"
+                        )
+                    raise TerminalError(
+                        f"terminal closed during auth (code={close_code})"
+                    )
+                await ws_local.close()
+                raise TerminalError(
+                    "terminal auth handshake returned an unexpected frame"
+                )
+
+            try:
+                try:
+                    ws = await _open_terminal()
+                except TerminalAuthExpired:
+                    # 60s WS token 在慢链路上可能已过期；只重换一次。
+                    logger.warning(
+                        "terminal auth token rejected, retrying once id=%s",
+                        getattr(session, "id", "")[:12],
+                    )
+                    ws = await _open_terminal()
                 logger.info(
                     "terminal connected id=%s", getattr(session, "id", "")[:12]
                 )
-            except (aiohttp.ClientError, OSError) as exc:
+            except (
+                aiohttp.ClientError,
+                OSError,
+                TokenError,
+                TerminalError,
+            ) as exc:
                 session.running = False
                 if cmd is not None:
                     # Interactive exec: the caller can still use the command
@@ -5146,7 +5246,12 @@ async def _hijack_pyromind_terminal(
                     elif msg.type == aiohttp.WSMsgType.TEXT:
                         try:
                             obj = json.loads(msg.data)
-                            if isinstance(obj, dict) and obj.get("type") == "pong":
+                            # Control frames (keep-alive pong / handshake auth_ok)
+                            # must never be rendered into the user's terminal.
+                            if isinstance(obj, dict) and obj.get("type") in (
+                                "pong",
+                                "auth_ok",
+                            ):
                                 continue
                         except (json.JSONDecodeError, TypeError):
                             pass
