@@ -34,6 +34,7 @@ DEFAULT_STORAGE_ENDPOINT = "https://storage.pyromind.ai"
 DEFAULT_REGION = "us-east-1"
 DEFAULT_CONTENT_TYPE = "application/octet-stream"
 ENV_STORAGE_ENDPOINT = "PYROMIND_STORAGE_ENDPOINT"
+ENV_STORAGE_ACCESS_KEY = "PYROMIND_STORAGE_ACCESS_KEY"
 ENV_STORAGE_SECRET_KEY = "PYROMIND_STORAGE_SECRET_KEY"
 ENV_STORAGE_BUCKET = "PYROMIND_STORAGE_BUCKET"
 
@@ -54,7 +55,7 @@ class StorageClient:
     
     The client uses MinIO/S3-compatible storage and requires:
     - Storage endpoint URL
-    - Access key (from PYROMIND_API_KEY env var)
+    - Access key (from PYROMIND_STORAGE_ACCESS_KEY env var)
     - Secret key (from PYROMIND_STORAGE_SECRET_KEY env var)
     - Bucket name (from PYROMIND_STORAGE_BUCKET env var, optional)
     """
@@ -77,7 +78,7 @@ class StorageClient:
                     Defaults to cluster-based endpoint if cluster is set,
                     otherwise "https://storage.pyromind.ai"
             access_key: Access key for storage authentication
-                       If not provided, reads from PYROMIND_API_KEY env var
+                       If not provided, reads from PYROMIND_STORAGE_ACCESS_KEY env var
             secret_key: Secret key for storage authentication
                        If not provided, reads from PYROMIND_STORAGE_SECRET_KEY env var
             bucket_name: Default bucket name to use
@@ -103,12 +104,12 @@ class StorageClient:
 
         # Get access key from parameter or environment variable
         if access_key is None:
-            access_key = os.getenv(ENV_API_KEY)
+            access_key = os.getenv(ENV_STORAGE_ACCESS_KEY)
 
         if not access_key:
             raise ValueError(
                 f"Storage access key is required. Please provide it either as a parameter "
-                f"or set the {ENV_API_KEY} environment variable."
+                f"or set the {ENV_STORAGE_ACCESS_KEY} environment variable."
             )
 
         # Get secret key from parameter or environment variable
@@ -748,7 +749,7 @@ def get_storage_info() -> Dict[str, Any]:
     """
     Get storage information from the API.
 
-    Calls the /storage_info endpoint to retrieve storage credentials and usage information.
+    Calls /storage_info to retrieve masked Storage credentials and usage information.
     Uses environment variables for configuration:
     - PYROMIND_API_KEY: API key for authentication
     - PYROMIND_BASE_URL: Base URL for the API (optional)
@@ -756,8 +757,8 @@ def get_storage_info() -> Dict[str, Any]:
 
     Returns:
         Dictionary containing storage information:
-        - access_key: Storage access key
-        - secret_key: Storage secret key
+        - access_key: Masked Storage access key
+        - secret_key: Masked Storage secret key
         - url: Storage endpoint URL
         - bucket_name: User's bucket name
         - used_size: Used storage in bytes with unit (e.g., "2655304097792byte")

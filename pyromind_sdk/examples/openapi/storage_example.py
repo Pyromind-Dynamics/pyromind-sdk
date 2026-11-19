@@ -7,7 +7,7 @@ This example demonstrates how to use the StorageClient for file operations.
 The storage credentials can be provided via:
 1. Environment variables (recommended):
    - PYROMIND_STORAGE_ENDPOINT
-   - PYROMIND_API_KEY (used as access key for storage)
+   - PYROMIND_STORAGE_ACCESS_KEY
    - PYROMIND_STORAGE_SECRET_KEY
    - PYROMIND_STORAGE_BUCKET (optional)
 2. Parameters when initializing the client
