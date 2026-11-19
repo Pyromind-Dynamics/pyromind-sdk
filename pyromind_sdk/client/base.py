@@ -22,6 +22,7 @@ from .trace import (
     set_trace_id,
 )
 from ..log_redaction import redact, redact_text
+from ..sdk_version import SDK_VERSION_HEADER, get_sdk_version
 from ..token import HttpTokenCache
 
 
@@ -224,6 +225,7 @@ class PyroMindClient:
         self.session.headers.update({
             "Content-Type": "application/json",
             "Accept": "application/json",
+            SDK_VERSION_HEADER: get_sdk_version(),
             # Same reason as the async client: do not depend on brotli decoding.
             "Accept-Encoding": "gzip, deflate",
             "X-Cluster": self.cluster,

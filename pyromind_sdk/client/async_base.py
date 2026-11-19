@@ -14,6 +14,7 @@ from typing import Optional, Dict, Any
 
 from .base import append_trace_id, extract_trace_id
 from ..log_redaction import redact, redact_text
+from ..sdk_version import SDK_VERSION_HEADER, get_sdk_version
 from ..token import AsyncHttpTokenCache
 from .trace import (
     TRACE_ID_HEADER,
@@ -200,6 +201,7 @@ class PyroMindAsyncClient:
                         # carries a short-lived token instead (see token.py).
                         "Content-Type": "application/json",
                         "Accept": "application/json",
+                        SDK_VERSION_HEADER: get_sdk_version(),
                         # Never advertise ``br``: aiohttp 3.14 + brotli 1.2
                         # cannot decode it (Decompressor.decompress signature
                         # mismatch), and the server honours what we ask for.

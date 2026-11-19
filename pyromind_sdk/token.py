@@ -25,6 +25,7 @@ import requests
 
 from .client.trace import TRACE_ID_HEADER, ensure_trace_id
 from .log_redaction import redact_text
+from .sdk_version import SDK_VERSION_HEADER, get_sdk_version
 
 TOKEN_PATH = "auth/token"
 
@@ -58,7 +59,7 @@ def _request_body(
     resource_id: Optional[str],
     cluster: Optional[str],
 ) -> dict:
-    body: dict = {"purpose": purpose}
+    body: dict = {"purpose": purpose, "sdk_version": get_sdk_version()}
     if resource_type:
         body["resource_type"] = resource_type
     if resource_id:
@@ -96,6 +97,7 @@ def fetch_cluster_hosts(base_url: str, api_key: str) -> list[dict]:
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "Accept": "application/json",
+        SDK_VERSION_HEADER: get_sdk_version(),
         TRACE_ID_HEADER: ensure_trace_id(),
     }
     try:
@@ -164,6 +166,7 @@ def fetch_token(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "Accept": "application/json",
+        SDK_VERSION_HEADER: get_sdk_version(),
         TRACE_ID_HEADER: ensure_trace_id(),
     }
     last_exc = None
@@ -227,6 +230,7 @@ async def async_fetch_token(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "Accept": "application/json",
+        SDK_VERSION_HEADER: get_sdk_version(),
         # aiohttp would otherwise advertise ``br`` and then fail to decode the
         # response ("Can not decode content-encoding: br" on aiohttp 3.14).
         "Accept-Encoding": "gzip, deflate",
