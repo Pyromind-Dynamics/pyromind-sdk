@@ -72,7 +72,7 @@ created = client.storage.transfers.submit(
     TransferRequest(
         source_path="/workspace/models",
         target_cluster="us-west-2",
-        target_path="/workspace/models",
+        target_path="/workspace",
     )
 )
 
@@ -91,9 +91,15 @@ service is missing, Portal rejects the request before creating a transfer task.
 Use the Portal API base URL for the environment you are using. The SDK defaults
 to the standard Portal endpoint; set `base_url` or `PYROMIND_BASE_URL` when
 using a different Portal environment.
+Normally, `target_path` is the destination directory for both files and
+directories. The service appends the source name: the example above lands at
+`/workspace/models`, while `target_path="/workspace/sync/"` would land at
+`/workspace/sync/models`. For a directory transfer, do not include the source
+name in `target_path` unless you intend to nest it inside a same-named directory.
 For a single file, `target_path` may be either the destination directory or the
 full destination file path without a trailing slash when its basename matches
-the source filename.
+the source filename. Add a trailing slash when a destination directory happens
+to have the same name as the source file.
 
 ## Sandboxes（⚠️desperate can not create）
 

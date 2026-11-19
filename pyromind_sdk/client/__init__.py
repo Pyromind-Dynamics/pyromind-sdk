@@ -12,7 +12,7 @@ from .studio import StudioClient
 from .storage import StorageClient
 from .echomind import EchoMindClient
 from .profile import ProfileClient
-from .storage_api import StorageAPIClient
+from .storage_api import FileShareResource, StorageAPIClient
 from .client import PyroMindAPIClient
 from .workflow import (
     validate_workflow,
@@ -25,11 +25,21 @@ from .async_sandbox import AsyncSandboxClient
 from .async_jupyterlab import AsyncJupyterLabClient
 from .async_inference import AsyncInferenceClient
 from .async_studio import AsyncStudioClient
-from .async_storage_api import AsyncStorageAPIClient
+from .async_storage_api import AsyncFileShareResource, AsyncStorageAPIClient
 from .async_echomind import AsyncEchoMindClient
 from .async_client import PyroMindAsyncAPIClient, PyroMindAsyncClient
 from .models import (
     EchoMindPage,
+    FileShareCreateResponse,
+    FileShareDeleteFailure,
+    FileShareDeleteResponse,
+    FileShareListQuery,
+    FileShareLocation,
+    FileSharePage,
+    FileShareRequest,
+    FileShareStatus,
+    FileShareTask,
+    FileShareTaskDisplay,
     InferencePage,
     InternalIPResponse,
     JupyterPage,
@@ -50,6 +60,7 @@ __all__ = [
     "EchoMindClient",
     "ProfileClient",
     "StorageAPIClient",
+    "FileShareResource",
     "PyroMindAPIClient",
     "validate_workflow",
     "ValidationError",
@@ -61,6 +72,7 @@ __all__ = [
     "AsyncInferenceClient",
     "AsyncStudioClient",
     "AsyncStorageAPIClient",
+    "AsyncFileShareResource",
     "AsyncEchoMindClient",
     "PyroMindAsyncAPIClient",
     "InternalIPResponse",
@@ -68,6 +80,16 @@ __all__ = [
     "JupyterPage",
     "InferencePage",
     "EchoMindPage",
+    "FileShareRequest",
+    "FileShareLocation",
+    "FileShareStatus",
+    "FileShareTask",
+    "FileShareTaskDisplay",
+    "FileShareCreateResponse",
+    "FileShareListQuery",
+    "FileSharePage",
+    "FileShareDeleteFailure",
+    "FileShareDeleteResponse",
     "ListQuery",
     "SandboxExecStreamChunk",
 ]

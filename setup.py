@@ -93,7 +93,7 @@ class bdist_wheel_with_timeout_hook(_bdist_wheel):
 ## todo update_version
 setup(
     name="pyromind-sdk",
-    version = "0.1.40.dev",
+    version = "0.1.18",
     description="Lightweight SDK stub for local development and testing of third-party nodes without the full platform codebase",
     long_description=long_description,
     long_description_content_type="text/markdown",

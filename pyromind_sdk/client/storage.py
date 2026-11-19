@@ -25,6 +25,7 @@ except ImportError:
 
 from pyromind_sdk.client.base import PyroMindAPIError, DEFAULT_API_BASE_URL, ENV_API_KEY, ENV_BASE_URL, ENV_CLUSTER
 from pyromind_sdk.client.trace import TRACE_ID_HEADER, ensure_trace_id
+from pyromind_sdk.sdk_version import SDK_VERSION_HEADER, get_sdk_version
 from pyromind_sdk.token import HttpTokenCache
 
 logger = logging.getLogger("pyromind_sdk.storage")
@@ -803,6 +804,7 @@ def get_storage_info(
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
+            SDK_VERSION_HEADER: get_sdk_version(),
             # 存储服务也是平台侧：带上 trace，日志能跟上层的 docker 命令对上
             TRACE_ID_HEADER: ensure_trace_id(),
         }

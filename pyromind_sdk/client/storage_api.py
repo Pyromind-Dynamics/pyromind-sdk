@@ -2,8 +2,25 @@
 
 from __future__ import annotations
 
-from .base import PyroMindAPIError, PyroMindClient
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from . import storage_endpoints as endpoints
+from .base import (
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_TIMEOUT,
+    RETRY_ALLOWED_METHODS,
+    RETRY_STATUS_CODES,
+    PyroMindAPIError,
+    PyroMindClient,
+)
 from .models import (
+    FileShareCreateResponse,
+    FileShareDeleteResponse,
+    FileShareListQuery,
+    FileSharePage,
+    FileShareRequest,
+    FileShareTask,
     TransferActionResponse,
     TransferClearResponse,
     TransferCreateResponse,
@@ -14,13 +31,138 @@ from .models import (
 )
 
 
+class FileShareResource:
+    """Same-cluster sharing operations exposed by the storage API."""
+
+    def __init__(self, storage: StorageAPIClient):
+        self._storage = storage
+
+    @staticmethod
+    def _coerce_request(
+        request: FileShareRequest | dict | None,
+        *,
+        source_path: str | None,
+        target_user_input: str | None,
+        target_user_id: int | None,
+    ) -> FileShareRequest:
+        if request is not None:
+            if any(
+                value is not None
+                for value in (source_path, target_user_input, target_user_id)
+            ):
+                raise TypeError("pass either request or individual share arguments")
+            return (
+                request
+                if isinstance(request, FileShareRequest)
+                else FileShareRequest(**request)
+            )
+        if source_path is None:
+            raise TypeError("source_path is required when request is not provided")
+        return FileShareRequest(
+            source_path=source_path,
+            target_user_input=target_user_input,
+            target_user_id=target_user_id,
+        )
+
+    def create(
+        self,
+        request: FileShareRequest | dict | None = None,
+        *,
+        source_path: str | None = None,
+        target_user_input: str | None = None,
+        target_user_id: int | None = None,
+    ) -> FileShareCreateResponse:
+        """Create a same-cluster share invitation using a UID or email."""
+
+        payload = self._coerce_request(
+            request,
+            source_path=source_path,
+            target_user_input=target_user_input,
+            target_user_id=target_user_id,
+        )
+        response = self._storage.post(
+            endpoints.FILE_SHARE_CREATE_URL,
+            json_data=payload.model_dump(exclude_none=True),
+        )
+        data = self._storage._extract_file_share_data(response)
+        return FileShareCreateResponse(**data)
+
+    def list_page(
+        self, query: FileShareListQuery | dict | None = None
+    ) -> FileSharePage:
+        """Fetch one page of sent or received share tasks."""
+
+        query = query or FileShareListQuery()
+        if not isinstance(query, FileShareListQuery):
+            query = FileShareListQuery(**query)
+        response = self._storage.get(
+            endpoints.FILE_SHARE_LIST_URL,
+            params=query.to_params(),
+        )
+        data = self._storage._extract_file_share_data(response) or {}
+        rows = data.get("list", []) if isinstance(data, dict) else []
+        return FileSharePage(
+            tasks=[FileShareTask(**row) for row in rows if isinstance(row, dict)],
+            total=int(data.get("total", 0) or 0) if isinstance(data, dict) else 0,
+            page_number=query.page_number,
+            page_size=query.page_size,
+        )
+
+    def list(
+        self, query: FileShareListQuery | dict | None = None
+    ) -> list[FileShareTask]:
+        """List all sent or received share tasks, paging automatically."""
+
+        query = query or FileShareListQuery()
+        if not isinstance(query, FileShareListQuery):
+            query = FileShareListQuery(**query)
+        tasks: list[FileShareTask] = []
+        page_number = query.page_number
+        while True:
+            page = self.list_page(
+                query.model_copy(update={"page_number": page_number})
+            )
+            tasks.extend(page.tasks)
+            if not page.tasks or len(tasks) >= page.total:
+                return tasks
+            page_number += 1
+
+    def get(self, biz_no: str) -> FileShareTask:
+        """Fetch one share task visible to the current participant."""
+
+        response = self._storage.get(
+            endpoints.FILE_SHARE_GET_URL.format(biz_no=biz_no)
+        )
+        return FileShareTask(**self._storage._extract_file_share_data(response))
+
+    def cancel(self, biz_no: str) -> FileShareTask:
+        """Cancel a pending share invitation created by the current user."""
+
+        response = self._storage.post(
+            endpoints.FILE_SHARE_CANCEL_URL.format(biz_no=biz_no)
+        )
+        return FileShareTask(**self._storage._extract_file_share_data(response))
+
+    def delete(self, biz_nos: str | list[str]) -> FileShareDeleteResponse:
+        """Hide terminal share tasks from the current user's list only."""
+
+        selected = [biz_nos] if isinstance(biz_nos, str) else biz_nos
+        response = self._storage.post(
+            endpoints.FILE_SHARE_DELETE_URL,
+            json_data={"biz_nos": selected},
+        )
+        return FileShareDeleteResponse(
+            **self._storage._extract_file_share_data(response)
+        )
+
 class StorageAPIClient(PyroMindClient):
-    """Client for storage-related REST APIs, including cross-cluster transfer.
+    """Client for storage REST APIs, transfers, and same-cluster file sharing.
 
     ``StorageAPIClient`` is the storage namespace exposed by
     :class:`PyroMindAPIClient`. It owns the transfer implementation directly;
     ``transfers`` and ``transfer`` are aliases to this same client so callers
-    can use ``client.storage.transfers.submit(...)``.
+    can use ``client.storage.transfers.submit(...)``. Same-cluster sharing is
+    exposed as the separate ``client.storage.file_shares`` resource.
 
     This class is separate from :class:`StorageClient`, which manages
     MinIO/S3-compatible object storage and requires storage credentials.
@@ -28,7 +170,48 @@ class StorageAPIClient(PyroMindClient):
     #: 跨集群 transfer 接口在 portal 本地处理：用短时 token，但地址保持在 portal。
     KEEP_PORTAL_BASE = True
 
-    _TRANSFER_PREFIX = "/storage/transfer"
+    def __init__(
+        self,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        cluster: str | None = None,
+        timeout: int = DEFAULT_TIMEOUT,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+    ) -> None:
+        super().__init__(
+            api_key=api_key,
+            base_url=base_url,
+            cluster=cluster,
+            timeout=timeout,
+            max_retries=max_retries,
+        )
+        # File-share POSTs have no server-side idempotency key. A response lost
+        # after task creation must not cause this client to create another task.
+        self.session.mount(
+            self._build_url(endpoints.FILE_SHARE_CREATE_URL),
+            HTTPAdapter(
+                max_retries=Retry(
+                    total=max_retries,
+                    backoff_factor=1,
+                    status_forcelist=RETRY_STATUS_CODES,
+                    allowed_methods={
+                        method for method in RETRY_ALLOWED_METHODS if method != "POST"
+                    },
+                )
+            ),
+        )
+
+    @property
+    def file_shares(self) -> FileShareResource:
+        """Return the same-cluster file sharing resource."""
+
+        return FileShareResource(self)
+
+    @property
+    def shares(self) -> FileShareResource:
+        """Short alias for :attr:`file_shares`."""
+
+        return self.file_shares
 
     @property
     def transfers(self) -> StorageAPIClient:
@@ -53,6 +236,21 @@ class StorageAPIClient(PyroMindClient):
                 message = response.get("message")
             raise PyroMindAPIError(
                 message or "Transfer API request failed",
+                response=response,
+            )
+        return self._extract_data(response)
+
+    def _extract_file_share_data(self, response):
+        """Extract share response data and raise for HTTP-200 business failures."""
+
+        if isinstance(response, dict) and response.get("success") is False:
+            error = response.get("error")
+            if isinstance(error, dict):
+                message = error.get("message") or error.get("code")
+            else:
+                message = response.get("message")
+            raise PyroMindAPIError(
+                message or "File share API request failed",
                 response=response,
             )
         return self._extract_data(response)
@@ -103,7 +301,7 @@ class StorageAPIClient(PyroMindClient):
             overwrite=overwrite,
         )
         response = self.post(
-            self._TRANSFER_PREFIX,
+            endpoints.TRANSFER_SUBMIT_URL,
             json_data=payload.model_dump(exclude_none=True),
         )
         return TransferCreateResponse(**self._extract_transfer_data(response))
@@ -115,7 +313,7 @@ class StorageAPIClient(PyroMindClient):
         if not isinstance(query, TransferListQuery):
             query = TransferListQuery(**query)
         response = self.get(
-            f"{self._TRANSFER_PREFIX}/list",
+            endpoints.TRANSFER_LIST_URL,
             params=query.to_params(),
         )
         data = self._extract_transfer_data(response) or {}
@@ -145,18 +343,22 @@ class StorageAPIClient(PyroMindClient):
     def cancel(self, transfer_id: int) -> TransferActionResponse:
         """Cancel an active transfer task."""
 
-        response = self.post(f"{self._TRANSFER_PREFIX}/{transfer_id}/cancel")
+        response = self.post(
+            endpoints.TRANSFER_CANCEL_URL.format(transfer_id=transfer_id)
+        )
         return TransferActionResponse(**self._extract_transfer_data(response))
 
     def delete(self, transfer_id: int) -> TransferActionResponse:
         """Delete a cancelled or finished transfer task."""
 
-        response = self._request("DELETE", f"{self._TRANSFER_PREFIX}/{transfer_id}")
+        response = self._request(
+            "DELETE", endpoints.TRANSFER_DELETE_URL.format(transfer_id=transfer_id)
+        )
         return TransferActionResponse(**self._extract_transfer_data(response))
 
     def clear_finished(self, ids: list[int] | None = None) -> TransferClearResponse:
         """Delete finished tasks; pass ``ids`` to delete only selected tasks."""
 
         body = {"ids": ids} if ids is not None else None
-        response = self.post(f"{self._TRANSFER_PREFIX}/clear", json_data=body)
+        response = self.post(endpoints.TRANSFER_CLEAR_URL, json_data=body)
         return TransferClearResponse(**self._extract_transfer_data(response))

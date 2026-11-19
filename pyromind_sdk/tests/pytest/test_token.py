@@ -65,6 +65,7 @@ def test_fetch_token_posts_purpose_sandbox_and_cluster(monkeypatch) -> None:
         "resource_type": "sandbox",
         "resource_id": "sb-1",
         "cluster": "us-west-2",
+        "sdk_version": sdk_token.get_sdk_version(),
     }
     assert captured["headers"]["Authorization"] == "Bearer long-term-key"
 
@@ -86,6 +87,27 @@ def test_fetch_token_requires_the_direct_base_url(monkeypatch) -> None:
     )
     with pytest.raises(sdk_token.TokenError):
         sdk_token.fetch_token("https://api-portal.example/api/v1", "key")
+
+
+def test_token_exchange_carries_the_sdk_version(monkeypatch) -> None:
+    """换票请求要带 sdk_version（body + header），供 portal/middleware 审计。"""
+    from pyromind_sdk.sdk_version import get_sdk_version
+
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        captured["headers"] = headers
+        return _FakeResponse(200, _ok_payload())
+
+    monkeypatch.setattr(sdk_token.requests, "post", fake_post)
+    sdk_token.fetch_token(
+        "https://portal.example/api/v1", "key", cluster="us-west-2"
+    )
+
+    version = get_sdk_version()
+    assert captured["json"]["sdk_version"] == version
+    assert captured["headers"]["X-SDK-Version"] == version
 
 
 def test_fetch_token_requires_a_cluster() -> None:

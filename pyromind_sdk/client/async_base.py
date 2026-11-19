@@ -14,6 +14,7 @@ from typing import Optional, Dict, Any
 
 from .base import append_trace_id, extract_trace_id
 from ..log_redaction import redact, redact_text
+from ..sdk_version import SDK_VERSION_HEADER, get_sdk_version
 from ..token import AsyncHttpTokenCache
 from .trace import (
     TRACE_ID_HEADER,
@@ -229,6 +230,7 @@ class PyroMindAsyncClient:
                         # carries a short-lived token instead (see token.py).
                         "Content-Type": "application/json",
                         "Accept": "application/json",
+                        SDK_VERSION_HEADER: get_sdk_version(),
                         # Explicit, so aiohttp's "advertise br when brotli is
                         # importable" default cannot pick the decoder that is
                         # broken here. See DEFAULT_ACCEPT_ENCODING.
