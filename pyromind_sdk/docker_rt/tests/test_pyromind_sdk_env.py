@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import asyncio
 import io
 import json
@@ -38,6 +39,8 @@ from ..backend.store import ContainerRecord, ContainerState
 
 def _adapter_with_fake_client() -> tuple[PyromindSDK, MagicMock]:
     adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.logger = logging.getLogger("docker_rt.test")
+    adapter.rift_ready = False
     adapter.sandbox_id = "sb-test-1"
     adapter.name = "old-name"
     adapter.image = "busybox:1.36"
@@ -1415,3 +1418,61 @@ def test_assembly_failure_is_loud_and_cleans_up(monkeypatch):
     else:
         raise AssertionError("组装失败必须报错，不能当成功")
     assert any(script.startswith("rm -rf /tmp/.drt-cp-") for script in calls["execs"])
+
+@pytest.mark.asyncio
+async def test_legacy_sandbox_exec_stream_uses_middleware_ws():
+    """老沙箱（rift_enabled=False）exec 回退 middleware exec-stream WS。"""
+    from types import SimpleNamespace
+
+    adapter, client = _adapter_with_fake_client()
+    adapter.rift_enabled = False
+    adapter.rift_ready = False
+    seen = {}
+
+    async def fake_stream(sandbox_id, command, cwd="", timeout=None, tty=False):
+        seen.update(sandbox_id=sandbox_id, command=command, cwd=cwd, tty=tty)
+        yield SimpleNamespace(type="stdout", data=b"ok\n")
+        yield SimpleNamespace(type="exit", data="", returncode=0)
+
+    client.exec_command_stream = fake_stream
+
+    chunks = [c async for c in adapter.iter_exec_stream(["echo", "hi"], cwd="/w")]
+    assert [c.type for c in chunks] == ["stdout", "exit"]
+    assert seen["sandbox_id"] == "sb-test-1"
+    assert seen["command"] == ["echo", "hi"]
+    assert seen["cwd"] == "/w"
+
+
+@pytest.mark.asyncio
+async def test_legacy_sandbox_execute_collects_platform_output():
+    from types import SimpleNamespace
+
+    adapter, client = _adapter_with_fake_client()
+    adapter.rift_enabled = False
+    adapter.rift_ready = False
+
+    async def fake_stream(sandbox_id, command, cwd="", timeout=None, tty=False):
+        yield SimpleNamespace(type="stdout", data=b"hi\n")
+        yield SimpleNamespace(type="stderr", data=b"warn\n")
+        yield SimpleNamespace(type="exit", data="", returncode=3)
+
+    client.exec_command_stream = fake_stream
+
+    result = await adapter.execute({"command": "echo hi"})
+    assert result["returncode"] == 3
+    assert result["output"] == "hi\n"
+    assert result["stderr"] == "warn\n"
+
+
+@pytest.mark.asyncio
+async def test_legacy_sandbox_connect_rift_skips_ping_gate(monkeypatch):
+    """老沙箱没有 rift-client：start 不做 Ping 门禁，也不去取密码。"""
+    adapter, _client = _adapter_with_fake_client()
+    adapter.rift_enabled = False
+
+    async def _boom():
+        raise AssertionError("legacy sandbox must not fetch a rift password")
+
+    monkeypatch.setattr(adapter, "_fetch_rift_password", _boom)
+    await adapter.connect_rift()
+    assert adapter.rift_ready is False

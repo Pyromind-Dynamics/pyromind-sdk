@@ -410,6 +410,14 @@ class SandboxResponse(BaseModel):
             "account access key."
         ),
     )
+    rift_enabled: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Whether the sandbox template injects rift-client. False means a "
+            "legacy sandbox: docker-rt falls back to the middleware "
+            "terminal/exec-stream WebSockets for exec and cp."
+        ),
+    )
 
 
 

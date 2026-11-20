@@ -401,6 +401,7 @@ class PyromindSDK:
         obj.working_dir = "/"
         obj.command = []
         obj.entrypoint = None
+        obj.rift_enabled = True  # 详情接口未带该字段时按新沙箱处理
         obj.sandbox_status = status or "Unknown"
         obj._terminal_phase = None
         obj._exit_code = 0
@@ -460,6 +461,7 @@ class PyromindSDK:
         self.working_dir = working_dir
         self.command = list(command or [])
         self.entrypoint = list(entrypoint) if entrypoint is not None else None
+        self.rift_enabled = True  # 详情接口未带该字段时按新沙箱处理
         self.sandbox_id: str | None = None
         self.sandbox_status = "Pending"
         self.resources: ResourceConfig | None = None
@@ -539,6 +541,7 @@ class PyromindSDK:
         self.screen_size = self._json_ready(response.screen_size)
         self.pod_name = response.id
         self.name = response.name or self.name
+        self._apply_rift_flags(response)
 
     async def _create_sandbox(
         self,
@@ -703,11 +706,51 @@ class PyromindSDK:
     ) -> dict[str, Any]:
         if not self.sandbox_id:
             raise RuntimeError("sandbox is not started")
+        if self._rift_disabled():
+            return await self._execute_legacy(action, cwd, timeout)
         if not self.rift_ready:
             raise RiftUnavailable(
                 "rift channel is not ready; refusing platform exec"
             )
         return await self._execute_rift(action, cwd, timeout)
+
+    async def _execute_legacy(
+        self,
+        action: dict[str, Any],
+        cwd: str,
+        timeout: int | None,
+    ) -> dict[str, Any]:
+        """老沙箱：经 middleware exec-stream WS 跑一条命令并收集输出。"""
+        command = action.get("command", "")
+        if isinstance(command, str):
+            argv = ["/bin/sh", "-c", command]
+        elif isinstance(command, (list, tuple)):
+            argv = [str(part) for part in command]
+        else:
+            raise RuntimeError(
+                f"unsupported command type: {type(command).__name__}"
+            )
+        stdout = bytearray()
+        stderr = bytearray()
+        code = -1
+        async for chunk in self._client.exec_command_stream(
+            self.sandbox_id,
+            argv,
+            cwd=cwd or self.working_dir,
+            timeout=timeout,
+        ):
+            if chunk.type == "stdout":
+                stdout += chunk.data if isinstance(chunk.data, bytes) else str(chunk.data).encode()
+            elif chunk.type == "stderr":
+                stderr += chunk.data if isinstance(chunk.data, bytes) else str(chunk.data).encode()
+            elif chunk.type == "exit":
+                code = int(chunk.returncode or 0)
+        return {
+            "output": stdout.decode("utf-8", "replace"),
+            "stderr": stderr.decode("utf-8", "replace"),
+            "returncode": code,
+            "exception_info": "",
+        }
 
     async def _execute_rift(
         self,
@@ -754,6 +797,16 @@ class PyromindSDK:
     async def ping_rift(self) -> bool:
         return bool(await self.ping_rift_version())
 
+    def _rift_disabled(self) -> bool:
+        """老沙箱（STS 未注入 rift-client）：exec/cp 走 middleware 旧通道。"""
+        return getattr(self, "rift_enabled", True) is False
+
+    def _apply_rift_flags(self, sandbox: Any) -> None:
+        """用平台详情里的 rift_enabled 覆盖本地判断（老中间件不带该字段则不动）。"""
+        enabled = getattr(sandbox, "rift_enabled", None)
+        if enabled is not None:
+            self.rift_enabled = bool(enabled)
+
     async def _fetch_rift_password(self) -> str:
         """从平台 detail 取该 sandbox 的 rift 密码。
 
@@ -763,6 +816,7 @@ class PyromindSDK:
         sandbox = await self._client.get_sandbox(
             self.sandbox_id, timeout=10, retry=False
         )
+        self._apply_rift_flags(sandbox)
         password = str(getattr(sandbox, "rift_password", "") or "").strip()
         if not password:
             raise RiftUnavailable(
@@ -809,12 +863,24 @@ class PyromindSDK:
         一次密码再试（resume/edit 可能换了密码），仍失败直接抛。
         失败抛 RiftUnavailable，调用方不得回退平台 exec 通道。
         """
+        if not self.sandbox_id:
+            raise RiftUnavailable("sandbox is not started")
+        if self._rift_disabled():
+            self.logger.info(
+                "rift not injected for sandbox=%s (legacy); exec/cp use middleware WS",
+                self.sandbox_id,
+            )
+            return
         cfg = load_rift_config()
         if not cfg.gateway:
             raise RiftUnavailable("DOCKER_RT_RIFT_GATEWAY is not configured")
-        if not self.sandbox_id:
-            raise RiftUnavailable("sandbox is not started")
         password = await self._fetch_rift_password()
+        if self._rift_disabled():
+            self.logger.info(
+                "rift not injected for sandbox=%s (legacy); exec/cp use middleware WS",
+                self.sandbox_id,
+            )
+            return
         self._rift_client = RiftGatewayClient(cfg, password, self.sandbox_id)
         try:
             await self._ping_rift_until_ready(cfg)
@@ -844,9 +910,24 @@ class PyromindSDK:
         timeout: int | None = None,
         stdin_close: Any | None = None,
     ) -> AsyncIterator[SandboxExecStreamChunk]:
-        """Stream one exec command through rift; no platform exec-stream fallback."""
+        """Stream one exec command: rift for injected sandboxes, middleware WS for legacy ones."""
         if not self.sandbox_id:
             raise RuntimeError("sandbox is not started")
+        if self._rift_disabled():
+            argv = (
+                list(cmd)
+                if isinstance(cmd, (list, tuple))
+                else ["/bin/sh", "-c", str(cmd)]
+            )
+            async for chunk in self._client.exec_command_stream(
+                self.sandbox_id,
+                argv,
+                cwd=cwd or self.working_dir,
+                timeout=timeout,
+                tty=tty,
+            ):
+                yield chunk
+            return
         if not self.rift_ready:
             raise RiftUnavailable(
                 "rift channel is not ready; refusing platform exec-stream"
@@ -1247,6 +1328,10 @@ class PyromindSDK:
 
     async def iter_archive_chunks(self, path: str):
         """Yield tar bytes for ``docker cp`` from a k8s-middleware sandbox."""
+        if self._rift_disabled():
+            async for chunk in self._iter_archive_chunks_legacy(path):
+                yield chunk
+            return
         if not self.rift_ready:
             raise RiftUnavailable(
                 "rift channel is not ready; refusing platform file API"
@@ -1256,6 +1341,39 @@ class PyromindSDK:
         async for chunk in self._rift_client.get_archive(path):
             yield chunk
         return
+
+    async def _iter_archive_chunks_legacy(self, path: str):
+        """老沙箱：目录走 tar 命令（经 execute），单文件用 files/read 打包成 tar。"""
+        target = path if path.startswith("/") else f"/{path}"
+        parent = target.rsplit("/", 1)[0] or "/"
+        base = target.rsplit("/", 1)[-1]
+        stat = await self.archive_path_stat(target)
+        if stat is None:
+            raise FileNotFoundError(target)
+        if stat["mode"] & 0o040000:
+            script = (
+                f"tar -C {shlex.quote(parent)} -cf - {shlex.quote(base)} "
+                "| base64 -w0"
+            )
+            result = await self.execute({"command": script}, cwd="/")
+            code = int(result.get("returncode", 0) or 0)
+            if code != 0:
+                raise RuntimeError(
+                    result.get("exception_info")
+                    or result.get("output")
+                    or f"tar failed for {target}"
+                )
+            yield base64.b64decode(str(result.get("output") or ""))
+            return
+        data = await self._client.read_file(self.sandbox_id, target)
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            info = tarfile.TarInfo(name=base or "/")
+            info.size = len(data)
+            info.mode = stat["mode"] & 0o777
+            tar.addfile(info, io.BytesIO(data))
+        yield buf.getvalue()
+
     async def put_archive(
         self, dest_path: str, tar: bytes | AsyncIterator[bytes]
     ) -> None:
@@ -1275,6 +1393,9 @@ class PyromindSDK:
         Either way the bytes we sent must be accounted for by rift-client;
         otherwise the copy must not look successful.
         """
+        if self._rift_disabled():
+            await self._put_archive_legacy(dest_path, tar)
+            return
         if not self.rift_ready:
             raise RiftUnavailable(
                 "rift channel is not ready; refusing platform file API"
@@ -1303,6 +1424,33 @@ class PyromindSDK:
                     "docker cp: the upload body was empty, nothing to extract"
                 )
             await self._put_archive_spooled(dest, spool, size)
+
+    async def _put_archive_legacy(self, dest_path: str, tar: Any) -> None:
+        """老沙箱：解析 tar，用 execute 建目录、files/write 写文件。"""
+        if not isinstance(tar, (bytes, bytearray, memoryview)):
+            payload = bytearray()
+            async for chunk in tar:
+                if chunk:
+                    payload += chunk
+            tar = bytes(payload)
+        dest = dest_path or "/"
+        with tarfile.open(fileobj=io.BytesIO(bytes(tar)), mode="r") as archive:
+            for member in archive.getmembers():
+                name = member.name.lstrip("/")
+                target = posixpath.join(dest, name)
+                if not dest.endswith("/") and name == posixpath.basename(dest):
+                    target = dest
+                if member.isdir():
+                    await self.execute(
+                        {"command": f"mkdir -p {shlex.quote(target)}"},
+                        cwd="/",
+                    )
+                    continue
+                if not member.isfile():
+                    continue
+                content = archive.extractfile(member)
+                data = content.read() if content is not None else b""
+                await self._client.write_file(self.sandbox_id, target, data)
 
     async def _put_archive_spooled(self, dest: str, spool: Any, size: int) -> None:
         spool.seek(0)

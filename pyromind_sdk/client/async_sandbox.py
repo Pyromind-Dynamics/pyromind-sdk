@@ -153,6 +153,7 @@ class AsyncSandboxClient(PyroMindAsyncClient):
             "uid": sandbox_data.get("uid"),
             "mount_public_dir": sandbox_data.get("mount_public_dir"),
             "rift_password": sandbox_data.get("rift_password"),
+            "rift_enabled": sandbox_data.get("rift_enabled"),
         }
 
         if "screen_size" in sandbox_data and sandbox_data["screen_size"]:
