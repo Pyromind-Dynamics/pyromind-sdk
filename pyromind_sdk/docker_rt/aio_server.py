@@ -1196,6 +1196,7 @@ def _display_status(c: Any) -> str:
     kube_env = getattr(c, "kube_env", None)
     if (
         isinstance(kube_env, PyromindSDK)
+        and getattr(kube_env, "rift_enabled", True)
         and c.state == ContainerState.RUNNING
         and not getattr(kube_env, "rift_ready", False)
     ):
@@ -1203,6 +1204,8 @@ def _display_status(c: Any) -> str:
         # rift-client answers Ping. Docker should not show it as Up yet.
         # Only RUNNING records are gated: a stopped/dead container keeps
         # showing Exited/Dead even though rift-client is gone with the Pod.
+        # Legacy sandboxes (rift_enabled=False) have no rift-client at all
+        # and use the middleware WS channel, so they are never gated here.
         return "pending"
     _, sandbox_status = _sandbox_identity(c)
     s = (sandbox_status or "").strip().lower()
@@ -1249,6 +1252,7 @@ def _rift_not_ready(c: Any) -> bool:
     kube_env = getattr(c, "kube_env", None)
     return (
         isinstance(kube_env, PyromindSDK)
+        and getattr(kube_env, "rift_enabled", True)
         and c.state == ContainerState.RUNNING
         and not getattr(kube_env, "rift_ready", False)
     )
@@ -4277,8 +4281,10 @@ async def start_exec(request: web.Request) -> web.StreamResponse | web.Response:
     detach = bool(body.get("Detach", False))
     tty = bool(body.get("Tty", exec_rec.tty))
     kube_env = container.kube_env
-    if isinstance(kube_env, PyromindSDK) and not getattr(
-        kube_env, "rift_ready", False
+    if (
+        isinstance(kube_env, PyromindSDK)
+        and getattr(kube_env, "rift_enabled", True)
+        and not getattr(kube_env, "rift_ready", False)
     ):
         return _err(
             503,

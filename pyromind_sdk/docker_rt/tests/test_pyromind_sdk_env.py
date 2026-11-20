@@ -1476,3 +1476,24 @@ async def test_legacy_sandbox_connect_rift_skips_ping_gate(monkeypatch):
     monkeypatch.setattr(adapter, "_fetch_rift_password", _boom)
     await adapter.connect_rift()
     assert adapter.rift_ready is False
+
+@pytest.mark.asyncio
+async def test_legacy_sandbox_is_not_gated_as_pending():
+    """老沙箱没有 rift：ps 状态与 ready 判断都不能因 rift_ready=False 而挂 pending。"""
+    from types import SimpleNamespace
+
+    from ..aio_server import _display_status
+
+    record = SimpleNamespace(
+        state=ContainerState.RUNNING,
+        container_id="cid",
+        sandbox_id="sb-test-1",
+        kube_env=SimpleNamespace(rift_enabled=False, rift_ready=False),
+        sandbox_status="Running",
+    )
+    from ..backend.pyromind_sdk_env import PyromindSDK
+
+    record.kube_env = PyromindSDK.__new__(PyromindSDK)
+    record.kube_env.rift_enabled = False
+    record.kube_env.rift_ready = False
+    assert _display_status(record) == "running"
