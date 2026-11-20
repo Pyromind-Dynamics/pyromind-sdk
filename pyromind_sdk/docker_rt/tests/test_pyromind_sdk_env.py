@@ -1497,3 +1497,118 @@ async def test_legacy_sandbox_is_not_gated_as_pending():
     record.kube_env.rift_enabled = False
     record.kube_env.rift_ready = False
     assert _display_status(record) == "running"
+
+@pytest.mark.asyncio
+async def test_terminal_channel_selection_for_pyromind_sandboxes():
+    """交互 exec 的通道选择：老沙箱→legacy，rift 就绪→rift，新沙箱未就绪→unavailable。"""
+    from ..aio_server import _pyromind_terminal_channel
+    from ..backend.pyromind_sdk_env import PyromindSDK
+
+    native = object()
+    assert _pyromind_terminal_channel(native) == "native"
+
+    env = PyromindSDK.__new__(PyromindSDK)
+    env.rift_enabled = False
+    env.rift_ready = False
+    assert _pyromind_terminal_channel(env) == "legacy"
+
+    env.rift_enabled = True
+    env.rift_ready = True
+    assert _pyromind_terminal_channel(env) == "rift"
+
+    env.rift_ready = False
+    assert _pyromind_terminal_channel(env) == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_legacy_cp_downloads_a_single_file_as_tar():
+    """老沙箱 cp 下行（单文件）：files/read 取内容后打包成 tar。"""
+    import io
+    import tarfile
+
+    adapter, client = _adapter_with_fake_client()
+    adapter.rift_enabled = False
+
+    async def fake_stat(_path):
+        return {"mode": 0o100644}
+
+    async def fake_read(sandbox_id, path):
+        assert (sandbox_id, path) == ("sb-test-1", "/work/app.py")
+        return b"print('hi')\n"
+
+    adapter.archive_path_stat = fake_stat
+    client.read_file = fake_read
+
+    chunks = [c async for c in adapter.iter_archive_chunks("/work/app.py")]
+    payload = b"".join(chunks)
+    with tarfile.open(fileobj=io.BytesIO(payload)) as tar:
+        names = tar.getnames()
+        assert names == ["app.py"]
+        assert tar.extractfile("app.py").read() == b"print('hi')\n"
+
+
+@pytest.mark.asyncio
+async def test_legacy_cp_downloads_a_directory_via_execute():
+    """老沙箱 cp 下行（目录）：经 execute 跑 tar，输出 base64 解码即 tar 字节。"""
+    import base64
+    import io
+    import tarfile
+
+    adapter, _client = _adapter_with_fake_client()
+    adapter.rift_enabled = False
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo("cfg")
+        info.size = 3
+        tar.addfile(info, io.BytesIO(b"abc"))
+    tar_bytes = buf.getvalue()
+
+    async def fake_stat(_path):
+        return {"mode": 0o040755}
+
+    async def fake_execute(action, cwd="/"):
+        assert "tar -C /work -cf - cfg | base64 -w0" in action["command"]
+        return {"returncode": 0, "output": base64.b64encode(tar_bytes).decode()}
+
+    adapter.archive_path_stat = fake_stat
+    adapter.execute = fake_execute
+
+    chunks = [c async for c in adapter.iter_archive_chunks("/work/cfg")]
+    assert b"".join(chunks) == tar_bytes
+
+
+@pytest.mark.asyncio
+async def test_legacy_cp_extracts_into_dirs_and_files():
+    """老沙箱 cp 上行：目录用 execute mkdir，普通文件用 files/write。"""
+    import io
+    import tarfile
+
+    adapter, client = _adapter_with_fake_client()
+    adapter.rift_enabled = False
+    executed = []
+    written = []
+
+    async def fake_execute(action, cwd="/"):
+        executed.append(action["command"])
+        return {"returncode": 0, "output": ""}
+
+    async def fake_write(sandbox_id, path, data):
+        written.append((sandbox_id, path, data))
+        return {}
+
+    adapter.execute = fake_execute
+    client.write_file = fake_write
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        d = tarfile.TarInfo("logs")
+        d.type = tarfile.DIRTYPE
+        tar.addfile(d)
+        f = tarfile.TarInfo("logs/app.log")
+        f.size = 5
+        tar.addfile(f, io.BytesIO(b"hello"))
+
+    await adapter.put_archive("/data", buf.getvalue())
+    assert any("mkdir -p 'logs'" in cmd or "mkdir -p /data/logs" in cmd for cmd in executed)
+    assert written == [("sb-test-1", "/data/logs/app.log", b"hello")]

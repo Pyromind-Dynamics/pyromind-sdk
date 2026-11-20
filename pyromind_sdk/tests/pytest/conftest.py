@@ -29,10 +29,16 @@ def _stub_token_exchange(monkeypatch):
             "test-token",
             900,
             "https://direct.example/api/v1",
+            "rift-gateway.example:443",
         ),
     )
 
     async def _async_fetch(*args, **kwargs):
-        return "test-token", 900, "https://direct.example/api/v1"
+        return (
+            "test-token",
+            900,
+            "https://direct.example/api/v1",
+            "rift-gateway.example:443",
+        )
 
     monkeypatch.setattr(sdk_token, "async_fetch_token", _async_fetch)

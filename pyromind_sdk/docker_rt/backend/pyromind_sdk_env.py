@@ -871,9 +871,13 @@ class PyromindSDK:
                 self.sandbox_id,
             )
             return
-        cfg = load_rift_config()
+        gateway = await self._client.fetch_rift_gateway()
+        cfg = load_rift_config(gateway)
         if not cfg.gateway:
-            raise RiftUnavailable("DOCKER_RT_RIFT_GATEWAY is not configured")
+            raise RiftUnavailable(
+                "rift gateway is not configured (platform rift_gateway / "
+                "DOCKER_RT_RIFT_GATEWAY)"
+            )
         password = await self._fetch_rift_password()
         if self._rift_disabled():
             self.logger.info(

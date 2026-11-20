@@ -307,15 +307,22 @@ class TestStorageCredentials:
         assert "PYROMIND_STORAGE_ACCESS_KEY" in str(exc.value)
 
 
-def test_rift_gateway_resolves_from_cluster_map(monkeypatch):
-    """The rift data-plane domain is part of CLUSTER_RESOURCE, not user config."""
+def test_rift_gateway_comes_from_the_platform_not_a_local_table(monkeypatch):
+    """网关地址由平台换票下发；本地不再有 cluster→gateway 硬编码表。"""
+    from pyromind_sdk import client  # noqa: F401
+    import pyromind_sdk.client.base as base_mod
+
+    assert not hasattr(base_mod, "resolve_rift_target_from_cluster")
+
     monkeypatch.delenv("DOCKER_RT_RIFT_GATEWAY", raising=False)
     monkeypatch.delenv("DOCKER_RT_RIFT_GATEWAY_TLS", raising=False)
-    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-1#pre")
 
     from pyromind_sdk.rift.config import load_rift_config
 
-    cfg = load_rift_config()
-    assert cfg.gateway == "pre-rift-gateway-us-west-1.pyromind.ai:443"
+    cfg = load_rift_config("platform-rift.example:443")
+    assert cfg.gateway == "platform-rift.example:443"
     assert cfg.gateway_tls is True
-    assert cfg.gateway_ca is None
+
+    # 显式环境变量仍可在本地/调试时覆盖平台下发值。
+    monkeypatch.setenv("DOCKER_RT_RIFT_GATEWAY", "localhost:18080")
+    assert load_rift_config("platform-rift.example:443").gateway == "localhost:18080"

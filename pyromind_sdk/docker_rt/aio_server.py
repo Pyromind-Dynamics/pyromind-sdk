@@ -5010,7 +5010,8 @@ async def _hijack_session(
     # platform terminal/exec-stream fallback: when rift is not ready the caller
     # already gets a 503 from create_exec, and this path fails explicitly too.
     if isinstance(kube_env, PyromindSDK) and cmd is not None:
-        if not getattr(kube_env, "rift_enabled", True):
+        channel = _pyromind_terminal_channel(kube_env)
+        if channel == "legacy":
             # 老沙箱（STS 未注入 rift-client）：回退 middleware 终端 WS
             logger.info(
                 "interactive exec: rift not injected, falling back to middleware terminal id=%s",
@@ -5020,7 +5021,7 @@ async def _hijack_session(
                 request, resp, protocol, session, kube_env, tty,
                 cmd=cmd, cwd=cwd,
             )
-        if getattr(kube_env, "rift_ready", False):
+        if channel == "rift":
             return await _hijack_rift_terminal(
                 request,
                 resp,
@@ -5105,7 +5106,7 @@ async def _hijack_session(
             return resp
         # Attach has no command channel to fall back to: the terminal is the
         # only way in, so a failure is reported on the stream itself.
-        if not getattr(kube_env, "rift_enabled", True):
+        if _pyromind_terminal_channel(kube_env) == "legacy":
             logger.info(
                 "attach: rift not injected, falling back to middleware terminal id=%s",
                 (getattr(session, "id", "") or "")[:12],
@@ -5113,7 +5114,7 @@ async def _hijack_session(
             return await _hijack_pyromind_terminal(
                 request, resp, protocol, session, kube_env, tty,
             )
-        if getattr(kube_env, "rift_ready", False):
+        if _pyromind_terminal_channel(kube_env) == "rift":
             return await _hijack_rift_terminal(
                 request,
                 resp,
@@ -5422,6 +5423,23 @@ def _terminal_close_notice(
         # uvicorn 收到 SIGTERM 时对每条已握手 WS 发的 code = Service Restart。
         return "\r\ndocker-rt: session closed because k8s_middleware restarted\r\n"
     return ""
+
+def _pyromind_terminal_channel(kube_env: Any) -> str:
+    """交互 exec 的通道选择：``native`` / ``legacy`` / ``rift`` / ``unavailable``。
+
+    * ``native``：非 PyromindSDK 适配器，沿用其自己的 attach 通道；
+    * ``legacy``：老沙箱（未注入 rift-client），走 middleware 终端 WS；
+    * ``rift``：平台注入的 rift-client 就绪，走网关 Exec PTY；
+    * ``unavailable``：新沙箱但 rift 未就绪（硬失败，不静默回退）。
+    """
+    if not isinstance(kube_env, PyromindSDK):
+        return "native"
+    if getattr(kube_env, "rift_enabled", True) is False:
+        return "legacy"
+    if getattr(kube_env, "rift_ready", False):
+        return "rift"
+    return "unavailable"
+
 
 def _pyromind_terminal_exchange() -> tuple[str, str, str]:
     """Return ``(portal_base, cluster, api_key)`` for the terminal exchange.

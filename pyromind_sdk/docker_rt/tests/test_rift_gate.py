@@ -115,7 +115,7 @@ def _connect_env(
     monkeypatch.setattr(
         mod,
         "load_rift_config",
-        lambda: SimpleNamespace(
+        lambda *_a, **_k: SimpleNamespace(
             gateway=gateway, ping_attempts=attempts, ping_interval=0
         ),
     )
@@ -127,6 +127,9 @@ def _connect_env(
     clients: list = []
 
     class _PlatformClient:
+        async def fetch_rift_gateway(self):
+            return gateway
+
         async def get_sandbox(self, sandbox_id, *, timeout=None, retry=True):
             value = password() if callable(password) else password
             return SimpleNamespace(rift_password=value)

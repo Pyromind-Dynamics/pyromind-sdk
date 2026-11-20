@@ -32,17 +32,16 @@ docker-rt **不上传、不启动任何东西**：`docker start` 只等 Ping 通
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `DOCKER_RT_RIFT_GATEWAY` | 空 | **默认不用设**：从 `CLUSTER_RESOURCE[PYROMIND_CLUSTER]["rift"][env]` 解析（如 `rift-gateway-us-west-1.pyromind.ai:443`）。只用于本地/测试覆盖。 |
+| `DOCKER_RT_RIFT_GATEWAY` | 空 | **默认不用设**：网关地址由**平台下发**（portal 换票响应的 `rift_gateway`，`host[:port]`），与 Console 集群配置同一公共参数。只用于本地/测试覆盖。 |
 | `DOCKER_RT_RIFT_GATEWAY_TLS` | 自动 | `:443` 或 `https://` 自动启用（用系统信任链；公司 CA 未装入系统信任库时改用 `DOCKER_RT_RIFT_GATEWAY_CA`），一般不用设。 |
-| `DOCKER_RT_RIFT_GATEWAY_CA` | 空 | 私有 CA 路径；默认取集群 map 的 `rift_ca`，只有在本地覆盖时才设。 |
+| `DOCKER_RT_RIFT_GATEWAY_CA` | 空 | 私有 CA 路径（公司 CA 未装入系统信任库时设）。 |
 | `DOCKER_RT_RIFT_PING_TIMEOUT` | `3` | 单次 Ping 超时（秒）。 |
 | `DOCKER_RT_RIFT_PING_ATTEMPTS` | `20` | start 时等待 rift-client 就绪的 Ping 次数。 |
 | `DOCKER_RT_RIFT_PING_INTERVAL` | `0.3` | Ping 间隔（秒）。 |
 | `DOCKER_RT_RIFT_HEALTH_INTERVAL` | `30` | 后台健康检查周期（秒），`0` 关闭。 |
 
-> 公网 gRPC 域名与 API 域名一起维护在 `pyromind_sdk/client/base.py` 的
-> `CLUSTER_RESOURCE[...]["rift"]`，必须与 Gateway Ingress 的 host/TLS 一致；
-> 代码里没有明文 h2c 的公网入口。
+> 网关地址是**平台下发的公共参数**（换票响应 `rift_gateway`，Console 用同一个
+> 字段）；SDK 不再内置 cluster→gateway 映射，平台未下发时 start 显式失败。
 >
 > `docker start` 会在 Pod Running 之后继续等待 rift-client Ping；只有 Ping
 > 成功后才把容器标成 `Running`/`Up`。次数用尽仍失败则 start 返回 503、容器置为

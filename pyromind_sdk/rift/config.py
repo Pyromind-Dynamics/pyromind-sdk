@@ -41,37 +41,27 @@ class RiftConfig:
     health_interval: float
 
 
-def _resolve_gateway() -> tuple[str, bool, str | None]:
+def _resolve_gateway(platform_gateway: str | None) -> tuple[str, bool, str | None]:
     """Resolve the public gRPC endpoint.
 
-    Default source is the SDK cluster map (``CLUSTER_RESOURCE[cluster]["rift"]``),
-    so users do not configure the data-plane domain. ``DOCKER_RT_RIFT_GATEWAY``
-    remains an override for local/dev; TLS is inferred from ``:443``/``https``.
-    A private CA comes from the cluster's ``rift_ca`` entry or the CA env.
+    The address is **published by the platform** (portal token exchange returns
+    ``rift_gateway`` as ``host[:port]``); the SDK keeps no hardcoded
+    cluster→gateway table. ``DOCKER_RT_RIFT_GATEWAY`` remains an explicit
+    override for local/dev. TLS is inferred from ``:443``/``https``; a private
+    CA comes from ``DOCKER_RT_RIFT_GATEWAY_CA``.
     """
     explicit = (os.getenv("DOCKER_RT_RIFT_GATEWAY") or "").strip()
     ca_env = (os.getenv("DOCKER_RT_RIFT_GATEWAY_CA") or "").strip() or None
     tls_raw = os.getenv("DOCKER_RT_RIFT_GATEWAY_TLS")
-    if explicit:
-        tls = _bool(tls_raw, explicit.startswith("https://") or explicit.endswith(":443"))
-        return explicit, tls, ca_env
-
-    cluster = (os.getenv("PYROMIND_CLUSTER") or "").strip()
-    if cluster:
-        try:
-            from pyromind_sdk.client.base import resolve_rift_target_from_cluster
-
-            gateway, tls, ca = resolve_rift_target_from_cluster(cluster)
-            if tls_raw is not None and tls_raw.strip():
-                tls = _bool(tls_raw, tls)
-            return gateway, tls, ca_env or ca
-        except Exception:  # noqa: BLE001 — fall through to "not configured"
-            pass
-    return "", _bool(tls_raw, False), ca_env
+    gateway = explicit or (platform_gateway or "").strip()
+    if not gateway:
+        return "", _bool(tls_raw, False), ca_env
+    tls = _bool(tls_raw, gateway.startswith("https://") or gateway.endswith(":443"))
+    return gateway, tls, ca_env
 
 
-def load_rift_config() -> RiftConfig:
-    gateway, gateway_tls, gateway_ca = _resolve_gateway()
+def load_rift_config(gateway: str | None = None) -> RiftConfig:
+    gateway, gateway_tls, gateway_ca = _resolve_gateway(gateway)
     return RiftConfig(
         gateway=gateway,
         gateway_tls=gateway_tls,

@@ -273,6 +273,20 @@ class PyroMindAsyncClient:
         if self._tokens.api_base_url:
             self.base_url = self._tokens.api_base_url
 
+    async def fetch_rift_gateway(self) -> str:
+        """该集群 rift-gateway 的公网地址（``host[:port]``），来自平台换票响应。
+
+        平台未下发时显式失败：数据面没有可用入口，不能靠本地硬编码猜测。
+        """
+        await self._ensure_api_base_url()
+        gateway = str(getattr(self._tokens, "api_rift_gateway", "") or "").strip()
+        if not gateway:
+            raise RuntimeError(
+                "the platform returned no rift_gateway for this cluster; "
+                "ask the platform operator to publish it in the cluster config"
+            )
+        return gateway
+
     def _build_url(self, endpoint: str) -> str:
         """Build full URL from endpoint"""
         return f"{self.base_url}/{endpoint.lstrip('/')}"

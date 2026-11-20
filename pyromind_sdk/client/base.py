@@ -53,12 +53,6 @@ CLUSTER_RESOURCE = {
             "dev": "http://localhost:8001",
         },
         "storage":"https://storage.pyromind.ai",
-        "rift": {
-            "prod": "rift-gateway-us-west-1.pyromind.ai:443",
-            "pre": "pre-rift-gateway-us-west-1.pyromind.ai:443",
-            "pre2": "pre-rift-gateway-us-west-1.pyromind.ai:443",
-            "dev": "localhost:18080",
-        },
     },
     "us-west-2": {
         "http": {
@@ -68,12 +62,6 @@ CLUSTER_RESOURCE = {
             "dev": "http://localhost:8002",
         },
         "storage":"https://storage-us-west-2.pyromind.ai",
-        "rift": {
-            "prod": "rift-us-west-2.pyromind.ai:443",
-            "pre": "pre-rift-us-west-2.pyromind.ai:443",
-            "pre2": "pre2-rift-us-west-2.pyromind.ai:443",
-            "dev": "localhost:18080",
-        },
     },
     "us-west-3": {
         "http": {
@@ -92,12 +80,6 @@ CLUSTER_RESOURCE = {
             "dev": "http://localhost:8002",
         },
         "storage": "https://storage-cn-east-1.pyromind-asia.cn",
-        "rift": {
-            "prod": "rift-cn-east-1.pyromind-asia.cn:443",
-            "pre": "pre-rift-cn-east-1.pyromind-asia.cn:443",
-            "pre2": "pre2-rift-cn-east-1.pyromind-asia.cn:443",
-            "dev": "localhost:18080",
-        },
     },
 }
 
@@ -147,27 +129,6 @@ def resolve_base_url_from_cluster(cluster: str) -> str:
     return base.rstrip("/") + "/api/v1"
 
 
-
-
-def resolve_rift_target_from_cluster(cluster: str) -> tuple[str, bool, str | None]:
-    """Return ``(gateway, tls, ca)`` for the rift data plane.
-
-    The domain lives next to the API/storage entries in :data:`CLUSTER_RESOURCE`;
-    callers should not have to configure it. TLS is implied by an ``https://``
-    scheme or a ``:443`` port. A private CA, when needed, is a per-cluster
-    ``rift_ca`` path in the same table.
-    """
-    code, env = parse_cluster_code(cluster)
-    cfg = CLUSTER_RESOURCE.get(code)
-    if not cfg:
-        valid = ", ".join(available_clusters())
-        raise ValueError(f"Unknown cluster {code!r}. Valid clusters: {valid}")
-    gateway = (cfg.get("rift", {}) or {}).get(env)
-    if not gateway:
-        raise ValueError(f"Unknown rift env {env!r} for cluster {code!r}")
-    tls = gateway.startswith("https://") or gateway.endswith(":443")
-    ca = cfg.get("rift_ca")
-    return gateway, tls, str(ca) if ca else None
 
 
 def resolve_api_base_url(cluster: Optional[str] = None) -> str:
@@ -432,6 +393,20 @@ class PyroMindClient:
             return
         if self._tokens.api_base_url:
             self.base_url = self._tokens.api_base_url
+
+    def fetch_rift_gateway(self) -> str:
+        """该集群 rift-gateway 的公网地址（``host[:port]``），来自平台换票响应。
+
+        平台未下发时显式失败：数据面没有可用入口，不能靠本地硬编码猜测。
+        """
+        self._sync_api_base_url()
+        gateway = str(getattr(self._tokens, "api_rift_gateway", "") or "").strip()
+        if not gateway:
+            raise RuntimeError(
+                "the platform returned no rift_gateway for this cluster; "
+                "ask the platform operator to publish it in the cluster config"
+            )
+        return gateway
 
     def _build_url(self, endpoint: str) -> str:
         """按 endpoint 拼完整 URL，**不做任何 I/O**。
