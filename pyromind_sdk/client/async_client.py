@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from .async_base import PyroMindAsyncClient as _PyroMindAsyncClientBase
 from .async_echomind import AsyncEchoMindClient
+from .evaluation import AsyncEvaluationClient
 from .async_inference import AsyncInferenceClient
 from .async_jupyterlab import AsyncJupyterLabClient
 from .async_sandbox import AsyncSandboxClient
@@ -114,6 +115,13 @@ class PyroMindAsyncAPIClient:
             timeout=timeout,
             max_retries=max_retries
         )
+        self.evaluations = AsyncEvaluationClient(
+            api_key=api_key,
+            base_url=base_url,
+            cluster=cluster,
+            timeout=timeout,
+            max_retries=max_retries
+        )
 
     async def close(self):
         """Close all client sessions"""
@@ -124,6 +132,7 @@ class PyroMindAsyncAPIClient:
         await self.sandboxes.close()
         await self.studio.close()
         await self.storage.close()
+        await self.evaluations.close()
 
     async def __aenter__(self):
         """Async context manager entry"""
