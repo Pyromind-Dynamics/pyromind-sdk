@@ -148,7 +148,13 @@ def _asset(content: bytes, media_header: Optional[str], disposition: Optional[st
 
 
 class EvaluationClient(PyroMindClient):
-    """Synchronous client for ``/api/v1/evaluations``."""
+    """Synchronous client for ``/api/v1/evaluations``.
+
+    These routes are served by the portal. Keep the portal address after the
+    API key is exchanged for a short-lived token.
+    """
+
+    KEEP_PORTAL_BASE = True
 
     def _data(self, response: Any) -> Any:
         return self._extract_data(response)
@@ -374,6 +380,8 @@ class EvaluationClient(PyroMindClient):
 
 class AsyncEvaluationClient(PyroMindAsyncClient):
     """Asynchronous client for the same ``/api/v1/evaluations`` routes."""
+
+    KEEP_PORTAL_BASE = True
 
     def _data(self, response: Any) -> Any:
         return self._extract_data(response)
