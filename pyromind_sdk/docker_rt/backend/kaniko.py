@@ -258,10 +258,10 @@ def extra_flags() -> list[str]:
         return []
 
 
-#: 平台注入到构建沙箱里的目录：rift-client 二进制与 per-sandbox token 都在
-#: /opt/rift 下（token 在 /opt/rift/rift-token）。必须让 kaniko 忽略（既不删也
-#: 不进镜像）。路径由平台模板固定，不可配置。
-RIFT_IGNORE_PATHS = ("/opt/rift",)
+#: 平台注入到构建沙箱里的目录：rift-client 二进制在 /opt/rift，per-sandbox token
+#: 在 /opt/rift-token（不能嵌在只读的 /opt/rift 下）。两者都必须让 kaniko 忽略
+#: （既不删也不进镜像）。路径由平台模板固定，不可配置。
+RIFT_IGNORE_PATHS = ("/opt/rift", "/opt/rift-token")
 
 
 def kaniko_args(
@@ -313,11 +313,10 @@ def kaniko_args(
     # keeps its own archive.
     args.append(f"--tar-path={tar_path(dests)}")
 
-    # 构建沙箱里还跑着 rift-client（构建的 exec / 上下文拷贝都靠它），平台把它注入
-    # 在普通 rootfs 目录 /opt/rift：二进制与 per-sandbox token
-    # （/opt/rift/rift-token）都在这个目录下。kaniko 的 DeleteFilesystem 会把这类
-    # 目录清掉，更糟的是之后的快照会把它们打进用户镜像。``--ignore-path=/opt/rift``
-    # 覆盖整个子树：kaniko 把它加进 defaultIgnoreList，DeleteFilesystem 与
+    # 构建沙箱里还跑着 rift-client（构建的 exec / 上下文拷贝都靠它），平台把二进制
+    # 注入在 /opt/rift、token 在 /opt/rift-token。kaniko 的 DeleteFilesystem 会把
+    # 这类目录清掉，更糟的是之后的快照会把它们打进用户镜像。``--ignore-path``
+    # 逐个覆盖：kaniko 把它们加进 defaultIgnoreList，DeleteFilesystem 与
     # GetFSFromLayers 都用这份列表（v1.24.0：cmd/executor/cmd/root.go:163、
     # pkg/util/fs_util.go:233/1084）。
     for path in RIFT_IGNORE_PATHS:

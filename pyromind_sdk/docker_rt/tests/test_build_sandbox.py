@@ -3961,9 +3961,9 @@ async def test_build_sandbox_idles_and_gates_on_rift(
     assert captured["entrypoint"] == ["sleep", "infinity"]
     assert "port_bindings" not in captured
     # 真机上 kaniko 看到的是这段脚本里的 argv：忽略目录必须真的下发
-    # （token 在 /opt/rift/rift-token，已被 /opt/rift 覆盖）。
+    # （二进制在 /opt/rift，token 在 /opt/rift-token，两者都要忽略）。
     assert "--ignore-path=/opt/rift" in _worker_script(sandbox)
-    assert "--ignore-path=/opt/rift-token" not in _worker_script(sandbox)
+    assert "--ignore-path=/opt/rift-token" in _worker_script(sandbox)
 
 
 @pytest.mark.asyncio

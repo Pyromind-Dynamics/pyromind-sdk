@@ -3,7 +3,7 @@
 `docker-rt` 的 exec/cp 主通道。**平台（k8s_middleware）在创建沙箱 Pod 时注入
 `rift-client`**：initContainer 从 `RIFT_CLIENT_IMAGE` 镜像把二进制拷进
 `/opt/rift`（emptyDir），per-sandbox rift 密码以 per-sandbox Secret 挂载到
-`/opt/rift/rift-token/token`；主容器命令被包成
+`/opt/rift-token/token`；主容器命令被包成
 `rift-client --supervise -- <用户 argv>`，rift-client 以 PID 1 先监听 7500，
 再 exec 用户进程（镜像 Entrypoint/Cmd + 请求 command/entrypoint，Docker 语义），
 转发信号、收割孤儿、按子进程退出码退出。
@@ -49,7 +49,7 @@ docker-rt **不上传、不启动任何东西**：`docker start` 只等 Ping 通
 >
 > Gateway 用 **per-sandbox 密码**（`get_sandbox` 返回的 `rift_password`）与 sandbox
 > Pipe 比对，再把同一个密码作为 `x-rift-token` 转发；Pod 内从挂载的 Secret 文件
-> `/opt/rift/rift-token/token` 读取（`0444`，非 root 镜像用户也能读），rift-client
+> `/opt/rift-token/token` 读取（`0444`，非 root 镜像用户也能读），rift-client
 > 常量时间比较。密码由平台按 sandbox 生成，**不是用户的长期 access key**；拿不到
 > 密码直接失败，不回落 access key。不再有公钥/KV/签名。
 
@@ -203,7 +203,7 @@ resize；心跳不算）收掉，与平台终端 `WS_IDLE_TIMEOUT_S` 一致。tt
 * 两道校验，使用同一个 per-sandbox 密码：
   * Gateway：调用方的密码必须与 Pipe 里的 `authorized_keys_data` 匹配，且
     `username == sandbox_id`；
-  * rift-client：校验 `x-rift-token` 与 `/opt/rift/rift-token/token`（Secret 挂载，0444）。
+  * rift-client：校验 `x-rift-token` 与 `/opt/rift-token/token`（Secret 挂载，0444）。
 * 密码同时存在于请求头（TLS）、Pipe 和 Pod 内 token 文件；它**不是**用户的长期
   access key，泄漏影响面限于该 sandbox。`rift-client` 与 token 都不打进
   用户镜像（kaniko `--ignore-path=/opt/rift` 覆盖二进制与 token 目录）。
