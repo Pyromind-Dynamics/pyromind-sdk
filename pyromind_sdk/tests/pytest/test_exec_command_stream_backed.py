@@ -25,7 +25,7 @@ def test_sync_exec_command_consumes_stream_and_aggregates_output() -> None:
     )
 
     result = client.exec_command(
-        sandbox_id="sb-test",
+        sandbox_id="sb-0123456789ab",
         command="  echo hello  ",
         cwd="  /workspace  ",
     )
@@ -35,7 +35,7 @@ def test_sync_exec_command_consumes_stream_and_aggregates_output() -> None:
     assert result.returncode == 7
     assert result.exception_info == ""
     client.exec_command_stream.assert_called_once_with(
-        sandbox_id="sb-test",
+        sandbox_id="sb-0123456789ab",
         command="echo hello",
         cwd="/workspace",
         timeout=600,
@@ -57,7 +57,7 @@ async def test_async_exec_command_consumes_stream_and_aggregates_output() -> Non
     client.exec_command_stream = fake_stream
 
     result = await client.exec_command(
-        sandbox_id="sb-test",
+        sandbox_id="sb-0123456789ab",
         command=["echo", "out"],
         timeout=12,
     )
@@ -87,7 +87,7 @@ def test_sync_exec_command_raises_when_the_stream_never_exits() -> None:
     client.exec_command_stream = MagicMock(side_effect=_REJECT)
 
     with pytest.raises(SandboxExecStreamError) as excinfo:
-        client.exec_command(sandbox_id="sb-other-users", command="ls /")
+        client.exec_command(sandbox_id="sb-ffffffffffff", command="ls /")
 
     assert excinfo.value.code == "4004"
 
@@ -103,4 +103,4 @@ async def test_async_exec_command_raises_when_the_stream_never_exits() -> None:
     client.exec_command_stream = fake_stream
 
     with pytest.raises(SandboxExecStreamError):
-        await client.exec_command(sandbox_id="sb-other-users", command="ls /")
+        await client.exec_command(sandbox_id="sb-ffffffffffff", command="ls /")

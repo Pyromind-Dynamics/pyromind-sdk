@@ -20,11 +20,11 @@ from pyromind_sdk.exec_stream import (
 def test_build_exec_stream_url_uses_the_exchanged_base_url() -> None:
     url = build_exec_stream_websocket_url(
         "https://pre-api.pyromind.ai/api/v1",
-        "sb-demo",
+        "sb-0123456789ab",
     )
 
     assert url == (
-        "wss://pre-api.pyromind.ai/api/v1/sandboxes/sb-demo/exec-stream"
+        "wss://pre-api.pyromind.ai/api/v1/sandboxes/sb-0123456789ab/exec-stream"
     )
 
 
