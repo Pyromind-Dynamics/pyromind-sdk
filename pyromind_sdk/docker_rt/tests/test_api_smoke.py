@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import socket
+import traceback
 
 import pytest
 
@@ -89,6 +91,55 @@ async def test_attach_waits_for_start(aiohttp_client, fake_kube: FakeKubeEnv):
         await asyncio.sleep(0.02)
     assert fake_kube.last_attach_cmd == ["__main__"]
     assert (await attach_task).status == 101
+
+
+@pytest.mark.asyncio
+async def test_attach_wait_failure_does_not_crash_the_cleanup_log(
+    aiohttp_client,
+    fake_kube: FakeKubeEnv,
+    monkeypatch,
+    caplog,
+):
+    """等 Running 失败时，finally 里的清理日志不能自己抛异常。
+
+    2026-11-23 实测：`foreground_cmd` 只在后面才赋值，early return 走到 finally
+    就抛 UnboundLocalError，把真正的错误（rift 403）盖成 aiohttp 500。
+    101 状态行在异常前已经发出，所以只能从日志里断言「没有崩」。
+    """
+    from ..aio_server import create_aio_app
+    from .. import aio_server as mod
+
+    caplog.set_level(logging.ERROR)
+
+    app = create_aio_app(run_reconcile=False)
+    mod.start_kube_environment = lambda **kw: fake_kube  # type: ignore
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/containers/create?name=att-fail",
+        json={"Image": "ubuntu:22.04", "Cmd": ["bash"], "OpenStdin": True},
+    )
+    cid = (await resp.json())["Id"]
+
+    async def _dead_sandbox(*_args, **_kwargs):
+        raise RuntimeError("sandbox is dead: [RIFT_UNAUTHORIZED] HTTP 403")
+
+    monkeypatch.setattr(mod, "_wait_container_running", _dead_sandbox)
+
+    attach = await client.post(
+        f"/containers/{cid}/attach?stream=1&stdout=1&stderr=1",
+        headers={"Connection": "Upgrade", "Upgrade": "tcp"},
+    )
+
+    assert attach.status == 101
+    logged = "\n".join(
+        record.getMessage()
+        + "".join(traceback.format_exception(*record.exc_info))
+        if record.exc_info
+        else record.getMessage()
+        for record in caplog.records
+    )
+    assert "UnboundLocalError" not in logged
 
 
 @pytest.mark.asyncio

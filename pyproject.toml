@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pyromind-sdk"
 ## todo update_version
-version = "0.1.18"
+version = "0.1.39.dev1"
 description = "Lightweight SDK stub for local development and testing of third-party nodes without the full platform codebase"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -44,7 +44,6 @@ dependencies = [
     "kubernetes>=29.0.0",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
-    "grpcio>=1.71.2",
     "protobuf>=5.29,<6",
 ]
 

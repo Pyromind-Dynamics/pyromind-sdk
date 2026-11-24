@@ -42,7 +42,7 @@ class RiftConfig:
 
 
 def _resolve_gateway(platform_gateway: str | None) -> tuple[str, bool, str | None]:
-    """Resolve the public gRPC endpoint.
+    """Resolve the public gateway endpoint (host[:port] for both WS and HTTP).
 
     The address is **published by the platform** (portal token exchange returns
     ``rift_gateway`` as ``host[:port]``); the SDK keeps no hardcoded

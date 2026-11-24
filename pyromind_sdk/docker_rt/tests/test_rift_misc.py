@@ -18,30 +18,6 @@ def test_gateway_tls_flags(monkeypatch):
     assert cfg.gateway_ca is None
 
 
-def test_rift_calls_carry_the_trace_id(monkeypatch):
-    from pyromind_sdk.rift import rift_client as mod
-
-    monkeypatch.setattr(mod, "ensure_trace_id", lambda: "trace-1")
-    client = mod.RiftGatewayClient.__new__(mod.RiftGatewayClient)
-    client._metadata = (("authorization", "Bearer k"), ("x-sandbox-id", "sb-1"))
-
-    assert client._call_metadata() == (
-        ("authorization", "Bearer k"),
-        ("x-sandbox-id", "sb-1"),
-        ("x-trace-id", "trace-1"),
-    )
-
-
-def test_rift_calls_omit_trace_when_there_is_none(monkeypatch):
-    from pyromind_sdk.rift import rift_client as mod
-
-    monkeypatch.setattr(mod, "ensure_trace_id", lambda: "")
-    client = mod.RiftGatewayClient.__new__(mod.RiftGatewayClient)
-    client._metadata = (("authorization", "Bearer k"),)
-
-    assert client._call_metadata() == (("authorization", "Bearer k"),)
-
-
 def test_ping_rift_version_reports_none_when_channel_is_down():
     from ..backend.pyromind_sdk_env import PyromindSDK
 

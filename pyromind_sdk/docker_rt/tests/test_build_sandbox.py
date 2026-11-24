@@ -3996,12 +3996,14 @@ async def test_connect_failure_stops_the_build_before_it_starts(
 
 
 def test_kaniko_ignores_the_rift_dirs() -> None:
-    """平台注入目录（二进制 + token 都在 /opt/rift 下）必须交给 kaniko 忽略。"""
+    """平台注入目录必须交给 kaniko 忽略：二进制在 /opt/rift，token 在 /opt/rift-token。"""
     from ..backend import kaniko
 
     args = kaniko.kaniko_args(destinations=["myapp:1"])
     assert "--ignore-path=/opt/rift" in args
-    assert "--ignore-path=/opt/rift-token" not in args
+    assert "--ignore-path=/opt/rift-token" in args
+
+
 @pytest.mark.asyncio
 async def test_build_without_push_ignores_an_unresolvable_push_prefix(
     monkeypatch: pytest.MonkeyPatch,

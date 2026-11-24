@@ -22,7 +22,7 @@ docker-rt **不上传、不启动任何东西**：`docker start` 只等 Ping 通
 | --- | --- |
 | `config.py` | 读取 `DOCKER_RT_RIFT_*` 环境变量（gateway 与 Ping/健康检查参数）。 |
 | `errors.py` | `RiftUnavailable` / `RiftUnauthenticated` / `RiftPermissionDenied`。 |
-| `rift_client.py` | `grpc.aio` 客户端（daemon 侧）：`ping` / `exec_once` / `open_exec` / `get_archive` / `put_archive`。 |
+| `ws_client.py` | WebSocket 客户端（daemon 侧）：`ping` / `exec_once` / `open_exec` / `get_archive` / `put_archive`，走网关 8082 的 `/v1/*`。 |
 | `pb/` | 由 `rift-gateway/proto/rift.proto` 生成的 Python stub。 |
 | `check_proto.py` | 构建期：proto 与 Python 生成物一致性检查（Go 端用 rift-client 仓库的 `tools/checkproto`）。 |
 

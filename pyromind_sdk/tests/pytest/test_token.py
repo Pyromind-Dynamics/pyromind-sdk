@@ -125,6 +125,28 @@ def test_fetch_token_rejects_http_error(monkeypatch) -> None:
         sdk_token.fetch_token("https://api-portal.example/api/v1", "key")
 
 
+def test_rejection_hints_the_version_prefix_only_on_404(monkeypatch) -> None:
+    """404 基本等于基址漏了 ``/api/v1``；403 之类的拒绝不能挂这条提示。"""
+
+    def message_for(status: int) -> str:
+        monkeypatch.setattr(
+            sdk_token.requests, "post", lambda *a, **k: _FakeResponse(status, {})
+        )
+        with pytest.raises(sdk_token.TokenError) as excinfo:
+            sdk_token.fetch_token(
+                "https://api-portal.example", "key", cluster="us-west-2"
+            )
+        return str(excinfo.value)
+
+    missing_prefix = message_for(404)
+    assert "HTTP 404" in missing_prefix
+    assert "/api/v1" in missing_prefix
+
+    forbidden = message_for(403)
+    assert "HTTP 403" in forbidden
+    assert "API version prefix" not in forbidden
+
+
 def test_http_token_cache_reuses_until_refresh(monkeypatch) -> None:
     calls = []
 

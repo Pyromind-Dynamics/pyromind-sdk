@@ -1261,18 +1261,26 @@ def _rift_not_ready(c: Any) -> bool:
 def _rift_gateway_missing() -> bool:
     """The data plane has no endpoint at all — a configuration error, not a Pod.
 
-    ``PYROMIND_CLUSTER`` (or ``DOCKER_RT_RIFT_GATEWAY``) is what maps to the
-    gateway domain. Without it every sandbox stays ``Created`` forever while the
-    API still lists them (the list falls back to the portal), which reads like
-    "the sandbox is broken" instead of "the daemon is misconfigured".
+    网关地址由平台按集群在换票时下发（``rift_gateway``），所以只要选定了集群
+    （``PYROMIND_CLUSTER``）或显式给了 ``DOCKER_RT_RIFT_GATEWAY``，就一定有
+    入口；两者都没有才是真的没配置。只看 ``load_rift_config()`` 会把「集群已选、
+    地址待换票时下发」的正常启动误报成未配置（2026-11-23 实测：每次启动都
+    打一条假 WARNING，真出问题时反而没人信）。
     """
     try:
-        return not load_rift_config().gateway
+        if load_rift_config().gateway:
+            return False
+        return not (os.getenv("PYROMIND_CLUSTER") or "").strip()
     except Exception:  # noqa: BLE001 - configuration must never break the API
         return False
 
 
 def _rift_not_ready_error(c: Any) -> web.Response:
+    settled = str(getattr(c, "error", "") or "").strip()
+    if settled:
+        # 连接时已经拿到真实原因（凭据缺失、边缘拒绝、RBAC 未同步…）：照实说，
+        # 不要退回「网关没配 / 沙箱要重建」这类泛化文案。
+        return _err(409, f"Container {c.id[:12]} is not running: {settled}")
     if _rift_gateway_missing():
         return _err(
             409,
@@ -4378,6 +4386,23 @@ async def start_exec(request: web.Request) -> web.StreamResponse | web.Response:
         return resp
 
 
+def _client_link_state(protocol: Any) -> str:
+    """采样 hijack 连接此刻的状态，只用于终端会话的结束摘要。
+
+    必须在 ``_force_close_hijack`` **之前**调用：那之后 transport 一定已经关了，
+    这个字段就恒为 closing/gone，失去"谁先断"的判别能力（2026-10-16 踩过）。
+    """
+    if protocol is None:
+        return "gone"
+    transport = getattr(protocol, "transport", None)
+    if transport is None:
+        return "gone"
+    try:
+        return "closing" if transport.is_closing() else "open"
+    except Exception:  # noqa: BLE001 - 只影响日志字段
+        return "unknown"
+
+
 def _force_close_hijack(request: web.Request, resp: web.StreamResponse) -> None:
     """Drop upgraded connection so aiohttp won't parse leftover raw bytes as HTTP."""
     protocol = request.protocol
@@ -4723,6 +4748,10 @@ async def attach_container(request: web.Request) -> web.StreamResponse | web.Res
         want_stream,
     )
     attach_started_at = time.monotonic()
+    # 下面有若干条 early return（等 Running 失败、no_command、logs-only），都会走到
+    # 末尾的 finally；变量必须先初始化，否则 finally 里的日志读它会抛
+    # UnboundLocalError，把真正的错误（比如 rift 403）盖成 aiohttp 500。
+    foreground_cmd: list[str] | None = None
     try:
         # `docker run IMG`（没有命令、没有 -i/-t、也不要日志）：没有命令可跑，
         # 但要**等 sandbox 真的 running 再告诉用户**（2026-10-21 用户要求：
@@ -5017,10 +5046,23 @@ async def _hijack_session(
                 "interactive exec: rift not injected, falling back to middleware terminal id=%s",
                 (getattr(session, "id", "") or "")[:12],
             )
-            return await _hijack_pyromind_terminal(
+            # 这个函数返回的是「有没有接管会话」（bool），不是 HTTP 响应：
+            # 直接 return 会把 True 交给 aiohttp，中间件读 .status 就 500
+            # （2026-11-24 实测：老沙箱 exec -it 进去就断、且不报错）。
+            handled = await _hijack_pyromind_terminal(
                 request, resp, protocol, session, kube_env, tty,
                 cmd=cmd, cwd=cwd,
             )
+            if not handled:
+                session.running = False
+                await _write_exec_error(
+                    resp,
+                    "[RIFT_UNAVAILABLE] cannot open an interactive session for "
+                    f"{kube_env.sandbox_id}: the platform terminal is unreachable",
+                    tty=tty,
+                )
+                _force_close_hijack(request, resp)
+            return resp
         if channel == "rift":
             return await _hijack_rift_terminal(
                 request,
@@ -5274,18 +5316,6 @@ async def _hijack_session(
     return resp
 
 
-
-    api_key = (os.getenv(ENV_API_KEY) or "").strip()
-    base = (os.getenv(ENV_BASE_URL) or "").strip() or DEFAULT_API_BASE_URL
-    cluster = (os.getenv(ENV_CLUSTER) or "").strip()
-    if not cluster:
-        raise RuntimeError(
-            "PYROMIND_CLUSTER is not set; docker-rt must select a cluster "
-            "from the portal's available clusters before opening a terminal."
-        )
-    return base.rstrip("/"), cluster, api_key
-
-
 def _pty_output_for_client(data: bytes, *, tty: bool) -> bytes:
     """PTY 输出 → Docker 客户端真正期望的字节形态。
 
@@ -5335,6 +5365,16 @@ _WS_CLOSE_HINTS: dict[int, str] = {
 
 #: 等待首帧 ``auth_ok`` 的上限；超时视为握手失败，可换票重试一次。
 _TERMINAL_AUTH_TIMEOUT_S = 10.0
+
+
+#: 这几种消息代表"这条 WS 结束了"。必须显式列出来：`async for` 在 CLOSE 上
+#: 直接 StopAsyncIteration，循环体看不到它们（见 _ws_close_note）。
+_WS_END_TYPES = (
+    WSMsgType.CLOSE,
+    WSMsgType.CLOSING,
+    WSMsgType.CLOSED,
+    WSMsgType.ERROR,
+)
 
 
 def _ws_close_note(ws: Any, msg: Any) -> str:
@@ -5893,6 +5933,18 @@ async def _hijack_pyromind_terminal(
                 # 传的输出一起被取消 ⇒ ``docker exec -i`` 输出为空。
                 # 客户端真断开时 pump_out 的 write 会失败并 set session_over ✓。
                 await asyncio.wait((out_task,))
+                # asyncio.wait 不消费任务异常：pump_out 挂掉时这里以前完全静默，
+                # 摘要只剩 reason=unknown、pty->cli=0B，看起来像"平台没回数据"。
+                out_error = out_task.exception()
+                if out_error is not None:
+                    stop[0] = stop[0] or (
+                        f"pump-out-failed {type(out_error).__name__}: {out_error}"
+                    )
+                    logger.error(
+                        "pyromind terminal pump_out failed id=%s",
+                        getattr(session, "id", "")[:12],
+                        exc_info=out_error,
+                    )
             finally:
                 session_over.set()
                 for task in (out_task, in_task, ping_task):
@@ -6101,7 +6153,16 @@ async def _hijack_rift_terminal(
 
     async def idle_watchdog() -> None:
         while not session_over.is_set():
-            await asyncio.sleep(_RIFT_IDLE_POLL_S)
+            # 用 session_over 当"可唤醒的 sleep"：会话一结束就立刻退，否则
+            # `gather` 要等满一个轮询周期（30s）才返回 —— 用户按 Ctrl-D 之后
+            # 终端会卡住半分钟（2026-11-24 实测）。
+            try:
+                await asyncio.wait_for(
+                    session_over.wait(), timeout=_RIFT_IDLE_POLL_S
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
             if time.monotonic() - last_activity[0] < _RIFT_IDLE_TIMEOUT_S:
                 continue
             idle_expired.set()

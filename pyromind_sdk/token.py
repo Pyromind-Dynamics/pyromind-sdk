@@ -53,6 +53,22 @@ def token_url(base_url: str) -> str:
     return f"{base_url.rstrip('/')}/{TOKEN_PATH}"
 
 
+def _rejected_message(action: str, status: int, url: str) -> str:
+    """换票/发现被拒时的报错；404 基本等于基址漏了 ``/api/v1`` 前缀。
+
+    门户只在 ``/api/v1/auth/token`` 提供该路由，把 ``PYROMIND_BASE_URL`` 设成
+    裸域名就会命中根路径 404，且请求进不了鉴权逻辑。这里只补归因，不自动
+    改写基址——基址始终按调用方给的原样使用。
+    """
+    message = f"{action} rejected (HTTP {status}) at {url}"
+    if status == 404:
+        message += (
+            " — the base URL must include the API version prefix, e.g. "
+            "https://api-portal.pyromind.ai/api/v1"
+        )
+    return message
+
+
 def _request_body(
     purpose: str,
     resource_type: Optional[str],
@@ -121,7 +137,9 @@ def fetch_cluster_hosts(base_url: str, api_key: str) -> list[dict]:
         ) from exc
     if not response.ok:
         raise TokenError(
-            f"cluster discovery rejected (HTTP {response.status_code}) at {url}"
+            _rejected_message(
+                "cluster discovery", response.status_code, url
+            )
         )
     try:
         payload = response.json()
@@ -209,7 +227,7 @@ def fetch_token(
 
     if not response.ok:
         raise TokenError(
-            f"token exchange rejected (HTTP {response.status_code}) at {url}"
+            _rejected_message("token exchange", response.status_code, url)
         )
     try:
         payload = response.json()
@@ -287,7 +305,7 @@ async def async_fetch_token(
         ) from last_exc
 
     if status >= 400:
-        raise TokenError(f"token exchange rejected (HTTP {status}) at {url}")
+        raise TokenError(_rejected_message("token exchange", status, url))
     return _parse_token_response(payload, status)
 
 

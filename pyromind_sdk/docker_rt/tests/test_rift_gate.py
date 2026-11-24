@@ -105,8 +105,8 @@ def _connect_env(
 ):
     """Build an env whose platform client returns a per-sandbox rift password.
 
-    ``ping`` receives the fake RiftGatewayClient and returns/raises; the
-    monkeypatched RiftGatewayClient records every credential it was built with.
+    ``ping`` receives the fake client and returns/raises; the monkeypatched
+    ``RiftWsClient`` records every credential it was built with.
     """
     import logging
 
@@ -116,7 +116,9 @@ def _connect_env(
         mod,
         "load_rift_config",
         lambda *_a, **_k: SimpleNamespace(
-            gateway=gateway, ping_attempts=attempts, ping_interval=0
+            gateway=gateway,
+            ping_attempts=attempts,
+            ping_interval=0,
         ),
     )
 
@@ -138,6 +140,7 @@ def _connect_env(
         def __init__(self, cfg, credential, sandbox_id):
             self.credential = credential
             self.calls = 0
+            self.closed = False
             clients.append(self)
 
         async def ping(self) -> str:
@@ -145,9 +148,9 @@ def _connect_env(
             return await ping(self)
 
         async def close(self) -> None:
-            pass
+            self.closed = True
 
-    monkeypatch.setattr(mod, "RiftGatewayClient", _RiftClient)
+    monkeypatch.setattr(mod, "RiftWsClient", _RiftClient)
 
     env = PyromindSDK.__new__(PyromindSDK)
     env.sandbox_id = "sb-1"
@@ -168,6 +171,23 @@ def test_connect_rift_uses_per_sandbox_password(monkeypatch) -> None:
     assert env.rift_last_error == ""
     assert [c.credential for c in clients] == ["pwd-1"]
     assert clients[0].calls == 1
+
+
+def test_reconnecting_closes_the_previous_client(monkeypatch) -> None:
+    """健康检查重连会换掉 _rift_client：旧 client 必须先关。
+
+    WS 客户端的 aiohttp session 不随对象回收关闭，漏一次就是日志里一条
+    ``Unclosed client session``（2026-11-23 实测 3 分钟刷了 4 条）。
+    """
+    import asyncio
+
+    env, clients = _connect_env(monkeypatch)
+    asyncio.run(env.connect_rift())
+    asyncio.run(env.connect_rift())
+
+    assert len(clients) == 2
+    assert clients[0].closed is True, "旧 client 必须在被替换前关闭"
+    assert clients[1].closed is False
 
 
 def test_connect_rift_fails_loudly_after_retries(monkeypatch) -> None:
@@ -230,16 +250,20 @@ def test_connect_rift_recovers_after_password_rotation(monkeypatch) -> None:
     assert [c.credential for c in clients] == ["pwd-old", "pwd-new"]
 
 
-def test_connect_rift_requires_a_sandbox_password(monkeypatch) -> None:
+def test_a_sandbox_without_a_password_falls_back_to_middleware(monkeypatch) -> None:
+    """没有 per-sandbox 密码 = 这个 Pod 没有数据面 → 走 middleware，不卡死。
+
+    2026-11-23：7 天前创建的沙箱没有 rift_password，之前直接抛错，exec 和
+    terminal 全被拒。用户要求兼容老沙箱：宁可回落旧通道，也不能让它不可用。
+    """
     import asyncio
 
-    from ...rift.errors import RiftUnavailable
-
     env, clients = _connect_env(monkeypatch, password=None)
-    with pytest.raises(RiftUnavailable) as excinfo:
-        asyncio.run(env.connect_rift())
-    assert "rift_password" in str(excinfo.value)
-    assert clients == []
+    asyncio.run(env.connect_rift())
+
+    assert env.rift_enabled is False, "拿不到密码必须判成 legacy"
+    assert env.rift_ready is False
+    assert clients == [], "legacy 通道不该建任何数据面客户端"
 
 
 def test_connect_rift_requires_a_gateway(monkeypatch) -> None:
@@ -325,155 +349,47 @@ def test_tty_exec_keeps_stdin_open() -> None:
     assert calls["stdin"] is True
 
 
-def test_exec_rst_after_exit_is_success() -> None:
-    from pyromind_sdk.rift.pb import rift_pb2
-
-    frames = [rift_pb2.ExecFrame(stdout=b"hi"), rift_pb2.ExecFrame(exit=rift_pb2.ExecExit(code=0))]
-    calls: dict = {}
-    adapter = _exec_adapter(_FakeSession(frames, raise_after_exit=True), calls)
-
-    chunks = _collect(adapter)
-
-    assert [c.type for c in chunks] == ["stdout", "exit"]
-    assert chunks[-1].returncode == 0
-
-
-def test_put_archive_reads_the_reply_from_awaiting_the_call() -> None:
-    """grpc.aio: done_writing() returns None; the reply comes from `await call`."""
+def test_an_edge_rejection_is_not_retried_by_the_ping_gate() -> None:
+    """路本身不通时，ping 门禁要立刻失败，不能把同一秒的 403 重试 20 次。"""
     import asyncio
+    from types import SimpleNamespace
 
-    from pyromind_sdk.rift import rift_client as mod
+    from pyromind_sdk.docker_rt.backend.pyromind_sdk_env import PyromindSDK
+    from pyromind_sdk.rift.errors import RiftMisconfigured
 
-    class _Reply:
-        bytes_written = 7
+    calls = []
 
-    class _Call:
-        def __init__(self):
-            self.writes = 0
+    class _Client:
+        async def ping(self):
+            calls.append(1)
+            raise RiftMisconfigured("edge answered plain HTTP 403")
 
-        async def write(self, frame):
-            self.writes += 1
+    env = PyromindSDK.__new__(PyromindSDK)
+    env.sandbox_id = "sb-edge"
+    env.rift_ready = False
+    env.rift_last_error = ""
+    env._rift_client = _Client()
+    env.logger = SimpleNamespace(info=lambda *a, **k: None)
 
-        async def done_writing(self):
-            return None
+    cfg = SimpleNamespace(ping_attempts=20, ping_interval=0.0)
+    try:
+        asyncio.run(env._ping_rift_until_ready(cfg))
+    except RiftMisconfigured:
+        pass
+    else:  # pragma: no cover - the gate must fail
+        raise AssertionError("edge rejection must propagate")
 
-        def __await__(self):
-            async def _reply():
-                return _Reply()
-
-            return _reply().__await__()
-
-    class _Stub:
-        def PutArchive(self, metadata=None):
-            return _Call()
-
-    client = mod.RiftGatewayClient.__new__(mod.RiftGatewayClient)
-    client._metadata = ()
-    client._stub = _Stub()
-
-    assert asyncio.run(client.put_archive("/tmp", b"x")) == 7
+    assert len(calls) == 1, "misconfiguration must not be retried"
+    assert env.rift_ready is False
 
 
-def test_map_rpc_error_names_the_ingress_body_limit_for_413() -> None:
-    import grpc
+def test_terminal_summary_helpers_are_defined() -> None:
+    """终端结束摘要依赖 _client_link_state；它曾只剩调用、没有定义，
+    legacy 终端一进去就 NameError -> 500（2026-11-24 实测）。"""
+    from .. import aio_server as mod
 
-    from pyromind_sdk.rift import rift_client as mod
-    from pyromind_sdk.rift.errors import RiftUnavailable
-
-    rpc_error = grpc.aio.AioRpcError(
-        grpc.StatusCode.UNKNOWN, None, None, "Received http2 header with status: 413"
-    )
-
-    mapped = mod._map_rpc_error(rpc_error)
-    assert isinstance(mapped, RiftUnavailable)
-    assert "413" in str(mapped)
-    assert "proxy-body-size" in str(mapped)
-
-
-def test_put_archive_recovers_the_terminal_status_after_a_dead_write() -> None:
-    """grpc core raises ExecuteBatchError mid-write; the call holds the status."""
-    import asyncio
-
-    import grpc
-
-    from pyromind_sdk.rift import rift_client as mod
-    from pyromind_sdk.rift.errors import RiftUnavailable
-
-    rpc_error = grpc.aio.AioRpcError(
-        grpc.StatusCode.UNKNOWN, None, None, "Received http2 header with status: 413"
-    )
-
-    class _Call:
-        async def write(self, frame):
-            raise RuntimeError('Failed "execute_batch"')
-
-        async def done_writing(self):
-            return None
-
-        def __await__(self):
-            async def _fail():
-                raise rpc_error
-
-            return _fail().__await__()
-
-    class _Stub:
-        def PutArchive(self, metadata=None):
-            return _Call()
-
-    client = mod.RiftGatewayClient.__new__(mod.RiftGatewayClient)
-    client._metadata = ()
-    client._stub = _Stub()
-
-    with pytest.raises(RiftUnavailable) as info:
-        asyncio.run(client.put_archive("/tmp", b"x"))
-    assert "413" in str(info.value)
-
-
-def test_put_archive_streams_and_rechunks_into_fixed_frames() -> None:
-    """daemon 传进来的是异步分块；gRPC 帧仍按 256 KiB 切，不整包驻留。"""
-    import asyncio
-
-    from pyromind_sdk.rift import rift_client as mod
-
-    class _Reply:
-        bytes_written = 0
-
-    class _Call:
-        def __init__(self) -> None:
-            self.chunks: list[bytes] = []
-
-        async def write(self, frame):
-            if frame.HasField("chunk"):
-                self.chunks.append(frame.chunk)
-
-        async def done_writing(self):
-            return None
-
-        def __await__(self):
-            async def _reply():
-                return _Reply()
-
-            return _reply().__await__()
-
-    call = _Call()
-
-    class _Stub:
-        def PutArchive(self, metadata=None):
-            return call
-
-    async def source():
-        yield b"a" * 1000
-        yield b"b" * (300 * 1024)
-
-    client = mod.RiftGatewayClient.__new__(mod.RiftGatewayClient)
-    client._metadata = ()
-    client._stub = _Stub()
-
-    asyncio.run(client.put_archive("/tmp", source()))
-
-    sizes = [len(chunk) for chunk in call.chunks]
-    assert sizes == [256 * 1024, 1000 + 300 * 1024 - 256 * 1024]
-    assert b"".join(call.chunks) == b"a" * 1000 + b"b" * (300 * 1024)
+    assert callable(mod._client_link_state)
+    assert mod._client_link_state(None) == "gone"
 
 
 def test_not_ready_message_names_the_missing_cluster(monkeypatch):
@@ -488,6 +404,7 @@ def test_not_ready_message_names_the_missing_cluster(monkeypatch):
     class _Record:
         id = "a" * 64
 
+    monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
     monkeypatch.setattr(
         mod, "load_rift_config", lambda: SimpleNamespace(gateway="")
     )
@@ -504,3 +421,35 @@ def test_not_ready_message_names_the_missing_cluster(monkeypatch):
     msg = (mod._rift_not_ready_error(_Record()).text or "")
     assert "rift-client is not ready" in msg
     assert "recreated" in msg
+
+
+def test_a_selected_cluster_is_not_reported_as_a_missing_gateway(monkeypatch):
+    """地址由平台换票时下发：集群已选就不能报「网关未配置」。
+
+    2026-11-23 实测：选了 ``us-west-2#pre`` 后每次启动仍打一条 "PYROMIND_CLUSTER
+    unset" 的 WARNING，exec 也被这段文案带偏，真正的原因被盖住。
+    """
+    from .. import aio_server as mod
+
+    monkeypatch.setattr(mod, "load_rift_config", lambda: SimpleNamespace(gateway=""))
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2#pre")
+    assert mod._rift_gateway_missing() is False
+
+    monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
+    assert mod._rift_gateway_missing() is True
+
+
+def test_not_ready_error_reports_the_cause_already_known(monkeypatch):
+    """连接时已经拿到真实原因，就别退回泛化文案。"""
+    from .. import aio_server as mod
+
+    class _Record:
+        id = "a" * 64
+        error = "[RIFT_UNAVAILABLE] the edge in front of the rift gateway answered HTTP 403"
+
+    monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
+    monkeypatch.setattr(mod, "load_rift_config", lambda: SimpleNamespace(gateway=""))
+
+    msg = (mod._rift_not_ready_error(_Record()).text or "")
+    assert "HTTP 403" in msg
+    assert "rift gateway is not configured" not in msg

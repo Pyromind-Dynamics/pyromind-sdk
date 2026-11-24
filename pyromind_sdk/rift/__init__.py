@@ -1,13 +1,15 @@
-"""Rift data plane: gateway client and health helpers.
+"""Rift data plane: the gateway client over WebSocket.
 
-rift-client itself is injected by the platform when the sandbox Pod is created;
-this package only speaks to it through the gateway.
+rift-client comes from the platform (injected when the Pod is created); this
+package only talks to it through the gateway. There is one transport: the WS
+tunnel on 8082 (``/v1/exec``、``/v1/archive``、``/v1/ping``).
 """
 
-from .rift_client import RiftExecSession, RiftGatewayClient
+from .ws_client import RiftWsClient, RiftWsExecSession
 from .config import RiftConfig, load_rift_config
 from .errors import (
     RiftError,
+    RiftMisconfigured,
     RiftPermissionDenied,
     RiftUnauthenticated,
     RiftUnavailable,
@@ -16,10 +18,11 @@ from .errors import (
 __all__ = [
     "RiftConfig",
     "RiftError",
-    "RiftExecSession",
-    "RiftGatewayClient",
+    "RiftMisconfigured",
     "RiftPermissionDenied",
     "RiftUnauthenticated",
     "RiftUnavailable",
+    "RiftWsClient",
+    "RiftWsExecSession",
     "load_rift_config",
 ]

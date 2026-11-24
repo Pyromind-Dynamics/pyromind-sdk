@@ -91,25 +91,47 @@ def _prompt(
     return input(message).strip()
 
 
-def _ask_environment(
-    envs: list[str],
+def _cluster_choices_from_discovery(clusters: list[dict]) -> list[str]:
+    """门户下发什么就列什么：原样去重、排序，不加也不去掉 ``#env`` 后缀。
+
+    线上门户对有权限的集群下发裸集群名（``cn-east-1`` 即线上），内部用户还会
+    额外拿到 ``cn-east-1#pre`` / ``cn-east-1#pre2``。环境口径由门户决定，
+    docker-rt 只展示和原样回传，选中的值就是 ``PYROMIND_CLUSTER``。
+    """
+    choices: list[str] = []
+    for item in clusters:
+        raw = str(item.get("cluster") or "").strip()
+        if raw and raw not in choices:
+            choices.append(raw)
+    choices.sort()
+    return choices
+
+
+def _reject_cluster_choice(
+    candidate: str,
     *,
-    stdin: Any | None,
+    choices: list[str],
     stdout: Any,
-    color: bool,
-) -> str:
-    env_choices = ", ".join(envs)
-    env_prompt = (
-        f"{_BOLD}{_CYAN}environment ({env_choices}){_RESET}: "
-        if color
-        else f"environment ({env_choices}): "
-    )
-    while True:
-        env = _prompt(env_prompt, stdin=stdin, stdout=stdout)
-        if env in envs:
-            return env
-        stdout.write(f"Unknown environment {env!r}; choose one of: {env_choices}\n")
+) -> None:
+    """说明这一行输入为什么不能用；只解释，不改写候选值。"""
+    cluster_code, _, environment = candidate.partition("#")
+    if environment in _PRE_ENVS and cluster_code in {
+        choice.partition("#")[0] for choice in choices
+    }:
+        # 预发只对内部用户下发：portal 已过滤掉，这里给出明确原因，
+        # 避免落到含混的 "Unknown cluster"。
+        stdout.write(
+            f"Environment {environment!r} requires an internal user; "
+            "choose one of the clusters listed above\n"
+        )
         stdout.flush()
+        return
+
+    stdout.write(
+        f"Unknown cluster {candidate!r}; "
+        "choose one of the clusters listed above\n"
+    )
+    stdout.flush()
 
 
 def _ask_cluster(
@@ -123,47 +145,29 @@ def _ask_cluster(
     """向门户查询这份 key 可用的集群，再交互选择一个。
 
     门户发现接口（console ``user_clusters_list`` 背后的实现）返回
-    ``[{"cluster", "host"}]``，``unapply`` 条目已过滤，``cluster`` 自带
-    环境后缀。所有可用组合逐行打印；也接受裸集群代码，多环境时再追问一次。
+    ``[{"cluster", "host"}]``，``unapply`` 条目已过滤。可选值逐行原样打印，
+    输入必须与其中某一条完全一致；选中的值原样作为 ``PYROMIND_CLUSTER``。
     """
     from ..client.base import DEFAULT_API_BASE_URL, ENV_BASE_URL
     from ..token import fetch_cluster_hosts
 
     base = (os.getenv(ENV_BASE_URL) or "").strip() or DEFAULT_API_BASE_URL
     clusters = fetch_cluster_hosts(base, api_key)
+    choices = _cluster_choices_from_discovery(clusters)
 
-    entries: list[str] = []
-    envs_by_code: dict[str, list[str]] = {}
-    for item in clusters:
-        raw = item.get("cluster") or ""
-        code, _, env = raw.partition("#")
-        code = code.strip()
-        env = env.strip() or "prod"
-        if not code:
-            continue
-        value = f"{code}#{env}"
-        if value in entries:
-            continue
-        entries.append(value)
-        envs_by_code.setdefault(code, []).append(env)
-    entries.sort()
-    for envs in envs_by_code.values():
-        envs.sort()
-
-    if not entries:
+    if not choices:
         raise RuntimeError("no clusters are enabled for this account")
 
-    choices = ", ".join(entries)
     if not interactive:
         raise RuntimeError(
             "PYROMIND_CLUSTER is not set and no interactive terminal is "
-            f"available; available clusters: {choices}"
+            f"available; available clusters: {', '.join(choices)}"
         )
 
     # 组合较多时内联提示太长：选项逐行输出，提示行只留变量名。
     stdout.write("Available clusters:\n")
-    for entry in entries:
-        stdout.write(f"{entry}\n")
+    for choice in choices:
+        stdout.write(f"{choice}\n")
     stdout.flush()
 
     prompt = (
@@ -173,30 +177,9 @@ def _ask_cluster(
     )
     while True:
         candidate = _prompt(prompt, stdin=stdin, stdout=stdout)
-        if candidate in entries:
+        if candidate in choices:
             return candidate
-        if candidate in envs_by_code:
-            envs = envs_by_code[candidate]
-            if len(envs) == 1:
-                return f"{candidate}#{envs[0]}"
-            env = _ask_environment(envs, stdin=stdin, stdout=stdout, color=color)
-            return f"{candidate}#{env}"
-        code, _, env = candidate.partition("#")
-        env = env.strip()
-        if env in _PRE_ENVS and code.strip() in envs_by_code:
-            # 预发只对内部用户下发：portal 已过滤，这里给出明确原因，
-            # 避免落到含混的 "Unknown cluster"。
-            stdout.write(
-                f"Environment {env!r} requires an internal user; "
-                "choose one of the clusters listed above\n"
-            )
-            stdout.flush()
-            continue
-        stdout.write(
-            f"Unknown cluster {candidate!r}; "
-            "choose one of the clusters listed above\n"
-        )
-        stdout.flush()
+        _reject_cluster_choice(candidate, choices=choices, stdout=stdout)
 
 
 #: Registry settings that survive a restart. The daemon reads env at start, so

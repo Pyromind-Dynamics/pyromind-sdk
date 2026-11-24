@@ -44,11 +44,18 @@ from pyromind_sdk.client.models import (
 from .archive import validate_tar_file, validate_tar_members
 from .portforward import parse_publish_spec
 from ...rift.config import load_rift_config
-from ...rift.errors import RiftUnavailable, RiftUnauthenticated, RiftPermissionDenied
-from ...rift.rift_client import RiftGatewayClient
+from ...rift.errors import (
+    RiftMisconfigured,
+    RiftPermissionDenied,
+    RiftUnauthenticated,
+    RiftUnavailable,
+)
+from ...rift.ws_client import RiftWsClient
 from .runtime import parse_binds
 
 logger = logging.getLogger("docker_rt.pyromind_sdk")
+
+
 _client_singleton: AsyncSandboxClient | None = None
 _client_singleton_lock = threading.Lock()
 _client_singleton_closing = False
@@ -808,22 +815,29 @@ class PyromindSDK:
             self.rift_enabled = bool(enabled)
 
     async def _fetch_rift_password(self) -> str:
-        """从平台 detail 取该 sandbox 的 rift 密码。
+        """从平台 detail 取该 sandbox 的 rift 密码；没有就把这条 sandbox 判成 legacy。
 
-        认证值是每个 sandbox 独立的随机密码（类似 JupyterLab 的 per-instance
-        密码），不再使用用户的长期 api_key；拿不到就硬失败，不回落。
+        密码是 k8s_middleware 建 Pod 时跟 rift-client 一起注入的 per-sandbox
+        Secret。拿不到只有两种可能：引入 rift 之前创建的老沙箱，或凭据丢了 ——
+        两者都说明这个 Pod **没有可用的数据面**。这时回落 middleware 通道
+        （老沙箱本来就走它），而不是把沙箱卡死在 "rift-client is not ready"。
+
+        2026-11-23 用户要求兼容：7 天前创建的沙箱必须还能 exec / 开 terminal。
         """
         sandbox = await self._client.get_sandbox(
             self.sandbox_id, timeout=10, retry=False
         )
         self._apply_rift_flags(sandbox)
         password = str(getattr(sandbox, "rift_password", "") or "").strip()
-        if not password:
-            raise RiftUnavailable(
-                "sandbox has no rift_password (created before the per-sandbox "
-                "credential upgrade); resume the sandbox to issue one"
-            )
-        return password
+        if password:
+            return password
+        self.rift_enabled = False
+        self.logger.warning(
+            "sandbox=%s has no rift_password; using the middleware channel "
+            "(resume it to get a per-sandbox credential)",
+            self.sandbox_id,
+        )
+        return ""
 
     async def _ping_rift_until_ready(self, cfg) -> None:
         last_error: BaseException | None = None
@@ -832,6 +846,11 @@ class PyromindSDK:
                 version = await self._rift_client.ping()
             except (RiftUnauthenticated, RiftPermissionDenied):
                 # 凭据/路由授权问题不会因重试变好，交给调用方决定是否换密码
+                self.rift_ready = False
+                raise
+            except RiftMisconfigured:
+                # 到网关的路本身不通（边缘裸 HTTP 拒绝 / 入口体积限制）：
+                # 重试只是把同一个失败再等一遍，立即报错。
                 self.rift_ready = False
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -871,6 +890,10 @@ class PyromindSDK:
                 self.sandbox_id,
             )
             return
+        # 健康检查/恢复会反复调进来，而每次都会 new 一个客户端接管 _rift_client。
+        # 先关掉上一个：WS 客户端的 aiohttp session 不随对象回收关闭，漏一次就是
+        # 一条 "Unclosed client session"（2026-11-23 实测：3 分钟内刷了 4 条）。
+        await self._close_rift()
         gateway = await self._client.fetch_rift_gateway()
         cfg = load_rift_config(gateway)
         if not cfg.gateway:
@@ -885,14 +908,16 @@ class PyromindSDK:
                 self.sandbox_id,
             )
             return
-        self._rift_client = RiftGatewayClient(cfg, password, self.sandbox_id)
+        self._rift_client = RiftWsClient(cfg, password, self.sandbox_id)
         try:
             await self._ping_rift_until_ready(cfg)
             return
         except (RiftUnauthenticated, RiftPermissionDenied):
             await self._close_rift()
         password = await self._fetch_rift_password()
-        self._rift_client = RiftGatewayClient(cfg, password, self.sandbox_id)
+        if self._rift_disabled():
+            return
+        self._rift_client = RiftWsClient(cfg, password, self.sandbox_id)
         await self._ping_rift_until_ready(cfg)
 
     async def _close_rift(self) -> None:
