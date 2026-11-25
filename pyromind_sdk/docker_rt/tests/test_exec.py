@@ -543,7 +543,7 @@ async def test_pyromind_terminal_bridge_pumps_stdin_and_resize(monkeypatch):
     monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2")
 
     kube_env = PyromindSDK.__new__(PyromindSDK)
-    kube_env.sandbox_id = "sb-terminal"
+    kube_env.sandbox_id = "sb-0123456789ab"
     resp = FakeResp()
     session = SimpleNamespace(
         id="exec-it", running=False, exit_code=None, tty_cols=100, tty_rows=30
@@ -788,7 +788,7 @@ async def _drive_terminal_bridge(
     monkeypatch.setattr(mod, "_pyromind_terminal_exchange", lambda *a, **k: ("https://portal.example/api/v1", "us-west-2", ""))
 
     kube_env = PyromindSDK.__new__(PyromindSDK)
-    kube_env.sandbox_id = "sb-terminal"
+    kube_env.sandbox_id = "sb-0123456789ab"
 
     async def write_ack(path):
         acked.append(path)
@@ -1731,7 +1731,7 @@ async def test_exec_with_stdin_and_no_tty_frames_the_terminal_output(monkeypatch
             tty_cols=0,
             tty_rows=0,
         )
-        kube_env = SimpleNamespace(sandbox_id="sb-1")
+        kube_env = SimpleNamespace(sandbox_id="sb-0123456789ab")
         request = SimpleNamespace(
             protocol=None, transport=None, content=_Content()
         )
@@ -1860,7 +1860,7 @@ async def test_terminal_bridge_retries_once_when_the_token_is_rejected(monkeypat
             _Resp(),
             None,
             session,
-            SimpleNamespace(sandbox_id="sb-1"),
+            SimpleNamespace(sandbox_id="sb-0123456789ab"),
             True,
             cmd=["bash"],
         ),
@@ -2164,7 +2164,7 @@ async def test_stdin_eof_does_not_teardown_the_session(monkeypatch):
         tty_cols=0,
         tty_rows=0,
     )
-    kube_env = SimpleNamespace(sandbox_id="sb-1")
+    kube_env = SimpleNamespace(sandbox_id="sb-0123456789ab")
     protocol = _Proto()
     # 真实路径里这两步由 _begin_tcp_upgrade 完成
     mod._keep_transport_after_client_eof(protocol)
