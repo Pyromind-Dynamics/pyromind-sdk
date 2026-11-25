@@ -76,14 +76,6 @@ class TerminalAuthExpired(TerminalError):
     """短时 WS token 在会话产生任何输出之前被拒绝。"""
 
 
-def _validated_sandbox_id(sandbox_id: str) -> str:
-    """校验 id 形态并把错误统一成 ``TerminalError``（docker-rt 只捕获这个类型）。"""
-    try:
-        return ensure_valid_sandbox_id(sandbox_id, action="terminal")
-    except ValueError as exc:
-        raise TerminalError(str(exc)) from exc
-
-
 def _websocket_url(
     base_url: str,
     sandbox_id: str,
@@ -109,7 +101,12 @@ def _websocket_url(
     for part in command or ():
         qs_params.append(("command", str(part)))
     # id 先做「格式+长度」校验再进路径：调用方传入的值不该能改变 URL 结构。
-    safe_id = quote(_validated_sandbox_id(sandbox_id), safe="")
+    safe_id = quote(
+        ensure_valid_sandbox_id(
+            sandbox_id, action="terminal", error_cls=TerminalError
+        ),
+        safe="",
+    )
     return f"{base}/sandboxes/{safe_id}/terminal?{urlencode(qs_params)}"
 
 
@@ -142,7 +139,7 @@ def fetch_terminal_token(
     cluster: Optional[str] = None,
 ) -> tuple[str, str]:
     """Exchange on the portal; returns ``(token, cluster_direct_base_url)``."""
-    _validated_sandbox_id(sandbox_id)
+    ensure_valid_sandbox_id(sandbox_id, action="terminal", error_cls=TerminalError)
     token, _ttl, api_base_url = fetch_token(
         base_url,
         api_key,
@@ -161,7 +158,7 @@ async def async_fetch_terminal_token(
     cluster: Optional[str] = None,
 ) -> tuple[str, str]:
     """Async variant of :func:`fetch_terminal_token`."""
-    _validated_sandbox_id(sandbox_id)
+    ensure_valid_sandbox_id(sandbox_id, action="terminal", error_cls=TerminalError)
     token, _ttl, api_base_url = await async_fetch_token(
         base_url,
         api_key,

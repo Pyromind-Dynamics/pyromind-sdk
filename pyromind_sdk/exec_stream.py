@@ -59,14 +59,6 @@ class SandboxExecStreamAuthExpired(SandboxExecStreamError):
     """
 
 
-def _validated_sandbox_id(sandbox_id: str) -> str:
-    """校验 id 形态并把错误统一成 ``SandboxExecStreamError``。"""
-    try:
-        return ensure_valid_sandbox_id(sandbox_id, action="exec-stream")
-    except ValueError as exc:
-        raise SandboxExecStreamError(str(exc)) from exc
-
-
 def build_exec_stream_websocket_url(api_base_url: str, sandbox_id: str) -> str:
     """Build the cluster-direct exec-stream WebSocket URL.
 
@@ -80,7 +72,12 @@ def build_exec_stream_websocket_url(api_base_url: str, sandbox_id: str) -> str:
             base = ws_scheme + base[len(http_scheme):]
             break
     # id 先做「格式+长度」校验再进路径：调用方传入的值不该能改变 URL 结构。
-    safe_id = quote(_validated_sandbox_id(sandbox_id), safe="")
+    safe_id = quote(
+        ensure_valid_sandbox_id(
+            sandbox_id, action="exec-stream", error_cls=SandboxExecStreamError
+        ),
+        safe="",
+    )
     return f"{base}/sandboxes/{safe_id}/exec-stream"
 
 
@@ -91,7 +88,9 @@ def fetch_exec_stream_token(
     cluster: Optional[str] = None,
 ) -> tuple[str, str]:
     """Exchange on the portal; returns ``(token, cluster_direct_base_url)``."""
-    _validated_sandbox_id(sandbox_id)
+    ensure_valid_sandbox_id(
+        sandbox_id, action="exec-stream", error_cls=SandboxExecStreamError
+    )
     token, _ttl, api_base_url = fetch_token(
         base_url,
         api_key,
@@ -110,7 +109,9 @@ async def async_fetch_exec_stream_token(
     cluster: Optional[str] = None,
 ) -> tuple[str, str]:
     """Async variant of :func:`fetch_exec_stream_token`."""
-    _validated_sandbox_id(sandbox_id)
+    ensure_valid_sandbox_id(
+        sandbox_id, action="exec-stream", error_cls=SandboxExecStreamError
+    )
     token, _ttl, api_base_url = await async_fetch_token(
         base_url,
         api_key,

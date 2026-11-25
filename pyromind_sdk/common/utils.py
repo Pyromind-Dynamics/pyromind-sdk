@@ -22,7 +22,7 @@ from typing import Any
 #: sandbox id 的格式与长度：与生成方（middleware ``generate_sandbox_id``）的规格
 #: 严格一致——``sb-`` + 12 位小写 hex，总长 15。格式只管前缀 + 字符集（拒绝
 #: ``/``、``..``、``*``、``%``、空格、HTML 片段等）；长度显式兜底，两个检查互相独立。
-SANDBOX_ID_PATTERN = re.compile(r"^sb-[0-9a-f]{12}$")
+SANDBOX_ID_PATTERN = re.compile(r"sb-[0-9a-f]{12}")
 SANDBOX_ID_MAX_LENGTH = 15
 
 #: 错误信息回显调用方输入时的最大长度（原值可能很长或含控制字符）。
@@ -44,15 +44,23 @@ def _safe_echo(identifier: Any) -> str:
     return text[:_MAX_ECHO_CHARS]
 
 
-def ensure_valid_sandbox_id(identifier: Any, *, action: str = "操作") -> str:
-    """校验 sandbox id，返回原值；非法时抛 ``ValueError``。
+def ensure_valid_sandbox_id(
+    identifier: Any,
+    *,
+    action: str = "operation",
+    error_cls: type[Exception] | None = None,
+) -> str:
+    """校验 sandbox id，返回原值；非法时抛 ``error_cls``（默认 ``ValueError``）。
 
-    调用方通常会把 ``ValueError`` 再包成自己的错误类型（``TerminalError`` /
-    ``SandboxExecStreamError``），保持既有异常契约。
+    ``error_cls`` 让各 WS 通道把校验失败统一包装成自己的异常（``TerminalError`` /
+    ``SandboxExecStreamError``），不用各自重复一遍 try/except。
     """
-    if not is_valid_sandbox_id(identifier):
-        raise ValueError(
-            f"invalid sandbox id for {action}: {_safe_echo(identifier)!r} "
-            "(expected 'sb-' + 12 lowercase hex chars)"
-        )
-    return identifier  # type: ignore[return-value]
+    if is_valid_sandbox_id(identifier):
+        return identifier
+    message = (
+        f"invalid sandbox id for {action}: {_safe_echo(identifier)!r} "
+        "(expected 'sb-' + 12 lowercase hex chars)"
+    )
+    if error_cls is not None:
+        raise error_cls(message)
+    raise ValueError(message)
