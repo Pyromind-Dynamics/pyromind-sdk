@@ -205,6 +205,30 @@ def start_daemon(
     return 0
 
 
+def write_pid_file(sock: str | None = None) -> Path:
+    """Record this process as the daemon serving ``sock``.
+
+    ``start_daemon`` (``docker-rt -d``) already writes one, but a **foreground**
+    ``docker-rt`` used to write nothing — so ``--stop`` fell back to a pgrep for
+    ``pyromind_sdk.docker_rt.server`` and never matched the ``docker-rt``
+    entrypoint, answering "not running" even while it was serving.
+    """
+    path = default_pid_file(sock)
+    path.write_text(str(os.getpid()), encoding="utf-8")
+    return path
+
+
+def clear_pid_file(path: Path | None) -> None:
+    """Remove ``path`` only when it still names this process."""
+    if path is None:
+        return
+    try:
+        if path.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            path.unlink()
+    except OSError:
+        pass
+
+
 def stop_daemon(
     *,
     sock: str | None = None,

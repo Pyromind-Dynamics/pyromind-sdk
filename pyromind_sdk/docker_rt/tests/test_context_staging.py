@@ -15,6 +15,8 @@ cannot be empty").
 from __future__ import annotations
 
 import os
+import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -46,12 +48,16 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_mode_defaults_to_storage_and_ignores_nonsense() -> None:
-    """Storage is the only default route; ``upload`` must be opted into."""
+def test_mode_defaults_to_auto_and_ignores_nonsense() -> None:
+    """``auto`` is the default: local when in-cluster, else storage.
+
+    ``upload`` must be opted into, and ``auto`` still fails loudly — an
+    unavailable storage route is an error, never a silent upload.
+    """
     from ..backend import context_staging as cs
 
     os.environ.pop("DOCKER_RT_BUILD_CONTEXT_MODE", None)
-    assert cs.staging_mode() == "storage"
+    assert cs.staging_mode() == "auto"
     assert cs.staging_enabled() is True
     assert cs.staging_required() is True
     os.environ["DOCKER_RT_BUILD_CONTEXT_MODE"] = "upload"
@@ -62,12 +68,17 @@ def test_mode_defaults_to_storage_and_ignores_nonsense() -> None:
         del os.environ["DOCKER_RT_BUILD_CONTEXT_MODE"]
 
 
-def test_unknown_mode_is_treated_as_storage(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A typo must fail loudly, not quietly restore the old direct upload."""
+def test_unknown_mode_is_treated_as_auto(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A typo must fail loudly, not quietly restore the old direct upload.
+
+    ``auto`` only picks the no-upload local route when the daemon really runs
+    inside the cluster; everywhere else it is the storage route, whose failures
+    are fatal (``staging_required``).
+    """
     from ..backend import context_staging as cs
 
     monkeypatch.setenv("DOCKER_RT_BUILD_CONTEXT_MODE", "turbo")
-    assert cs.staging_mode() == "storage"
+    assert cs.staging_mode() == "auto"
     assert cs.staging_required() is True
 
 
@@ -382,6 +393,189 @@ def test_cleanup_deletes_the_build_directory(monkeypatch: pytest.MonkeyPatch) ->
 
 
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# the local (no-upload) route — a daemon started from a JupyterLab terminal
+# --------------------------------------------------------------------------
+
+
+def test_local_is_a_known_staging_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ..backend import context_staging as cs
+
+    monkeypatch.setenv("DOCKER_RT_BUILD_CONTEXT_MODE", "local")
+    assert cs.staging_mode() == "local"
+    # Staging still runs — it just never uploads anything.
+    assert cs.staging_enabled() is True
+    # A local failure falls back to the storage route, so a storage failure is
+    # still fatal — ``upload`` is the only mode that never stages.
+    assert cs.staging_required() is True
+
+
+def test_local_staging_requested_follows_the_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ..backend import context_staging as cs
+
+    monkeypatch.setattr(cs, "local_workspace_ready", lambda: False)
+    monkeypatch.setenv("DOCKER_RT_BUILD_CONTEXT_MODE", "local")
+    # Forced on even when the environment says otherwise — the caller turns
+    # that combination into a build error rather than silently ignoring it.
+    assert cs.local_staging_requested() is True
+
+    monkeypatch.setenv("DOCKER_RT_BUILD_CONTEXT_MODE", "auto")
+    assert cs.local_staging_requested() is False
+    monkeypatch.setattr(cs, "local_workspace_ready", lambda: True)
+    assert cs.local_staging_requested() is True
+
+    for mode in ("storage", "upload"):
+        monkeypatch.setenv("DOCKER_RT_BUILD_CONTEXT_MODE", mode)
+        assert cs.local_staging_requested() is False
+
+
+def test_local_workspace_ready_needs_jupyter_and_a_writable_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_dir: Path
+) -> None:
+    from ..backend import context_staging as cs
+    from ..backend import jupyter_env
+
+    monkeypatch.setattr(jupyter_env, "is_jupyterlab_terminal", lambda **_kw: False)
+    monkeypatch.setenv("DOCKER_RT_BUILD_STAGING_WORKSPACE", str(tmp_dir))
+    assert cs.local_workspace_ready() is False
+
+    monkeypatch.setattr(jupyter_env, "is_jupyterlab_terminal", lambda **_kw: True)
+    assert cs.local_workspace_ready() is True
+
+    # A workspace that does not exist (a laptop daemon) is not ready either.
+    monkeypatch.setenv(
+        "DOCKER_RT_BUILD_STAGING_WORKSPACE", str(tmp_dir / "no-such-dir")
+    )
+    assert cs.local_workspace_ready() is False
+
+
+def _tar_bytes(files: dict[str, bytes]) -> bytes:
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def test_local_stager_unpacks_the_context_where_the_sandbox_reads_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_dir: Path
+) -> None:
+    from ..backend import context_staging as cs
+
+    monkeypatch.setenv("DOCKER_RT_BUILD_STAGING_WORKSPACE", str(tmp_dir))
+    plan = cs.plan_staging(archive="context.tar.gz")
+    stager = cs.LocalStager(plan)
+
+    stager.unpack(_tar_bytes({"Dockerfile": b"FROM scratch\n", "hello.txt": b"hi"}))
+
+    # The tree landed exactly where the sandbox's mount exposes it, and where
+    # the daemon says it is.
+    expected = os.path.join(plan.workspace, plan.rel_context_dir)
+    assert stager.context_dir == expected
+    assert stager.describe() == expected
+    assert plan.host_context == expected
+    assert plan.staged_context == f"{plan.mount_path}/{plan.build_id}/context"
+    with open(os.path.join(expected, "Dockerfile"), "rb") as handle:
+        assert handle.read() == b"FROM scratch\n"
+    assert os.path.isfile(os.path.join(expected, "hello.txt"))
+    assert stager.staged is True
+    # Published atomically: a half-unpacked tree is never visible.
+    assert not os.path.exists(expected + ".part")
+
+
+def test_local_stager_refuses_to_unpack_outside_the_build_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_dir: Path
+) -> None:
+    """The context arrives over an API — it is not trusted to stay inside."""
+    from ..backend import context_staging as cs
+
+    monkeypatch.setenv("DOCKER_RT_BUILD_STAGING_WORKSPACE", str(tmp_dir))
+    stager = cs.LocalStager(cs.plan_staging(archive="context.tar.gz"))
+
+    with pytest.raises(cs.StagingError):
+        stager.unpack(_tar_bytes({"../escape.txt": b"nope"}))
+    assert not os.path.exists(stager.context_dir)
+
+
+def test_local_stager_drops_nothing_when_the_archive_is_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_dir: Path
+) -> None:
+    from ..backend import context_staging as cs
+
+    monkeypatch.setenv("DOCKER_RT_BUILD_STAGING_WORKSPACE", str(tmp_dir))
+    stager = cs.LocalStager(cs.plan_staging(archive="context.tar.gz"))
+
+    with pytest.raises(cs.StagingError):
+        stager.unpack(_tar_bytes({}))
+
+
+def test_local_stager_cleanup_removes_the_directory_and_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch, tmp_dir: Path
+) -> None:
+    from ..backend import context_staging as cs
+
+    monkeypatch.setenv("DOCKER_RT_BUILD_STAGING_WORKSPACE", str(tmp_dir))
+    stager = cs.LocalStager(cs.plan_staging(archive="context.tar.gz"))
+    stager.unpack(_tar_bytes({"Dockerfile": b"FROM scratch\n"}))
+
+    assert stager.cleanup() is True
+    assert not os.path.exists(stager.build_dir)
+    # The sandbox normally leaves it alone; a second cleanup is a no-op.
+    assert stager.cleanup() is True
+
+
+def test_local_stager_cleanup_takes_a_half_unpacked_directory_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_dir: Path
+) -> None:
+    """A failed unpack leaves the directory; the ``finally`` must still clear it."""
+    from ..backend import context_staging as cs
+
+    monkeypatch.setenv("DOCKER_RT_BUILD_STAGING_WORKSPACE", str(tmp_dir))
+    stager = cs.LocalStager(cs.plan_staging(archive="context.tar.gz"))
+    os.makedirs(os.path.join(stager.context_dir + ".part"))
+    with open(os.path.join(stager.context_dir + ".part", "half"), "wb") as handle:
+        handle.write(b"half")
+
+    assert stager.cleanup() is True
+    assert not os.path.exists(stager.build_dir)
+
+
+def test_local_stager_unpack_failure_propagates(
+    monkeypatch: pytest.MonkeyPatch, tmp_dir: Path
+) -> None:
+    """The caller decides what a failed unpack means — do not swallow it."""
+    from ..backend import context_staging as cs
+
+    blocker = tmp_dir / "a-file"
+    blocker.write_text("not a directory")
+    monkeypatch.setenv("DOCKER_RT_BUILD_STAGING_WORKSPACE", str(blocker))
+    stager = cs.LocalStager(cs.plan_staging(archive="context.tar.gz"))
+
+    with pytest.raises(OSError):
+        stager.unpack(_tar_bytes({"Dockerfile": b"FROM scratch\n"}))
+
+
+def test_verify_script_checks_the_mounted_context_and_reports_entries() -> None:
+    from ..backend import context_staging as cs
+
+    plan = cs.plan_staging(archive="context.tar.gz")
+    script = cs.verify_context_script(plan)
+
+    assert f"test -d {plan.staged_context}" in script
+    # It must fail loudly on an empty directory: that is what a wrong subPath
+    # looks like, and the caller falls back on a non-zero exit.
+    assert "exit 9" in script
+    assert cs.parse_context_entries(f"noise\n{cs.CONTEXT_MARKER}7\n") == 7
+    assert cs.parse_context_entries("nothing here") is None
+
+
 # build ids: what the sweeper relies on
 # --------------------------------------------------------------------------
 
@@ -751,3 +945,96 @@ def test_cleanup_reports_failure_instead_of_raising(
 
     assert stager.cleanup() is False
     assert stager.uploaded is True  # still needs cleaning up
+
+
+# --------------------------------------------------------------------------
+# sweeping locally staged leftovers — the watcher's side of the local route
+# --------------------------------------------------------------------------
+
+
+def _local_staging_root(tmp_dir: Path, entries: dict[str, float]) -> str:
+    """Create ``<workspace>/.docker-rt-build/<name>`` directories.
+
+    ``entries`` maps a directory name to its age in seconds.
+    """
+    root = tmp_dir / ".docker-rt-build"
+    for name, age_s in entries.items():
+        path = root / name
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "context.tar.gz").write_bytes(b"x")
+        when = time.time() - age_s
+        os.utime(path, (when, when))
+    return str(tmp_dir)
+
+
+def test_local_sweep_removes_what_the_dead_daemon_left(tmp_dir: Path) -> None:
+    from ..backend import context_staging as cs
+
+    stale = "20261022-101010-80566-0-deadbee"
+    workspace = _local_staging_root(tmp_dir, {stale: 0.0})
+
+    assert cs.sweep_local_stale_staging(dead_pid=1234, workspace=workspace) == [
+        stale
+    ]
+    assert not (tmp_dir / ".docker-rt-build" / stale).exists()
+
+
+def test_local_sweep_keeps_a_directory_whose_daemon_is_still_running(
+    tmp_dir: Path,
+) -> None:
+    from ..backend import context_staging as cs
+
+    mine = cs.new_build_id()  # names os.getpid(), which is alive
+    workspace = _local_staging_root(tmp_dir, {mine: 0.0})
+
+    assert cs.sweep_local_stale_staging(dead_pid=1234, workspace=workspace) == []
+    assert (tmp_dir / ".docker-rt-build" / mine).is_dir()
+
+
+def test_local_sweep_waits_for_an_unattributable_directory_to_age_out(
+    tmp_dir: Path,
+) -> None:
+    from ..backend import context_staging as cs
+
+    workspace = _local_staging_root(tmp_dir, {"not-ours": 0.0})
+    assert cs.sweep_local_stale_staging(workspace=workspace, max_age_s=3600) == []
+
+    workspace = _local_staging_root(tmp_dir, {"not-ours": 7200.0})
+    assert cs.sweep_local_stale_staging(workspace=workspace, max_age_s=3600) == [
+        "not-ours"
+    ]
+
+
+def test_local_sweep_is_a_no_op_without_the_directory(tmp_dir: Path) -> None:
+    from ..backend import context_staging as cs
+
+    assert cs.sweep_local_stale_staging(workspace=str(tmp_dir / "empty")) == []
+
+
+def test_local_sweep_leaves_stray_files_alone(tmp_dir: Path) -> None:
+    from ..backend import context_staging as cs
+
+    root = tmp_dir / ".docker-rt-build"
+    root.mkdir(parents=True)
+    (root / "loose-file").write_text("not ours")
+
+    assert cs.sweep_local_stale_staging(workspace=str(tmp_dir)) == []
+    assert (root / "loose-file").exists()
+
+
+def test_local_sweep_honours_the_disable_knob(
+    monkeypatch: pytest.MonkeyPatch, tmp_dir: Path
+) -> None:
+    from ..backend import context_staging as cs
+
+    monkeypatch.setenv("DOCKER_RT_BUILD_STAGING_SWEEP", "false")
+    workspace = _local_staging_root(tmp_dir, {"20261022-101010-80566-0-deadbee": 0.0})
+
+    assert cs.sweep_local_stale_staging(dead_pid=1234, workspace=workspace) == []
+    assert (tmp_dir / ".docker-rt-build").is_dir()
+
+
+# --------------------------------------------------------------------------
+# storage credentials come from the cluster, not the portal
+# --------------------------------------------------------------------------
+

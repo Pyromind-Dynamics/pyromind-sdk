@@ -145,6 +145,12 @@ setup(
     package_data={
         "pyromind_sdk": ["*.md"],
         "pyromind_sdk.docker_rt": ["*.md", "requirements.txt", "requirements-dev.txt"],
+        # rift-client 的二进制与 Go 源码在 k8s_middleware/rift（平台注入镜像）；
+        # SDK 只带 Python gRPC stubs 与 proto。
+        "pyromind_sdk.rift": [
+            "README.md",
+            "proto/*.proto",
+        ],
         "pyromind_sdk.tests": ["nodes/*.yaml"],
     },
     include_package_data=True,

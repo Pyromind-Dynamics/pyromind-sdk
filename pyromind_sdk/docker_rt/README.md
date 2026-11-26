@@ -106,6 +106,8 @@ The build uses Storage as temporary file storage; the final result is stored at:
 /workspace/docker_images/<image-tag>.tar
 ```
 
+The build context reaches the sandbox automatically, with nothing to configure. When docker-rt itself runs inside the cluster — started from a JupyterLab web terminal is the recognised case — the daemon and the sandbox share the same workspace filesystem, so the context is unpacked straight onto it and kaniko builds from that directory: nothing is uploaded, nothing is copied inside the sandbox (the daemon log says `Unpacking the build context into … (shared workspace filesystem — no upload)`). Every other environment (your laptop, a plain SSH session) keeps the workspace-storage upload exactly as before.
+
 ### Push to a registry
 
 Builds do **not** push by default (`DOCKER_RT_BUILD_PUSH=false`); after a successful build, push the archive explicitly with `docker push <tag>`. Short image names require a registry prefix and credentials with push permission:
@@ -136,7 +138,7 @@ The result is `/workspace/docker_images/myapp_dev.tar`, stored in the remote Pyr
 | Symptom | What to check |
 | --- | --- |
 | Sandbox cannot pull an image | Verify the target cluster can reach the registry and that the image is accessible to the platform. |
-| Build cannot start | Check that the builder image is pullable and has a shell and `sleep`; raise builder memory if the sandbox is OOM-killed (`DOCKER_RT_BUILD_SANDBOX_MEMORY`). |
+| Build cannot start | Check that the builder image is pullable and has a shell and `sleep`. The sandbox is 16Gi/8cpu by default (`DOCKER_RT_BUILD_SANDBOX_MEMORY` / `_CPU`; the platform requires CPU:memory = 1:2); if it dies before reporting an exit code it is retried once with doubled resources (`build sandbox died before reporting an exit code … Retried with 32Gi`). A **failed** build keeps its sandbox for inspection (`DOCKER_RT_BUILD_SANDBOX_KEEP=true` by default; successful builds are always cleaned up). |
 | Build hangs while fetching dependencies / DNS failures | The build runs on the cluster's network; every networked address in the Dockerfile must be reachable from the cluster — see "China region cluster differences". |
 | Build completes but push fails | Check registry reachability and credentials, and that the prefix includes a namespace (see "China region cluster differences"). The image archive may still exist in `/workspace/docker_images/`. |
 | `docker exec` fails with `[EXEC_STREAM_LOST]` / `[EXEC_STREAM_RELAY_FAILED]` | The platform reported the reason: the exec stream died before the command announced an exit status. The message carries the diagnosis and how many bytes had been delivered: `0 stdout / 0 stderr` almost certainly means the command never started; delivered bytes mean it ran and only the tail was lost — do **not** re-run blindly, retry only idempotent commands. |

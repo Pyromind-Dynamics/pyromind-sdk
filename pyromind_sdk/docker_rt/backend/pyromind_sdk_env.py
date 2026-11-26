@@ -9,15 +9,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import io
 import inspect
+import io
 import logging
 import os
 import posixpath
-import queue
 import shlex
-import uuid
 import tarfile
+import tempfile
+import time
+import uuid
 import threading
 import weakref
 from typing import Any, AsyncIterator
@@ -40,17 +41,21 @@ from pyromind_sdk.client.models import (
     SandboxType,
     VolumeMount,
 )
-from pyromind_sdk.exec_stream import (
-    async_fetch_exec_stream_token,
-    build_exec_stream_websocket_url,
-    iter_exec_stream_async,
-)
-from pyromind_sdk.log_redaction import redact_text
-
+from .archive import validate_tar_file, validate_tar_members
 from .portforward import parse_publish_spec
+from ...rift.config import load_rift_config
+from ...rift.errors import (
+    RiftMisconfigured,
+    RiftPermissionDenied,
+    RiftUnauthenticated,
+    RiftUnavailable,
+)
+from ...rift.ws_client import RiftWsClient
 from .runtime import parse_binds
 
 logger = logging.getLogger("docker_rt.pyromind_sdk")
+
+
 _client_singleton: AsyncSandboxClient | None = None
 _client_singleton_lock = threading.Lock()
 _client_singleton_closing = False
@@ -65,13 +70,33 @@ _SDK_API_ERRORS = (PyroMindAPIError, PyroMindAsyncAPIError)
 
 DEFAULT_CPU = "1"
 DEFAULT_MEMORY = "2Gi"
-_EXEC_STREAM_QUEUE_SIZE = 64
 _CLEANUP_RUNNING_STATUS = "running"
 _CLEANUP_RETRY_ATTEMPTS = 60
 _CLEANUP_DELETE_RETRY_DELAY_S = 1.0
 _CLEANUP_PAUSE_TIMEOUT_S = 60.0
 _CLEANUP_PAUSE_POLL_INTERVAL_S = 1.0
 _CLEANUP_STATUS_TIMEOUT_S = 10.0
+#: 单条 rift 流的上传速度被前门代理的 HTTP/2 流控窗口限住（窗口 × RTT）。
+#: 公网 RTT 200–400ms 时单流约 0.1–0.3 MiB/s，4 条并发测得约 12 倍聚合带宽
+#: （2026-10-30，Mac → pre 网关）。大于阈值且是单个普通文件的 tar 走并行分片。
+def _cp_int(name: str, default: int, *, floor: int = 0) -> int:
+    raw = os.getenv(name)
+    try:
+        return max(floor, int(str(raw).strip())) if raw and raw.strip() else default
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using %d", name, raw, default)
+        return default
+
+
+_CP_PARALLEL_MIN_BYTES = _cp_int("DOCKER_RT_CP_PARALLEL_MIN_BYTES", 8 << 20)
+_CP_PART_BYTES = _cp_int("DOCKER_RT_CP_PART_BYTES", 8 << 20, floor=1 << 20)
+_CP_STREAMS = _cp_int("DOCKER_RT_CP_STREAMS", 4, floor=1)
+
+#: 刷 Pod 状态的硬上限（秒）。数据面请求（exec/cp/start）进来都会先强制刷新一次
+#: 状态，而客户端默认 600s 超时 —— 控制面（pre-api）抖一下就把数据面拖死：
+#: 2026-10-30 本地实测 1 MiB 的 `docker cp` 卡了 109.6s，一个字节都还没传。
+#: 超时就沿用缓存状态，让 exec/cp 自己用网关的结果说话。
+_PHASE_REFRESH_TIMEOUT_S = 5.0
 _CLEANUP_PAUSE_REQUEST_TIMEOUT_S = 30.0
 _CLEANUP_DELETE_TIMEOUT_S = 30.0
 DEFAULT_CLEANUP_CONCURRENCY = 4
@@ -186,6 +211,27 @@ def new_sandbox_client() -> AsyncSandboxClient:
         connector_limit=DEFAULT_CONNECTOR_LIMIT,
         connector_limit_per_host=DEFAULT_CONNECTOR_LIMIT,
     )
+
+
+def _member_tar(name: str, data: bytes, mode: int = 0o600) -> bytes:
+    """One-member tar: what a part stream ships to rift-client."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(name=name)
+        info.size = len(data)
+        info.mode = mode
+        info.mtime = int(time.time())
+        tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def _spool_reader(fileobj: Any, chunk: int = 1 << 20):
+    """Sync chunk reader over the spooled body (``put_archive`` wants iterables)."""
+    while True:
+        data = fileobj.read(chunk)
+        if not data:
+            return
+        yield data
 
 
 def get_sandbox_client() -> AsyncSandboxClient:
@@ -309,140 +355,6 @@ class _OneShotWs:
         self._started = True
 
 
-class _SdkExecStreamWs:
-    """Kubernetes-WS-like adapter backed by streaming exec events."""
-
-    def __init__(
-        self,
-        events: Any,
-        stop_event: threading.Event | None = None,
-        *,
-        async_events: bool = False,
-    ) -> None:
-        self._events = events
-        self._stop_event = stop_event or threading.Event()
-        self._async_events = async_events
-        self._queue: "queue.Queue[tuple[str, Any] | None]" = queue.Queue(
-            maxsize=_EXEC_STREAM_QUEUE_SIZE
-        )
-        self._stdout = bytearray()
-        self._stderr = bytearray()
-        self._returncode = 0
-        self._done = False
-        self._error: BaseException | None = None
-        self._thread = threading.Thread(target=self._read_events, daemon=True)
-        self._thread.start()
-
-    def _put_event(self, event: tuple[str, Any] | None) -> bool:
-        """Queue one event, respecting early close as backpressure."""
-        while not self._stop_event.is_set():
-            try:
-                self._queue.put(event, timeout=0.2)
-                return True
-            except queue.Full:
-                continue
-        return False
-
-    def _handle_event(self, event: Any) -> bool:
-        event_type = getattr(event, "type", "")
-        if event_type in {"stdout", "stderr"}:
-            return self._put_event(
-                (event_type, getattr(event, "data", ""))
-            )
-        if event_type == "exit":
-            self._returncode = int(getattr(event, "returncode", 0) or 0)
-        return True
-
-    def _record_error(self, exc: BaseException) -> None:
-        self._error = exc
-        self._returncode = 1
-        message = redact_text(str(exc)).strip() or type(exc).__name__
-        self._put_event(
-            ("stderr", f"exec stream error: {message}\n".encode("utf-8"))
-        )
-
-    def _signal_done(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                self._queue.put(None, timeout=0.2)
-                break
-            except queue.Full:
-                continue
-
-    async def _consume_async_events(self) -> None:
-        async for event in self._events:
-            if not self._handle_event(event):
-                return
-
-    def _read_events(self) -> None:
-        try:
-            if self._async_events:
-                asyncio.run(self._consume_async_events())
-            else:
-                for event in self._events:
-                    if not self._handle_event(event):
-                        return
-        except BaseException as exc:
-            self._record_error(exc)
-        finally:
-            self._signal_done()
-
-    def is_open(self) -> bool:
-        return not self._done
-
-    def update(self, timeout: float = 0.2) -> None:
-        try:
-            event = self._queue.get(timeout=max(timeout, 0))
-        except queue.Empty:
-            return
-        if event is None:
-            self._done = True
-            return
-        stream_type, data = event
-        if isinstance(data, bytes):
-            raw = data
-        elif isinstance(data, bytearray):
-            raw = bytes(data)
-        else:
-            raw = str(data).encode("utf-8")
-        if stream_type == "stdout":
-            self._stdout.extend(raw)
-        else:
-            self._stderr.extend(raw)
-
-    def peek_stdout(self) -> bool:
-        return bool(self._stdout)
-
-    def read_stdout(self) -> bytes:
-        data = bytes(self._stdout)
-        self._stdout.clear()
-        return data
-
-    def peek_stderr(self) -> bool:
-        return bool(self._stderr)
-
-    def read_stderr(self) -> bytes:
-        data = bytes(self._stderr)
-        self._stderr.clear()
-        return data
-
-    @property
-    def returncode(self) -> int:
-        return self._returncode
-
-    def close(self) -> None:
-        self._stop_event.set()
-        self._done = True
-        if self._async_events:
-            return
-        close = getattr(self._events, "close", None)
-        if callable(close):
-            try:
-                close()
-            except (RuntimeError, ValueError):
-                pass
-
-
 class PyromindSDK:
     """Docker-rt environment adapter backed by the PyroMind sandbox OpenAPI."""
 
@@ -495,6 +407,8 @@ class PyromindSDK:
         obj.env = {}
         obj.working_dir = "/"
         obj.command = []
+        obj.entrypoint = None
+        obj.rift_enabled = True  # 详情接口未带该字段时按新沙箱处理
         obj.sandbox_status = status or "Unknown"
         obj._terminal_phase = None
         obj._exit_code = 0
@@ -515,6 +429,9 @@ class PyromindSDK:
         obj.system_image_path = system_image_path
         obj.screen_size = obj._json_ready(screen_size)
         obj._client = client or get_sandbox_client()
+        obj.rift_ready = False
+        obj.rift_last_error = ""
+        obj._rift_client = None
         return obj
 
     def __init__(
@@ -526,6 +443,7 @@ class PyromindSDK:
         env: dict[str, str] | None = None,
         working_dir: str = "/",
         command: list[str] | None = None,
+        entrypoint: list[str] | None = None,
         binds: list[str] | None = None,
         mounts: list[dict[str, Any]] | None = None,
         tmpfs: dict[str, str] | None = None,
@@ -549,6 +467,8 @@ class PyromindSDK:
         self.env = dict(env or {})
         self.working_dir = working_dir
         self.command = list(command or [])
+        self.entrypoint = list(entrypoint) if entrypoint is not None else None
+        self.rift_enabled = True  # 详情接口未带该字段时按新沙箱处理
         self.sandbox_id: str | None = None
         self.sandbox_status = "Pending"
         self.resources: ResourceConfig | None = None
@@ -576,6 +496,9 @@ class PyromindSDK:
             gpu_card=gpu_card,
         )
         self._client = client or get_sandbox_client()
+        self.rift_ready = False
+        self.rift_last_error = ""
+        self._rift_client = None
 
     @classmethod
     async def create(
@@ -601,13 +524,9 @@ class PyromindSDK:
             # `docker run -e` 的容器环境变量（create 时注入 Pod）
             env=kwargs.get("env"),
             gpu_card=kwargs.get("gpu_card"),
+            command=obj.command,
+            entrypoint=obj.entrypoint,
         )
-        if obj.command and obj.command not in (["sleep"], ["sleep", "2h"]):
-            obj.logger.warning(
-                "k8s_middleware does not accept Cmd yet; "
-                "container will use the image default command. cmd=%s",
-                obj.command,
-            )
         return obj
 
     # ---- construction helpers -------------------------------------------
@@ -629,6 +548,7 @@ class PyromindSDK:
         self.screen_size = self._json_ready(response.screen_size)
         self.pod_name = response.id
         self.name = response.name or self.name
+        self._apply_rift_flags(response)
 
     async def _create_sandbox(
         self,
@@ -646,6 +566,8 @@ class PyromindSDK:
         gpu: str | None,
         gpu_card: str | None,
         env: dict[str, str] | None = None,
+        command: list[str] | None = None,
+        entrypoint: list[str] | None = None,
     ) -> None:
         request = SandboxRequest(
             sandbox_type=SandboxType.CUSTOM,
@@ -666,6 +588,10 @@ class PyromindSDK:
             # `docker run -e`：容器环境变量。以前这里没有这个字段 ⇒ docker-rt 的
             # `docker inspect` 里有 Config.Env、容器里却读不到（`<unset>`）。
             env=dict(env) if env else None,
+            # `docker run IMG cmd` / `--entrypoint`：平台用它们和镜像 config
+            # 解析出最终 argv，交给 rift-client --supervise 当 PID1 执行。
+            command=list(command) if command else None,
+            entrypoint=list(entrypoint) if entrypoint is not None else None,
         )
         try:
             response = await self._client.create(request)
@@ -787,67 +713,222 @@ class PyromindSDK:
     ) -> dict[str, Any]:
         if not self.sandbox_id:
             raise RuntimeError("sandbox is not started")
+        if self._rift_disabled():
+            return await self._execute_legacy(action, cwd, timeout)
+        if not self.rift_ready:
+            raise RiftUnavailable(
+                "rift channel is not ready; refusing platform exec"
+            )
+        return await self._execute_rift(action, cwd, timeout)
+
+    async def _execute_legacy(
+        self,
+        action: dict[str, Any],
+        cwd: str,
+        timeout: int | None,
+    ) -> dict[str, Any]:
+        """老沙箱：经 middleware exec-stream WS 跑一条命令并收集输出。"""
         command = action.get("command", "")
-        result = await self._client.exec_command(
+        if isinstance(command, str):
+            argv = ["/bin/sh", "-c", command]
+        elif isinstance(command, (list, tuple)):
+            argv = [str(part) for part in command]
+        else:
+            raise RuntimeError(
+                f"unsupported command type: {type(command).__name__}"
+            )
+        stdout = bytearray()
+        stderr = bytearray()
+        code = -1
+        async for chunk in self._client.exec_command_stream(
             self.sandbox_id,
-            command,
+            argv,
+            cwd=cwd or self.working_dir,
+            timeout=timeout,
+        ):
+            if chunk.type == "stdout":
+                stdout += chunk.data if isinstance(chunk.data, bytes) else str(chunk.data).encode()
+            elif chunk.type == "stderr":
+                stderr += chunk.data if isinstance(chunk.data, bytes) else str(chunk.data).encode()
+            elif chunk.type == "exit":
+                code = int(chunk.returncode or 0)
+        return {
+            "output": stdout.decode("utf-8", "replace"),
+            "stderr": stderr.decode("utf-8", "replace"),
+            "returncode": code,
+            "exception_info": "",
+        }
+
+    async def _execute_rift(
+        self,
+        action: dict[str, Any],
+        cwd: str,
+        timeout: int | None,
+    ) -> dict[str, Any]:
+        if self._rift_client is None:
+            raise RiftUnavailable("rift client is not initialized")
+        command = action.get("command", "")
+        if isinstance(command, str):
+            argv = ["/bin/sh", "-c", command]
+        elif isinstance(command, (list, tuple)):
+            argv = [str(part) for part in command]
+        else:
+            raise RiftUnavailable(
+                f"unsupported command type: {type(command).__name__}"
+            )
+        stdout, stderr, code = await self._rift_client.exec_once(
+            argv,
             cwd=cwd or self.working_dir,
             timeout=timeout,
         )
         return {
-            "output": result.output or "",
-            "stderr": result.stderr or "",
-            "returncode": result.returncode,
-            "exception_info": result.exception_info or "",
+            "output": stdout.decode("utf-8", "replace"),
+            "stderr": stderr.decode("utf-8", "replace"),
+            "returncode": code,
+            "exception_info": "",
         }
 
-    def attach_exec(
-        self,
-        cmd: list[str],
-        *,
-        stdin: bool = True,
-        tty: bool = False,
-        cwd: str = "",
-    ) -> _SdkExecStreamWs:
-        # Stream output over the platform WebSocket so long-running commands are
-        # not subject to the one-shot HTTP request timeout or response buffering.
-        # Docker's -i/-it flags select this path, but stdin is intentionally not
-        # forwarded to the sandbox.
-        stop_event = threading.Event()
+    async def ping_rift_version(self) -> str | None:
+        """Build string reported by the injected rift-client (None when down).
 
-        async def _events():
-            # Token fetch is async; do it lazily inside the iterator so
-            # ``attach_exec`` (a sync method) never blocks the event loop.
-            token, api_base_url = await async_fetch_exec_stream_token(
-                self._client.exchange_base_url,
+        ``<git describe>+<source sha12>`` — two builds of the same commit differ
+        here, which is the only way to tell a stale Pod apart.
+        """
+        if self._rift_client is None:
+            return None
+        try:
+            return await self._rift_client.ping()
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def ping_rift(self) -> bool:
+        return bool(await self.ping_rift_version())
+
+    def _rift_disabled(self) -> bool:
+        """老沙箱（STS 未注入 rift-client）：exec/cp 走 middleware 旧通道。"""
+        return getattr(self, "rift_enabled", True) is False
+
+    def _apply_rift_flags(self, sandbox: Any) -> None:
+        """用平台详情里的 rift_enabled 覆盖本地判断（老中间件不带该字段则不动）。"""
+        enabled = getattr(sandbox, "rift_enabled", None)
+        if enabled is not None:
+            self.rift_enabled = bool(enabled)
+
+    async def _fetch_rift_password(self) -> str:
+        """从平台 detail 取该 sandbox 的 rift 密码；没有就把这条 sandbox 判成 legacy。
+
+        密码是 k8s_middleware 建 Pod 时跟 rift-client 一起注入的 per-sandbox
+        Secret。拿不到只有两种可能：引入 rift 之前创建的老沙箱，或凭据丢了 ——
+        两者都说明这个 Pod **没有可用的数据面**。这时回落 middleware 通道
+        （老沙箱本来就走它），而不是把沙箱卡死在 "rift-client is not ready"。
+
+        2026-11-23 用户要求兼容：7 天前创建的沙箱必须还能 exec / 开 terminal。
+        """
+        sandbox = await self._client.get_sandbox(
+            self.sandbox_id, timeout=10, retry=False
+        )
+        self._apply_rift_flags(sandbox)
+        password = str(getattr(sandbox, "rift_password", "") or "").strip()
+        if password:
+            return password
+        self.rift_enabled = False
+        self.logger.warning(
+            "sandbox=%s has no rift_password; using the middleware channel "
+            "(resume it to get a per-sandbox credential)",
+            self.sandbox_id,
+        )
+        return ""
+
+    async def _ping_rift_until_ready(self, cfg) -> None:
+        last_error: BaseException | None = None
+        for _ in range(cfg.ping_attempts):
+            try:
+                version = await self._rift_client.ping()
+            except (RiftUnauthenticated, RiftPermissionDenied):
+                # 凭据/路由授权问题不会因重试变好，交给调用方决定是否换密码
+                self.rift_ready = False
+                raise
+            except RiftMisconfigured:
+                # 到网关的路本身不通（边缘裸 HTTP 拒绝 / 入口体积限制）：
+                # 重试只是把同一个失败再等一遍，立即报错。
+                self.rift_ready = False
+                raise
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                await asyncio.sleep(cfg.ping_interval)
+                continue
+            self.rift_ready = True
+            self.rift_last_error = ""
+            self.logger.info(
+                "rift ready sandbox=%s version=%s gateway=%s",
                 self.sandbox_id,
-                self._client.api_key,
-                self._client.cluster,
+                version,
+                cfg.gateway,
             )
-            url = build_exec_stream_websocket_url(api_base_url, self.sandbox_id)
+            return
+        self.rift_ready = False
+        self.rift_last_error = str(last_error or "unknown")
+        raise RiftUnavailable(
+            f"rift-client did not answer Ping: {self.rift_last_error}"
+        )
 
-            async def _refresh_token() -> str:
-                refreshed, _ = await async_fetch_exec_stream_token(
-                    self._client.exchange_base_url,
-                    self.sandbox_id,
-                    self._client.api_key,
-                    self._client.cluster,
-                )
-                return refreshed
+    async def connect_rift(self) -> None:
+        """Ping 校验平台注入的 rift-client；不可达就硬失败。
 
-            async for chunk in iter_exec_stream_async(
-                url=url,
-                token=token,
-                command=list(cmd),
-                cwd=cwd or self.working_dir,
-                timeout=None,
-                tty=tty,
-                stop_event=stop_event,
-                refresh_token=_refresh_token,
-            ):
-                yield chunk
+        二进制与 token 由 k8s_middleware 在建 Pod 时注入（initContainer +
+        per-sandbox Secret），rift-client 以 --supervise 当 PID1。docker-rt
+        不再上传/启动任何东西：这里只建立网关连接并用 Ping 确认数据面可用。
+        网关认证用 get_sandbox 返回的 per-sandbox 密码；鉴权失败时重新拉取
+        一次密码再试（resume/edit 可能换了密码），仍失败直接抛。
+        失败抛 RiftUnavailable，调用方不得回退平台 exec 通道。
+        """
+        if not self.sandbox_id:
+            raise RiftUnavailable("sandbox is not started")
+        if self._rift_disabled():
+            self.logger.info(
+                "rift not injected for sandbox=%s (legacy); exec/cp use middleware WS",
+                self.sandbox_id,
+            )
+            return
+        # 健康检查/恢复会反复调进来，而每次都会 new 一个客户端接管 _rift_client。
+        # 先关掉上一个：WS 客户端的 aiohttp session 不随对象回收关闭，漏一次就是
+        # 一条 "Unclosed client session"（2026-11-23 实测：3 分钟内刷了 4 条）。
+        await self._close_rift()
+        gateway = await self._client.fetch_rift_gateway()
+        cfg = load_rift_config(gateway)
+        if not cfg.gateway:
+            raise RiftUnavailable(
+                "rift gateway is not configured (platform rift_gateway / "
+                "DOCKER_RT_RIFT_GATEWAY)"
+            )
+        password = await self._fetch_rift_password()
+        if self._rift_disabled():
+            self.logger.info(
+                "rift not injected for sandbox=%s (legacy); exec/cp use middleware WS",
+                self.sandbox_id,
+            )
+            return
+        self._rift_client = RiftWsClient(cfg, password, self.sandbox_id)
+        try:
+            await self._ping_rift_until_ready(cfg)
+            return
+        except (RiftUnauthenticated, RiftPermissionDenied):
+            await self._close_rift()
+        password = await self._fetch_rift_password()
+        if self._rift_disabled():
+            return
+        self._rift_client = RiftWsClient(cfg, password, self.sandbox_id)
+        await self._ping_rift_until_ready(cfg)
 
-        return _SdkExecStreamWs(_events(), stop_event, async_events=True)
+    async def _close_rift(self) -> None:
+        client = getattr(self, "_rift_client", None)
+        self._rift_client = None
+        self.rift_ready = False
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:  # noqa: BLE001
+                self.logger.debug("closing rift client failed", exc_info=True)
 
     async def iter_exec_stream(
         self,
@@ -858,41 +939,77 @@ class PyromindSDK:
         timeout: int | None = None,
         stdin_close: Any | None = None,
     ) -> AsyncIterator[SandboxExecStreamChunk]:
-        """Stream one exec command without leaving the running event loop.
-
-        Output-only: the exec-stream channel has no PTY and forwards no stdin.
-        Interactive work belongs on ``/sandboxes/{id}/terminal``.
-        """
+        """Stream one exec command: rift for injected sandboxes, middleware WS for legacy ones."""
         if not self.sandbox_id:
             raise RuntimeError("sandbox is not started")
-        token, api_base_url = await async_fetch_exec_stream_token(
-            self._client.exchange_base_url,
-            self.sandbox_id,
-            self._client.api_key,
-            self._client.cluster,
-        )
-        url = build_exec_stream_websocket_url(api_base_url, self.sandbox_id)
-
-        async def _refresh_token() -> str:
-            refreshed, _ = await async_fetch_exec_stream_token(
-                self._client.exchange_base_url,
-                self.sandbox_id,
-                self._client.api_key,
-                self._client.cluster,
+        if self._rift_disabled():
+            argv = (
+                list(cmd)
+                if isinstance(cmd, (list, tuple))
+                else ["/bin/sh", "-c", str(cmd)]
             )
-            return refreshed
-
-        async for chunk in iter_exec_stream_async(
-            url=url,
-            token=token,
-            command=list(cmd),
+            async for chunk in self._client.exec_command_stream(
+                self.sandbox_id,
+                argv,
+                cwd=cwd or self.working_dir,
+                timeout=timeout,
+                tty=tty,
+            ):
+                yield chunk
+            return
+        if not self.rift_ready:
+            raise RiftUnavailable(
+                "rift channel is not ready; refusing platform exec-stream"
+            )
+        if self._rift_client is None:
+            raise RiftUnavailable("rift client is not initialized")
+        argv = (
+            list(cmd)
+            if isinstance(cmd, (list, tuple))
+            else ["/bin/sh", "-c", str(cmd)]
+        )
+        session = await self._rift_client.open_exec(
+            argv,
             cwd=cwd or self.working_dir,
-            timeout=timeout,
             tty=tty,
-            stdin_close=stdin_close,
-            refresh_token=_refresh_token,
-        ):
-            yield chunk
+            # Non-tty exec is output-only: Opening with stdin=True made
+            # rift-client wait for `stdin_close` before sending the exit frame,
+            # while this path only closes stdin *after* the frames loop ends —
+            # a 60s deadlock that ended in RST_STREAM. The PTY path
+            # (_hijack_rift_terminal) keeps stdin=True.
+            stdin=bool(tty),
+        )
+        saw_exit = False
+        try:
+            async for frame in session.frames():
+                body = frame.WhichOneof("body")
+                if body == "stdout":
+                    yield SandboxExecStreamChunk(
+                        type="stdout", data=frame.stdout
+                    )
+                elif body == "stderr":
+                    yield SandboxExecStreamChunk(
+                        type="stderr", data=frame.stderr
+                    )
+                elif body == "exit":
+                    saw_exit = True
+                    yield SandboxExecStreamChunk(
+                        type="exit",
+                        data="",
+                        returncode=int(frame.exit.code),
+                    )
+                    break
+        except Exception:
+            # Once the exit frame is in, a following RST_STREAM is just the
+            # gateway tearing down a bidi stream the client is no longer
+            # sending on. Report success, not RIFT_UNAVAILABLE.
+            if not saw_exit:
+                raise
+        finally:
+            try:
+                await session.close_stdin()
+            except Exception:  # noqa: BLE001
+                pass
 
     def attach_main(
         self,
@@ -976,7 +1093,28 @@ class PyromindSDK:
                 if cached is not None:
                     return cached
             try:
-                sandbox = await self._client.get_sandbox(self.sandbox_id)
+                sandbox = await self._client.get_sandbox(
+                    self.sandbox_id,
+                    timeout=_PHASE_REFRESH_TIMEOUT_S,
+                    # A status probe with retries would multiply the bound.
+                    retry=False,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                # Control plane is slow, the data plane is what the caller is
+                # here for: keep the cached view and let exec/cp answer for
+                # itself instead of blocking on the client's 600s timeout.
+                logger.warning(
+                    "status refresh timed out after %.0fs sandbox=%s; "
+                    "keeping cached phase %r",
+                    _PHASE_REFRESH_TIMEOUT_S,
+                    self.sandbox_id,
+                    self.sandbox_status,
+                )
+                return (
+                    self._phase_from_status(str(self.sandbox_status or ""))
+                    if self.sandbox_status
+                    else "Unknown"
+                )
             except _SDK_API_ERRORS as exc:
                 self._phase_refreshed_at = loop.time()
                 if exc.status_code == 404:
@@ -998,6 +1136,7 @@ class PyromindSDK:
             return self._phase_from_status(status)
 
     async def cleanup(self) -> None:
+        await self._close_rift()
         if not self.sandbox_id:
             return
         sandbox_id = self.sandbox_id
@@ -1135,12 +1274,19 @@ class PyromindSDK:
     async def stop(self) -> None:
         if not self.sandbox_id:
             return
+        await self._close_rift()
         await self._client.pause(self.sandbox_id)
         self.sandbox_status = "Stopped"
 
     async def resume(self) -> None:
         if not self.sandbox_id:
             raise RuntimeError("sandbox is not started")
+        # resume creates a brand-new Pod: the platform injects rift-client as
+        # PID1 again, so there is nothing to upload here. The old gateway
+        # channel holds a possibly rotated per-sandbox password; drop it and
+        # let _start_record re-fetch credentials via connect_rift.
+        await self._close_rift()
+        self.rift_ready = False
         response = await self._client.resume(self.sandbox_id)
         self._bind_response(response)
         self._terminal_phase = None
@@ -1211,66 +1357,44 @@ class PyromindSDK:
 
     async def iter_archive_chunks(self, path: str):
         """Yield tar bytes for ``docker cp`` from a k8s-middleware sandbox."""
+        if self._rift_disabled():
+            async for chunk in self._iter_archive_chunks_legacy(path):
+                yield chunk
+            return
+        if not self.rift_ready:
+            raise RiftUnavailable(
+                "rift channel is not ready; refusing platform file API"
+            )
+        if self._rift_client is None:
+            raise RiftUnavailable("rift client is not initialized")
+        async for chunk in self._rift_client.get_archive(path):
+            yield chunk
+        return
+
+    async def _iter_archive_chunks_legacy(self, path: str):
+        """老沙箱：目录走 tar 命令（经 execute），单文件用 files/read 打包成 tar。"""
         target = path if path.startswith("/") else f"/{path}"
         parent = target.rsplit("/", 1)[0] or "/"
         base = target.rsplit("/", 1)[-1]
         stat = await self.archive_path_stat(target)
         if stat is None:
             raise FileNotFoundError(target)
-
         if stat["mode"] & 0o040000:
-            # 目录分支**不**直接 ``tar … | base64`` 走一次性 exec —— 实测（2026-10-14）：
-            # 命令退出瞬间会把管道里没送出的尾部丢掉（立刻退出 4/6 截断、末尾多活 1 秒
-            # 6/6 完好）。而固定等待不是修复。
-            # 改成：先把 tar 落到容器内临时文件，再用**带回执机制**的文件读取
-            # （read_file → middleware 读完 payload 才关 stdin，生产者不会在数据在途时退出）
-            # 把整包取回来，最后删掉临时文件。
-            tmp_name = f"/tmp/.docker-rt-cp-{uuid.uuid4().hex}.tar"
-            quoted_tmp = shlex.quote(tmp_name)
-            try:
-                result = await self.execute(
-                    {
-                        "command": (
-                            f"tar -C {shlex.quote(parent)} -cf {quoted_tmp} "
-                            f"-- {shlex.quote(base)}; rc=$?; "
-                            f"wc -c < {quoted_tmp} > /tmp/.docker-rt-cp-size; exit $rc"
-                        )
-                    },
-                    cwd="/",
-                )
-                code = int(result.get("returncode", 0) or 0)
-                if code != 0:
-                    raise RuntimeError(
-                        result.get("exception_info")
-                        or result.get("output")
-                        or f"tar failed for {target}"
-                    )
-                raw = await self._client.read_file(self.sandbox_id, tmp_name)
-                if not raw:
-                    raise RuntimeError(f"tar produced no data for {target}")
-                yield raw
-            finally:
-                try:
-                    await self.execute(
-                        {"command": f"rm -f {quoted_tmp} /tmp/.docker-rt-cp-size"},
-                        cwd="/",
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("temp tar cleanup failed for %s: %s", tmp_name, exc)
-            return
-
-        data = await self._client.read_file(self.sandbox_id, target)
-        # 对账：上面 archive_path_stat 已经拿到了文件的真实大小（容器里 wc -c），
-        # 而 tar 头若用 len(data) —— 即「实际收到的字节数」—— 来写，一旦上游
-        # 的流被截断，就会产出一个**自洽**的 tar：docker cp 解开它、安静地写出
-        # 一个缺尾的文件、退出码 0、两边日志都干净。所以先比大小再打包。
-        expected = int(stat.get("size") or 0)
-        if expected and len(data) < expected:
-            raise RuntimeError(
-                f"short read for {target}: got {len(data)} of {expected} bytes — "
-                "the file read stream was truncated; refusing to emit a "
-                "self-consistent truncated tar"
+            script = (
+                f"tar -C {shlex.quote(parent)} -cf - {shlex.quote(base)} "
+                "| base64 -w0"
             )
+            result = await self.execute({"command": script}, cwd="/")
+            code = int(result.get("returncode", 0) or 0)
+            if code != 0:
+                raise RuntimeError(
+                    result.get("exception_info")
+                    or result.get("output")
+                    or f"tar failed for {target}"
+                )
+            yield base64.b64decode(str(result.get("output") or ""))
+            return
+        data = await self._client.read_file(self.sandbox_id, target)
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w") as tar:
             info = tarfile.TarInfo(name=base or "/")
@@ -1279,21 +1403,73 @@ class PyromindSDK:
             tar.addfile(info, io.BytesIO(data))
         yield buf.getvalue()
 
-    async def put_archive(self, dest_path: str, tar_bytes: bytes) -> None:
-        """Extract ``docker cp`` tar bytes into a k8s-middleware sandbox."""
+    async def put_archive(
+        self, dest_path: str, tar: bytes | AsyncIterator[bytes]
+    ) -> None:
+        """Extract a ``docker cp`` tar into a k8s-middleware sandbox.
+
+        Two shapes:
+
+        * one regular file larger than ``_CP_PARALLEL_MIN_BYTES`` — split into
+          ``_CP_PART_BYTES`` parts sent over ``_CP_STREAMS`` concurrent
+          ``PutArchive`` streams, then assembled in the Pod. A single stream is
+          bounded by the front proxy's HTTP/2 flow-control window: from a
+          high-RTT client that is ~0.1–0.3 MiB/s, while four streams measured
+          ~12x the single-stream rate (2026-10-30);
+        * anything else (directories, symlinks, small files) — one validated
+          stream, exactly as before.
+
+        Either way the bytes we sent must be accounted for by rift-client;
+        otherwise the copy must not look successful.
+        """
+        if self._rift_disabled():
+            await self._put_archive_legacy(dest_path, tar)
+            return
+        if not self.rift_ready:
+            raise RiftUnavailable(
+                "rift channel is not ready; refusing platform file API"
+            )
+        if self._rift_client is None:
+            raise RiftUnavailable("rift client is not initialized")
         dest = dest_path or "/"
-        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r") as tar:
-            for member in tar.getmembers():
+
+        if isinstance(tar, (bytes, bytearray, memoryview)):
+            payload = bytes(tar)
+            validate_tar_members(payload)
+            await self._put_archive_single(dest, payload, len(payload))
+            return
+
+        # A live stream cannot be inspected (or replayed) in place: spool it so
+        # one code path can validate the archive, decide between the parallel
+        # and single-stream shapes, and still deliver every byte.
+        with tempfile.TemporaryFile(prefix="drt-cp-") as spool:
+            size = 0
+            async for chunk in tar:
+                if chunk:
+                    spool.write(chunk)
+                    size += len(chunk)
+            if size == 0:
+                raise RiftUnavailable(
+                    "docker cp: the upload body was empty, nothing to extract"
+                )
+            await self._put_archive_spooled(dest, spool, size)
+
+    async def _put_archive_legacy(self, dest_path: str, tar: Any) -> None:
+        """老沙箱：解析 tar，用 execute 建目录、files/write 写文件。"""
+        if not isinstance(tar, (bytes, bytearray, memoryview)):
+            payload = bytearray()
+            async for chunk in tar:
+                if chunk:
+                    payload += chunk
+            tar = bytes(payload)
+        dest = dest_path or "/"
+        with tarfile.open(fileobj=io.BytesIO(bytes(tar)), mode="r") as archive:
+            for member in archive.getmembers():
                 name = member.name.lstrip("/")
-                normalized = posixpath.normpath(name)
-                if (
-                    normalized == ".."
-                    or normalized.startswith("../")
-                    or posixpath.isabs(normalized)
-                ):
-                    raise ValueError(f"unsafe path in tar archive: {member.name!r}")
+                target = posixpath.join(dest, name)
+                if not dest.endswith("/") and name == posixpath.basename(dest):
+                    target = dest
                 if member.isdir():
-                    target = posixpath.join(dest, name)
                     await self.execute(
                         {"command": f"mkdir -p {shlex.quote(target)}"},
                         cwd="/",
@@ -1301,12 +1477,132 @@ class PyromindSDK:
                     continue
                 if not member.isfile():
                     continue
-                content = tar.extractfile(member)
+                content = archive.extractfile(member)
                 data = content.read() if content is not None else b""
-                target = posixpath.join(dest, name)
-                if not dest.endswith("/") and name == posixpath.basename(dest):
-                    target = dest
                 await self._client.write_file(self.sandbox_id, target, data)
+
+    async def _put_archive_spooled(self, dest: str, spool: Any, size: int) -> None:
+        spool.seek(0)
+        members = validate_tar_file(spool)
+        spool.seek(0)
+
+        if (
+            len(members) == 1
+            and members[0].isreg()
+            and members[0].size > 0
+            and size >= _CP_PARALLEL_MIN_BYTES
+            and _CP_STREAMS > 1
+        ):
+            if await self._put_archive_parallel(dest, spool, members[0]):
+                return
+            spool.seek(0)
+
+        await self._put_archive_single(dest, _spool_reader(spool), size)
+
+    async def _put_archive_single(
+        self, dest: str, data: Any, size: int
+    ) -> None:
+        written = await self._rift_client.put_archive(dest, data)
+        if written != size:
+            raise RiftUnavailable(
+                f"docker cp: rift-client received {written} of {size} bytes; "
+                "refusing to report the copy as successful"
+            )
+        logger.info(
+            "archive put done sandbox=%s dest=%s bytes=%d written=%d",
+            self.sandbox_id,
+            dest,
+            size,
+            written,
+        )
+
+    async def _put_archive_parallel(
+        self, dest: str, spool: Any, member: Any
+    ) -> bool:
+        """Send one big regular file as N concurrent parts; assemble in the Pod.
+
+        Returns False when the Pod cannot be prepared, so the caller can fall
+        back to the single validated stream instead of failing the copy.
+        """
+        staging = f"/tmp/.drt-cp-{uuid.uuid4().hex}"
+        prepared = await self.execute(
+            {"command": f"mkdir -p {shlex.quote(staging)}"}, cwd="/"
+        )
+        if int(prepared.get("returncode", 0) or 0) != 0:
+            logger.warning(
+                "docker cp: cannot create staging dir for %s; using one stream",
+                member.name,
+            )
+            return False
+
+        started = time.monotonic()
+        sem = asyncio.Semaphore(_CP_STREAMS)
+        parts: list[tuple[int, int]] = []
+        offset = int(member.offset_data)
+        for index, _ in enumerate(range(0, member.size, _CP_PART_BYTES)):
+            parts.append((index, offset + index * _CP_PART_BYTES))
+
+        async def send(index: int, start: int) -> None:
+            spool.seek(start)
+            data = spool.read(min(_CP_PART_BYTES, offset + member.size - start))
+            if not data:
+                return
+            frame = _member_tar(f"part-{index:05d}", data)
+            async with sem:
+                await self._rift_client.put_archive(staging, frame)
+
+        try:
+            await asyncio.gather(*(send(i, o) for i, o in parts))
+        except Exception:
+            await self._remove_staging(staging)
+            raise
+
+        target = posixpath.join(dest, member.name)
+        parent = posixpath.dirname(target) or "/"
+        assemble = (
+            f"set -e; cd {shlex.quote(staging)}; "
+            f"cat part-* > payload; "
+            f"chmod {member.mode & 0o777:o} payload; "
+            # docker cp preserves mtime; the single-stream path gets it from tar.
+            f"touch -d @{int(member.mtime)} payload 2>/dev/null || true; "
+            f"mkdir -p {shlex.quote(parent)}; "
+            f"mv -f payload {shlex.quote(target)}; "
+            f"cd /; rm -rf {shlex.quote(staging)}"
+        )
+        try:
+            result = await self.execute({"command": assemble}, cwd="/")
+            code = int(result.get("returncode", 0) or 0)
+        except Exception as exc:  # noqa: BLE001
+            await self._remove_staging(staging)
+            raise RiftUnavailable(
+                f"docker cp: assembling {member.name} failed: {exc}"
+            ) from exc
+        if code != 0:
+            await self._remove_staging(staging)
+            raise RiftUnavailable(
+                f"docker cp: assembling {member.name} failed: "
+                f"{result.get('stderr') or result.get('output') or f'exit {code}'}"
+            )
+        logger.info(
+            "archive put done sandbox=%s dest=%s name=%s bytes=%d parts=%d "
+            "streams=%d elapsed=%.1fs",
+            self.sandbox_id,
+            dest,
+            member.name,
+            member.size,
+            len(parts),
+            _CP_STREAMS,
+            time.monotonic() - started,
+        )
+        return True
+
+    async def _remove_staging(self, staging: str) -> None:
+        try:
+            await self.execute(
+                {"command": f"rm -rf {shlex.quote(staging)}"}, cwd="/"
+            )
+        except Exception:  # noqa: BLE001 - best effort
+            logger.debug("staging cleanup failed for %s", staging, exc_info=True)
 
     def patch_pod_metadata(self, **kwargs: Any) -> None:
         return None
@@ -1327,6 +1623,11 @@ class PyromindSDK:
             resources=sandbox.resources or self._resources,
             volume_mounts=sandbox.volume_mounts,
             port_mappings=sandbox.port_mappings,
+            # 必须带上：平台的 edit 见到 image 就会按请求里的 command/entrypoint
+            # 重解析 argv。漏了它们，一次 rename 就会把用户的主进程命令悄悄换成
+            # 镜像默认值（Docker 的 rename 绝不改配置）。
+            command=list(self.command) if self.command else None,
+            entrypoint=list(self.entrypoint) if self.entrypoint is not None else None,
         )
 
     async def rename(self, new_name: str) -> None:

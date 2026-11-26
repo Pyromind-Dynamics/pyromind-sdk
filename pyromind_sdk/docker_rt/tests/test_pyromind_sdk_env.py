@@ -1,14 +1,13 @@
 from __future__ import annotations
 
+import logging
 import asyncio
 import io
 import json
 import tarfile
-import threading
-import time
 import weakref
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 from pyromind_sdk.client.models import (
@@ -34,23 +33,14 @@ from ..aio_server import (
 from ..api.images import image_id
 from ..backend.pyromind_sdk_env import PyromindSDK, _OneShotWs
 from ..backend import pyromind_sdk_env as env_mod
-from ..backend.pyromind_sdk_env import _SdkExecStreamWs
 from ..backend.reconcile import _container_state_from_status
 from ..backend.store import ContainerRecord, ContainerState
 
 
-@pytest.fixture(autouse=True)
-def _stub_exec_stream_token(monkeypatch):
-    """Unit tests must not perform a real token exchange for exec-stream."""
-
-    async def fake_token(*_args, **_kwargs):
-        return "test-token", "https://direct.example/api/v1"
-
-    monkeypatch.setattr(env_mod, "async_fetch_exec_stream_token", fake_token)
-
-
 def _adapter_with_fake_client() -> tuple[PyromindSDK, MagicMock]:
     adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.logger = logging.getLogger("docker_rt.test")
+    adapter.rift_ready = False
     adapter.sandbox_id = "sb-test-1"
     adapter.name = "old-name"
     adapter.image = "busybox:1.36"
@@ -114,13 +104,14 @@ def test_shared_async_client_starts_at_the_portal(
     """All requests start at the portal; the exchange returns the direct base."""
     monkeypatch.setenv("PYROMIND_API_KEY", "test-key")
     monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
-    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-1")
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-1#pre")
 
     client = env_mod.new_sandbox_client()
 
     assert client.base_url == "https://api-portal.pyromind.ai/api/v1"
     assert client.exchange_base_url == client.base_url
-    assert client.cluster == "us-west-1"
+    # token 交换需要环境后缀（中间件按 #pre 选集群），原样保留
+    assert client.cluster == "us-west-1#pre"
 
 
 def test_shared_async_client_keeps_an_explicit_base_url(
@@ -156,6 +147,8 @@ def test_close_sandbox_client_clears_shared_singleton() -> None:
 
 def test_rename_keeps_other_fields_and_updates_name():
     adapter, client = _adapter_with_fake_client()
+    adapter.command = ["python", "app.py"]
+    adapter.entrypoint = ["/usr/bin/tini", "--"]
 
     asyncio.run(adapter.rename("new-name"))
 
@@ -164,6 +157,22 @@ def test_rename_keeps_other_fields_and_updates_name():
     assert request.image == "busybox:1.36"
     assert request.port_mappings[0].container_port == 80
     assert adapter.name == "new-name"
+    # 平台 edit 见到 image 就重解析 argv：rename 必须带上原始 command/entrypoint，
+    # 否则用户的主进程命令会被悄悄换成镜像默认值。
+    assert request.command == ["python", "app.py"]
+    assert request.entrypoint == ["/usr/bin/tini", "--"]
+
+
+def test_rename_without_command_sends_none_not_empty_list():
+    adapter, client = _adapter_with_fake_client()
+    adapter.command = []
+    adapter.entrypoint = None
+
+    asyncio.run(adapter.rename("new-name"))
+
+    request = client.update.call_args.args[1]
+    assert request.command is None
+    assert request.entrypoint is None
 
 
 def test_restart_pauses_then_resumes():
@@ -304,7 +313,7 @@ def test_refresh_phase_does_not_refetch_after_not_found():
     assert asyncio.run(adapter.refresh_phase()) == "NotFound"
     assert asyncio.run(adapter.refresh_phase(force=True)) == "NotFound"
 
-    client.get_sandbox.assert_called_once_with("sb-test-1")
+    client.get_sandbox.assert_called_once_with("sb-test-1", timeout=ANY, retry=False)
 
 
 def test_refresh_phase_singleflights_status_requests():
@@ -320,7 +329,7 @@ def test_refresh_phase_singleflights_status_requests():
 
     asyncio.run(run())
 
-    client.get_sandbox.assert_called_once_with("sb-test-1")
+    client.get_sandbox.assert_called_once_with("sb-test-1", timeout=ANY, retry=False)
     assert adapter.sandbox_status == "stopped"
 
 
@@ -438,186 +447,24 @@ def test_archive_path_stat_uses_shell_exec(monkeypatch: MonkeyPatch) -> None:
     assert stat["size"] == 123
 
 
-def test_attach_exec_preserves_argv_quoting(monkeypatch: MonkeyPatch):
-    """argv (e.g. ``sh -c '<script>'``) must be sent as a list, not space-joined."""
-    adapter, client = _adapter_with_fake_client()
-    captured = {}
+def test_running_container_is_pending_until_rift_is_ready() -> None:
+    record = _record("custom")
+    record.state = ContainerState.RUNNING
+    record.kube_env.sandbox_status = "Running"
 
-    def fake_stream(**kwargs):
-        captured.update(kwargs)
+    record.kube_env.rift_ready = False
+    assert _display_status(record) == "pending"
+    assert _display_status_text(record) == "Created"
 
-        async def events():
-            yield SimpleNamespace(type="stdout", data="OK\n")
-            yield SimpleNamespace(type="exit", returncode=0)
+    record.kube_env.rift_ready = True
+    assert _display_status(record) == "running"
+    assert _display_status_text(record) == "Up"
 
-        return events()
-
-    monkeypatch.setattr(env_mod, "iter_exec_stream_async", fake_stream)
-
-    adapter.working_dir = "/workspace"
-    ws = adapter.attach_exec(
-        ["sh", "-c", "test -d /home/user && echo OK || echo NOT_EXIST"],
-        stdin=False,
-        tty=False,
-        cwd="",
-    )
-
-    # The token is fetched lazily inside the async iterator, so the stream
-    # arguments become visible once the background reader starts consuming.
-    for _ in range(100):
-        ws.update(timeout=0.01)
-        if ws.peek_stdout() and not ws.is_open():
-            break
-    assert captured["command"] == [
-        "sh", "-c", "test -d /home/user && echo OK || echo NOT_EXIST"
-    ]
-    assert captured["tty"] is False
-    assert captured["cwd"] == "/workspace"
-    assert captured["timeout"] is None
-    assert captured["stop_event"].is_set() is False
-    assert ws.read_stdout() == b"OK\n"
-    assert ws.returncode == 0
-    assert client.exec_command_stream.call_count == 0
-
-
-def test_attach_exec_surfaces_stream_errors(monkeypatch: MonkeyPatch):
-    adapter, _ = _adapter_with_fake_client()
-
-    def fake_stream(**kwargs):
-        async def events():
-            yield SimpleNamespace(type="stdout", data="partial\n")
-            raise RuntimeError("stream disconnected")
-
-        return events()
-
-    monkeypatch.setattr(env_mod, "iter_exec_stream_async", fake_stream)
-
-    ws = adapter.attach_exec(["echo", "hi"], stdin=False, tty=False)
-    for _ in range(100):
-        ws.update(timeout=0.01)
-        if not ws.is_open():
-            break
-
-    assert ws.read_stdout() == b"partial\n"
-    assert ws.read_stderr() == b"exec stream error: stream disconnected\n"
-    assert ws.returncode == 1
-
-
-def test_attach_exec_interactive_streams_output_with_tty(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    adapter, _ = _adapter_with_fake_client()
-    captured = {}
-
-    def fake_stream(**kwargs):
-        captured.update(kwargs)
-
-        async def events():
-            yield SimpleNamespace(type="stdout", data=b"ready\n")
-            yield SimpleNamespace(type="exit", returncode=0)
-
-        return events()
-
-    monkeypatch.setattr(env_mod, "iter_exec_stream_async", fake_stream)
-
-    ws = adapter.attach_exec(["bash"], stdin=True, tty=True)
-    for _ in range(100):
-        if captured:
-            break
-        time.sleep(0.01)
-    assert captured["command"] == ["bash"]
-    assert captured["tty"] is True
-    for _ in range(100):
-        ws.update(timeout=0.01)
-        if ws.peek_stdout() and not ws.is_open():
-            break
-    assert ws.read_stdout() == b"ready\n"
-
-
-def test_exec_stream_completes_when_output_queue_was_full(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(env_mod, "_EXEC_STREAM_QUEUE_SIZE", 2)
-
-    def events():
-        yield SimpleNamespace(type="stdout", data=b"one")
-        yield SimpleNamespace(type="stdout", data=b"two")
-        yield SimpleNamespace(type="exit", returncode=7)
-
-    ws = _SdkExecStreamWs(events())
-    time.sleep(0.6)
-
-    for _ in range(20):
-        ws.update(timeout=0.01)
-        if not ws.is_open():
-            break
-
-    assert ws.is_open() is False
-    assert ws.read_stdout() == b"onetwo"
-    assert ws.returncode == 7
-
-
-def test_exec_stream_preserves_binary_output() -> None:
-    def events():
-        yield SimpleNamespace(type="stdout", data=b"\x00\xff\xe4")
-        yield SimpleNamespace(type="stderr", data=b"\xfe\x01")
-        yield SimpleNamespace(type="exit", returncode=0)
-
-    ws = _SdkExecStreamWs(events())
-    for _ in range(20):
-        ws.update(timeout=0.01)
-        if not ws.is_open():
-            break
-
-    assert ws.read_stdout() == b"\x00\xff\xe4"
-    assert ws.read_stderr() == b"\xfe\x01"
-
-
-def test_async_exec_stream_uses_one_reader_thread(monkeypatch: MonkeyPatch) -> None:
-    adapter, _ = _adapter_with_fake_client()
-    starting_threads = threading.active_count()
-    seen_threads = []
-
-    def fake_stream(**kwargs):
-        async def events():
-            seen_threads.append(threading.active_count())
-            yield SimpleNamespace(type="exit", returncode=0)
-
-        return events()
-
-    monkeypatch.setattr(env_mod, "iter_exec_stream_async", fake_stream)
-
-    ws = adapter.attach_exec(["true"], stdin=False, tty=False)
-    for _ in range(100):
-        ws.update(timeout=0.01)
-        if not ws.is_open():
-            break
-
-    assert seen_threads == [starting_threads + 1]
-
-
-def test_async_exec_stream_close_stops_reader(monkeypatch: MonkeyPatch) -> None:
-    adapter, _ = _adapter_with_fake_client()
-    stopped = threading.Event()
-
-    def fake_stream(**kwargs):
-        stop_event = kwargs["stop_event"]
-
-        async def events():
-            while not stop_event.is_set():
-                await asyncio.sleep(0.01)
-            stopped.set()
-            if False:
-                yield SimpleNamespace(type="exit", returncode=0)
-
-        return events()
-
-    monkeypatch.setattr(env_mod, "iter_exec_stream_async", fake_stream)
-
-    ws = adapter.attach_exec(["cat"], stdin=True, tty=True)
-    ws.close()
-
-    assert stopped.wait(timeout=1)
+    # A stopped container is not gated by rift readiness.
+    record.kube_env.rift_ready = False
+    record.state = ContainerState.EXITED
+    record.kube_env.sandbox_status = "Stopped"
+    assert _display_status(record) == "stopped"
 
 
 def test_container_state_from_status_hides_pending_from_running_ps() -> None:
@@ -648,29 +495,110 @@ def test_refresh_record_state_queries_backend_before_lifecycle() -> None:
     )
     asyncio.run(_refresh_record_state(record))
 
-    client.get_sandbox.assert_called_once_with("sb-pending")
+    client.get_sandbox.assert_called_once_with("sb-pending", timeout=ANY, retry=False)
     assert record.state == ContainerState.CREATED
 
 
 def test_put_archive_writes_files_into_sandbox() -> None:
     adapter, client = _adapter_with_fake_client()
+    adapter.rift_ready = True
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
         info = tarfile.TarInfo(name="hello.txt")
         info.size = 5
         tar.addfile(info, io.BytesIO(b"hello"))
+    payload = buf.getvalue()
+    rift = SimpleNamespace(put_archive=AsyncMock(return_value=len(payload)))
+    adapter._rift_client = rift
 
-    asyncio.run(adapter.put_archive("/var", buf.getvalue()))
+    asyncio.run(adapter.put_archive("/var", payload))
 
-    client.write_file.assert_called_once()
-    args = client.write_file.call_args.args
-    assert args[0] == "sb-test-1"
-    assert args[1] == "/var/hello.txt"
-    assert args[2] == b"hello"
+    rift.put_archive.assert_awaited_once_with("/var", payload)
+    client.write_file.assert_not_called()
+
+
+def _tar_with_hello() -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(name="hello.txt")
+        info.size = 5
+        tar.addfile(info, io.BytesIO(b"hello"))
+    return buf.getvalue()
+
+
+def test_put_archive_refuses_success_when_nothing_was_written() -> None:
+    """rift 回 0 字节时 `docker cp` 不能报成功。
+
+    2026-10-30 现场：旧的 daemon 把异步 ``put_archive`` 当同步调用（没 await），
+    结果什么都没发、HTTP 却回 200，CLI 打印 "Successfully copied" 而文件不存在。
+    """
+    from ...rift.errors import RiftUnavailable
+
+    adapter, _client = _adapter_with_fake_client()
+    adapter.rift_ready = True
+    rift = SimpleNamespace(put_archive=AsyncMock(return_value=0))
+    adapter._rift_client = rift
+
+    try:
+        asyncio.run(adapter.put_archive("/var", _tar_with_hello()))
+    except RiftUnavailable as exc:
+        assert "0 of" in str(exc)
+    else:
+        raise AssertionError("expected RiftUnavailable when 0 bytes were written")
+
+
+def test_put_archive_refuses_partial_transfer() -> None:
+    from ...rift.errors import RiftUnavailable
+
+    adapter, _client = _adapter_with_fake_client()
+    adapter.rift_ready = True
+    payload = _tar_with_hello()
+    rift = SimpleNamespace(put_archive=AsyncMock(return_value=len(payload) - 1))
+    adapter._rift_client = rift
+
+    try:
+        asyncio.run(adapter.put_archive("/var", payload))
+    except RiftUnavailable as exc:
+        assert "of" in str(exc)
+    else:
+        raise AssertionError("expected RiftUnavailable on a truncated transfer")
+
+
+def test_put_archive_streams_and_counts_bytes() -> None:
+    """流式入口也要能算出准确字节数（大 tar 不进内存）。"""
+    adapter, _client = _adapter_with_fake_client()
+    adapter.rift_ready = True
+    payload = _tar_with_hello()
+    seen: dict[str, object] = {}
+
+    async def fake_put(dest, chunks):
+        total = 0
+        if hasattr(chunks, "__aiter__"):
+            async for chunk in chunks:
+                total += len(chunk)
+        else:
+            for chunk in chunks:
+                total += len(chunk)
+        seen["dest"] = dest
+        seen["total"] = total
+        return total
+
+    adapter._rift_client = SimpleNamespace(put_archive=fake_put)
+
+    async def source():
+        yield payload[:7]
+        yield payload[7:]
+
+    asyncio.run(adapter.put_archive("/var/", source()))
+
+    assert seen == {"dest": "/var/", "total": len(payload)}
 
 
 def test_put_archive_rejects_path_traversal() -> None:
     adapter, client = _adapter_with_fake_client()
+    adapter.rift_ready = True
+    rift = SimpleNamespace(put_archive=AsyncMock())
+    adapter._rift_client = rift
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
         info = tarfile.TarInfo(name="../../etc/passwd")
@@ -683,6 +611,7 @@ def test_put_archive_rejects_path_traversal() -> None:
         assert "unsafe path" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+    rift.put_archive.assert_not_awaited()
     client.write_file.assert_not_called()
 
 
@@ -736,7 +665,7 @@ def test_wait_until_running_returns_when_up() -> None:
     asyncio.run(adapter.wait_until_running())
 
     assert adapter.sandbox_status == "running"
-    client.get_sandbox.assert_called_once_with("sb-wait")
+    client.get_sandbox.assert_called_once_with("sb-wait", timeout=ANY, retry=False)
 
 
 def test_wait_until_running_raises_on_failed_status() -> None:
@@ -834,6 +763,10 @@ def _record(type_: str) -> ContainerRecord:
     adapter.resources = {}
     adapter.volume_mounts = []
     adapter.port_mappings = []
+    # Most tests are about lifecycle/list output, not the rift gate; a fixture
+    # that is exec-ready keeps `docker ps` semantics unchanged. The gate itself
+    # is covered by test_running_container_is_pending_until_rift_is_ready.
+    adapter.rift_ready = True
 
     return ContainerRecord(
         id=f"sb-{type_}",
@@ -1002,6 +935,7 @@ def test_standard_filters_match_record() -> None:
     adapter.sandbox_id = "sb-demo"
     adapter.sandbox_status = "Running"
     adapter.sandbox_type = "custom"
+    adapter.rift_ready = True
     adapter.resources = {}
     adapter.volume_mounts = []
     adapter.port_mappings = []
@@ -1178,49 +1112,10 @@ def test_id_filter_uses_docker_id_not_sandbox_id() -> None:
     assert _matches_filters(record, {"id": ["sb-different"]}) is False
 
 
-def test_pyromind_terminal_exchange_uses_portal_base(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    from ..aio_server import _pyromind_terminal_exchange
-
-    monkeypatch.setenv(
-        "PYROMIND_BASE_URL", "https://api-portal.pyromind.ai/api/v1"
-    )
-    monkeypatch.delenv("PYROMIND_API_KEY", raising=False)
-    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2")
-
-    base, cluster, api_key = _pyromind_terminal_exchange()
-
-    assert base == "https://api-portal.pyromind.ai/api/v1"
-    assert cluster == "us-west-2"
-    assert api_key == ""
 
 
-def test_pyromind_terminal_url_carries_command_and_size() -> None:
-    """``docker exec -it <cid> <cmd>`` must reach the PTY as an argv.
 
-    Without this the terminal side would open its login shell and the command
-    the user typed would be silently dropped.
-    """
-    from pyromind_sdk.terminal import build_terminal_websocket_url
 
-    url = build_terminal_websocket_url(
-        "https://api-us-west-2.pyromind.ai/api/v1",
-        "sb-1",
-        cols=132,
-        rows=43,
-        command=["bash", "-l"],
-        cwd="/workspace",
-    )
-
-    assert url.startswith(
-        "wss://api-us-west-2.pyromind.ai/api/v1/sandboxes/sb-1/terminal?"
-    )
-    assert "cols=132&rows=43" in url
-    assert "command=bash" in url
-    assert "command=-l" in url
-    assert "cwd=%2Fworkspace" in url
-    assert "token=" not in url
 
 
 # ---------------------------------------------------------------------------
@@ -1366,3 +1261,354 @@ def test_inspect_without_a_resolved_ip_keeps_the_field_empty(
     result = _to_inspect(record, pod_ip="")
 
     assert result["NetworkSettings"]["IPAddress"] == ""
+
+
+def test_refresh_phase_is_bounded_when_the_control_plane_stalls(monkeypatch):
+    """控制面卡住不能把 exec/cp 一起拖死（客户端默认超时是 600s）。
+
+    2026-10-30 本地实测：`pre-api` 抖动时，1 MiB 的 `docker cp` 先卡了 109.6s
+    才进入传输。刷新必须有自己的上限，超时就沿用缓存状态。
+    """
+    import time as _time
+
+    from ..backend import pyromind_sdk_env as envmod
+
+    adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.sandbox_id = "sb-slow"
+    adapter.sandbox_status = "running"
+    adapter._terminal_phase = None
+    adapter._phase_refreshed_at = 0.0
+
+    class _SlowClient:
+        # Enforce the per-request timeout like aiohttp does.
+        async def get_sandbox(self, *args, **kwargs):
+            timeout = kwargs.get("timeout")
+            if timeout:
+                await asyncio.sleep(timeout)
+                raise asyncio.TimeoutError()
+            await asyncio.sleep(10)
+
+    adapter._client = _SlowClient()
+    monkeypatch.setattr(envmod, "_PHASE_REFRESH_TIMEOUT_S", 0.05)
+
+    started = _time.monotonic()
+    phase = asyncio.run(adapter.refresh_phase(force=True))
+    elapsed = _time.monotonic() - started
+
+    assert elapsed < 2, f"refresh took {elapsed:.1f}s; it must be bounded"
+    assert phase == "Running", "超时后应沿用缓存状态，而不是 Unknown/失败"
+
+
+def _parallel_adapter(monkeypatch, *, execute_rc=0):
+    """PyromindSDK 替身：记录每条 rift put_archive 与每次 exec。"""
+    from ..backend import pyromind_sdk_env as envmod
+
+    calls = {"puts": [], "execs": []}
+
+    class _Rift:
+        async def put_archive(self, dest, data):
+            if isinstance(data, (bytes, bytearray, memoryview)):
+                payload = bytes(data)
+            elif hasattr(data, "__aiter__"):
+                payload = b"".join([chunk async for chunk in data])
+            else:
+                payload = b"".join(list(data))
+            calls["puts"].append((dest, payload))
+            return len(payload)
+
+    adapter = PyromindSDK.__new__(PyromindSDK)
+    adapter.sandbox_id = "sb-par"
+    adapter.rift_ready = True
+    adapter._rift_client = _Rift()
+
+    async def _execute(action, cwd="", **kwargs):
+        command = action["command"]
+        calls["execs"].append(command)
+        # mkdir 总是成功，只有"组装"那一步受 execute_rc 控制
+        rc = 0 if command.startswith("mkdir") else execute_rc
+        return {"output": "", "stderr": "", "returncode": rc}
+
+    adapter.execute = _execute  # type: ignore[method-assign]
+    monkeypatch.setattr(envmod, "_CP_PARALLEL_MIN_BYTES", 1)
+    monkeypatch.setattr(envmod, "_CP_PART_BYTES", 1 << 20)
+    monkeypatch.setattr(envmod, "_CP_STREAMS", 2)
+    return adapter, calls
+
+
+def _one_file_tar(name: str, body: bytes) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(name=name)
+        info.size = len(body)
+        info.mode = 0o640
+        tar.addfile(info, io.BytesIO(body))
+    return buf.getvalue()
+
+
+def test_big_single_file_is_split_into_parallel_parts(monkeypatch):
+    import asyncio as _asyncio
+
+    body = b"x" * (3 * 1024 * 1024 + 7)  # 1 MiB parts -> 4 parts
+    frame = _one_file_tar("big.bin", body)
+    adapter, calls = _parallel_adapter(monkeypatch)
+
+    async def source():
+        yield frame
+
+    _asyncio.run(adapter.put_archive("/var", source()))
+
+    staging = [dest for dest, _ in calls["puts"]]
+    assert staging and all(d.startswith("/tmp/.drt-cp-") for d in staging), staging
+    assert len(staging) == 4, "3MiB+7 with 1MiB parts is four part streams"
+
+    # 每个分片都是单成员 tar，名字按序号；拼起来必须等于原文件
+    joined = b""
+    for index, (_dest, payload) in enumerate(calls["puts"]):
+        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as tar:
+            member = tar.next()
+            assert member.name == f"part-{index:05d}"
+            joined += tar.extractfile(member).read()
+    assert joined == body
+
+    assert calls["execs"][0].startswith("mkdir -p /tmp/.drt-cp-")
+    assemble = calls["execs"][-1]
+    assert "cat part-*" in assemble
+    assert "mv -f payload /var/big.bin" in assemble
+    assert "chmod 640 payload" in assemble
+
+
+def test_directory_archive_stays_one_stream(monkeypatch):
+    import asyncio as _asyncio
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for name, body in (("d/a.txt", b"a"), ("d/b.txt", b"bb")):
+            info = tarfile.TarInfo(name)
+            info.size = len(body)
+            tar.addfile(info, io.BytesIO(body))
+    frame = buf.getvalue()
+    adapter, calls = _parallel_adapter(monkeypatch)
+
+    async def source():
+        yield frame
+
+    _asyncio.run(adapter.put_archive("/var", source()))
+
+    assert [dest for dest, _ in calls["puts"]] == ["/var"]
+    assert calls["puts"][0][1] == frame
+    assert calls["execs"] == [], "多成员归档不能走分片/组装"
+
+
+def test_assembly_failure_is_loud_and_cleans_up(monkeypatch):
+    import asyncio as _asyncio
+
+    from pyromind_sdk.rift.errors import RiftUnavailable
+
+    body = b"y" * (2 * 1024 * 1024)
+    frame = _one_file_tar("big.bin", body)
+    adapter, calls = _parallel_adapter(monkeypatch, execute_rc=2)
+
+    async def source():
+        yield frame
+
+    try:
+        _asyncio.run(adapter.put_archive("/var", source()))
+    except RiftUnavailable as exc:
+        assert "assembling big.bin failed" in str(exc)
+    else:
+        raise AssertionError("组装失败必须报错，不能当成功")
+    assert any(script.startswith("rm -rf /tmp/.drt-cp-") for script in calls["execs"])
+
+@pytest.mark.asyncio
+async def test_legacy_sandbox_exec_stream_uses_middleware_ws():
+    """老沙箱（rift_enabled=False）exec 回退 middleware exec-stream WS。"""
+    from types import SimpleNamespace
+
+    adapter, client = _adapter_with_fake_client()
+    adapter.rift_enabled = False
+    adapter.rift_ready = False
+    seen = {}
+
+    async def fake_stream(sandbox_id, command, cwd="", timeout=None, tty=False):
+        seen.update(sandbox_id=sandbox_id, command=command, cwd=cwd, tty=tty)
+        yield SimpleNamespace(type="stdout", data=b"ok\n")
+        yield SimpleNamespace(type="exit", data="", returncode=0)
+
+    client.exec_command_stream = fake_stream
+
+    chunks = [c async for c in adapter.iter_exec_stream(["echo", "hi"], cwd="/w")]
+    assert [c.type for c in chunks] == ["stdout", "exit"]
+    assert seen["sandbox_id"] == "sb-test-1"
+    assert seen["command"] == ["echo", "hi"]
+    assert seen["cwd"] == "/w"
+
+
+@pytest.mark.asyncio
+async def test_legacy_sandbox_execute_collects_platform_output():
+    from types import SimpleNamespace
+
+    adapter, client = _adapter_with_fake_client()
+    adapter.rift_enabled = False
+    adapter.rift_ready = False
+
+    async def fake_stream(sandbox_id, command, cwd="", timeout=None, tty=False):
+        yield SimpleNamespace(type="stdout", data=b"hi\n")
+        yield SimpleNamespace(type="stderr", data=b"warn\n")
+        yield SimpleNamespace(type="exit", data="", returncode=3)
+
+    client.exec_command_stream = fake_stream
+
+    result = await adapter.execute({"command": "echo hi"})
+    assert result["returncode"] == 3
+    assert result["output"] == "hi\n"
+    assert result["stderr"] == "warn\n"
+
+
+@pytest.mark.asyncio
+async def test_legacy_sandbox_connect_rift_skips_ping_gate(monkeypatch):
+    """老沙箱没有 rift-client：start 不做 Ping 门禁，也不去取密码。"""
+    adapter, _client = _adapter_with_fake_client()
+    adapter.rift_enabled = False
+
+    async def _boom():
+        raise AssertionError("legacy sandbox must not fetch a rift password")
+
+    monkeypatch.setattr(adapter, "_fetch_rift_password", _boom)
+    await adapter.connect_rift()
+    assert adapter.rift_ready is False
+
+@pytest.mark.asyncio
+async def test_legacy_sandbox_is_not_gated_as_pending():
+    """老沙箱没有 rift：ps 状态与 ready 判断都不能因 rift_ready=False 而挂 pending。"""
+    from types import SimpleNamespace
+
+    from ..aio_server import _display_status
+
+    record = SimpleNamespace(
+        state=ContainerState.RUNNING,
+        container_id="cid",
+        sandbox_id="sb-test-1",
+        kube_env=SimpleNamespace(rift_enabled=False, rift_ready=False),
+        sandbox_status="Running",
+    )
+    from ..backend.pyromind_sdk_env import PyromindSDK
+
+    record.kube_env = PyromindSDK.__new__(PyromindSDK)
+    record.kube_env.rift_enabled = False
+    record.kube_env.rift_ready = False
+    assert _display_status(record) == "running"
+
+@pytest.mark.asyncio
+async def test_terminal_channel_selection_for_pyromind_sandboxes():
+    """交互 exec 的通道选择：老沙箱→legacy，rift 就绪→rift，新沙箱未就绪→unavailable。"""
+    from ..aio_server import _pyromind_terminal_channel
+    from ..backend.pyromind_sdk_env import PyromindSDK
+
+    native = object()
+    assert _pyromind_terminal_channel(native) == "native"
+
+    env = PyromindSDK.__new__(PyromindSDK)
+    env.rift_enabled = False
+    env.rift_ready = False
+    assert _pyromind_terminal_channel(env) == "legacy"
+
+    env.rift_enabled = True
+    env.rift_ready = True
+    assert _pyromind_terminal_channel(env) == "rift"
+
+    env.rift_ready = False
+    assert _pyromind_terminal_channel(env) == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_legacy_cp_downloads_a_single_file_as_tar():
+    """老沙箱 cp 下行（单文件）：files/read 取内容后打包成 tar。"""
+    import io
+    import tarfile
+
+    adapter, client = _adapter_with_fake_client()
+    adapter.rift_enabled = False
+
+    async def fake_stat(_path):
+        return {"mode": 0o100644}
+
+    async def fake_read(sandbox_id, path):
+        assert (sandbox_id, path) == ("sb-test-1", "/work/app.py")
+        return b"print('hi')\n"
+
+    adapter.archive_path_stat = fake_stat
+    client.read_file = fake_read
+
+    chunks = [c async for c in adapter.iter_archive_chunks("/work/app.py")]
+    payload = b"".join(chunks)
+    with tarfile.open(fileobj=io.BytesIO(payload)) as tar:
+        names = tar.getnames()
+        assert names == ["app.py"]
+        assert tar.extractfile("app.py").read() == b"print('hi')\n"
+
+
+@pytest.mark.asyncio
+async def test_legacy_cp_downloads_a_directory_via_execute():
+    """老沙箱 cp 下行（目录）：经 execute 跑 tar，输出 base64 解码即 tar 字节。"""
+    import base64
+    import io
+    import tarfile
+
+    adapter, _client = _adapter_with_fake_client()
+    adapter.rift_enabled = False
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo("cfg")
+        info.size = 3
+        tar.addfile(info, io.BytesIO(b"abc"))
+    tar_bytes = buf.getvalue()
+
+    async def fake_stat(_path):
+        return {"mode": 0o040755}
+
+    async def fake_execute(action, cwd="/"):
+        assert "tar -C /work -cf - cfg | base64 -w0" in action["command"]
+        return {"returncode": 0, "output": base64.b64encode(tar_bytes).decode()}
+
+    adapter.archive_path_stat = fake_stat
+    adapter.execute = fake_execute
+
+    chunks = [c async for c in adapter.iter_archive_chunks("/work/cfg")]
+    assert b"".join(chunks) == tar_bytes
+
+
+@pytest.mark.asyncio
+async def test_legacy_cp_extracts_into_dirs_and_files():
+    """老沙箱 cp 上行：目录用 execute mkdir，普通文件用 files/write。"""
+    import io
+    import tarfile
+
+    adapter, client = _adapter_with_fake_client()
+    adapter.rift_enabled = False
+    executed = []
+    written = []
+
+    async def fake_execute(action, cwd="/"):
+        executed.append(action["command"])
+        return {"returncode": 0, "output": ""}
+
+    async def fake_write(sandbox_id, path, data):
+        written.append((sandbox_id, path, data))
+        return {}
+
+    adapter.execute = fake_execute
+    client.write_file = fake_write
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        d = tarfile.TarInfo("logs")
+        d.type = tarfile.DIRTYPE
+        tar.addfile(d)
+        f = tarfile.TarInfo("logs/app.log")
+        f.size = 5
+        tar.addfile(f, io.BytesIO(b"hello"))
+
+    await adapter.put_archive("/data", buf.getvalue())
+    assert any("mkdir -p 'logs'" in cmd or "mkdir -p /data/logs" in cmd for cmd in executed)
+    assert written == [("sb-test-1", "/data/logs/app.log", b"hello")]

@@ -7,7 +7,7 @@
 #
 # 为什么必须用 -debug 变体：executor 镜像的最后一个 stage 是 FROM scratch，
 # 里面只有静态二进制 /kaniko/executor 和一个 CA bundle —— 没有 shell，也没有
-# coreutils。而 k8s 的 CUSTOM sandbox 模板硬编码了 command: ["sleep", "infinity"]，
+# coreutils。而构建沙箱的 create 请求显式指定 entrypoint: ["sleep", "infinity"]，
 # 没有 shell 的镜像连启动都启动不了，更别说往里 exec 命令了。-debug 就是同一个
 # 镜像加上 busybox（提供 sleep、cat、/bin/sh），正是 kaniko 官方为这种场景发的。
 #
@@ -73,6 +73,6 @@ ENV PATH=/kaniko/bin:/usr/local/bin:/kaniko:/busybox
 # base image 已经在下面这个位置带了标准 CA 证书：
 # /kaniko/ssl/certs/ca-certificates.crt
 
-# 上游的 entrypoint 保持不变：沙箱从不走它（模板会覆盖 command），
-# 但直接 docker run 时行为应和上游一致。
+# 上游的 entrypoint 保持不变：构建沙箱的 create 请求会用
+# entrypoint: ["sleep", "infinity"] 显式覆盖它，但直接 docker run 时行为应和上游一致。
 ENTRYPOINT ["/kaniko/executor"]

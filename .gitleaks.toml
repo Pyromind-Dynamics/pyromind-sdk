@@ -1,0 +1,32 @@
+[extend]
+# Keep the built-in ruleset and add the ID-style credentials it misses.
+useDefault = true
+
+title = "pyromind-sdk"
+
+[[rules]]
+id = "aliyun-access-key-id"
+description = "Alibaba Cloud AccessKey ID"
+regex = '''\bLTAI[0-9A-Za-z]{12,}\b'''
+keywords = ["ltai"]
+
+[[rules]]
+id = "aliyun-acr-instance-id"
+description = "Alibaba Cloud ACR instance id"
+regex = '''\bcri-[a-z0-9]{10,}\b'''
+keywords = ["cri-"]
+
+[allowlist]
+description = "Synthetic placeholders and test fixtures"
+regexes = [
+  '''LTAIx{8,}''',
+  '''cri-x{8,}''',
+  '''ZnJvbS1maWxl''',
+  '''test-api-key-12345''',
+  '''not-a-real-auth''',
+  '''your-api-key''',
+  '''your-access-key''',
+  '''test-access-key''',
+  '''registry-token''',
+  '''registry-pw-9c1f''',
+]

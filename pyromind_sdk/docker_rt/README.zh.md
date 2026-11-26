@@ -106,6 +106,8 @@ PyroMind 后端（默认后端）没有 Kubernetes API 端口转发端点，因�
 /workspace/docker_images/<image-tag>.tar
 ```
 
+构建上下文会**自动**送达 Sandbox，不需要任何配置。当 docker-rt 自身运行在集群内时——从 JupyterLab Web 终端启动即属于此种情况——daemon 与构建 Sandbox 挂载着同一个共享 workspace 文件系统，上下文会被直接解包到该文件系统，kaniko 从这个目录构建：不上传、Sandbox 内也不再复制（daemon 日志显示 `Unpacking the build context into … (shared workspace filesystem — no upload)`）。其他环境（本机、普通 SSH 会话）保持原来的存储上传路径不变。
+
 ### 推送到镜像仓库
 
 构建完成后**不会**自动推送（`DOCKER_RT_BUILD_PUSH=false`）；需要时用 `docker push <tag>` 显式推送。使用短镜像名时，需要配置仓库前缀以及具备推送权限的凭据：
@@ -136,7 +138,7 @@ docker build -t myapp:dev .
 | 现象 | 检查项 |
 | --- | --- |
 | Sandbox 无法拉取镜像 | 确认目标集群可访问镜像仓库，且平台有权限读取该镜像。 |
-| 构建无法启动 | 检查构建器镜像是否可拉取、是否包含 shell 和 `sleep`；若 Sandbox 因 OOM 被终止，可提高内存（`DOCKER_RT_BUILD_SANDBOX_MEMORY`）。 |
+| 构建无法启动 | 检查构建器镜像是否可拉取、是否包含 shell 和 `sleep`；构建沙箱默认 16Gi/8cpu（`DOCKER_RT_BUILD_SANDBOX_MEMORY` / `_CPU`，平台要求 CPU:memory = 1:2），若它在报出退出码之前死亡，会自动把资源翻倍重试一次（`build sandbox died before reporting an exit code … Retried with 32Gi`）。**失败**的构建默认保留沙箱便于排查（`DOCKER_RT_BUILD_SANDBOX_KEEP=true`），成功的构建始终清理。 |
 | 构建卡在拉取依赖、域名解析失败 | 构建使用集群网络，Dockerfile 中的联网地址必须集群可达，见「中国区集群使用差异」。 |
 | 构建完成但推送失败 | 检查仓库连通性与凭据，并确认前缀包含命名空间（见「中国区集群使用差异」）。镜像归档可能仍保存在 `/workspace/docker_images/`。 |
 | `docker exec` 报 `[EXEC_STREAM_LOST]` / `[EXEC_STREAM_RELAY_FAILED]` | 平台已给出原因：exec 流在命令给出退出码之前中断。消息中包含诊断信息与已投递字节数：`0 stdout / 0 stderr` 基本说明命令未启动；已有字节输出说明命令已执行、仅丢失尾部——**不要盲目重试**，仅对幂等命令重试。 |

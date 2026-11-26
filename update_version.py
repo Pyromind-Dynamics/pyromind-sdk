@@ -32,8 +32,8 @@ def update_version(new_version: str):
         pyproject_toml.write_text(content, encoding="utf-8")
         print(f"✓ Updated version in pyproject.toml to {new_version}")
     
-    # Update __init__.py
-    init_py = Path(__file__).parent / "__init__.py"
+    # Update __init__.py (the package lives under pyromind_sdk/)
+    init_py = Path(__file__).parent / "pyromind_sdk" / "__init__.py"
     if init_py.exists():
         content = init_py.read_text(encoding="utf-8")
         if "__version__" in content:

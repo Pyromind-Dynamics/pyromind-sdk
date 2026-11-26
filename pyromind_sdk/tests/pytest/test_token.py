@@ -29,13 +29,14 @@ class _FakeResponse:
         return self._payload
 
 
-def _ok_payload(token="t-1", ttl=60, api_base_url=_DIRECT):
+def _ok_payload(token="t-1", ttl=60, api_base_url=_DIRECT, rift_gateway=""):
     return {
         "success": True,
         "data": {
             "token": token,
             "expires_in": ttl,
             "api_base_url": api_base_url,
+            "rift_gateway": rift_gateway,
         },
     }
 
@@ -49,7 +50,7 @@ def test_fetch_token_posts_purpose_sandbox_and_cluster(monkeypatch) -> None:
 
     monkeypatch.setattr(sdk_token.requests, "post", fake_post)
 
-    token, ttl, api_base_url = sdk_token.fetch_token(
+    token, ttl, api_base_url, rift_gateway = sdk_token.fetch_token(
         "https://api-portal.example/api/v1",
         "long-term-key",
         purpose=sdk_token.PURPOSE_WS_EXEC,
@@ -58,7 +59,7 @@ def test_fetch_token_posts_purpose_sandbox_and_cluster(monkeypatch) -> None:
         cluster="us-west-2",
     )
 
-    assert (token, ttl, api_base_url) == ("t-1", 60, _DIRECT)
+    assert (token, ttl, api_base_url, rift_gateway) == ("t-1", 60, _DIRECT, "")
     assert captured["url"] == "https://api-portal.example/api/v1/auth/token"
     assert captured["json"] == {
         "purpose": "ws-exec",
@@ -124,12 +125,34 @@ def test_fetch_token_rejects_http_error(monkeypatch) -> None:
         sdk_token.fetch_token("https://api-portal.example/api/v1", "key")
 
 
+def test_rejection_hints_the_version_prefix_only_on_404(monkeypatch) -> None:
+    """404 基本等于基址漏了 ``/api/v1``；403 之类的拒绝不能挂这条提示。"""
+
+    def message_for(status: int) -> str:
+        monkeypatch.setattr(
+            sdk_token.requests, "post", lambda *a, **k: _FakeResponse(status, {})
+        )
+        with pytest.raises(sdk_token.TokenError) as excinfo:
+            sdk_token.fetch_token(
+                "https://api-portal.example", "key", cluster="us-west-2"
+            )
+        return str(excinfo.value)
+
+    missing_prefix = message_for(404)
+    assert "HTTP 404" in missing_prefix
+    assert "/api/v1" in missing_prefix
+
+    forbidden = message_for(403)
+    assert "HTTP 403" in forbidden
+    assert "API version prefix" not in forbidden
+
+
 def test_http_token_cache_reuses_until_refresh(monkeypatch) -> None:
     calls = []
 
     def fake_fetch(*_args, **_kwargs):
         calls.append(1)
-        return f"token-{len(calls)}", 900, _DIRECT
+        return f"token-{len(calls)}", 900, _DIRECT, ""
 
     monkeypatch.setattr(sdk_token, "fetch_token", fake_fetch)
 
@@ -146,7 +169,7 @@ def test_http_token_cache_reuses_until_refresh(monkeypatch) -> None:
 
 def test_http_token_cache_refreshes_before_expiry(monkeypatch) -> None:
     monkeypatch.setattr(
-        sdk_token, "fetch_token", lambda *a, **k: ("short-lived", 10, _DIRECT)
+        sdk_token, "fetch_token", lambda *a, **k: ("short-lived", 10, _DIRECT, "")
     )
     cache = sdk_token.HttpTokenCache(
         "https://api-portal.example/api/v1", "key", refresh_skew_s=30
@@ -157,7 +180,7 @@ def test_http_token_cache_refreshes_before_expiry(monkeypatch) -> None:
     monkeypatch.setattr(
         sdk_token,
         "fetch_token",
-        lambda *a, **k: calls.append(1) or ("refreshed", 900, _DIRECT),
+        lambda *a, **k: calls.append(1) or ("refreshed", 900, _DIRECT, ""),
     )
     assert cache.token() == "refreshed", "TTL 已落入刷新余量内必须重新换票"
     assert calls
@@ -168,7 +191,7 @@ def test_async_http_token_cache_reuses(monkeypatch) -> None:
 
     async def fake_fetch(*_args, **_kwargs):
         calls.append(1)
-        return "async-token", 900, _DIRECT
+        return "async-token", 900, _DIRECT, ""
 
     monkeypatch.setattr(sdk_token, "async_fetch_token", fake_fetch)
 
@@ -190,7 +213,7 @@ def test_sync_client_refreshes_the_token_once_on_401(monkeypatch) -> None:
     from pyromind_sdk.client.base import PyroMindClient
 
     monkeypatch.setattr(
-        sdk_token, "fetch_token", lambda *_a, **_k: ("test-token", 900, _DIRECT)
+        sdk_token, "fetch_token", lambda *_a, **_k: ("test-token", 900, _DIRECT, "")
     )
     client = PyroMindClient(
         api_key="long-term-key",
@@ -275,7 +298,7 @@ def test_http_cache_exchanges_at_the_portal_and_keeps_the_direct_base(
     monkeypatch.setattr(
         sdk_token,
         "fetch_token",
-        lambda base, *a, **k: calls.append(base) or ("t", 900, _DIRECT),
+        lambda base, *a, **k: calls.append(base) or ("t", 900, _DIRECT, ""),
     )
     cache = sdk_token.HttpTokenCache(
         "https://api-portal.pyromind.ai/api/v1", "key", cluster="us-west-1#pre"
@@ -293,7 +316,7 @@ def test_profile_client_uses_portal_token_but_stays_on_portal(monkeypatch) -> No
     monkeypatch.setattr(
         sdk_token,
         "fetch_token",
-        lambda *a, **k: calls.append(1) or ("portal-token", 900, _DIRECT),
+        lambda *a, **k: calls.append(1) or ("portal-token", 900, _DIRECT, ""),
     )
     client = ProfileClient(
         api_key="long-term-key",
@@ -328,7 +351,7 @@ def test_direct_client_uses_the_short_lived_token_and_direct_base(
     from pyromind_sdk.client.base import PyroMindClient
 
     monkeypatch.setattr(
-        sdk_token, "fetch_token", lambda *a, **k: ("short-lived", 900, _DIRECT)
+        sdk_token, "fetch_token", lambda *a, **k: ("short-lived", 900, _DIRECT, "")
     )
     client = PyroMindClient(
         api_key="long-term-key",

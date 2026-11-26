@@ -13,9 +13,9 @@ from typing import Any, Iterable
 from ..backend.buildkit import normalize_for_registry
 
 
-def image_id(name: str) -> str:
-    digest = hashlib.sha256(name.encode()).hexdigest()
-    return f"sha256:{digest}"
+def image_id(name: str, config_digest: str = "") -> str:
+    """The image ID: the config digest when known, else the legacy tag hash."""
+    return config_digest or f"sha256:{hashlib.sha256(name.encode()).hexdigest()}"
 
 
 def _strip_sha256(value: str) -> str:
@@ -30,33 +30,45 @@ def _repo_tag(name: str) -> str:
 
 
 def to_image_summary(
-    name: str, *, created: int | None = None, size: int = 0
+    name: str,
+    *,
+    created: int | None = None,
+    size: int = 0,
+    config_digest: str = "",
+    repo_digests: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "Containers": -1,
         "Created": created or int(time.time()),
-        "Id": image_id(name),
+        "Id": image_id(name, config_digest),
         "Labels": None,
         "ParentId": "",
-        "RepoDigests": [],
+        "RepoDigests": list(repo_digests or []),
         "RepoTags": [_repo_tag(name)],
         "SharedSize": -1,
         "Size": int(size or 0),
     }
 
 
-def to_image_inspect(name: str, *, created: float | None = None) -> dict[str, Any]:
+def to_image_inspect(
+    name: str,
+    *,
+    created: float | None = None,
+    size: int = 0,
+    config_digest: str = "",
+    repo_digests: Iterable[str] | None = None,
+) -> dict[str, Any]:
     """Stub ImageInspect used by docker-py ``images.list()`` → ``inspect_image``."""
     ts = created if created is not None else time.time()
     created_iso = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%S.%fZ"
     )
-    iid = image_id(name)
+    iid = image_id(name, config_digest)
     tag = _repo_tag(name)
     return {
         "Id": iid,
         "RepoTags": [tag],
-        "RepoDigests": [],
+        "RepoDigests": list(repo_digests or []),
         "Parent": "",
         "Comment": "",
         "Created": created_iso,
@@ -64,8 +76,8 @@ def to_image_inspect(name: str, *, created: float | None = None) -> dict[str, An
         "Author": "",
         "Architecture": "amd64",
         "Os": "linux",
-        "Size": 0,
-        "VirtualSize": 0,
+        "Size": int(size or 0),
+        "VirtualSize": int(size or 0),
         "GraphDriver": {"Name": "docker-rt", "Data": None},
         "RootFS": {"Type": "layers", "Layers": []},
         "Metadata": {"LastTagTime": "0001-01-01T00:00:00Z"},

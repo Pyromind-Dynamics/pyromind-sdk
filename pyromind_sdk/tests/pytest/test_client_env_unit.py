@@ -197,6 +197,28 @@ class TestStorageClientEndpoint:
         assert client.endpoint == "storage-us-west-2.pyromind.ai"
 
 
+class TestStorageClientCredentials:
+    """Storage has its own access key; the platform API key is not a fallback."""
+
+    def test_storage_access_key_overrides_api_key(self, monkeypatch):
+        monkeypatch.setenv("PYROMIND_API_KEY", "api-key")
+        monkeypatch.setenv("PYROMIND_STORAGE_ACCESS_KEY", "storage-ak")
+        client = StorageClient(secret_key="sk")
+        assert client.access_key == "storage-ak"
+
+    def test_api_key_not_used_when_storage_access_key_unset(self, monkeypatch):
+        import pytest
+        monkeypatch.setenv("PYROMIND_API_KEY", "api-key")
+        monkeypatch.delenv("PYROMIND_STORAGE_ACCESS_KEY", raising=False)
+        with pytest.raises(ValueError):
+            StorageClient(secret_key="sk")
+
+    def test_explicit_access_key_wins(self, monkeypatch):
+        monkeypatch.setenv("PYROMIND_STORAGE_ACCESS_KEY", "storage-ak")
+        client = StorageClient(access_key="explicit", secret_key="sk")
+        assert client.access_key == "explicit"
+
+
 class TestInferenceStartupArgs:
     def test_dict_startup_args_are_serialized_to_argv(self):
         request = InferenceJobRequest(
@@ -283,3 +305,24 @@ class TestStorageCredentials:
             StorageClient(endpoint="https://storage.example.com")
 
         assert "PYROMIND_STORAGE_ACCESS_KEY" in str(exc.value)
+
+
+def test_rift_gateway_comes_from_the_platform_not_a_local_table(monkeypatch):
+    """网关地址由平台换票下发；本地不再有 cluster→gateway 硬编码表。"""
+    from pyromind_sdk import client  # noqa: F401
+    import pyromind_sdk.client.base as base_mod
+
+    assert not hasattr(base_mod, "resolve_rift_target_from_cluster")
+
+    monkeypatch.delenv("DOCKER_RT_RIFT_GATEWAY", raising=False)
+    monkeypatch.delenv("DOCKER_RT_RIFT_GATEWAY_TLS", raising=False)
+
+    from pyromind_sdk.rift.config import load_rift_config
+
+    cfg = load_rift_config("platform-rift.example:443")
+    assert cfg.gateway == "platform-rift.example:443"
+    assert cfg.gateway_tls is True
+
+    # 显式环境变量仍可在本地/调试时覆盖平台下发值。
+    monkeypatch.setenv("DOCKER_RT_RIFT_GATEWAY", "localhost:18080")
+    assert load_rift_config("platform-rift.example:443").gateway == "localhost:18080"

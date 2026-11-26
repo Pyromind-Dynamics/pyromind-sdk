@@ -23,6 +23,84 @@ def _tar_with(name: str, payload: bytes = b"payload", *, fmt: int = tarfile.GNU_
     return buf.getvalue()
 
 
+def _tar_with_entries(entries: list[tuple[str, bytes, bytes]]) -> bytes:
+    """``entries`` is (name, typeflag, body); ``body`` is the payload or linkname."""
+    buf = BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.GNU_FORMAT) as tar:
+        for name, typeflag, body in entries:
+            info = tarfile.TarInfo(name)
+            info.type = typeflag
+            if typeflag in (tarfile.SYMTYPE, tarfile.LNKTYPE):
+                info.linkname = body.decode()
+            elif typeflag == tarfile.REGTYPE:
+                info.size = len(body)
+            tar.addfile(info, BytesIO(body) if typeflag == tarfile.REGTYPE else None)
+    return buf.getvalue()
+
+
+class TestValidateTarMembers:
+    def test_allows_regular_files_and_relative_links(self) -> None:
+        from ..backend.archive import validate_tar_members
+
+        data = _tar_with_entries(
+            [
+                ("dir/file.txt", tarfile.REGTYPE, b"hi"),
+                ("dir/link", tarfile.SYMTYPE, b"file.txt"),
+                ("dir/", tarfile.DIRTYPE, b""),
+            ]
+        )
+        validate_tar_members(data)
+
+    @pytest.mark.parametrize(
+        "name", ["../etc/passwd", "/../etc/passwd", "a/../../etc/passwd"]
+    )
+    def test_rejects_traversal(self, name: str) -> None:
+        from ..backend.archive import validate_tar_members
+
+        with pytest.raises(ValueError, match="unsafe path"):
+            validate_tar_members(_tar_with(name, b"x"))
+
+    @pytest.mark.parametrize("target", ["/etc", "../../etc", "../x"])
+    def test_rejects_escaping_symlink(self, target: str) -> None:
+        from ..backend.archive import validate_tar_members
+
+        data = _tar_with_entries([("link", tarfile.SYMTYPE, target.encode())])
+        with pytest.raises(ValueError, match="symlink"):
+            validate_tar_members(data)
+
+    def test_rejects_write_through_symlink(self) -> None:
+        from ..backend.archive import validate_tar_members
+
+        data = _tar_with_entries(
+            [
+                ("link", tarfile.SYMTYPE, b"sub"),
+                ("link/passwd", tarfile.REGTYPE, b"x"),
+            ]
+        )
+        with pytest.raises(ValueError, match="writes through symlink"):
+            validate_tar_members(data)
+
+    def test_rejects_device_nodes(self) -> None:
+        from ..backend.archive import validate_tar_members
+
+        data = _tar_with_entries([("dev/sda", tarfile.BLKTYPE, b"")])
+        with pytest.raises(ValueError, match="device node"):
+            validate_tar_members(data)
+
+    def test_rejects_escaping_hardlink(self) -> None:
+        from ..backend.archive import validate_tar_members
+
+        data = _tar_with_entries([("hard", tarfile.LNKTYPE, b"../../etc/passwd")])
+        with pytest.raises(ValueError, match="hardlink"):
+            validate_tar_members(data)
+
+    def test_rejects_invalid_archive(self) -> None:
+        from ..backend.archive import validate_tar_members
+
+        with pytest.raises(ValueError, match="invalid tar archive"):
+            validate_tar_members(b"not a tar archive")
+
+
 def test_path_stat_uses_go_filemode_bits():
     from ..aio_server import _wire_path_stat
 
@@ -336,3 +414,25 @@ def test_stream_framing_roundtrip():
     err = frame_stderr(b"e")
     assert err[0] == 2
     assert frame_stdout(b"") == b""
+
+
+def test_sync_put_archive_refuses_an_async_adapter():
+    """同步助手遇到异步 ``put_archive`` 必须报错，不能静默空转。
+
+    2026-10-30：旧的 daemon 走到 ``archive.put_archive`` 时，``PyromindSDK``
+    的异步实现被当同步调用 —— 协程从未 await，字节一个没发，HTTP 却回 200，
+    ``docker cp`` 打印 "Successfully copied" 而文件不存在。
+    """
+    from ..backend.archive import make_single_file_tar, put_archive
+
+    class AsyncEnv:
+        async def put_archive(self, dest_path, tar_bytes):
+            raise AssertionError("must never be awaited from the sync helper")
+
+    data = make_single_file_tar("hello.txt", b"hello")
+    try:
+        put_archive(AsyncEnv(), "/var", data)
+    except TypeError as exc:
+        assert "is async" in str(exc)
+    else:
+        raise AssertionError("expected TypeError for an async put_archive")

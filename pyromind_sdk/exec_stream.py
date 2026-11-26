@@ -79,7 +79,7 @@ def fetch_exec_stream_token(
     cluster: Optional[str] = None,
 ) -> tuple[str, str]:
     """Exchange on the portal; returns ``(token, cluster_direct_base_url)``."""
-    token, _ttl, api_base_url = fetch_token(
+    token, _ttl, api_base_url, _rift = fetch_token(
         base_url,
         api_key,
         purpose=PURPOSE_WS_EXEC,
@@ -97,7 +97,7 @@ async def async_fetch_exec_stream_token(
     cluster: Optional[str] = None,
 ) -> tuple[str, str]:
     """Async variant of :func:`fetch_exec_stream_token`."""
-    token, _ttl, api_base_url = await async_fetch_token(
+    token, _ttl, api_base_url, _rift = await async_fetch_token(
         base_url,
         api_key,
         purpose=PURPOSE_WS_EXEC,
@@ -178,7 +178,7 @@ async def _iter_exec_stream_events(
     timeout: Optional[int] = None,
     tty: bool = False,
     stop_event: Optional[threading.Event] = None,
-    ping_interval_s: float = 60.0,
+    ping_interval_s: float = 10.0,
     stdin_close: Optional[threading.Event] = None,
 ) -> AsyncIterator[Dict[str, Any]]:
     # Output-only channel: the server refused stdin support here (see the

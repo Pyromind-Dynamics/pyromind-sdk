@@ -12,7 +12,7 @@ from pathlib import Path
 WRAPPER_DIR = Path.home() / ".pyromind" / "bin"
 WRAPPER_PATH = WRAPPER_DIR / "docker"
 PATH_LINE = 'export PATH="$HOME/.pyromind/bin:$PATH"'
-WRAPPER_VERSION = "20"
+WRAPPER_VERSION = "22"
 
 
 def _wrapper_version() -> str | None:
@@ -229,6 +229,14 @@ if [[ "${{args[0]:-}}" == "rm" ]]; then
         rm_opts+=("$arg")
         ;;
       *)
+        # `docker rm` removes containers. A path here can only be a mistake:
+        # say so, instead of letting the CLI turn it into a bare
+        # `404: Not Found` (the slashes do not even match the API route).
+        if [[ "$arg" == */* ]]; then
+          printf 'docker-rt: %s looks like a path; docker rm removes containers.\\n' "$arg" >&2
+          printf 'Delete files with: docker exec <container> rm %s\\n' "$arg" >&2
+          exit 1
+        fi
         rm_targets+=("$arg")
         ;;
     esac
@@ -264,10 +272,19 @@ if [[ "${{args[0]:-}}" == "rm" ]]; then
         _rm_err="$(mktemp)"
         "$REAL_DOCKER" rm "${{rm_opts[@]}}" "$target" >"$_rm_out" 2>"$_rm_err"
         rc=$?
-        if [[ $rc -eq 0 ]]; then
+        # The CLI can exit 0 while printing "Error response from daemon"
+        # (a 404 for an unknown container does exactly that), so the exit
+        # code alone is not evidence: an error line must win, or we claim
+        # a deletion that never happened.
+        # `rm` prints nothing to stderr on a real success, so ANY stderr means
+        # the container was not removed (a 404, "Cannot connect to the Docker
+        # daemon", …). Reporting a false success is the one outcome we cannot
+        # have; a false failure at least shows the message.
+        if [[ $rc -eq 0 && ! -s "$_rm_err" ]]; then
           printf '%s deleted\\n' "$target"
           cat "$_rm_err" >&2
         else
+          [[ $rc -eq 0 ]] && rc=1
           cat "$_rm_out" >&2
           cat "$_rm_err" >&2
         fi
@@ -445,46 +462,59 @@ if [[ "${{args[0]:-}}" == "network" ]]; then
   exit 1
 fi
 if [[ "${{args[0]:-}}" == "cp" ]]; then
-  src="${{args[1]:-}}"
-  dst="${{args[2]:-}}"
+  # Flags may come first (`docker cp -q src dst`); the display must use the two
+  # positional arguments, not args[1]/args[2].
+  src=""
+  dst=""
+  _cp_quiet=0
+  for _a in "${{args[@]:1}}"; do
+    case "$_a" in
+      -q|--quiet) _cp_quiet=1; continue ;;
+      -?*|--*) continue ;;
+    esac
+    if [[ -z "$src" ]]; then
+      src="$_a"
+    elif [[ -z "$dst" ]]; then
+      dst="$_a"
+    fi
+  done
+  _cp_out="$(mktemp)"
+  _cp_err="$(mktemp)"
   if [[ -t 2 ]]; then
-    _cp_out="$(mktemp)"
-    _cp_err="$(mktemp)"
-    # Do NOT wrap this in ``script``: the BSD form (``script -q /dev/null cmd``)
-    # is unsupported by util-linux' script on Linux ("Usage: script [options]
-    # [file]"); it starts an inner shell instead of running the command, so
-    # ``docker cp`` silently copied nothing (2026-11-06 用户报：无提示、无文件).
-    "$REAL_DOCKER" "${{args[@]}}" >"$_cp_out" 2>"$_cp_err" &
-    _cp_pid=$!
-    _spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-    _i=0
-    printf '\\n' >&2
-    while kill -0 "$_cp_pid" 2>/dev/null; do
-      printf '\\r%s copying %s -> %s ...' "${{_spin[$_i]}}" "$src" "$dst" >&2
-      _i=$(( (_i + 1) % ${{#_spin[@]}} ))
-      sleep 0.1
-    done
-    wait "$_cp_pid"
-    _rc=$?
-    printf '\\r\\033[K' >&2
-    if [[ $_rc -eq 0 ]]; then
-      _clean_out="$(tr -d '\\000-\\010' < "$_cp_out")"
-      _success_line="$(printf '%s' "$_clean_out" | grep -a 'Successfully copied' | tail -n 1 | sed -E 's/^.*Successfully copied/Successfully copied/')"
+    printf 'docker-rt: copying %s -> %s ...\\n' "$src" "$dst" >&2
+  fi
+  # Never route the CLI through `script`: util-linux only takes the command via
+  # -c, so `script -q -e /dev/null docker cp …` runs an *interactive shell* and
+  # the copy never happens (2026-10-30: "Successfully copied" with no file).
+  "$REAL_DOCKER" "${{args[@]}}" >"$_cp_out" 2>"$_cp_err"
+  _rc=$?
+  _clean_out="$(tr -d '\\000-\\010' < "$_cp_out")"
+  _clean_err="$(tr -d '\\000-\\010' < "$_cp_err")"
+  # The docker CLI prints "Successfully copied" *before* it returns the error
+  # (cli/command/container/cp.go): an error line wins over that summary.
+  if printf '%s\\n%s\\n' "$_clean_out" "$_clean_err" | grep -aqE 'Error response from daemon|RIFT_UNAVAILABLE|File too large|No such container|cannot be copied|no such directory'; then
+    _rc=1
+  fi
+  if [[ $_rc -eq 0 ]]; then
+    if [[ $_cp_quiet -eq 0 ]]; then
+      _success_line="$(printf '%s\\n' "$_clean_out" | grep -a 'Successfully copied' | tail -n 1 | sed -E 's/^.*Successfully copied/Successfully copied/')"
       if [[ -n "$_success_line" ]]; then
         printf '%s\\n' "$_success_line" >&1
       else
         printf 'Successfully copied %s -> %s\\n' "${{src}}" "${{dst}}" >&1
       fi
-      cat "$_cp_err" >&2
-    else
-      tr -d '\\000-\\010' < "$_cp_out" >&1
-      cat "$_cp_err" >&2
     fi
-    rm -f "$_cp_out" "$_cp_err"
-    exit $_rc
+    printf '%s\\n' "$_clean_out" | grep -av 'Successfully copied' >&1
+    [[ -s "$_cp_err" ]] && cat "$_cp_err" >&2
   else
-    echo "docker-rt: copying ${{src}} -> ${{dst}}, please wait..." >&2
+    printf '%s\\n' "$_clean_out" | grep -av 'Successfully copied' >&1
+    [[ -n "$_clean_err" ]] && printf '%s\\n' "$_clean_err" >&2
+    if ! printf '%s\\n%s\\n' "$_clean_out" "$_clean_err" | grep -aq '[^[:space:]]'; then
+      echo "docker cp failed (exit $_rc, no output from docker; see the docker-rt log)" >&2
+    fi
   fi
+  rm -f "$_cp_out" "$_cp_err"
+  exit $_rc
 fi
 exec "$REAL_DOCKER" "${{args[@]}}"
 """

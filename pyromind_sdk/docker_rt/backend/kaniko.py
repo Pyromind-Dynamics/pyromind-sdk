@@ -30,10 +30,14 @@ Everything here is a pure function so it can be unit-tested without a cluster.
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import logging
 import os
 import re
 import shlex
+import tarfile
+from pathlib import Path
 
 logger = logging.getLogger("docker_rt.kaniko")
 
@@ -254,6 +258,12 @@ def extra_flags() -> list[str]:
         return []
 
 
+#: 平台注入到构建沙箱里的目录：rift-client 二进制在 /opt/rift，per-sandbox token
+#: 在 /opt/rift-token（不能嵌在只读的 /opt/rift 下）。两者都必须让 kaniko 忽略
+#: （既不删也不进镜像）。路径由平台模板固定，不可配置。
+RIFT_IGNORE_PATHS = ("/opt/rift", "/opt/rift-token")
+
+
 def kaniko_args(
     *,
     destinations: list[str],
@@ -302,6 +312,15 @@ def kaniko_args(
     # be a file path, and the name comes from ``--destination`` so each tag
     # keeps its own archive.
     args.append(f"--tar-path={tar_path(dests)}")
+
+    # 构建沙箱里还跑着 rift-client（构建的 exec / 上下文拷贝都靠它），平台把二进制
+    # 注入在 /opt/rift、token 在 /opt/rift-token。kaniko 的 DeleteFilesystem 会把
+    # 这类目录清掉，更糟的是之后的快照会把它们打进用户镜像。``--ignore-path``
+    # 逐个覆盖：kaniko 把它们加进 defaultIgnoreList，DeleteFilesystem 与
+    # GetFSFromLayers 都用这份列表（v1.24.0：cmd/executor/cmd/root.go:163、
+    # pkg/util/fs_util.go:233/1084）。
+    for path in RIFT_IGNORE_PATHS:
+        args.append(f"--ignore-path={path}")
 
     # Skip kaniko's push-permission probe.
     #
@@ -653,3 +672,33 @@ def parse_digest(raw: str | None) -> str:
         if line.startswith("sha256:") and len(line) > len("sha256:"):
             return line
     return ""
+
+
+def config_digest_from_archive(archive: str | Path) -> str:
+    """The image ID a ``docker save`` archive carries.
+
+    Docker's image ID is the sha256 of the image **config** blob (schema 2),
+    not of the manifest and not of the archive. ``--digest-file`` gives the
+    manifest digest kaniko *would* push, which differs once docker-rt pushes
+    the archive itself; reporting that as the image ID made `docker images`
+    and a registry-side check disagree. Returns ``""`` for anything that is
+    not a readable docker archive.
+    """
+    try:
+        with tarfile.open(archive, "r:*") as bundle:
+            manifest_member = bundle.extractfile("manifest.json")
+            if manifest_member is None:
+                return ""
+            manifest = json.loads(manifest_member.read() or b"[]")
+            config_name = str((manifest[0] if manifest else {}).get("Config") or "")
+            if not config_name:
+                return ""
+            config_member = bundle.extractfile(config_name)
+            if config_member is None:
+                return ""
+            blob = config_member.read()
+    except Exception:  # noqa: BLE001 - metadata must never fail a build
+        return ""
+    if not blob:
+        return ""
+    return "sha256:" + hashlib.sha256(blob).hexdigest()

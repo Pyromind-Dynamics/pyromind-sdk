@@ -38,6 +38,137 @@ ENV_LOG_LEVEL = "PYROMIND_LOG_LEVEL"
 RETRY_STATUS_CODES = [502, 503, 504]
 RETRY_ALLOWED_METHODS = ["GET", "POST", "PUT", "DELETE"]
 
+# Cluster -> per-env API base URL mapping.
+#
+# The terminal CLI resolves `--cluster <code>` (optionally with an `#env`
+# suffix, e.g. `us-west-1`) to a per-cluster direct API base URL via
+# this table. Portal (`api-portal.pyromind.ai`) does not proxy WebSocket,
+# so terminal connections must use the per-cluster direct domains here.
+CLUSTER_RESOURCE = {
+    "us-west-1": {
+        "http": {
+            "prod": "https://api.pyromind.ai",
+            "pre": "https://pre-api.pyromind.ai",
+            "pre2": "https://pre2-api.pyromind.ai",
+            "dev": "http://localhost:8001",
+        },
+        "storage":"https://storage.pyromind.ai",
+    },
+    "us-west-2": {
+        "http": {
+            "prod": "https://api-us-west-2.pyromind.ai",
+            "pre": "https://pre-api-us-west-2.pyromind.ai",
+            "pre2": "https://pre2-api-us-west-2.pyromind.ai",
+            "dev": "http://localhost:8002",
+        },
+        "storage":"https://storage-us-west-2.pyromind.ai",
+    },
+    "us-west-3": {
+        "http": {
+            "prod": "https://api-us-west-3.pyromind.ai",
+            "pre": "https://pre-api-us-west-3.pyromind.ai",
+            "pre2": "https://pre2-api-us-west-3.pyromind.ai",
+            "dev": "http://localhost:8003",
+        },
+        "storage": "https://storage-us-west-3.pyromind.ai",
+    },
+    "cn-east-1": {
+        "http": {
+            "prod": "https://api-cn-east-1.pyromind-asia.cn",
+            "pre": "https://pre-api-cn-east-1.pyromind-asia.cn",
+            "pre2": "https://pre2-api-cn-east-1.pyromind-asia.cn",
+            "dev": "http://localhost:8002",
+        },
+        "storage": "https://storage-cn-east-1.pyromind-asia.cn",
+    },
+}
+
+
+def available_clusters():
+    """Cluster codes a client / docker-rt can target — the keys of :data:`CLUSTER_RESOURCE`.
+
+    Order follows the table's declaration order (``us-west-1``, ``us-west-2``,
+    ``cn-east-1``) so prompts and ``--help`` read like the config. These keys are
+    the **only** thing exposed to users; per-env addresses stay an implementation
+    detail of the table. Callers that build prompts or help text should use this
+    instead of hard-coding example cluster names.
+    """
+    return list(CLUSTER_RESOURCE)
+
+
+def parse_cluster_code(cluster: str):
+    """Split a cluster identifier into (cluster_code, env).
+
+    Accepted shapes:
+      * "us-west-1"       -> ("us-west-1", "prod")
+      * "us-west-1"   -> ("us-west-1", "pre")
+      * "us-west-12"  -> ("us-west-1", "pre2")
+    """
+    if not cluster:
+        return "", "prod"
+    cluster = cluster.strip()
+    if "#" in cluster:
+        code, env = cluster.split("#", 1)
+        return code.strip(), (env.strip() or "prod")
+    return cluster, "prod"
+
+
+def resolve_base_url_from_cluster(cluster: str) -> str:
+    """Return the per-cluster API base URL (with trailing /api/v1).
+
+    Raises ValueError if the cluster code or env suffix is unknown.
+    """
+    code, env = parse_cluster_code(cluster)
+    cfg = CLUSTER_RESOURCE.get(code)
+    if not cfg:
+        valid = ", ".join(available_clusters())
+        raise ValueError(f"Unknown cluster {code!r}. Valid clusters: {valid}")
+    base = cfg.get("http", {}).get(env)
+    if not base:
+        raise ValueError(f"Unknown env {env!r} for cluster {code!r}")
+    return base.rstrip("/") + "/api/v1"
+
+
+
+
+def resolve_api_base_url(cluster: Optional[str] = None) -> str:
+    """Resolve the base URL for a **cluster-direct** (data-plane) client.
+
+    Resolution order:
+
+    1. ``PYROMIND_BASE_URL`` — an explicit override always wins.
+    2. The per-cluster direct address from :data:`CLUSTER_RESOURCE`, keyed by
+       ``cluster`` or ``PYROMIND_CLUSTER`` (``us-west-1`` style suffixes
+       included).
+    3. ``DEFAULT_API_BASE_URL`` — the portal, as a last resort only.
+
+    Sandbox operations (list/get/create, exec, and the file read/write behind
+    ``docker cp``) are data-plane calls and belong on the cluster, not on the
+    portal. The portal is the control plane: ``ProfileClient`` (``/user_info``,
+    ``/storage_info``, access keys) keeps using ``DEFAULT_API_BASE_URL`` and
+    never calls this.
+
+    When neither ``PYROMIND_BASE_URL`` nor a cluster is configured the portal
+    is still returned, so an unconfigured client keeps working exactly as
+    before.
+    """
+    explicit = (os.getenv(ENV_BASE_URL) or "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    code = (cluster or os.getenv(ENV_CLUSTER) or "").strip()
+    if code:
+        try:
+            return resolve_base_url_from_cluster(code)
+        except ValueError as exc:
+            logger.warning(
+                "cannot resolve a direct base URL for cluster %r (%s); "
+                "falling back to the portal %s",
+                code,
+                exc,
+                DEFAULT_API_BASE_URL,
+            )
+    return DEFAULT_API_BASE_URL.rstrip("/")
+
 ERROR_MESSAGE_MAX_LENGTH = 500
 _TRACE_ID_HEADER_KEYS = {
     "x-trace-id",
@@ -262,6 +393,20 @@ class PyroMindClient:
             return
         if self._tokens.api_base_url:
             self.base_url = self._tokens.api_base_url
+
+    def fetch_rift_gateway(self) -> str:
+        """该集群 rift-gateway 的公网地址（``host[:port]``），来自平台换票响应。
+
+        平台未下发时显式失败：数据面没有可用入口，不能靠本地硬编码猜测。
+        """
+        self._sync_api_base_url()
+        gateway = str(getattr(self._tokens, "api_rift_gateway", "") or "").strip()
+        if not gateway:
+            raise RuntimeError(
+                "the platform returned no rift_gateway for this cluster; "
+                "ask the platform operator to publish it in the cluster config"
+            )
+        return gateway
 
     def _build_url(self, endpoint: str) -> str:
         """按 endpoint 拼完整 URL，**不做任何 I/O**。

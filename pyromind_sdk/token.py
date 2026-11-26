@@ -53,6 +53,22 @@ def token_url(base_url: str) -> str:
     return f"{base_url.rstrip('/')}/{TOKEN_PATH}"
 
 
+def _rejected_message(action: str, status: int, url: str) -> str:
+    """换票/发现被拒时的报错；404 基本等于基址漏了 ``/api/v1`` 前缀。
+
+    门户只在 ``/api/v1/auth/token`` 提供该路由，把 ``PYROMIND_BASE_URL`` 设成
+    裸域名就会命中根路径 404，且请求进不了鉴权逻辑。这里只补归因，不自动
+    改写基址——基址始终按调用方给的原样使用。
+    """
+    message = f"{action} rejected (HTTP {status}) at {url}"
+    if status == 404:
+        message += (
+            " — the base URL must include the API version prefix, e.g. "
+            "https://api-portal.pyromind.ai/api/v1"
+        )
+    return message
+
+
 def _request_body(
     purpose: str,
     resource_type: Optional[str],
@@ -69,15 +85,25 @@ def _request_body(
     return body
 
 
-def _parse_token_response(payload: object, status: int) -> Tuple[str, int, str]:
+def _parse_token_response(
+    payload: object, status: int
+) -> Tuple[str, int, str, str]:
     if isinstance(payload, dict):
         data = payload.get("data")
         if isinstance(data, dict):
             token = str(data.get("token") or "")
             expires_in = int(data.get("expires_in") or 0)
             api_base_url = str(data.get("api_base_url") or "").strip()
+            # 公共参数：该集群 rift-gateway 的公网地址（host[:port]）。
+            # 平台未配置时为空串；docker-rt 连接数据面时会显式报错。
+            rift_gateway = str(data.get("rift_gateway") or "").strip()
             if token and expires_in > 0 and api_base_url:
-                return token, expires_in, api_base_url.rstrip("/")
+                return (
+                    token,
+                    expires_in,
+                    api_base_url.rstrip("/"),
+                    rift_gateway,
+                )
     raise TokenError(f"token exchange failed (HTTP {status}): malformed response")
 
 
@@ -111,7 +137,9 @@ def fetch_cluster_hosts(base_url: str, api_key: str) -> list[dict]:
         ) from exc
     if not response.ok:
         raise TokenError(
-            f"cluster discovery rejected (HTTP {response.status_code}) at {url}"
+            _rejected_message(
+                "cluster discovery", response.status_code, url
+            )
         )
     try:
         payload = response.json()
@@ -151,9 +179,11 @@ def fetch_token(
     """Exchange the long-lived key on the portal.
 
     ``resource_type``/``resource_id`` bind a WebSocket token to one object
-    (e.g. ``sandbox`` + ``sb-...``).  Returns ``(token, ttl_s, api_base_url)``
-    where ``api_base_url`` is the cluster-direct base URL every later request
-    must target.
+    (e.g. ``sandbox`` + ``sb-...``).  Returns
+    ``(token, ttl_s, api_base_url, rift_gateway)`` where ``api_base_url`` is
+    the cluster-direct base URL every later request must target and
+    ``rift_gateway`` is the platform-provided rift-gateway address
+    (``host[:port]``, empty when the platform has none for this cluster).
     """
     if not cluster:
         raise TokenError(
@@ -197,7 +227,7 @@ def fetch_token(
 
     if not response.ok:
         raise TokenError(
-            f"token exchange rejected (HTTP {response.status_code}) at {url}"
+            _rejected_message("token exchange", response.status_code, url)
         )
     try:
         payload = response.json()
@@ -275,7 +305,7 @@ async def async_fetch_token(
         ) from last_exc
 
     if status >= 400:
-        raise TokenError(f"token exchange rejected (HTTP {status}) at {url}")
+        raise TokenError(_rejected_message("token exchange", status, url))
     return _parse_token_response(payload, status)
 
 
@@ -299,6 +329,8 @@ class HttpTokenCache:
         self._lock = threading.Lock()
         #: Cluster-direct base URL returned by the portal exchange.
         self.api_base_url: Optional[str] = None
+        #: rift-gateway address (``host[:port]``) returned by the portal exchange.
+        self.api_rift_gateway: Optional[str] = None
 
     def _fresh_token(self) -> Optional[str]:
         """Cached token still inside its validity window (no I/O, no lock)."""
@@ -316,7 +348,7 @@ class HttpTokenCache:
                 return cached
         # 网络交换放在锁外：刷新期间其他线程仍能读到旧值，不会整段阻塞；
         # 并发刷新最多多换一次票，写入用锁保证不撕裂。
-        token, ttl, api_base_url = fetch_token(
+        token, ttl, api_base_url, rift_gateway = fetch_token(
             self._exchange_url,
             self._api_key,
             purpose=PURPOSE_HTTP,
@@ -326,6 +358,7 @@ class HttpTokenCache:
             self._token = token
             self._expires_at = time.monotonic() + ttl
             self.api_base_url = api_base_url
+            self.api_rift_gateway = rift_gateway
         return token
 
     def invalidate(self) -> None:
@@ -359,6 +392,8 @@ class AsyncHttpTokenCache:
         self._expires_at = 0.0
         #: Cluster-direct base URL returned by the portal exchange.
         self.api_base_url: Optional[str] = None
+        #: rift-gateway address (``host[:port]``) returned by the portal exchange.
+        self.api_rift_gateway: Optional[str] = None
 
     def _fresh_token(self) -> Optional[str]:
         if (
@@ -373,7 +408,7 @@ class AsyncHttpTokenCache:
             cached = self._fresh_token()
             if cached is not None:
                 return cached
-        token, ttl, api_base_url = await async_fetch_token(
+        token, ttl, api_base_url, rift_gateway = await async_fetch_token(
             self._exchange_url,
             self._api_key,
             purpose=PURPOSE_HTTP,
@@ -382,6 +417,7 @@ class AsyncHttpTokenCache:
         self._token = token
         self._expires_at = time.monotonic() + ttl
         self.api_base_url = api_base_url
+        self.api_rift_gateway = rift_gateway
         return token
 
     async def invalidate(self) -> None:

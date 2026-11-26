@@ -55,8 +55,7 @@ pyromind_sdk/
 ├── cli.py                            # Unified `pyromind` CLI
 ├── python_function_to_yaml_cli.py    # Python-to-YAML CLI
 ├── test_run_workflow_cli.py          # Workflow submission CLI
-├── exec_stream.py                    # Streaming sandbox exec helpers
-└── terminal.py                       # Interactive sandbox terminal
+└── exec_stream.py                    # Streaming sandbox exec helpers
 ```
 
 ## Requirements
@@ -260,6 +259,54 @@ docker rm -f demo
 
 `docker-rt-context` switches the Docker CLI to the `docker-rt` endpoint. The daemon requires the Docker CLI and access to the configured cluster. Common lifecycle and exec commands are supported; image builds and port forwarding have additional behavior and constraints. `docker logs`, `docker events`, `docker compose`, `docker buildx`, and `docker network` are all intercepted by the CLI wrapper with a clear message, and BuildKit is unavailable. For the full matrix and the reason behind each gap, see the dedicated [`docker-rt` documentation](pyromind_sdk/docker_rt/README.md).
 
+### Command channel (rift)
+
+`docker exec`, `docker cp`, interactive `docker exec -it` and `docker attach` do
+not use the platform exec WebSocket. Pod Running is only a prerequisite: the
+**platform injects `rift-client` when it creates the sandbox Pod** (initContainer
+binary + per-sandbox token Secret), where it runs as PID 1 (`--supervise`) and
+execs the user process. `docker-rt` uploads nothing; it waits until rift-client
+answers Ping and only then reports the container as Running/Up. These calls
+**always** go through the **rift gateway** (gRPC over HTTP/2) to the sandbox
+Service on port `7500` — this is not a runtime switch:
+
+```text
+docker exec / cp -> docker-rt -> rift gateway (auth) -> Service:7500 -> rift-client
+```
+
+Requirements and behaviour:
+
+- Set `DOCKER_RT_RIFT_GATEWAY` to a reachable gateway (or `PYROMIND_CLUSTER`,
+  which resolves it from the SDK cluster map). Use
+  `DOCKER_RT_RIFT_GATEWAY_TLS=true` for a public-CA TLS endpoint, or
+  `DOCKER_RT_RIFT_GATEWAY_CA=/path/ca.pem` for a private CA. The gateway itself
+  is configured with `RIFT_AUTH_URL` pointing at the platform authorizer.
+  Without a gateway, exec/cp fail with `[RIFT_UNAVAILABLE]`.
+- The rift-client Go sources and the injection image live in the standalone
+  `rift-client` repo; the SDK ships only the Python gRPC stubs and the proto.
+- `docker start` does not return until rift-client answers Ping
+  (`DOCKER_RT_RIFT_PING_ATTEMPTS` × `DOCKER_RT_RIFT_PING_INTERVAL`); if the
+  channel never comes up, start fails and the container is not reported as
+  Running. A live channel is re-checked every
+  `DOCKER_RT_RIFT_HEALTH_INTERVAL` seconds.
+- There is deliberately **no fallback** to the platform exec channel: if rift
+  is unavailable the command fails loudly instead of silently switching
+  transport.
+- Sandboxes created **before** platform-side injection have no rift-client and
+  must be recreated (`docker rm` + `docker run`). `docker stop` + `docker start`
+  resumes the Pod; the platform refreshes the token Secret on resume.
+- The gateway compares the sandbox's per-sandbox rift password (from the
+  platform `get_sandbox` detail, never the account access key) against the
+  sandbox `Pipe` and forwards the same password as `x-rift-token`; the pod
+  reads it from the mounted Secret file (`0444`, so non-root image users can
+  read it too) and compares it in constant time. No public key, KV or signing
+  is involved.
+- Feishu alerts for an unreachable `rift-client` are emitted by the gateway
+  (it counts consecutive failures per sandbox), not by the local daemon.
+
+See [`pyromind_sdk/rift/README.md`](pyromind_sdk/rift/README.md)
+for the full environment-variable table.
+
 ## Custom workflow nodes
 
 The SDK can load node definitions from YAML and convert Python functions to node configuration. For example:
@@ -279,12 +326,11 @@ See [node SDK documentation](pyromind_sdk/README_CN.md) and the [examples](pyrom
 
 The client workflow package validates and converts workflow payloads between standard and lightweight representations. Its public helpers include `validate_workflow`, `validate_standard_format`, `to_workflow_lite`, `to_workflow_standard`, `WorkflowLiteConverter`, and `LayoutGenerator`.
 
-The `pyromind` command provides three user-facing tools:
+The `pyromind` command provides two user-facing tools:
 
 | Command | Purpose |
 | --- | --- |
 | `pyromind python-to-yaml <file> <function> --node-name <name>` | Statically analyze a Python function and print or write a YAML node definition. |
-| `pyromind terminal <sandbox-id>` | Open an interactive terminal in a running custom sandbox. Requires API key and cluster settings. |
 | `pyromind docker-rt` | Start the Docker-compatible runtime described below. |
 
 For example, write a node definition to a file:

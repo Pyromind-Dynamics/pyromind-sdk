@@ -302,7 +302,44 @@ def test_cluster_help_points_at_the_portal_resource_map() -> None:
     """No static cluster table: the choices come from the portal at setup time."""
     from ..daemon import prepare_server_parser
 
-    help_text = prepare_server_parser().format_help()
+    # argparse breaks the choice list on hyphens ("cn-" / "east-1"), so drop the
+    # whitespace entirely before matching codes.
+    help_text = "".join(prepare_server_parser().format_help().split())
 
     assert "--cluster" in help_text
-    assert "available clusters" in help_text
+    assert "availableclusters" in help_text  # help_text 已去掉所有空白
+
+
+def test_foreground_daemon_records_its_pid(monkeypatch: MonkeyPatch, tmp_path) -> None:
+    """前台启动也要写 pid 文件，否则 `--stop` 永远说 not running。"""
+    from .. import daemon as daemon_mod
+
+    sock = str(tmp_path / "docker-rt.sock")
+    monkeypatch.setenv("DOCKER_RT_PID_FILE", str(tmp_path / "daemon.pid"))
+
+    path = daemon_mod.write_pid_file(sock)
+    assert path.read_text(encoding="utf-8").strip() == str(os.getpid())
+
+    # `--stop` 读的就是这个文件
+    calls = []
+
+    def fake_kill(pid, sig):
+        calls.append((pid, sig))
+        if sig == 0:
+            raise ProcessLookupError()
+
+    monkeypatch.setattr(daemon_mod.os, "kill", fake_kill)
+    assert daemon_mod.stop_daemon(sock=sock) == 0
+    assert (os.getpid(), daemon_mod.signal.SIGTERM) in calls
+    assert not path.exists()
+
+
+def test_clear_pid_file_leaves_another_process_alone(tmp_path) -> None:
+    from .. import daemon as daemon_mod
+
+    path = tmp_path / "other.pid"
+    path.write_text("999999", encoding="utf-8")
+    daemon_mod.clear_pid_file(path)
+    assert path.exists(), "别的进程的 pid 文件不能被删"
+
+    daemon_mod.clear_pid_file(None)  # 没写过也不该炸

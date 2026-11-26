@@ -32,9 +32,16 @@ def _capture_env_class():
     class _Env(PyromindSDK):
         def __init__(self) -> None:
             self.puts: list[tuple[str, bytes]] = []
+            # These tests are about the size pre-check, not the rift gate.
+            self.rift_ready = True
 
-        async def put_archive(self, dest_path, tar_bytes):  # type: ignore[override]
-            self.puts.append((dest_path, bytes(tar_bytes)))
+        async def put_archive(self, dest_path, tar):  # type: ignore[override]
+            # 正常路径已改成流式（大 tar 不进内存），这里按顺序收齐再断言。
+            if hasattr(tar, "__aiter__"):
+                chunks = [chunk async for chunk in tar]
+            else:
+                chunks = [bytes(tar)]
+            self.puts.append((dest_path, b"".join(chunks)))
 
     return _Env
 

@@ -56,7 +56,6 @@ pyromind_sdk/
 ├── python_function_to_yaml_cli.py    # Python 转 YAML 命令行工具
 ├── test_run_workflow_cli.py          # 工作流提交命令行工具
 ├── exec_stream.py                    # 沙箱流式执行辅助工具
-└── terminal.py                       # 沙箱交互式终端
 ```
 
 ## 环境要求
@@ -260,6 +259,45 @@ docker rm -f demo
 
 `docker-rt-context` 会将 Docker CLI 切换到 `docker-rt` 端点。守护进程需要 Docker CLI，并且必须能访问配置的集群。常见容器生命周期和 exec 命令均可使用；镜像构建和端口转发有额外行为与限制。`docker logs`、`docker events`、`docker compose`、`docker buildx`、`docker network` 这些命令在 docker-rt 下会直接被 CLI 包装器拦截并给出提示，BuildKit 也不可用。完整清单与每项不可用的原因请参阅专门的 [`docker-rt` 文档](pyromind_sdk/docker_rt/README.md)。
 
+### 命令通道（rift）
+
+`docker exec`、`docker cp`、交互式 `docker exec -it` 与 `docker attach` **不走**平台
+的 exec WebSocket。Pod Running 只是前置条件：**平台在创建沙箱 Pod 时注入
+`rift-client`**（initContainer 拷二进制 + per-sandbox token Secret），它以 PID 1
+（`--supervise`）运行并 exec 用户进程。`docker-rt` 不上传任何东西，只等 rift-client
+Ping 通之后才把容器标成 Running/Up。这些调用**始终**经 **rift gateway**（HTTP/2 上的
+gRPC）转发到沙箱 Service 的 `7500` 端口——不是运行时切换：
+
+```text
+docker exec / cp -> docker-rt -> rift gateway（鉴权）-> Service:7500 -> rift-client
+```
+
+要求与行为：
+
+- 设置 `DOCKER_RT_RIFT_GATEWAY` 指向可达的 gateway（或设 `PYROMIND_CLUSTER`，由
+  SDK 集群表解析）：公网 CA 用 `DOCKER_RT_RIFT_GATEWAY_TLS=true`，自签/私有 CA 用
+  `DOCKER_RT_RIFT_GATEWAY_CA=/path/ca.pem`。gateway 侧用 `RIFT_AUTH_URL` 指向平台
+  鉴权接口。没有 gateway 时，exec/cp 会直接以 `[RIFT_UNAVAILABLE]` 失败。
+- rift-client 的 Go 源码与注入镜像在独立仓库 `rift-client`；SDK 只带 Python gRPC
+  stubs 与 proto。
+- `docker start` 在 rift-client Ping 通之前不会返回
+  （`DOCKER_RT_RIFT_PING_ATTEMPTS` × `DOCKER_RT_RIFT_PING_INTERVAL`），始终不通则
+  start 失败、容器不会显示为 Running；已就绪的通道按
+  `DOCKER_RT_RIFT_HEALTH_INTERVAL` 周期复检。
+- **刻意不提供**回落到平台 exec 通道的行为：rift 不可用就明确报错，而不是静默换传输。
+- **平台注入上线之前**创建的沙箱没有 rift-client，必须重建（`docker rm` +
+  `docker run`）。`docker stop` + `docker start` 恢复 Pod，平台会在 resume 时刷新
+  token Secret。
+- Gateway 用该 sandbox 自己的 rift 密码（取自平台 `get_sandbox` 的 `rift_password`，
+  不是用户 access key）与沙箱 `Pipe` 里的值比对，并把同一个密码作为
+  `x-rift-token` 转发；Pod 内从挂载的 Secret 文件读取（`0444`，非 root 镜像用户也能
+  读）并做常量时间比较。不涉及公钥、KV 或签名。
+- `rift-client` 不可达的飞书告警由 **gateway** 发出（按 sandbox 统计连续失败），本机
+  daemon 不发通知。
+
+完整环境变量表见
+[`pyromind_sdk/rift/README.md`](pyromind_sdk/rift/README.md)。
+
 ## 自定义工作流节点
 
 SDK 支持从 YAML 加载节点定义，也可以将 Python 函数转换为节点配置。例如：
@@ -284,7 +322,6 @@ YAML 格式、节点校验及更多用法见[节点 SDK 文档](pyromind_sdk/REA
 | 命令 | 用途 |
 | --- | --- |
 | `pyromind python-to-yaml <file> <function> --node-name <name>` | 静态分析 Python 函数，并输出或写入 YAML 节点定义。 |
-| `pyromind terminal <sandbox-id>` | 连接运行中的 custom 沙箱交互式终端，需要 API Key 和集群配置。 |
 | `pyromind docker-rt` | 启动下文所述的 Docker 兼容运行时。 |
 
 例如，将节点定义写入文件：
