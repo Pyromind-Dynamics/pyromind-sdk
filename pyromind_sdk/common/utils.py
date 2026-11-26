@@ -16,6 +16,59 @@ import re
 from typing import Any
 
 # ---------------------------------------------------------------------------
+# portal 地址与集群环境
+# ---------------------------------------------------------------------------
+
+#: 默认（prod）门户地址。
+DEFAULT_API_BASE_URL = "https://api-portal.pyromind.ai/api/v1"
+PRE_API_BASE_URL = "https://pre-api-portal.pyromind.ai/api/v1"
+PRE2_API_BASE_URL = "https://pre2-api-portal.pyromind.ai/api/v1"
+
+_ENV_API_BASE_URLS = {
+    "prod": DEFAULT_API_BASE_URL,
+    "pre": PRE_API_BASE_URL,
+    "pre2": PRE2_API_BASE_URL,
+}
+
+
+def normalise_cluster(raw: str) -> str:
+    """把 ``code#prod`` / 空后缀归一化成裸集群名，其它环境原样保留。"""
+    value = (raw or "").strip()
+    code, sep, env = value.partition("#")
+    code = code.strip()
+    env = env.strip().lower()
+    if not code:
+        return value
+    if not sep or not env or env == "prod":
+        return code
+    return f"{code}#{env}"
+
+
+def cluster_environment(cluster: str) -> str:
+    """取集群的环境后缀；裸集群名按 prod。"""
+    _, _, env = (cluster or "").strip().partition("#")
+    return env.strip().lower() or "prod"
+
+
+def api_base_url_for_cluster(
+    cluster: str,
+    configured_base: str | None = None,
+) -> str:
+    """集群对应的门户地址；显式配置优先，其次按环境选择 pre/pre2/prod。"""
+    configured = (configured_base or "").strip()
+    if configured:
+        return configured.rstrip("/")
+    env = cluster_environment(cluster)
+    try:
+        return _ENV_API_BASE_URLS[env]
+    except KeyError as exc:
+        raise ValueError(
+            f"unknown cluster environment {env!r} in {cluster!r}; "
+            "expected 'prod', 'pre', or 'pre2'"
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
 # sandbox id 校验
 # ---------------------------------------------------------------------------
 

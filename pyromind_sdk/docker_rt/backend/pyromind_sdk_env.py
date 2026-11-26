@@ -28,8 +28,8 @@ from pyromind_sdk.client.async_base import (
 )
 from pyromind_sdk.client.async_sandbox import AsyncSandboxClient
 from pyromind_sdk.client.base import (
-    DEFAULT_API_BASE_URL,
     ENV_BASE_URL,
+    ENV_CLUSTER,
     PyroMindAPIError,
 )
 from pyromind_sdk.client.models import (
@@ -45,6 +45,7 @@ from pyromind_sdk.exec_stream import (
     build_exec_stream_websocket_url,
     iter_exec_stream_async,
 )
+from pyromind_sdk.common.utils import api_base_url_for_cluster
 from pyromind_sdk.log_redaction import redact_text
 
 from .portforward import parse_publish_spec
@@ -181,8 +182,10 @@ def new_sandbox_client() -> AsyncSandboxClient:
     address for the rest of the session. Only profile/storage lookups stay on
     the portal with the long-lived key.
     """
+    cluster = (os.getenv(ENV_CLUSTER) or "").strip()
     return AsyncSandboxClient(
-        base_url=(os.getenv(ENV_BASE_URL) or DEFAULT_API_BASE_URL),
+        cluster=cluster,
+        base_url=api_base_url_for_cluster(cluster, os.getenv(ENV_BASE_URL)),
         connector_limit=DEFAULT_CONNECTOR_LIMIT,
         connector_limit_per_host=DEFAULT_CONNECTOR_LIMIT,
     )

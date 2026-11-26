@@ -17,6 +17,11 @@ except ImportError:
     pass
 from typing import Any
 
+from ..common.utils import (
+    DEFAULT_API_BASE_URL,
+    api_base_url_for_cluster,
+    normalise_cluster,
+)
 from ..log_redaction import mask_secret
 
 DOCKER_LINUX_INSTALL_HINT = """\
@@ -37,10 +42,8 @@ _CYAN = "\033[36m"
 _YELLOW = "\033[33m"
 _RESET = "\033[0m"
 
-#: 预发环境：prod 门户通常不下发，输入时提示切换到对应门户
+#: 预发环境：prod 门户通常不下发，选中后直接切到对应门户
 _PRE_ENVS = ("pre", "pre2")
-
-_PRE_PORTAL_HINT = "https://pre-api-portal.pyromind.ai/api/v1"
 
 
 def _cluster_value(code: str, env: str) -> str:
@@ -49,19 +52,6 @@ def _cluster_value(code: str, env: str) -> str:
     prod 是默认环境，裸集群名即可；只有非 prod 才保留 ``#env`` 后缀。
     """
     return code if env == "prod" else f"{code}#{env}"
-
-
-def normalise_cluster(raw: str) -> str:
-    """把 ``code#prod`` / 空后缀归一化成裸集群名，其它环境原样保留。"""
-    value = (raw or "").strip()
-    code, sep, env = value.partition("#")
-    code = code.strip()
-    env = env.strip().lower()
-    if not code:
-        return value
-    if not sep or not env or env == "prod":
-        return code
-    return f"{code}#{env}"
 
 
 def check_docker_cli(*, stderr: Any | None = None) -> bool:
@@ -144,7 +134,7 @@ def _ask_cluster(
     ``[{"cluster", "host"}]``，``unapply`` 条目已过滤，``cluster`` 自带
     环境后缀。所有可用组合逐行打印；也接受裸集群代码，多环境时再追问一次。
     """
-    from ..client.base import DEFAULT_API_BASE_URL, ENV_BASE_URL
+    from ..client.base import ENV_BASE_URL
     from ..token import fetch_cluster_hosts
 
     base = (os.getenv(ENV_BASE_URL) or "").strip() or DEFAULT_API_BASE_URL
@@ -205,15 +195,9 @@ def _ask_cluster(
         code = code.strip()
         env = env.strip().lower()
         if env in _PRE_ENVS and code in envs_by_code:
-            # prod 门户不会下发 pre/pre2；提示用户换成对应环境门户再重试，
-            # 不再误报成“需要内部用户”。
-            portal = f" ({_PRE_PORTAL_HINT})" if env == "pre" else ""
-            stdout.write(
-                f"Environment {env!r} is not available on this portal; set "
-                f"PYROMIND_BASE_URL to the {env} portal{portal} and retry\n"
-            )
-            stdout.flush()
-            continue
+            # prod 门户通常不下发 pre/pre2；选中后直接切到对应门户，
+            # 不再要求用户手填 PYROMIND_BASE_URL。
+            return _cluster_value(code, env)
         stdout.write(
             f"Unknown cluster {candidate!r}; "
             "choose one of the clusters listed above\n"
@@ -301,6 +285,17 @@ def prepare_env(
         )
         os.environ["PYROMIND_CLUSTER"] = cluster
 
+    if cluster:
+        from ..client.base import ENV_BASE_URL
+
+        configured_base = (os.getenv(ENV_BASE_URL) or "").strip()
+        # 默认 prod 门户不足以覆盖 pre/pre2 集群；选到预发环境时自动切到
+        # 对应门户。显式配置的自定义基址始终优先。
+        if not configured_base or (
+            configured_base.rstrip("/") == DEFAULT_API_BASE_URL.rstrip("/")
+        ):
+            os.environ[ENV_BASE_URL] = api_base_url_for_cluster(cluster)
+
     result["api_key"] = api_key
     result["cluster"] = cluster
     return result
@@ -320,15 +315,18 @@ async def check_connection(
 ) -> int:
     """Verify PyroMind API access and return the number of visible sandboxes."""
     from pyromind_sdk.client.async_sandbox import AsyncSandboxClient
-    from pyromind_sdk.client.base import DEFAULT_API_BASE_URL, ENV_BASE_URL
+    from pyromind_sdk.client.base import ENV_BASE_URL
 
+    selected_cluster = cluster or os.getenv("PYROMIND_CLUSTER") or ""
     owns_client = client is None
     client = client or AsyncSandboxClient(
         api_key=api_key or os.getenv("PYROMIND_API_KEY"),
-        cluster=cluster or os.getenv("PYROMIND_CLUSTER"),
+        cluster=selected_cluster,
         # Every request starts at the portal: it hands back the token and the
         # cluster-direct address this daemon will talk to afterwards.
-        base_url=(os.getenv(ENV_BASE_URL) or DEFAULT_API_BASE_URL),
+        base_url=api_base_url_for_cluster(
+            selected_cluster, os.getenv(ENV_BASE_URL)
+        ),
         timeout=_CONNECTION_CHECK_TIMEOUT_S,
     )
     try:

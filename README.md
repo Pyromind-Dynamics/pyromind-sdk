@@ -219,10 +219,20 @@ The async client exposes this service as `client.instances`.
 | Method | Purpose |
 | --- | --- |
 | `get_user_info()` | Get account information, optionally including credit information. |
+| `get_user_clusters()` | List the cluster codes enabled for the account. |
 | `get_access_key()` / `get_storage_info()` | Get an access key or storage credentials. |
 | `add_key()` / `list_keys()` | Add and list SSH public keys. |
 
 `ProfileClient` is available only on the synchronous top-level client.
+
+### Storage API (`client.storage_api`)
+
+| Method | Purpose |
+| --- | --- |
+| `file_shares` / `shares` | Access same-cluster file share tasks. |
+| `transfers` / `transfer` | Access cross-cluster file transfer tasks. |
+| `submit()` / `list_page()` / `list()` | Submit and list cross-cluster transfers. |
+| `cancel()` / `delete()` / `clear_finished()` | Cancel, delete, or clear finished transfers. |
 
 ### Storage (`StorageClient`)
 

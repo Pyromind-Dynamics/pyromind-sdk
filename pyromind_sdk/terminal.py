@@ -34,13 +34,15 @@ from urllib.parse import quote, urlencode
 import aiohttp
 
 from pyromind_sdk.client.base import (
-    DEFAULT_API_BASE_URL,
     ENV_API_KEY,
     ENV_BASE_URL,
     ENV_CLUSTER,
 )
 from pyromind_sdk.client.trace import TRACE_ID_HEADER, ensure_trace_id
-from pyromind_sdk.common.utils import ensure_valid_sandbox_id
+from pyromind_sdk.common.utils import (
+    api_base_url_for_cluster,
+    ensure_valid_sandbox_id,
+)
 from pyromind_sdk.log_redaction import redact_text
 from pyromind_sdk.token import (
     PURPOSE_WS_TERMINAL,
@@ -331,10 +333,11 @@ def run_terminal(
         return 1
 
     # 1. Resolve the exchange base: explicit --base-url > $PYROMIND_BASE_URL >
-    # the portal. The cluster determines which direct address we get back.
-    if not base_url:
-        base_url = (os.getenv(ENV_BASE_URL) or "").strip() or DEFAULT_API_BASE_URL
+    # the cluster's environment portal. The cluster determines which direct
+    # address we get back.
     cluster = (cluster or os.getenv(ENV_CLUSTER) or "").strip()
+    if not base_url:
+        base_url = api_base_url_for_cluster(cluster, os.getenv(ENV_BASE_URL))
     if not cluster:
         print(
             f"Error: --cluster is required (or set {ENV_CLUSTER}); choose one "

@@ -12,7 +12,11 @@ from ..bootstrap import (
     print_connected,
 )
 
-_PYROMIND_VARS = ("PYROMIND_API_KEY", "PYROMIND_CLUSTER")
+_PYROMIND_VARS = (
+    "PYROMIND_API_KEY",
+    "PYROMIND_CLUSTER",
+    "PYROMIND_BASE_URL",
+)
 
 #: What the portal's discovery call returns in these tests.
 _TEST_MAP = {
@@ -211,8 +215,10 @@ def test_bare_code_asks_environment_when_prod_is_absent(
     assert "environment (pre, pre2): " in stdout.getvalue()
 
 
-def test_pre_is_rejected_when_the_portal_hides_it(monkeypatch: MonkeyPatch) -> None:
-    """prod 门户不下发 pre：提示改成设置 pre 门户地址。"""
+def test_pre_selection_switches_to_the_pre_portal(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """选中 pre 集群后直接切到 pre 门户，不提示用户填 PYROMIND_BASE_URL。"""
     import pyromind_sdk.token as token_mod
 
     monkeypatch.setattr(
@@ -224,17 +230,20 @@ def test_pre_is_rejected_when_the_portal_hides_it(monkeypatch: MonkeyPatch) -> N
     )
     monkeypatch.setenv("PYROMIND_API_KEY", "existing-key")
     monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
+    monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
 
     stdout = io.StringIO()
-    info = prepare_env(stdin=io.StringIO("us-west-2#pre\nus-west-2\n"), stdout=stdout)
+    info = prepare_env(stdin=io.StringIO("us-west-2#pre\n"), stdout=stdout)
 
-    assert info["cluster"] == "us-west-2"
+    assert info["cluster"] == "us-west-2#pre"
+    assert (
+        os.environ["PYROMIND_BASE_URL"]
+        == "https://pre-api-portal.pyromind.ai/api/v1"
+    )
     text = stdout.getvalue()
     assert "\nus-west-2\n" in text
-    assert "PYROMIND_CLUSTER: " in text
-    assert "requires an internal user" not in text
-    assert "PYROMIND_BASE_URL" in text
-    assert "pre-api-portal.pyromind.ai" in text
+    assert "is not available on this portal" not in text
+    assert "pre-api-portal.pyromind.ai" not in text
 
 
 def test_cluster_prompt_rejects_unknown_code_and_asks_again(monkeypatch: MonkeyPatch) -> None:
