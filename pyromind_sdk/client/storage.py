@@ -23,8 +23,9 @@ except ImportError:
         "Please install it with: pip install minio"
     )
 
-from pyromind_sdk.client.base import PyroMindAPIError, DEFAULT_API_BASE_URL, ENV_API_KEY, ENV_BASE_URL, ENV_CLUSTER
+from pyromind_sdk.client.base import PyroMindAPIError, ENV_API_KEY, ENV_BASE_URL, ENV_CLUSTER
 from pyromind_sdk.client.trace import TRACE_ID_HEADER, ensure_trace_id
+from pyromind_sdk.common.utils import api_base_url_for_cluster
 from pyromind_sdk.sdk_version import SDK_VERSION_HEADER, get_sdk_version
 from pyromind_sdk.token import HttpTokenCache
 
@@ -788,12 +789,14 @@ def get_storage_info(
             f"API key is required. Please set the {ENV_API_KEY} environment variable."
         )
 
-    base = (base_url or os.getenv(ENV_BASE_URL) or DEFAULT_API_BASE_URL).rstrip("/")
     cluster = (cluster or os.getenv(ENV_CLUSTER) or "").strip()
     if not cluster:
         raise ValueError(
             f"A cluster is required to look up storage: pass cluster= or set {ENV_CLUSTER}."
         )
+    base = api_base_url_for_cluster(
+        cluster, base_url or os.getenv(ENV_BASE_URL)
+    )
 
     tokens = HttpTokenCache(base, api_key, cluster=cluster)
     for attempt in (0, 1):

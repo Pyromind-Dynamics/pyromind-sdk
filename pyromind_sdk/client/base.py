@@ -21,13 +21,18 @@ from .trace import (
     reset_trace_id,
     set_trace_id,
 )
+from ..common.utils import (
+    DEFAULT_API_BASE_URL as _DEFAULT_API_BASE_URL,
+    api_base_url_for_cluster,
+)
 from ..log_redaction import redact, redact_text
 from ..sdk_version import SDK_VERSION_HEADER, get_sdk_version
 from ..token import HttpTokenCache
 
 
 # Constants
-DEFAULT_API_BASE_URL = "https://api-portal.pyromind.ai/api/v1"
+#: 兼容旧导入路径：唯一来源见 ``common/utils.py``。
+DEFAULT_API_BASE_URL = _DEFAULT_API_BASE_URL
 DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_RETRIES = 3
 ENV_API_KEY = "PYROMIND_API_KEY"
@@ -174,28 +179,19 @@ class PyroMindClient:
         # Strip whitespace from API key
         api_key = api_key.strip()
 
-        # 门户地址必须显式提供（参数或 PYROMIND_BASE_URL）；只有全部缺失时才
-        # 落到默认 prod 门户。非 prod 集群 + 默认门户视为配置错误，直接失败，
-        # 不按 cluster/env 猜门户地址。
-        configured_base = (base_url or os.getenv(ENV_BASE_URL) or "").strip()
-        base_url = configured_base or DEFAULT_API_BASE_URL
-        self.api_key = api_key
-        self.base_url = base_url.rstrip('/')
-        #: 换票用门户地址；首次换票后 ``base_url`` 会切到集群直连地址。
-        self.exchange_base_url = self.base_url
-
         # 集群选择是显式的：--cluster、环境变量或 docker-rt 启动时从门户列表选。
         # 构造阶段不联网；未设置集群时，第一次换票才报错（见 token.fetch_token）。
         self.cluster = (cluster or os.getenv(ENV_CLUSTER) or "").strip()
-        cluster_env = (
-            self.cluster.partition("#")[2] if "#" in self.cluster else "prod"
+
+        # 门户地址：显式参数 / PYROMIND_BASE_URL 优先；否则按集群环境自动选择
+        # prod / pre / pre2 门户，用户不需要再手填基址。
+        configured_base = (base_url or os.getenv(ENV_BASE_URL) or "").strip()
+        self.api_key = api_key
+        self.base_url = api_base_url_for_cluster(
+            self.cluster, configured_base=configured_base
         )
-        if not configured_base and cluster_env != "prod":
-            raise ValueError(
-                f"PYROMIND_CLUSTER={self.cluster!r} targets the "
-                f"{cluster_env!r} environment; set PYROMIND_BASE_URL to that "
-                "environment's portal (the default base URL is the prod portal)."
-            )
+        #: 换票用门户地址；首次换票后 ``base_url`` 会切到集群直连地址。
+        self.exchange_base_url = self.base_url
 
         # Data-plane clients exchange the long-lived key on the portal and then
         # target the cluster-direct ``api_base_url`` returned by the exchange

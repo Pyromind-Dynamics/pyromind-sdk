@@ -29,17 +29,20 @@ import signal
 import sys
 import time
 from typing import Optional, Sequence
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import aiohttp
 
 from pyromind_sdk.client.base import (
-    DEFAULT_API_BASE_URL,
     ENV_API_KEY,
     ENV_BASE_URL,
     ENV_CLUSTER,
 )
 from pyromind_sdk.client.trace import TRACE_ID_HEADER, ensure_trace_id
+from pyromind_sdk.common.utils import (
+    api_base_url_for_cluster,
+    ensure_valid_sandbox_id,
+)
 from pyromind_sdk.log_redaction import redact_text
 from pyromind_sdk.token import (
     PURPOSE_WS_TERMINAL,
@@ -99,7 +102,14 @@ def _websocket_url(
     # login shell, with them it execs *that* command under the same PTY.
     for part in command or ():
         qs_params.append(("command", str(part)))
-    return f"{base}/sandboxes/{sandbox_id}/terminal?{urlencode(qs_params)}"
+    # id 先做「格式+长度」校验再进路径：调用方传入的值不该能改变 URL 结构。
+    safe_id = quote(
+        ensure_valid_sandbox_id(
+            sandbox_id, action="terminal", error_cls=TerminalError
+        ),
+        safe="",
+    )
+    return f"{base}/sandboxes/{safe_id}/terminal?{urlencode(qs_params)}"
 
 
 def build_terminal_websocket_url(
@@ -131,6 +141,7 @@ def fetch_terminal_token(
     cluster: Optional[str] = None,
 ) -> tuple[str, str]:
     """Exchange on the portal; returns ``(token, cluster_direct_base_url)``."""
+    ensure_valid_sandbox_id(sandbox_id, action="terminal", error_cls=TerminalError)
     token, _ttl, api_base_url = fetch_token(
         base_url,
         api_key,
@@ -149,6 +160,7 @@ async def async_fetch_terminal_token(
     cluster: Optional[str] = None,
 ) -> tuple[str, str]:
     """Async variant of :func:`fetch_terminal_token`."""
+    ensure_valid_sandbox_id(sandbox_id, action="terminal", error_cls=TerminalError)
     token, _ttl, api_base_url = await async_fetch_token(
         base_url,
         api_key,
@@ -321,10 +333,11 @@ def run_terminal(
         return 1
 
     # 1. Resolve the exchange base: explicit --base-url > $PYROMIND_BASE_URL >
-    # the portal. The cluster determines which direct address we get back.
-    if not base_url:
-        base_url = (os.getenv(ENV_BASE_URL) or "").strip() or DEFAULT_API_BASE_URL
+    # the cluster's environment portal. The cluster determines which direct
+    # address we get back.
     cluster = (cluster or os.getenv(ENV_CLUSTER) or "").strip()
+    if not base_url:
+        base_url = api_base_url_for_cluster(cluster, os.getenv(ENV_BASE_URL))
     if not cluster:
         print(
             f"Error: --cluster is required (or set {ENV_CLUSTER}); choose one "

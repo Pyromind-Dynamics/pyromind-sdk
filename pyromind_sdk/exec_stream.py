@@ -17,11 +17,13 @@ from typing import (
     Optional,
     Union,
 )
+from urllib.parse import quote
 
 import aiohttp
 
 from .client.models import SandboxExecStreamChunk
 from .client.trace import TRACE_ID_HEADER, ensure_trace_id
+from .common.utils import ensure_valid_sandbox_id
 from .log_redaction import redact_text
 from .token import (
     PURPOSE_WS_EXEC,
@@ -69,7 +71,14 @@ def build_exec_stream_websocket_url(api_base_url: str, sandbox_id: str) -> str:
         if base.startswith(http_scheme):
             base = ws_scheme + base[len(http_scheme):]
             break
-    return f"{base}/sandboxes/{sandbox_id}/exec-stream"
+    # id 先做「格式+长度」校验再进路径：调用方传入的值不该能改变 URL 结构。
+    safe_id = quote(
+        ensure_valid_sandbox_id(
+            sandbox_id, action="exec-stream", error_cls=SandboxExecStreamError
+        ),
+        safe="",
+    )
+    return f"{base}/sandboxes/{safe_id}/exec-stream"
 
 
 def fetch_exec_stream_token(
@@ -79,6 +88,9 @@ def fetch_exec_stream_token(
     cluster: Optional[str] = None,
 ) -> tuple[str, str]:
     """Exchange on the portal; returns ``(token, cluster_direct_base_url)``."""
+    ensure_valid_sandbox_id(
+        sandbox_id, action="exec-stream", error_cls=SandboxExecStreamError
+    )
     token, _ttl, api_base_url = fetch_token(
         base_url,
         api_key,
@@ -97,6 +109,9 @@ async def async_fetch_exec_stream_token(
     cluster: Optional[str] = None,
 ) -> tuple[str, str]:
     """Async variant of :func:`fetch_exec_stream_token`."""
+    ensure_valid_sandbox_id(
+        sandbox_id, action="exec-stream", error_cls=SandboxExecStreamError
+    )
     token, _ttl, api_base_url = await async_fetch_token(
         base_url,
         api_key,

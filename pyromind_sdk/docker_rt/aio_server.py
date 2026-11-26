@@ -3035,6 +3035,16 @@ async def list_images(request: web.Request) -> web.Response:
     """
     from .backend import context_staging, build_sandbox
 
+    # 没有 storage 凭据时直接报错：本地缓存只覆盖当前 daemon 构建过的镜像，
+    # 静默返回它会掩盖“workspace 归档都看不到”的配置问题。
+    if not context_staging.storage_credentials_configured():
+        return _err(
+            500,
+            "Workspace storage is not configured: set "
+            "PYROMIND_STORAGE_ACCESS_KEY and PYROMIND_STORAGE_SECRET_KEY "
+            "before running docker images.",
+        )
+
     store: ContainerStore = request.app["store"]
     summaries: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -4924,20 +4934,20 @@ def _pyromind_terminal_exchange() -> tuple[str, str, str]:
     minted there goes in the WebSocket's first auth frame.
     """
     from pyromind_sdk.client.base import (
-        DEFAULT_API_BASE_URL,
         ENV_API_KEY,
         ENV_BASE_URL,
         ENV_CLUSTER,
     )
+    from pyromind_sdk.common.utils import api_base_url_for_cluster
 
     api_key = (os.getenv(ENV_API_KEY) or "").strip()
-    base = (os.getenv(ENV_BASE_URL) or "").strip() or DEFAULT_API_BASE_URL
     cluster = (os.getenv(ENV_CLUSTER) or "").strip()
     if not cluster:
         raise RuntimeError(
             "PYROMIND_CLUSTER is not set; docker-rt must select a cluster "
             "from the portal's available clusters before opening a terminal."
         )
+    base = api_base_url_for_cluster(cluster, os.getenv(ENV_BASE_URL))
     return base.rstrip("/"), cluster, api_key
 
 

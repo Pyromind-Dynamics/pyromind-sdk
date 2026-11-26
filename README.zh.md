@@ -219,10 +219,20 @@ with PyroMindAPIClient(
 | 方法 | 用途 |
 | --- | --- |
 | `get_user_info()` | 获取账户信息，可选择包含积分信息。 |
+| `get_user_clusters()` | 列出账户已开通的集群编码。 |
 | `get_access_key()` / `get_storage_info()` | 获取访问密钥或存储凭据。 |
 | `add_key()` / `list_keys()` | 添加和列出 SSH 公钥。 |
 
 `ProfileClient` 仅在同步顶层客户端中提供。
+
+### 存储 API (`client.storage_api`)
+
+| 方法 | 用途 |
+| --- | --- |
+| `file_shares` / `shares` | 访问同集群文件分享任务。 |
+| `transfers` / `transfer` | 访问跨集群文件传输任务。 |
+| `submit()` / `list_page()` / `list()` | 提交和列出跨集群传输任务。 |
+| `cancel()` / `delete()` / `clear_finished()` | 取消、删除或清理已结束的传输任务。 |
 
 ### 存储 (`StorageClient`)
 

@@ -193,6 +193,14 @@ def storage_cluster() -> str | None:
     return None
 
 
+def storage_credentials_configured() -> bool:
+    """Whether both storage AK/SK environment variables are present."""
+    return bool(
+        _env("PYROMIND_STORAGE_ACCESS_KEY")
+        and _env("PYROMIND_STORAGE_SECRET_KEY")
+    )
+
+
 def parallel_uploads() -> int:
     """Concurrent multipart uploads (``DOCKER_RT_BUILD_STAGING_PARALLEL``)."""
     try:

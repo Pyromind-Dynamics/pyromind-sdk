@@ -51,7 +51,7 @@ def _stub_exec_stream_token(monkeypatch):
 
 def _adapter_with_fake_client() -> tuple[PyromindSDK, MagicMock]:
     adapter = PyromindSDK.__new__(PyromindSDK)
-    adapter.sandbox_id = "sb-test-1"
+    adapter.sandbox_id = "sb-0123456789ab"
     adapter.name = "old-name"
     adapter.image = "busybox:1.36"
     adapter.working_dir = "/"
@@ -172,14 +172,14 @@ def test_restart_pauses_then_resumes():
 
     asyncio.run(adapter.restart())
 
-    client.pause.assert_called_once_with("sb-test-1")
-    client.resume.assert_called_once_with("sb-test-1")
+    client.pause.assert_called_once_with("sb-0123456789ab")
+    client.resume.assert_called_once_with("sb-0123456789ab")
 
 
 def test_resume_binds_response():
     adapter, client = _adapter_with_fake_client()
     response = MagicMock()
-    response.id = "sb-test-1"
+    response.id = "sb-0123456789ab"
     response.status = "Running"
     response.resources = None
     response.configuration = None
@@ -191,7 +191,7 @@ def test_resume_binds_response():
 
     asyncio.run(adapter.resume())
 
-    client.resume.assert_called_once_with("sb-test-1")
+    client.resume.assert_called_once_with("sb-0123456789ab")
     assert adapter.sandbox_status == "Running"
 
 
@@ -200,7 +200,7 @@ def test_stop_only_pauses():
 
     asyncio.run(adapter.stop())
 
-    client.pause.assert_called_once_with("sb-test-1")
+    client.pause.assert_called_once_with("sb-0123456789ab")
     client.delete.assert_not_called()
 
 
@@ -218,12 +218,12 @@ def test_cleanup_pauses_before_delete(monkeypatch):
     asyncio.run(adapter.cleanup())
 
     client.pause.assert_called_once_with(
-        "sb-test-1",
+        "sb-0123456789ab",
         timeout=env_mod._CLEANUP_PAUSE_REQUEST_TIMEOUT_S,
         retry=False,
     )
     client.delete.assert_called_once_with(
-        "sb-test-1",
+        "sb-0123456789ab",
         timeout=env_mod._CLEANUP_DELETE_TIMEOUT_S,
         retry=False,
     )
@@ -237,7 +237,7 @@ def test_cleanup_does_not_pause_when_fresh_status_is_stopped():
 
     client.pause.assert_not_called()
     client.delete.assert_called_once_with(
-        "sb-test-1",
+        "sb-0123456789ab",
         timeout=env_mod._CLEANUP_DELETE_TIMEOUT_S,
         retry=False,
     )
@@ -255,7 +255,7 @@ def test_cleanup_directly_deletes_non_running_status(status):
 
     client.pause.assert_not_called()
     client.delete.assert_called_once_with(
-        "sb-test-1",
+        "sb-0123456789ab",
         timeout=env_mod._CLEANUP_DELETE_TIMEOUT_S,
         retry=False,
     )
@@ -304,7 +304,7 @@ def test_refresh_phase_does_not_refetch_after_not_found():
     assert asyncio.run(adapter.refresh_phase()) == "NotFound"
     assert asyncio.run(adapter.refresh_phase(force=True)) == "NotFound"
 
-    client.get_sandbox.assert_called_once_with("sb-test-1")
+    client.get_sandbox.assert_called_once_with("sb-0123456789ab")
 
 
 def test_refresh_phase_singleflights_status_requests():
@@ -320,7 +320,7 @@ def test_refresh_phase_singleflights_status_requests():
 
     asyncio.run(run())
 
-    client.get_sandbox.assert_called_once_with("sb-test-1")
+    client.get_sandbox.assert_called_once_with("sb-0123456789ab")
     assert adapter.sandbox_status == "stopped"
 
 
@@ -360,7 +360,7 @@ def test_cleanup_status_timeout_does_not_pause_unconfirmed_running():
 
     client.pause.assert_not_called()
     client.delete.assert_called_once_with(
-        "sb-test-1",
+        "sb-0123456789ab",
         timeout=env_mod._CLEANUP_DELETE_TIMEOUT_S,
         retry=False,
     )
@@ -376,12 +376,12 @@ def test_pause_timeout_still_attempts_delete():
     asyncio.run(adapter.cleanup())
 
     client.pause.assert_awaited_once_with(
-        "sb-test-1",
+        "sb-0123456789ab",
         timeout=env_mod._CLEANUP_PAUSE_REQUEST_TIMEOUT_S,
         retry=False,
     )
     client.delete.assert_awaited_once_with(
-        "sb-test-1",
+        "sb-0123456789ab",
         timeout=env_mod._CLEANUP_DELETE_TIMEOUT_S,
         retry=False,
     )
@@ -664,7 +664,7 @@ def test_put_archive_writes_files_into_sandbox() -> None:
 
     client.write_file.assert_called_once()
     args = client.write_file.call_args.args
-    assert args[0] == "sb-test-1"
+    assert args[0] == "sb-0123456789ab"
     assert args[1] == "/var/hello.txt"
     assert args[2] == b"hello"
 
@@ -1206,7 +1206,7 @@ def test_pyromind_terminal_url_carries_command_and_size() -> None:
 
     url = build_terminal_websocket_url(
         "https://api-us-west-2.pyromind.ai/api/v1",
-        "sb-1",
+        "sb-0123456789ab",
         cols=132,
         rows=43,
         command=["bash", "-l"],
@@ -1214,7 +1214,7 @@ def test_pyromind_terminal_url_carries_command_and_size() -> None:
     )
 
     assert url.startswith(
-        "wss://api-us-west-2.pyromind.ai/api/v1/sandboxes/sb-1/terminal?"
+        "wss://api-us-west-2.pyromind.ai/api/v1/sandboxes/sb-0123456789ab/terminal?"
     )
     assert "cols=132&rows=43" in url
     assert "command=bash" in url

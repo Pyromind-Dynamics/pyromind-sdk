@@ -12,6 +12,18 @@ import pytest
 from .helpers import FakeKubeEnv
 
 
+@pytest.fixture(autouse=True)
+def _workspace_storage_stub(monkeypatch):
+    """Most API tests do not exercise storage; keep the workspace index offline."""
+    from ..backend import context_staging
+
+    monkeypatch.setenv("PYROMIND_STORAGE_ACCESS_KEY", "test-ak")
+    monkeypatch.setenv("PYROMIND_STORAGE_SECRET_KEY", "test-sk")
+    monkeypatch.setattr(
+        context_staging, "list_workspace_images", lambda *args, **kwargs: []
+    )
+
+
 @pytest.mark.asyncio
 async def test_attach_after_start(aiohttp_client, fake_kube: FakeKubeEnv):
     from ..aio_server import create_aio_app
@@ -685,6 +697,41 @@ async def test_images_list_ignores_container_images(aiohttp_client):
     images = await (await client.get("/images/json")).json()
     tags = [t for img in images for t in (img.get("RepoTags") or [])]
     assert not any("cluster/only:1" in t for t in tags)
+
+
+@pytest.mark.parametrize(
+    "missing", ["PYROMIND_STORAGE_ACCESS_KEY", "PYROMIND_STORAGE_SECRET_KEY"]
+)
+@pytest.mark.asyncio
+async def test_images_list_requires_storage_credentials(monkeypatch, tmp_path, missing):
+    """Missing storage credentials must fail loudly, not return local images."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from ..aio_server import create_aio_app
+    from ..backend import build_sandbox
+
+    (tmp_path / "local.tar").write_bytes(b"not-a-real-archive")
+    (tmp_path / "local.tar.meta.json").write_text(
+        json.dumps({"tags": ["local/only:1"], "created": 1700000000}),
+        encoding="utf-8",
+    )
+    cache_dir_calls = []
+    monkeypatch.setattr(
+        build_sandbox,
+        "image_cache_dir",
+        lambda: cache_dir_calls.append(True) or tmp_path,
+    )
+    monkeypatch.delenv(missing, raising=False)
+
+    app = create_aio_app(run_reconcile=False)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/images/json")
+        body = await resp.json()
+
+    assert resp.status == 500
+    assert "PYROMIND_STORAGE_ACCESS_KEY" in body["message"]
+    assert "PYROMIND_STORAGE_SECRET_KEY" in body["message"]
+    assert not cache_dir_calls
 
 
 @pytest.mark.asyncio
