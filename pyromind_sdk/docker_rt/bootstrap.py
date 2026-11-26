@@ -20,6 +20,7 @@ from typing import Any
 from ..common.utils import (
     DEFAULT_API_BASE_URL,
     api_base_url_for_cluster,
+    cluster_value,
     normalise_cluster,
 )
 from ..log_redaction import mask_secret
@@ -41,18 +42,6 @@ _GREEN = "\033[32m"
 _CYAN = "\033[36m"
 _YELLOW = "\033[33m"
 _RESET = "\033[0m"
-
-#: 预发环境：prod 门户通常不下发，选中后直接切到对应门户
-_PRE_ENVS = ("pre", "pre2")
-
-
-def _cluster_value(code: str, env: str) -> str:
-    """门户的 ``code#env`` → docker-rt 使用的集群名。
-
-    prod 是默认环境，裸集群名即可；只有非 prod 才保留 ``#env`` 后缀。
-    """
-    return code if env == "prod" else f"{code}#{env}"
-
 
 def check_docker_cli(*, stderr: Any | None = None) -> bool:
     """Return True when a Docker CLI binary is available on PATH."""
@@ -149,7 +138,7 @@ def _ask_cluster(
         env = env.strip().lower() or "prod"
         if not code:
             continue
-        value = _cluster_value(code, env)
+        value = cluster_value(code, env)
         if value in entries:
             continue
         entries.append(value)
@@ -188,16 +177,16 @@ def _ask_cluster(
         if candidate in envs_by_code:
             envs = envs_by_code[candidate]
             if len(envs) == 1:
-                return _cluster_value(candidate, envs[0])
+                return cluster_value(candidate, envs[0])
             env = _ask_environment(envs, stdin=stdin, stdout=stdout, color=color)
-            return _cluster_value(candidate, env)
+            return cluster_value(candidate, env)
         code, _, env = candidate.partition("#")
         code = code.strip()
         env = env.strip().lower()
-        if env in _PRE_ENVS and code in envs_by_code:
-            # prod 门户通常不下发 pre/pre2；选中后直接切到对应门户，
+        if env and code in envs_by_code:
+            # 线上集群是裸名；带环境后缀就是预发，直接切到对应门户，
             # 不再要求用户手填 PYROMIND_BASE_URL。
-            return _cluster_value(code, env)
+            return cluster_value(code, env)
         stdout.write(
             f"Unknown cluster {candidate!r}; "
             "choose one of the clusters listed above\n"

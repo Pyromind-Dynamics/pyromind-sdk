@@ -1,8 +1,14 @@
 from pyromind_sdk.common.utils import (
     DEFAULT_API_BASE_URL,
     api_base_url_for_cluster,
+    cluster_value,
     normalise_cluster,
 )
+
+
+def test_cluster_value_keeps_the_pre_environment_suffix():
+    assert cluster_value("us-west-2", "prod") == "us-west-2"
+    assert cluster_value("us-west-2", "pre") == "us-west-2#pre"
 
 
 def test_normalise_cluster_drops_only_the_prod_suffix():

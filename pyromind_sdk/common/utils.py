@@ -44,6 +44,14 @@ def normalise_cluster(raw: str) -> str:
     return f"{code}#{env}"
 
 
+def cluster_value(code: str, env: str) -> str:
+    """门户的 ``code#env`` → 客户端使用的集群名。
+
+    prod 是默认环境，裸集群名即可；带环境后缀的都是预发环境。
+    """
+    return code if env == "prod" else f"{code}#{env}"
+
+
 def cluster_environment(cluster: str) -> str:
     """取集群的环境后缀；裸集群名按 prod。"""
     _, _, env = (cluster or "").strip().partition("#")
