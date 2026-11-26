@@ -14,8 +14,7 @@ from ..bootstrap import (
 
 _PYROMIND_VARS = ("PYROMIND_API_KEY", "PYROMIND_CLUSTER")
 
-#: What the portal's discovery call returns in these tests. 线上条目是裸集群名，
-#: 预发条目带 ``code#env`` 后缀，与门户实际下发一致。
+#: What the portal's discovery call returns in these tests.
 _TEST_MAP = {
     "us-west-1": {"prod": "https://prod-west1.example/api/v1"},
     "us-west-2": {
@@ -33,10 +32,7 @@ def _stub_cluster_hosts(monkeypatch: MonkeyPatch):
 
     def _hosts(resource_map):
         return [
-            {
-                "cluster": code if env == "prod" else f"{code}#{env}",
-                "host": f"{code}-{env}.example",
-            }
+            {"cluster": f"{code}#{env}", "host": f"{code}-{env}.example"}
             for code in resource_map
             for env in resource_map[code]
         ]
@@ -142,7 +138,7 @@ def test_prepare_env_does_not_create_backend_env(monkeypatch: MonkeyPatch) -> No
 
 
 def test_cluster_prompt_lists_the_portal_clusters(monkeypatch: MonkeyPatch) -> None:
-    """Choices come from the portal cluster list: 线上裸名，预发 ``code#env``。"""
+    """Choices come from the portal cluster list, one ``cluster#env`` per line."""
     monkeypatch.setenv("PYROMIND_API_KEY", "existing-key")
     monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
 
@@ -159,15 +155,16 @@ def test_cluster_prompt_lists_the_portal_clusters(monkeypatch: MonkeyPatch) -> N
         "us-west-2#pre",
     ):
         assert f"\n{entry}\n" in text
-    assert "#prod" not in text
+    assert "us-west-1#prod" not in text
+    assert "us-west-2#prod" not in text
     assert "PYROMIND_CLUSTER: " in text
     assert "environment (" not in text
 
 
-def test_cluster_prompt_selects_exactly_what_the_portal_listed(
+def test_cluster_prompt_accepts_bare_code_as_prod(
     monkeypatch: MonkeyPatch,
 ) -> None:
-    """输入必须与列表某条完全一致：裸名即线上，预发要显式带后缀，不再追问环境。"""
+    """docker-rt 的 prod 集群用裸集群名表示，不再追加 #prod。"""
     monkeypatch.setenv("PYROMIND_API_KEY", "existing-key")
     monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
 
@@ -178,49 +175,80 @@ def test_cluster_prompt_selects_exactly_what_the_portal_listed(
     assert "environment (" not in stdout.getvalue()
 
 
-def test_pre_is_rejected_when_the_portal_hides_it(monkeypatch: MonkeyPatch) -> None:
-    """pre 只对内部用户下发: 不在可选集合里时给出明确原因。"""
+def test_cluster_prompt_accepts_legacy_prod_suffix(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """旧输入 us-west-2#prod 仍可用，但保存时归一化成裸集群名。"""
+    monkeypatch.setenv("PYROMIND_API_KEY", "existing-key")
+    monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
+
+    info = prepare_env(stdin=io.StringIO("us-west-2#prod\n"), stdout=io.StringIO())
+
+    assert info["cluster"] == "us-west-2"
+
+
+def test_bare_code_asks_environment_when_prod_is_absent(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """没有 prod 的集群仍需选择 pre/pre2 环境。"""
     import pyromind_sdk.token as token_mod
 
     monkeypatch.setattr(
         token_mod,
         "fetch_cluster_hosts",
         lambda base_url, api_key: [
-            {"cluster": "us-west-2", "host": "prod-west2.example"},
+            {"cluster": "us-west-2#pre", "host": "pre-west2.example"},
+            {"cluster": "us-west-2#pre2", "host": "pre2-west2.example"},
         ],
     )
     monkeypatch.setenv("PYROMIND_API_KEY", "existing-key")
     monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
 
     stdout = io.StringIO()
-    info = prepare_env(
-        stdin=io.StringIO("us-west-2#pre\nus-west-2\n"), stdout=stdout
+    info = prepare_env(stdin=io.StringIO("us-west-2\npre2\n"), stdout=stdout)
+
+    assert info["cluster"] == "us-west-2#pre2"
+    assert "environment (pre, pre2): " in stdout.getvalue()
+
+
+def test_pre_is_rejected_when_the_portal_hides_it(monkeypatch: MonkeyPatch) -> None:
+    """prod 门户不下发 pre：提示改成设置 pre 门户地址。"""
+    import pyromind_sdk.token as token_mod
+
+    monkeypatch.setattr(
+        token_mod,
+        "fetch_cluster_hosts",
+        lambda base_url, api_key: [
+            {"cluster": "us-west-2#prod", "host": "prod-west2.example"},
+        ],
     )
+    monkeypatch.setenv("PYROMIND_API_KEY", "existing-key")
+    monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
+
+    stdout = io.StringIO()
+    info = prepare_env(stdin=io.StringIO("us-west-2#pre\nus-west-2\n"), stdout=stdout)
 
     assert info["cluster"] == "us-west-2"
     text = stdout.getvalue()
     assert "\nus-west-2\n" in text
     assert "PYROMIND_CLUSTER: " in text
-    assert "Environment 'pre' requires an internal user" in text
+    assert "requires an internal user" not in text
+    assert "PYROMIND_BASE_URL" in text
+    assert "pre-api-portal.pyromind.ai" in text
 
 
-def test_cluster_prompt_rejects_unknown_choice_and_asks_again(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """门户没下发的写法一律拒绝：``cn-east-1`` 不等于 ``cn-east-1#pre``。"""
+def test_cluster_prompt_rejects_unknown_code_and_asks_again(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("PYROMIND_API_KEY", "existing-key")
     monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
 
     stdout = io.StringIO()
     info = prepare_env(
-        stdin=io.StringIO("asia-north-9\ncn-east-1\ncn-east-1#pre\n"),
+        stdin=io.StringIO("asia-north-9\ncn-east-1\n"),
         stdout=stdout,
     )
 
-    text = stdout.getvalue()
     assert info["cluster"] == "cn-east-1#pre"
-    assert "Unknown cluster 'asia-north-9'" in text
-    assert "Unknown cluster 'cn-east-1'" in text
+    assert "Unknown cluster 'asia-north-9'" in stdout.getvalue()
 
 
 def test_cluster_prompt_blank_asks_again(monkeypatch: MonkeyPatch) -> None:
@@ -232,6 +260,30 @@ def test_cluster_prompt_blank_asks_again(monkeypatch: MonkeyPatch) -> None:
 
     assert info["cluster"] == "us-west-1"
     assert "Unknown cluster ''" in stdout.getvalue()
+
+
+def test_env_prompt_rejects_unknown_env(monkeypatch: MonkeyPatch) -> None:
+    """The environment must be one the portal listed for the cluster."""
+    import pyromind_sdk.token as token_mod
+
+    monkeypatch.setattr(
+        token_mod,
+        "fetch_cluster_hosts",
+        lambda base_url, api_key: [
+            {"cluster": "us-west-2#pre", "host": "pre-west2.example"},
+            {"cluster": "us-west-2#pre2", "host": "pre2-west2.example"},
+        ],
+    )
+    monkeypatch.setenv("PYROMIND_API_KEY", "existing-key")
+    monkeypatch.delenv("PYROMIND_CLUSTER", raising=False)
+
+    stdout = io.StringIO()
+    info = prepare_env(
+        stdin=io.StringIO("us-west-2\nstaging\npre\n"), stdout=stdout
+    )
+
+    assert info["cluster"] == "us-west-2#pre"
+    assert "Unknown environment 'staging'" in stdout.getvalue()
 
 
 def test_check_docker_cli_missing_prints_hint(monkeypatch: MonkeyPatch) -> None:

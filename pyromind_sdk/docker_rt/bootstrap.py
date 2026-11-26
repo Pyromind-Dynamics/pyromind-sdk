@@ -41,9 +41,31 @@ _CYAN = "\033[36m"
 _YELLOW = "\033[33m"
 _RESET = "\033[0m"
 
-#: 预发环境：portal 只对内部用户（user_type=internal/internal_test）下发；
-#: SDK 仅据此给出更明确的拒绝提示
+#: 预发环境：prod 门户通常不下发，输入时提示切换到对应门户
 _PRE_ENVS = ("pre", "pre2")
+
+_PRE_PORTAL_HINT = "https://pre-api-portal.pyromind.ai/api/v1"
+
+
+def _cluster_value(code: str, env: str) -> str:
+    """门户的 ``code#env`` → docker-rt 使用的集群名。
+
+    prod 是默认环境，裸集群名即可；只有非 prod 才保留 ``#env`` 后缀。
+    """
+    return code if env == "prod" else f"{code}#{env}"
+
+
+def normalise_cluster(raw: str) -> str:
+    """把 ``code#prod`` / 空后缀归一化成裸集群名，其它环境原样保留。"""
+    value = (raw or "").strip()
+    code, sep, env = value.partition("#")
+    code = code.strip()
+    env = env.strip().lower()
+    if not code:
+        return value
+    if not sep or not env or env == "prod":
+        return code
+    return f"{code}#{env}"
 
 
 def check_docker_cli(*, stderr: Any | None = None) -> bool:
@@ -91,38 +113,71 @@ def _prompt(
     return input(message).strip()
 
 
-def _cluster_choices_from_discovery(clusters: list[dict]) -> list[str]:
-    """门户下发什么就列什么：原样去重、排序，不加也不去掉 ``#env`` 后缀。
+def _cluster_choices_from_discovery(
+    clusters: list[dict],
+) -> tuple[list[str], dict[str, list[str]]]:
+    """门户发现结果 → 展示值 + 按集群代码归组的环境。
 
-    线上门户对有权限的集群下发裸集群名（``cn-east-1`` 即线上），内部用户还会
-    额外拿到 ``cn-east-1#pre`` / ``cn-east-1#pre2``。环境口径由门户决定，
-    docker-rt 只展示和原样回传，选中的值就是 ``PYROMIND_CLUSTER``。
+    ``#prod`` 是默认环境，统一收敛成裸集群名；``#pre`` / ``#pre2`` 保留后缀。
     """
-    choices: list[str] = []
+    entries: list[str] = []
+    envs_by_code: dict[str, list[str]] = {}
     for item in clusters:
         raw = str(item.get("cluster") or "").strip()
-        if raw and raw not in choices:
-            choices.append(raw)
-    choices.sort()
-    return choices
+        code, _, env = raw.partition("#")
+        code = code.strip()
+        env = env.strip().lower() or "prod"
+        if not code:
+            continue
+        value = _cluster_value(code, env)
+        if value not in entries:
+            entries.append(value)
+        envs = envs_by_code.setdefault(code, [])
+        if env not in envs:
+            envs.append(env)
+    entries.sort()
+    for envs in envs_by_code.values():
+        envs.sort()
+    return entries, envs_by_code
+
+
+def _ask_environment(
+    envs: list[str],
+    *,
+    stdin: Any | None,
+    stdout: Any,
+    color: bool,
+) -> str:
+    """同一集群有多个非 prod 环境时，逐行追问一次。"""
+    env_choices = ", ".join(envs)
+    env_prompt = (
+        f"{_BOLD}{_CYAN}environment ({env_choices}){_RESET}: "
+        if color
+        else f"environment ({env_choices}): "
+    )
+    while True:
+        env = _prompt(env_prompt, stdin=stdin, stdout=stdout)
+        if env in envs:
+            return env
+        stdout.write(f"Unknown environment {env!r}; choose one of: {env_choices}\n")
+        stdout.flush()
 
 
 def _reject_cluster_choice(
     candidate: str,
     *,
-    choices: list[str],
+    envs_by_code: dict[str, list[str]],
     stdout: Any,
 ) -> None:
     """说明这一行输入为什么不能用；只解释，不改写候选值。"""
     cluster_code, _, environment = candidate.partition("#")
-    if environment in _PRE_ENVS and cluster_code in {
-        choice.partition("#")[0] for choice in choices
-    }:
-        # 预发只对内部用户下发：portal 已过滤掉，这里给出明确原因，
-        # 避免落到含混的 "Unknown cluster"。
+    if environment in _PRE_ENVS and cluster_code in envs_by_code:
+        # prod 门户通常不下发 pre/pre2，提示用户换到对应门户，而不是
+        # 误报成“需要内部用户”。
+        portal = f" ({_PRE_PORTAL_HINT})" if environment == "pre" else ""
         stdout.write(
-            f"Environment {environment!r} requires an internal user; "
-            "choose one of the clusters listed above\n"
+            f"Environment {environment!r} is not available on this portal; set "
+            f"PYROMIND_BASE_URL to the {environment} portal{portal} and retry\n"
         )
         stdout.flush()
         return
@@ -153,21 +208,21 @@ def _ask_cluster(
 
     base = (os.getenv(ENV_BASE_URL) or "").strip() or DEFAULT_API_BASE_URL
     clusters = fetch_cluster_hosts(base, api_key)
-    choices = _cluster_choices_from_discovery(clusters)
+    entries, envs_by_code = _cluster_choices_from_discovery(clusters)
 
-    if not choices:
+    if not entries:
         raise RuntimeError("no clusters are enabled for this account")
 
     if not interactive:
         raise RuntimeError(
             "PYROMIND_CLUSTER is not set and no interactive terminal is "
-            f"available; available clusters: {', '.join(choices)}"
+            f"available; available clusters: {', '.join(entries)}"
         )
 
     # 组合较多时内联提示太长：选项逐行输出，提示行只留变量名。
     stdout.write("Available clusters:\n")
-    for choice in choices:
-        stdout.write(f"{choice}\n")
+    for entry in entries:
+        stdout.write(f"{entry}\n")
     stdout.flush()
 
     prompt = (
@@ -176,10 +231,20 @@ def _ask_cluster(
         else "PYROMIND_CLUSTER: "
     )
     while True:
-        candidate = _prompt(prompt, stdin=stdin, stdout=stdout)
-        if candidate in choices:
+        candidate = normalise_cluster(
+            _prompt(prompt, stdin=stdin, stdout=stdout)
+        )
+        if candidate in entries:
             return candidate
-        _reject_cluster_choice(candidate, choices=choices, stdout=stdout)
+        if candidate in envs_by_code:
+            envs = envs_by_code[candidate]
+            if len(envs) == 1:
+                return _cluster_value(candidate, envs[0])
+            env = _ask_environment(envs, stdin=stdin, stdout=stdout, color=color)
+            return _cluster_value(candidate, env)
+        _reject_cluster_choice(
+            candidate, envs_by_code=envs_by_code, stdout=stdout
+        )
 
 
 #: Registry settings that survive a restart. The daemon reads env at start, so
@@ -273,9 +338,11 @@ def prepare_env(
     result = {"api_key": None, "cluster": None}
 
     provided_api = api_key.strip() if api_key is not None else None
-    provided_cluster = cluster.strip() if cluster is not None else None
+    provided_cluster = normalise_cluster(cluster) if cluster is not None else None
     api_key = provided_api or (os.getenv("PYROMIND_API_KEY") or "").strip()
-    cluster = provided_cluster or (os.getenv("PYROMIND_CLUSTER") or "").strip()
+    cluster = provided_cluster or normalise_cluster(
+        os.getenv("PYROMIND_CLUSTER") or ""
+    )
     if provided_api:
         os.environ["PYROMIND_API_KEY"] = provided_api
     if provided_cluster:

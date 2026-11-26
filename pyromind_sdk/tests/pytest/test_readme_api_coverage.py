@@ -25,6 +25,7 @@ from pyromind_sdk.client import (
     async_inference,
     async_jupyterlab,
     async_sandbox,
+    async_storage_api,
     async_studio,
     echomind,
     inference,
@@ -32,6 +33,7 @@ from pyromind_sdk.client import (
     profile,
     sandbox,
     storage,
+    storage_api,
     studio,
 )
 
@@ -47,6 +49,10 @@ _SECTIONS: dict[str, tuple[type, ...]] = {
     "client.inference": (inference.InferenceClient, async_inference.AsyncInferenceClient),
     "client.echomind": (echomind.EchoMindClient, async_echomind.AsyncEchoMindClient),
     "client.profile": (profile.ProfileClient,),
+    "client.storage_api": (
+        storage_api.StorageAPIClient,
+        async_storage_api.AsyncStorageAPIClient,
+    ),
     "StorageClient": (storage.StorageClient,),
 }
 

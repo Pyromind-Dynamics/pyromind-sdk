@@ -3383,6 +3383,16 @@ async def list_images(request: web.Request) -> web.Response:
     """
     from .backend import context_staging, build_sandbox, image_meta
 
+    # 没有 storage 凭据时直接报错：本地缓存只覆盖当前 daemon 构建过的镜像，
+    # 静默返回它会掩盖“workspace 归档都看不到”的配置问题。
+    if not context_staging.storage_credentials_configured():
+        return _err(
+            500,
+            "Workspace storage is not configured: set "
+            "PYROMIND_STORAGE_ACCESS_KEY and PYROMIND_STORAGE_SECRET_KEY "
+            "before running docker images.",
+        )
+
     store: ContainerStore = request.app["store"]
     summaries: list[dict[str, Any]] = []
     seen: set[str] = set()

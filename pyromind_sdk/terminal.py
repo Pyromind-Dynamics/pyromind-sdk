@@ -8,15 +8,13 @@ middleware 的 ``/sandboxes/{id}/terminal``，首帧发 ``{"type":"auth","token"
 
 from __future__ import annotations
 
-import time
 from typing import Optional, Sequence
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
-from pyromind_sdk.client.base import DEFAULT_API_BASE_URL
+from pyromind_sdk.common.utils import ensure_valid_sandbox_id
 from pyromind_sdk.log_redaction import redact_text
 from pyromind_sdk.token import (
     PURPOSE_WS_TERMINAL,
-    TokenError,
     async_fetch_token,
     fetch_token,
 )
@@ -32,8 +30,10 @@ class TerminalError(RuntimeError):
     def __init__(self, message: str) -> None:
         super().__init__(redact_text(message))
 
+
 class TerminalAuthExpired(TerminalError):
     """短时 WS token 在会话产生任何输出之前被拒绝。"""
+
 
 def _websocket_url(
     base_url: str,
@@ -59,7 +59,15 @@ def _websocket_url(
     # login shell, with them it execs *that* command under the same PTY.
     for part in command or ():
         qs_params.append(("command", str(part)))
-    return f"{base}/sandboxes/{sandbox_id}/terminal?{urlencode(qs_params)}"
+    # id 先做「格式+长度」校验再进路径：调用方传入的值不该能改变 URL 结构。
+    safe_id = quote(
+        ensure_valid_sandbox_id(
+            sandbox_id, action="terminal", error_cls=TerminalError
+        ),
+        safe="",
+    )
+    return f"{base}/sandboxes/{safe_id}/terminal?{urlencode(qs_params)}"
+
 
 def build_terminal_websocket_url(
     base_url: str,
@@ -82,6 +90,7 @@ def build_terminal_websocket_url(
         base_url, sandbox_id, cols, rows, command, cwd
     )
 
+
 def fetch_terminal_token(
     base_url: str,
     sandbox_id: str,
@@ -89,6 +98,7 @@ def fetch_terminal_token(
     cluster: Optional[str] = None,
 ) -> tuple[str, str]:
     """Exchange on the portal; returns ``(token, cluster_direct_base_url)``."""
+    ensure_valid_sandbox_id(sandbox_id, action="terminal", error_cls=TerminalError)
     token, _ttl, api_base_url, _rift = fetch_token(
         base_url,
         api_key,
@@ -99,6 +109,7 @@ def fetch_terminal_token(
     )
     return token, api_base_url
 
+
 async def async_fetch_terminal_token(
     base_url: str,
     sandbox_id: str,
@@ -106,6 +117,7 @@ async def async_fetch_terminal_token(
     cluster: Optional[str] = None,
 ) -> tuple[str, str]:
     """Async variant of :func:`fetch_terminal_token`."""
+    ensure_valid_sandbox_id(sandbox_id, action="terminal", error_cls=TerminalError)
     token, _ttl, api_base_url, _rift = await async_fetch_token(
         base_url,
         api_key,

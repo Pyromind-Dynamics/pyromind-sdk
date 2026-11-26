@@ -41,7 +41,7 @@ def _adapter_with_fake_client() -> tuple[PyromindSDK, MagicMock]:
     adapter = PyromindSDK.__new__(PyromindSDK)
     adapter.logger = logging.getLogger("docker_rt.test")
     adapter.rift_ready = False
-    adapter.sandbox_id = "sb-test-1"
+    adapter.sandbox_id = "sb-0123456789ab"
     adapter.name = "old-name"
     adapter.image = "busybox:1.36"
     adapter.working_dir = "/"
@@ -181,14 +181,14 @@ def test_restart_pauses_then_resumes():
 
     asyncio.run(adapter.restart())
 
-    client.pause.assert_called_once_with("sb-test-1")
-    client.resume.assert_called_once_with("sb-test-1")
+    client.pause.assert_called_once_with("sb-0123456789ab")
+    client.resume.assert_called_once_with("sb-0123456789ab")
 
 
 def test_resume_binds_response():
     adapter, client = _adapter_with_fake_client()
     response = MagicMock()
-    response.id = "sb-test-1"
+    response.id = "sb-0123456789ab"
     response.status = "Running"
     response.resources = None
     response.configuration = None
@@ -200,7 +200,7 @@ def test_resume_binds_response():
 
     asyncio.run(adapter.resume())
 
-    client.resume.assert_called_once_with("sb-test-1")
+    client.resume.assert_called_once_with("sb-0123456789ab")
     assert adapter.sandbox_status == "Running"
 
 
@@ -209,7 +209,7 @@ def test_stop_only_pauses():
 
     asyncio.run(adapter.stop())
 
-    client.pause.assert_called_once_with("sb-test-1")
+    client.pause.assert_called_once_with("sb-0123456789ab")
     client.delete.assert_not_called()
 
 
@@ -227,12 +227,12 @@ def test_cleanup_pauses_before_delete(monkeypatch):
     asyncio.run(adapter.cleanup())
 
     client.pause.assert_called_once_with(
-        "sb-test-1",
+        "sb-0123456789ab",
         timeout=env_mod._CLEANUP_PAUSE_REQUEST_TIMEOUT_S,
         retry=False,
     )
     client.delete.assert_called_once_with(
-        "sb-test-1",
+        "sb-0123456789ab",
         timeout=env_mod._CLEANUP_DELETE_TIMEOUT_S,
         retry=False,
     )
@@ -246,7 +246,7 @@ def test_cleanup_does_not_pause_when_fresh_status_is_stopped():
 
     client.pause.assert_not_called()
     client.delete.assert_called_once_with(
-        "sb-test-1",
+        "sb-0123456789ab",
         timeout=env_mod._CLEANUP_DELETE_TIMEOUT_S,
         retry=False,
     )
@@ -264,7 +264,7 @@ def test_cleanup_directly_deletes_non_running_status(status):
 
     client.pause.assert_not_called()
     client.delete.assert_called_once_with(
-        "sb-test-1",
+        "sb-0123456789ab",
         timeout=env_mod._CLEANUP_DELETE_TIMEOUT_S,
         retry=False,
     )
@@ -313,7 +313,7 @@ def test_refresh_phase_does_not_refetch_after_not_found():
     assert asyncio.run(adapter.refresh_phase()) == "NotFound"
     assert asyncio.run(adapter.refresh_phase(force=True)) == "NotFound"
 
-    client.get_sandbox.assert_called_once_with("sb-test-1", timeout=ANY, retry=False)
+    client.get_sandbox.assert_called_once_with("sb-0123456789ab", timeout=ANY, retry=False)
 
 
 def test_refresh_phase_singleflights_status_requests():
@@ -329,7 +329,7 @@ def test_refresh_phase_singleflights_status_requests():
 
     asyncio.run(run())
 
-    client.get_sandbox.assert_called_once_with("sb-test-1", timeout=ANY, retry=False)
+    client.get_sandbox.assert_called_once_with("sb-0123456789ab", timeout=ANY, retry=False)
     assert adapter.sandbox_status == "stopped"
 
 
@@ -369,7 +369,7 @@ def test_cleanup_status_timeout_does_not_pause_unconfirmed_running():
 
     client.pause.assert_not_called()
     client.delete.assert_called_once_with(
-        "sb-test-1",
+        "sb-0123456789ab",
         timeout=env_mod._CLEANUP_DELETE_TIMEOUT_S,
         retry=False,
     )
@@ -385,12 +385,12 @@ def test_pause_timeout_still_attempts_delete():
     asyncio.run(adapter.cleanup())
 
     client.pause.assert_awaited_once_with(
-        "sb-test-1",
+        "sb-0123456789ab",
         timeout=env_mod._CLEANUP_PAUSE_REQUEST_TIMEOUT_S,
         retry=False,
     )
     client.delete.assert_awaited_once_with(
-        "sb-test-1",
+        "sb-0123456789ab",
         timeout=env_mod._CLEANUP_DELETE_TIMEOUT_S,
         retry=False,
     )
@@ -1438,7 +1438,7 @@ async def test_legacy_sandbox_exec_stream_uses_middleware_ws():
 
     chunks = [c async for c in adapter.iter_exec_stream(["echo", "hi"], cwd="/w")]
     assert [c.type for c in chunks] == ["stdout", "exit"]
-    assert seen["sandbox_id"] == "sb-test-1"
+    assert seen["sandbox_id"] == "sb-0123456789ab"
     assert seen["command"] == ["echo", "hi"]
     assert seen["cwd"] == "/w"
 
@@ -1487,7 +1487,7 @@ async def test_legacy_sandbox_is_not_gated_as_pending():
     record = SimpleNamespace(
         state=ContainerState.RUNNING,
         container_id="cid",
-        sandbox_id="sb-test-1",
+        sandbox_id="sb-0123456789ab",
         kube_env=SimpleNamespace(rift_enabled=False, rift_ready=False),
         sandbox_status="Running",
     )
@@ -1533,7 +1533,7 @@ async def test_legacy_cp_downloads_a_single_file_as_tar():
         return {"mode": 0o100644}
 
     async def fake_read(sandbox_id, path):
-        assert (sandbox_id, path) == ("sb-test-1", "/work/app.py")
+        assert (sandbox_id, path) == ("sb-0123456789ab", "/work/app.py")
         return b"print('hi')\n"
 
     adapter.archive_path_stat = fake_stat
@@ -1611,4 +1611,46 @@ async def test_legacy_cp_extracts_into_dirs_and_files():
 
     await adapter.put_archive("/data", buf.getvalue())
     assert any("mkdir -p 'logs'" in cmd or "mkdir -p /data/logs" in cmd for cmd in executed)
-    assert written == [("sb-test-1", "/data/logs/app.log", b"hello")]
+    assert written == [("sb-0123456789ab", "/data/logs/app.log", b"hello")]
+
+
+def test_pyromind_terminal_exchange_uses_portal_base(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    from ..aio_server import _pyromind_terminal_exchange
+
+    monkeypatch.setenv(
+        "PYROMIND_BASE_URL", "https://api-portal.pyromind.ai/api/v1"
+    )
+    monkeypatch.delenv("PYROMIND_API_KEY", raising=False)
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2")
+
+    base, cluster, api_key = _pyromind_terminal_exchange()
+
+    assert base == "https://api-portal.pyromind.ai/api/v1"
+    assert cluster == "us-west-2"
+    assert api_key == ""
+
+
+def test_pyromind_terminal_url_carries_command_and_size() -> None:
+    """``docker exec -it <cid> <cmd>`` must reach the PTY as an argv.
+
+    Without this the terminal side would open its login shell and the command
+    the user typed would be silently dropped.
+    """
+    from pyromind_sdk.terminal import build_terminal_websocket_url
+
+    url = build_terminal_websocket_url(
+        "https://api-us-west-2.pyromind.ai/api/v1",
+        "sb-0123456789ab",
+        cols=132,
+        rows=43,
+        command=["bash", "-l"],
+        cwd="/workspace",
+    )
+
+    assert url.startswith(
+        "wss://api-us-west-2.pyromind.ai/api/v1/sandboxes/sb-0123456789ab/terminal?"
+    )
+    assert "cols=132&rows=43" in url
+    assert "command=bash" in url
