@@ -125,6 +125,44 @@ def test_fetch_token_rejects_http_error(monkeypatch) -> None:
         sdk_token.fetch_token("https://api-portal.example/api/v1", "key")
 
 
+def test_fetch_token_surfaces_the_portal_detail(monkeypatch) -> None:
+    """门户 403 的 detail（内部用户/集群权限）必须带出来，只报状态码没法排查。"""
+    monkeypatch.setattr(
+        sdk_token.requests,
+        "post",
+        lambda *a, **k: _FakeResponse(
+            403, {"detail": "User does not have access to cn-east-1#pre"}
+        ),
+    )
+    with pytest.raises(sdk_token.TokenError, match="cn-east-1#pre"):
+        sdk_token.fetch_token(
+            "https://api-portal.example/api/v1", "key", cluster="cn-east-1#pre"
+        )
+
+
+def test_discovery_404_points_at_the_api_prefix(monkeypatch) -> None:
+    """基址漏了 /api/v1 时，报错要直接说清楚。"""
+    monkeypatch.setattr(
+        sdk_token.requests, "post", lambda *a, **k: _FakeResponse(404, {})
+    )
+    with pytest.raises(sdk_token.TokenError, match="/api/v1"):
+        sdk_token.fetch_cluster_hosts("https://api-portal.example", "key")
+
+
+def test_discovery_403_with_html_body_keeps_the_status(monkeypatch) -> None:
+    """WAF 之类返回 HTML 时按状态码归因，不能把 JSON 解析异常抛给调用方。"""
+
+    class _HtmlResponse(_FakeResponse):
+        def json(self):
+            raise ValueError("not json")
+
+    monkeypatch.setattr(
+        sdk_token.requests, "post", lambda *a, **k: _HtmlResponse(403, None)
+    )
+    with pytest.raises(sdk_token.TokenError, match="HTTP 403"):
+        sdk_token.fetch_cluster_hosts("https://api-portal.example/api/v1", "key")
+
+
 def test_rejection_hints_the_version_prefix_only_on_404(monkeypatch) -> None:
     """404 基本等于基址漏了 ``/api/v1``；403 之类的拒绝不能挂这条提示。"""
 

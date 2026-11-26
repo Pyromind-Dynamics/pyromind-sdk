@@ -196,18 +196,21 @@ def _ask_cluster(
     stdin: Any | None,
     stdout: Any,
     color: bool,
+    clusters: list[dict] | None = None,
 ) -> str:
     """向门户查询这份 key 可用的集群，再交互选择一个。
 
     门户发现接口（console ``user_clusters_list`` 背后的实现）返回
     ``[{"cluster", "host"}]``，``unapply`` 条目已过滤。可选值逐行原样打印，
     输入必须与其中某一条完全一致；选中的值原样作为 ``PYROMIND_CLUSTER``。
+    ``clusters`` 传入时复用调用方已经查到的结果（校验失败后重选，避免重复请求）。
     """
     from ..client.base import DEFAULT_API_BASE_URL, ENV_BASE_URL
     from ..token import fetch_cluster_hosts
 
-    base = (os.getenv(ENV_BASE_URL) or "").strip() or DEFAULT_API_BASE_URL
-    clusters = fetch_cluster_hosts(base, api_key)
+    if clusters is None:
+        base = (os.getenv(ENV_BASE_URL) or "").strip() or DEFAULT_API_BASE_URL
+        clusters = fetch_cluster_hosts(base, api_key)
     entries, envs_by_code = _cluster_choices_from_discovery(clusters)
 
     if not entries:
@@ -245,6 +248,58 @@ def _ask_cluster(
         _reject_cluster_choice(
             candidate, envs_by_code=envs_by_code, stdout=stdout
         )
+
+
+def _verify_cluster_against_portal(
+    cluster: str,
+    *,
+    api_key: str,
+    interactive: bool,
+    stdin: Any | None,
+    stdout: Any,
+    color: bool,
+) -> str:
+    """核对环境变量/CLI 指定的集群是否在门户的可用列表里。
+
+    交互选择那条路本来就会列选项；但 ``PYROMIND_CLUSTER`` 来自环境时以前不做
+    任何核对，换票被拒只剩一行状态码。这里提前查一次发现接口：不在列表就列出
+    真实可选值并说明原因（例如 pre 要换 pre 门户），交互终端直接重选。发现接
+    口本身不可用（网络/老门户）时不拦截，交给换票报错。
+    """
+    from ..client.base import DEFAULT_API_BASE_URL, ENV_BASE_URL
+    from ..token import fetch_cluster_hosts
+
+    base = (os.getenv(ENV_BASE_URL) or "").strip() or DEFAULT_API_BASE_URL
+    try:
+        clusters = fetch_cluster_hosts(base, api_key)
+    except Exception as exc:  # noqa: BLE001 — 核对是尽力而为，不能挡住启动
+        logger.warning(
+            "cannot verify PYROMIND_CLUSTER=%r against %s: %s", cluster, base, exc
+        )
+        return cluster
+
+    entries, envs_by_code = _cluster_choices_from_discovery(clusters)
+    if cluster in entries:
+        return cluster
+
+    # 只在这里给出归因；列表交给 _ask_cluster 统一打印，不重复输出。
+    stdout.write(f"PYROMIND_CLUSTER={cluster!r} is not offered by {base}.\n")
+    stdout.flush()
+    _reject_cluster_choice(cluster, envs_by_code=envs_by_code, stdout=stdout)
+
+    if not interactive:
+        raise RuntimeError(
+            f"PYROMIND_CLUSTER={cluster!r} is not available for this account; "
+            f"choose one of: {', '.join(entries) or '(none)'}"
+        )
+    return _ask_cluster(
+        api_key=api_key,
+        interactive=interactive,
+        stdin=stdin,
+        stdout=stdout,
+        color=color,
+        clusters=clusters,
+    )
 
 
 #: Registry settings that survive a restart. The daemon reads env at start, so
@@ -397,6 +452,17 @@ def prepare_env(
                 "available to prompt for it"
             )
         cluster = _ask_cluster(
+            api_key=api_key,
+            interactive=interactive,
+            stdin=stdin,
+            stdout=stdout,
+            color=color,
+        )
+        os.environ["PYROMIND_CLUSTER"] = cluster
+    else:
+        # 环境变量/CLI 给的集群也要和门户核对：否则换票 403 时没有任何提示。
+        cluster = _verify_cluster_against_portal(
+            cluster,
             api_key=api_key,
             interactive=interactive,
             stdin=stdin,

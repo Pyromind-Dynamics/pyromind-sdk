@@ -53,14 +53,39 @@ def token_url(base_url: str) -> str:
     return f"{base_url.rstrip('/')}/{TOKEN_PATH}"
 
 
-def _rejected_message(action: str, status: int, url: str) -> str:
-    """换票/发现被拒时的报错；404 基本等于基址漏了 ``/api/v1`` 前缀。
+#: 服务端 detail 的展示上限：足够定位（内部用户校验/集群权限），又不回显整段响应。
+_FAILURE_DETAIL_MAX = 200
 
-    门户只在 ``/api/v1/auth/token`` 提供该路由，把 ``PYROMIND_BASE_URL`` 设成
-    裸域名就会命中根路径 404，且请求进不了鉴权逻辑。这里只补归因，不自动
-    改写基址——基址始终按调用方给的原样使用。
+
+def _detail_from_payload(payload: object) -> str:
+    """取出门户给的原因（FastAPI 的 ``detail``），脱敏并截断。"""
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    if not isinstance(detail, str):
+        return ""
+    return redact_text(detail).strip()[:_FAILURE_DETAIL_MAX]
+
+
+def _failure_detail(response) -> str:
+    """尽力从错误响应里取 ``detail``；不是 JSON 就放弃（例如 WAF 的 HTML）。"""
+    try:
+        return _detail_from_payload(response.json())
+    except ValueError:
+        return ""
+
+
+def _rejected_message(
+    action: str, status: int, url: str, detail: str = ""
+) -> str:
+    """换票/发现被拒时的报错：带上门户的原因，404 再补基址归因。
+
+    门户的 403 有两类显式判断（非内部用户不能选 pre、账号没有该集群/环境权限），
+    只报状态码会让调用方无从下手；``detail`` 已在 :func:`_detail_from_payload`
+    脱敏。404 基本等于基址漏了 ``/api/v1`` 前缀——门户只在
+    ``/api/v1/auth/token`` 提供该路由。这里只补归因，不自动改写基址。
     """
     message = f"{action} rejected (HTTP {status}) at {url}"
+    if detail:
+        message += f": {detail}"
     if status == 404:
         message += (
             " — the base URL must include the API version prefix, e.g. "
@@ -138,7 +163,10 @@ def fetch_cluster_hosts(base_url: str, api_key: str) -> list[dict]:
     if not response.ok:
         raise TokenError(
             _rejected_message(
-                "cluster discovery", response.status_code, url
+                "cluster discovery",
+                response.status_code,
+                url,
+                _failure_detail(response),
             )
         )
     try:
@@ -227,7 +255,12 @@ def fetch_token(
 
     if not response.ok:
         raise TokenError(
-            _rejected_message("token exchange", response.status_code, url)
+            _rejected_message(
+                "token exchange",
+                response.status_code,
+                url,
+                _failure_detail(response),
+            )
         )
     try:
         payload = response.json()
@@ -305,7 +338,11 @@ async def async_fetch_token(
         ) from last_exc
 
     if status >= 400:
-        raise TokenError(_rejected_message("token exchange", status, url))
+        raise TokenError(
+            _rejected_message(
+                "token exchange", status, url, _detail_from_payload(payload)
+            )
+        )
     return _parse_token_response(payload, status)
 
 

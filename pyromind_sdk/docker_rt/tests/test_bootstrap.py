@@ -262,6 +262,80 @@ def test_cluster_prompt_blank_asks_again(monkeypatch: MonkeyPatch) -> None:
     assert "Unknown cluster ''" in stdout.getvalue()
 
 
+def _stub_portal_with_prod_only(monkeypatch: MonkeyPatch) -> None:
+    """门户只下发线上集群（prod 裸名），模拟 prod 门户不给内部用户补 pre。"""
+    import pyromind_sdk.token as token_mod
+
+    monkeypatch.setattr(
+        token_mod,
+        "fetch_cluster_hosts",
+        lambda base_url, api_key: [
+            {"cluster": "us-west-2", "host": "prod-west2.example"},
+        ],
+    )
+
+
+def test_env_cluster_not_offered_lists_choices_and_reselects(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """环境变量给的集群也要核对：不在列表就列出可用值、说明换 pre 门户，并重选。"""
+    _stub_portal_with_prod_only(monkeypatch)
+    monkeypatch.setenv("PYROMIND_API_KEY", "existing-key")
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2#pre")
+
+    stdout = io.StringIO()
+    info = prepare_env(stdin=io.StringIO("us-west-2\n"), stdout=stdout)
+
+    text = stdout.getvalue()
+    assert info["cluster"] == "us-west-2"
+    assert os.environ["PYROMIND_CLUSTER"] == "us-west-2"
+    assert "PYROMIND_CLUSTER='us-west-2#pre' is not offered" in text
+    assert "Available clusters:\n" in text
+    assert "PYROMIND_BASE_URL" in text
+
+
+def test_env_cluster_not_offered_fails_without_a_terminal(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """非交互启动不发问：直接失败并带上可用列表。"""
+    _stub_portal_with_prod_only(monkeypatch)
+    monkeypatch.setenv("PYROMIND_API_KEY", "existing-key")
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2#pre")
+
+    with pytest.raises(RuntimeError, match="us-west-2#pre.*not available"):
+        prepare_env(interactive=False, stdout=io.StringIO())
+
+
+def test_env_cluster_discovery_failure_does_not_block_startup(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """发现接口不可用（网络/老门户）时不拦截，交给换票报错。"""
+    import pyromind_sdk.token as token_mod
+
+    def _unreachable(base_url, api_key):
+        raise token_mod.TokenError("portal unreachable")
+
+    monkeypatch.setattr(token_mod, "fetch_cluster_hosts", _unreachable)
+    monkeypatch.setenv("PYROMIND_API_KEY", "existing-key")
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2#pre")
+
+    info = prepare_env(stdin=io.StringIO(""), stdout=io.StringIO())
+
+    assert info["cluster"] == "us-west-2#pre"
+
+
+def test_env_cluster_in_the_list_needs_no_prompt(monkeypatch: MonkeyPatch) -> None:
+    """列表里已有的集群直接通过，不多打任何提示、不再提问。"""
+    monkeypatch.setenv("PYROMIND_API_KEY", "existing-key")
+    monkeypatch.setenv("PYROMIND_CLUSTER", "us-west-2#pre")
+
+    stdout = io.StringIO()
+    info = prepare_env(stdin=io.StringIO(""), stdout=stdout)
+
+    assert info["cluster"] == "us-west-2#pre"
+    assert "Available clusters" not in stdout.getvalue()
+
+
 def test_env_prompt_rejects_unknown_env(monkeypatch: MonkeyPatch) -> None:
     """The environment must be one the portal listed for the cluster."""
     import pyromind_sdk.token as token_mod
