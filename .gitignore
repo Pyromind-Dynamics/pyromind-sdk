@@ -20,8 +20,10 @@ ENV/
 
 # macOS
 .DS_Store
-# Ignore all hidden files
+# Ignore all hidden files, but keep GitHub Actions workflows trackable
 .*
+!.github/
+!.github/**/
 
 # Testing
 .pytest_cache/
