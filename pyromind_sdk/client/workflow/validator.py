@@ -7,7 +7,30 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from ._input_validation import _has_usable_input_value
 
 logger = logging.getLogger(__name__)
-SPECIAL_NODE_TYPES = frozenset({"PrimitiveNode"})
+SPECIAL_NODE_TYPES = frozenset({"PrimitiveNode", "StartNode", "PrimitiveGroupNode"})
+
+
+def _is_special_node_type(node_type: Optional[str]) -> bool:
+    return node_type in SPECIAL_NODE_TYPES
+
+
+def _is_primitive_group_node_type(node_type: Optional[str]) -> bool:
+    return node_type in {"StartNode", "PrimitiveGroupNode"}
+
+
+def _primitive_group_slot(source_node: Dict[str, Any], source_handle: Any) -> Optional[Dict[str, Any]]:
+    """Return the StartNode property a source handle refers to, if any."""
+    data = source_node.get("data") if isinstance(source_node, dict) else None
+    if not isinstance(data, dict):
+        return None
+    slots = data.get("primitiveSlots")
+    if not isinstance(slots, list):
+        return None
+    handle = "" if source_handle is None else str(source_handle)
+    for slot in slots:
+        if isinstance(slot, dict) and str(slot.get("id")) == handle:
+            return slot
+    return None
 
 
 
@@ -25,7 +48,7 @@ def _resolve_standard_node_info(
 ) -> Tuple[Optional[Dict], Optional[str]]:
     """Require definitions for executable nodes, optionally fetching for this user."""
     executable = any(
-        isinstance(node, dict) and _standard_node_type(node) != "PrimitiveNode"
+        isinstance(node, dict) and not _is_special_node_type(_standard_node_type(node))
         for node in nodes
     )
     if not executable:
@@ -392,6 +415,45 @@ def _xyflow_input_bindings(
     return connected
 
 
+def _primitive_group_slot_value(source_node: Dict[str, Any], source_handle: Any) -> Any:
+    """Read the slot value a Primitive Group edge inlines into its target."""
+    slot = _primitive_group_slot(source_node, source_handle)
+    return slot.get("value") if slot is not None else None
+
+
+def _validate_primitive_group_slots(
+    node_id: Any,
+    data: Dict[str, Any],
+    input_bindings: Optional[Dict[str, Dict[str, Dict]]],
+) -> List[str]:
+    """Connected StartNode slots must inline a non-empty value, like the parser."""
+    slots = data.get("primitiveSlots")
+    if not isinstance(slots, list):
+        return []
+    node_key = str(node_id)
+    connected = {
+        str(edge.get("sourceHandle"))
+        for bindings in (input_bindings or {}).values()
+        for edge in bindings.values()
+        if isinstance(edge, dict) and str(edge.get("source")) == node_key
+    }
+    errors = []
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        slot_id = slot.get("id")
+        if not isinstance(slot_id, str) or not slot_id or slot_id == "origin":
+            continue
+        if slot_id not in connected:
+            continue
+        value = slot.get("value")
+        if value is None or value == "":
+            errors.append(
+                f"StartNode {node_id}: slot '{slot_id}' value is required and cannot be empty"
+            )
+    return errors
+
+
 def _node_parameters(data: Dict[str, Any]) -> Dict[str, Any]:
     """Read the parameters consumed by the Xyflow execution parser."""
     if "config" in data:
@@ -462,6 +524,8 @@ def _validate_nodes(
             value = _node_parameters(data).get("value")
             if value is None or value == "":
                 errors.append(f"PrimitiveNode {node_id}: value is required and cannot be empty")
+        elif isinstance(node_type, str) and node_type in {"StartNode", "PrimitiveGroupNode"}:
+            errors.extend(_validate_primitive_group_slots(node_id, data, input_bindings))
         elif node_info and isinstance(node_type, str):
             errors.extend(_validate_standard_node_definition(
                 node_id, node, node_info, set(input_bindings.get(str(node_id), {}))
@@ -509,10 +573,13 @@ def _validate_xyflow_config(
     # value, while other edges provide a dynamic value checked by edge types.
     for param_name, edge in (input_bindings or {}).items():
         source = (node_map or {}).get(str(edge.get("source")), {})
-        if _standard_node_type(source) == "PrimitiveNode":
+        source_type = _standard_node_type(source)
+        if source_type == "PrimitiveNode":
             source_data = source.get("data", {})
             if isinstance(source_data, dict):
                 config[param_name] = _node_parameters(source_data).get("value")
+        elif source_type in {"StartNode", "PrimitiveGroupNode"}:
+            config[param_name] = _primitive_group_slot_value(source, edge.get("sourceHandle"))
         else:
             config.pop(param_name, None)
 
@@ -645,7 +712,7 @@ def _validate_standard_node_definition(
 ) -> List[str]:
     """Check only schemas and bindings owned by the server."""
     node_type = _standard_node_type(node)
-    if not node_type or node_type == "PrimitiveNode":
+    if not node_type or _is_special_node_type(node_type):
         return []
     if node_type not in node_info:
         return [f"Node {node_id} has unknown type '{node_type}' (not found in node_info)"]
@@ -796,6 +863,15 @@ def _validate_type_compatibility(
             continue
         source_type = _standard_node_type(node_map[source_id])
         target_type = _standard_node_type(node_map[target_id])
+        if _is_primitive_group_node_type(source_type):
+            errors.extend(_validate_primitive_group_edge_type(
+                edge,
+                node_map[source_id],
+                target_type,
+                node_info,
+                exclude_string_types=exclude_string_types,
+            ))
+            continue
         if source_type not in node_info or target_type not in node_info:
             continue
         source_handle = edge.get("sourceHandle", "0")
@@ -871,6 +947,71 @@ def _is_type_compatible(source_type: str, target_type: str, exclude_string_types
             if _is_single_type_compatible(st, tt):
                 return True
     return False
+
+
+_PRIMITIVE_GROUP_TYPE_TOKENS = {"STRING", "INT", "FLOAT", "NUMBER", "BOOLEAN", "COMBO"}
+
+
+def _primitive_group_slot_type(slot: Dict[str, Any]) -> Optional[str]:
+    """Type token of a StartNode property; arrays are COMBO, '*' is unknown."""
+    primitive = slot.get("primitiveType")
+    if isinstance(primitive, list):
+        return "COMBO"
+    if isinstance(primitive, str):
+        value = primitive.strip().upper()
+        return value if value and value != "*" else None
+    return None
+
+
+def _primitive_group_target_type(
+    node_info: Dict[str, Any], target_type: Optional[str], target_handle: str
+) -> Optional[str]:
+    """Concrete input type of a target port, or None when it is ambiguous."""
+    definition = node_info.get(target_type) if target_type else None
+    inputs = definition.get("input") if isinstance(definition, dict) else None
+    if not isinstance(inputs, dict):
+        return None
+    for category in ("required", "optional"):
+        params = inputs.get(category)
+        if not isinstance(params, dict) or target_handle not in params:
+            continue
+        spec = params[target_handle]
+        if isinstance(spec, (list, tuple)) and spec and isinstance(spec[0], str):
+            return spec[0]
+        # 联合类型 / 带类型的 COMBO：首元素不是单一类型，交给前端校验。
+        return None
+    return None
+
+
+def _validate_primitive_group_edge_type(
+    edge: Dict[str, Any],
+    source_node: Dict[str, Any],
+    target_type: Optional[str],
+    node_info: Dict[str, Any],
+    exclude_string_types: bool = False,
+) -> List[str]:
+    """Type-check a StartNode property against the target input it feeds."""
+    slot = _primitive_group_slot(source_node, edge.get("sourceHandle"))
+    target_handle = edge.get("targetHandle")
+    if slot is None or not isinstance(target_handle, str) or not target_handle:
+        return []
+    slot_type = _primitive_group_slot_type(slot)
+    target_spec = _primitive_group_target_type(node_info, target_type, target_handle)
+    if not slot_type or not target_spec:
+        return []
+    target_token = target_spec.strip().upper()
+    if (
+        slot_type not in _PRIMITIVE_GROUP_TYPE_TOKENS
+        or target_token not in _PRIMITIVE_GROUP_TYPE_TOKENS
+    ):
+        return []
+    if _is_type_compatible(slot_type, target_token, exclude_string_types=exclude_string_types):
+        return []
+    return [
+        f"Edge '{edge.get('id')}': Type mismatch between StartNode property "
+        f"'{edge.get('sourceHandle')}' ({slot_type}) and "
+        f"{target_type}.{target_handle} ({target_token})"
+    ]
 
 
 def _validate_business_logic(
@@ -996,13 +1137,18 @@ def _validate_edges(
             continue
         if not isinstance(target_handle, str) or not target_handle:
             errors.append(f"Edge '{edge_id}': missing or invalid 'targetHandle' field")
-        if node_info:
-            if source_id in node_map:
-                source_type = _standard_node_type(node_map[source_id])
-                if _get_node_output_type_by_name(source_type, source_handle, node_info) is None:
+        if source_id in node_map:
+            source_type = _standard_node_type(node_map[source_id])
+            if _is_primitive_group_node_type(source_type):
+                if _primitive_group_slot(node_map[source_id], source_handle) is None:
                     errors.append(
-                        f"Edge '{edge_id}': unknown source output '{source_handle}' on node '{source_id}'"
+                        f"Edge '{edge_id}': unknown StartNode property '{source_handle}' on node '{source_id}'"
                     )
+            elif node_info and _get_node_output_type_by_name(source_type, source_handle, node_info) is None:
+                errors.append(
+                    f"Edge '{edge_id}': unknown source output '{source_handle}' on node '{source_id}'"
+                )
+        if node_info:
             if target_id in node_map and isinstance(target_handle, str) and target_handle:
                 target_type = _standard_node_type(node_map[target_id])
                 if _get_node_input_type(target_type, target_handle, node_info) is None:
@@ -1246,6 +1392,10 @@ def _get_node_output_type_by_name(node_type: Optional[str], output_name: Any, no
     """
     if node_type == "PrimitiveNode":
         return "AUTO" if output_name in ("value", "0", 0) and not isinstance(output_name, bool) else None
+    if node_type in {"StartNode", "PrimitiveGroupNode"}:
+        if isinstance(output_name, str) and output_name and output_name != "origin":
+            return "AUTO"
+        return None
     if node_type not in node_info or isinstance(output_name, bool):
         return None
 

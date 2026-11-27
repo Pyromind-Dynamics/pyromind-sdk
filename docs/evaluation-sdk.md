@@ -80,6 +80,7 @@ atif = client.evaluations.read_atif(done["id"])["atif"]
 |---|---|---|
 | `list_scripts()` | `GET /evaluations/scripts` | `items`、`display_types` |
 | `list_workflows()` | `GET /evaluations/workflows` | `items`。当前用户的 Studio 未开通时失败 |
+| `list_workflow_nodes(workflow_name)` | `GET /evaluations/workflow_nodes?workflow_name=` | `items`，每项 `{value, label}`。只列可执行节点；`PrimitiveNode`/`StartNode` 不会出现 |
 | `list_jobs(project_id=None, search_key=None, page_number=1, page_size=20)` | `GET /evaluations/jobs` | `items`、`total`、`page_number`、`page_size`。每条带 `latest_run`、`run_count`，不含脚本和 HTML 正文。`page_size` 最大 100 |
 | `create_job(payload)` | `POST /evaluations/jobs` | 任务，含服务端分配的 `id` |
 | `get_job(job_id)` | `GET /evaluations/jobs/{job_id}` | 任务全文，含 `script_content`、`html_template`、`render_script`。已保存的 `extra_params.api_key` 返回空字符串 |
@@ -113,17 +114,83 @@ atif = client.evaluations.read_atif(done["id"])["atif"]
 | `script_name` | 自定义脚本文件名，必须是 `.py` 或 `.sh` |
 | `script_content` | 自定义脚本全文，最大 1 MB |
 | `workflow_name` | 留空时使用 `builtin/{display_type}`。自定义工作流必须是当前用户存储里的 Xyflow JSON |
-| `extra_params` | 模型、端点、温度、API Key、回放参数。对象，不是 JSON 字符串 |
+| `extra_params` | 模型、端点、温度、API Key、回放参数，以及下面的 `output_path_mode`、`output_node_id`、`_workflow_group_values`、`_script_bindings`。对象，不是 JSON 字符串 |
 | `input_bindings` | 把参数名绑定到工作流节点编号。内置工作流可以不传 |
-| `output_path` | 结果目录。留空时用 `evaluations/{任务编号}` |
-| `atif_output_path` | 轨迹文件名或路径。留空时文件名是 `trajectory.atif.json` |
+| `output_path` | 结果目录。实际落盘位置还要看 `extra_params.output_path_mode` |
+| `atif_output_path` | 轨迹文件。`custom` 模式使用这份路径；`specified` 和不传时使用其中的文件名；`auto` 固定为 `trajectory.atif.json` |
 | `write_mode` | `overwrite` 或 `append`。默认覆盖 |
 | `html_template`、`html_template_name` | 仅 `custom_html` 使用。必须是完整 HTML，文件名以 `.html` 或 `.htm` 结尾，最大 2 MB |
 | `render_script`、`render_script_name` | 可选。除 `custom_html` 外的模板可用。文件名以 `.js` 结尾，最大 1 MB，并且要定义 `pyromindRender(atif)` |
 
 服务端会清掉互斥字段：`custom_html` 不保留 `render_script`；其他展示类型不保留 `html_template`。
 
-`sample_data` 存在 MySQL `TEXT` 字段里，内联 JSON 大约不能超过 64 KB。大图和大轨迹先上传到存储，这里只填路径，例如 `evaluations/samples/board.atif.json`。
+`sample_data` 存在 MySQL `TEXT` 字段里，内联 JSON 大约不能超过 64 KB。大图和大轨迹先上传到存储，这里只填路径，例如 `evaluations/samples/board.atif.json`。控制台里，内置脚本要求填写样本；自定义脚本可以不填。接口本身允许 `sample_data` 为空，脚本需要自己处理。
+
+### 结果路径
+
+每次运行前，服务端按 `extra_params.output_path_mode` 算出这一次的目录，并写成 Pod 里的 `/workspace/...` 路径。这个模式保存在任务上，生成脚本命令时 `output_path_mode` 和 `output_node_id` 会被去掉，脚本读到的 `extra_params` 里没有这两项。
+
+| `output_path_mode` | 运行时目录 |
+|---|---|
+| `auto` | `/workspace/evaluations/output/runs/{运行编号}/trajectory.atif.json`。不使用任务上保存的 `output_path` |
+| `specified`，路径里含有运行占位符 | 替换占位符，不再追加一层。占位符可以是 `{jobId}`、`{job_id}`、`$job_id`、`{runId}`、`{run_id}`、`$run_id` |
+| `specified`，路径里没有运行占位符 | `{output_path}/runs/{运行编号}/{轨迹文件名}` |
+| `custom` | `atif_output_path` 原样使用，不追加运行编号。路径没有扩展名时当作目录，并补上 `trajectory.atif.json`。多次运行写同一个文件 |
+| 不传 | 旧任务的规则：`{output_path 或 evaluations/{任务编号}}/runs/{运行编号}/{轨迹文件名}` |
+
+控制台「从output自动读取」保存 `output_path_mode=auto` 和 `output_path=evaluations/output`。表单里不再显示路径输入框（只显示提示），运行时固定写成 `/workspace/evaluations/output/runs/{运行编号}/trajectory.atif.json`，任务上保存的 `output_path`/`atif_output_path` 不参与。
+
+控制台「指定output路径」默认保存：
+
+```text
+output_path: /workspace/evaluations/{jobId}/runs/{runId}
+atif_output_path: /workspace/evaluations/{jobId}/runs/{runId}/trajectory.atif.json
+output_path_mode: specified
+```
+
+任务编号是 3、运行编号是 10 时，实际目录是 `/workspace/evaluations/3/runs/10/trajectory.atif.json`。如果改成不含 `{runId}` 的目录，例如 `custom/results`，实际目录是 `/workspace/custom/results/runs/10/`。原来的轨迹文件名会保留；没有可用文件名时用 `trajectory.atif.json`。
+
+控制台「从存储选择」保存 `output_path_mode=custom`，`atif_output_path` 是选中的文件。存储路径入库前会去掉 `/workspace/` 前缀，运行时再加回去。
+
+`write_mode` 为 `append` 时，新文件还不存在会先复制上一次成功运行的轨迹。`overwrite` 会在脚本启动前删掉这一次的目标文件。
+
+### 自定义工作流评测
+
+`workflow_name` 指向用户存储里的工作流时，服务端**不会**把评测运行器命令注入进去（只有内置工作流会）。这次运行怎么执行由模板自己决定：
+
+- 模板里的命令节点需要自己完成评测并写出 ATIF；运行结束后，服务端从该节点的输出里找结果：
+  - 推荐：打印一行 `PYROMIND_EVAL_RESULT {"result_atif_path": "...", "result_display_type": "..."}`（内置评测命令就是这么做的）；
+  - 或者让节点输出一个名为 `result_atif_path`、`atif_path`、`atif_output_path` 等的参数，展示类型用 `display_type`/`result_display_type`。
+- 找不到时回退到这次运行预先算好的路径（auto/指定），文件不在那里就会判失败。
+
+`extra_params.output_path_mode=auto` 时可以指定从哪个节点的输出读取结果：
+
+| 字段 | 说明 |
+|---|---|
+| `extra_params.output_node_id` | 模板节点编号（字符串）。必须是可执行节点；`PrimitiveNode`/`StartNode` 会在建任务/建运行时被拒绝。直接使用 `list_workflow_nodes(workflow_name)` 返回的 `value`。不指定时扫描所有节点，取第一个带结果的输出 |
+| `extra_params._workflow_group_values` | StartNode 属性的覆盖值，键是 `"{节点编号}:{属性id}"`，值是属性的值（字符串/数字/布尔）。只在建运行的那次生效，不改已保存的工作流；属性在模板里已连线却给空值时，运行会在提交阶段失败 |
+
+自定义工作流也可以使用本地推理（`extra_params.inference_mode="local"`）；`script_id` 仍要传一个合法的内置脚本编号（如 `local_chat`），它只作为任务元数据，不会被执行。
+
+```python
+job = client.evaluations.create_job({
+    "name": "custom-workflow",
+    "display_type": "multi_turn",
+    "workflow_name": "benchmark",
+    "script_source": "builtin",
+    "script_id": "local_chat",
+    "sample_data": '{"messages": [{"role": "user", "content": "1+1"}]}',
+    "extra_params": {
+        "inference_mode": "local",
+        "output_path_mode": "auto",
+        "output_node_id": "10",
+        "_workflow_group_values": {
+            "19:s_mwx8kq8s_5": "/workspace/Qwen3.5-4B",
+            "19:s_mwx8ksht_6": 3000
+        }
+    }
+})
+```
 
 ## 5. 三种执行方式
 
@@ -148,7 +215,7 @@ atif = client.evaluations.read_atif(done["id"])["atif"]
 
 ### 本地模型：`local_chat`
 
-不要传 `openai_endpoint` 和 `model`。服务端会去掉端点，运行时从 `/v1/models` 发现模型，并且必须恰好有一个。
+不要传 `openai_endpoint` 和 `model`。服务端会去掉端点；内置对话脚本运行前还会把 `model` 清空，再从 `{openai_endpoint}/models` 发现模型，并且必须恰好有一个。`extra_params.inference_image` 可以随任务保存，准备运行时不读取它，也不会据此更换推理镜像。
 
 ```python
 "script_source": "builtin",
@@ -181,16 +248,37 @@ atif = client.evaluations.read_atif(done["id"])["atif"]
 
 ### 自定义脚本
 
-脚本单独上传，运行目录里没有 `common.py`。脚本从 `--config` 指向的 JSON 读取 `sample_data`、`openai_endpoint`、`display_type`、`extra_params`、`atif_output_path`、`runner_result_path`。它必须自己写出 ATIF 文件，并在 `runner_result_path` 写入：
+脚本单独上传，运行目录里没有 `common.py`。`script_id` 要传 `null`。不传时请求模型的默认值是 `openai_chat`；自定义脚本如果留着这个编号，又走本地推理和内置工作流，服务端会在运行前把 `extra_params.model` 清空。
+
+脚本从 `--config` 指向的 JSON 读取这些字段：
+
+| 字段 | 内容 |
+|---|---|
+| `sample_data` | 样本字符串，或已经改写过的 Pod 内路径 |
+| `openai_endpoint` | 外部模式是保存的地址。本地模式在保存时为空，运行时由推理节点的 `param` 写入 |
+| `display_type` | 任务的展示类型 |
+| `extra_params` | 任务参数。其中没有 `api_key`、`output_path_mode`、`_script_bindings` |
+| `output_path` | 这一次运行的结果目录 |
+| `atif_output_path` | 这一次运行的轨迹文件 |
+| `write_mode` | `overwrite` 或 `append` |
+| `run_id` | 这一次运行的编号 |
+| `runner_result_path` | 脚本必须写下结果说明的文件 |
+
+密钥不进入命令字符串。运行器把它放进环境变量 `EVAL_API_KEY`，也放进脚本目录旁的 `runner_api_key`。写给脚本的 `extra_params` 里没有 `api_key` 原键。内置对话脚本读取 `EVAL_API_KEY`。
+
+脚本必须自己写出 ATIF 文件；可选地在 `runner_result_path` 写入结果说明：
 
 ```json
 {"result_atif_path": "...", "result_display_type": "pcb"}
 ```
 
-没有轨迹文件时，这次运行失败。
+`result_atif_path` 可以省略，省略时使用上面的 `atif_output_path`；整个文件不写也可以，只要 ATIF 已经写在 `atif_output_path`。没有轨迹文件时，这次运行失败。
+
+调用已有推理服务：
 
 ```python
 "script_source": "custom",
+"script_id": None,
 "script_name": "pcb_prediction.py",
 "script_content": open("pcb_prediction.py", encoding="utf-8").read(),
 "extra_params": {
@@ -201,7 +289,37 @@ atif = client.evaluations.read_atif(done["id"])["atif"]
 }
 ```
 
+启动本地推理时不要传 `openai_endpoint`。`model_path`、`inference_engine`、`gpu_count`、`gpu_product` 仍要传，用来启动推理节点。自定义脚本不会像内置对话脚本那样查询 `/models`。`extra_params.model` 留空时，脚本读到的模型名就是空字符串；端点要等推理服务启动后从 `openai_endpoint` 读取。
+
+控制台在「启动推理服务」或「调用已有推理服务」并且上传自定义脚本时，会自动带上三项参数绑定。键名可以改，值在运行时填入。SDK 直接传这个对象即可：
+
+```python
+"extra_params": {
+    "inference_mode": "external",
+    "openai_endpoint": "https://example.com/v1",
+    "model": "vision-model",
+    "api_key": "sk-...",
+    "_script_bindings": {
+        "endpoint": "my_endpoint",
+        "model": "my_model",
+        "api_key": "my_key",
+    },
+}
+```
+
+运行器在写 config 之前取出 `_script_bindings`，再把三个运行时的值抄到脚本自己的键名下：
+
+| 绑定 | 抄进去的值 |
+|---|---|
+| `endpoint` | 这一次的 `openai_endpoint`。本地推理是节点启动后的地址 |
+| `model` | `extra_params.model`。本地内置对话脚本此时已经被清空，所以是空字符串 |
+| `api_key` | `runner_api_key` 文件里的密钥，不是命令行里的明文 |
+
+脚本看到的 `extra_params` 里同时还有原来的 `model` 键（如果它没有被清空）。`api_key` 原键不会留下，只留下改名后的键。不需要改名时不要传 `_script_bindings`。
+
 ## 6. 七个展示模板
+
+控制台新建任务目前只列出 `multi_turn` 和 `custom_html`。接口仍接受下面七个 `display_type`，SDK 可以继续创建其余类型。`list_scripts` 返回的目录也没有收窄。
 
 `display_type` 决定控制台用哪一个页面。页面是否有内容，取决于脚本写出的 ATIF 结构。内置对话脚本 `openai_chat.py` 始终写对话步骤和 `extra.eval`，展示类型只记在 `extra.eval.task` 里，页面不读这个字段。
 

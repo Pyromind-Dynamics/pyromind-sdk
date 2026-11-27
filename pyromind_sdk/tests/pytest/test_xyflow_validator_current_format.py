@@ -182,6 +182,118 @@ def test_primitive_value_can_supply_required_input(validator: Callable) -> None:
     assert valid, errors
 
 
+def test_primitive_group_slot_can_supply_required_input(validator: Callable) -> None:
+    workflow = {
+        "id": "workflow",
+        "nodes": [
+            {
+                "id": "one",
+                "type": "default",
+                "data": {
+                    "nodeType": "StartNode",
+                    "config": {},
+                    "primitiveSlots": [
+                        {"id": "s1", "name": "anything", "primitiveType": "STRING", "value": "hello"},
+                    ],
+                },
+            },
+            {"id": "two", "data": {"nodeType": "AnythingToString", "config": {}}},
+        ],
+        "edges": [{"source": "one", "target": "two", "sourceHandle": "s1", "targetHandle": "anything"}],
+    }
+
+    valid, errors = validator(workflow, node_info=NODE_INFO)
+
+    assert valid, errors
+
+
+def test_connected_primitive_group_slot_cannot_be_empty(validator: Callable) -> None:
+    workflow = {
+        "id": "workflow",
+        "nodes": [
+            {
+                "id": "one",
+                "type": "default",
+                "data": {
+                    "nodeType": "StartNode",
+                    "config": {},
+                    "primitiveSlots": [
+                        {"id": "s1", "name": "anything", "primitiveType": "STRING", "value": ""},
+                        {"id": "s2", "name": "unused", "primitiveType": "STRING", "value": ""},
+                    ],
+                },
+            },
+            {"id": "two", "data": {"nodeType": "AnythingToString", "config": {}}},
+        ],
+        "edges": [{"source": "one", "target": "two", "sourceHandle": "s1", "targetHandle": "anything"}],
+    }
+
+    valid, errors = validator(workflow, node_info=NODE_INFO)
+
+    assert not valid
+    assert any("slot 's1'" in error for error in errors)
+    # 未连线的属性不参与内联，允许为空。
+    assert not any("slot 's2'" in error for error in errors)
+
+
+def test_primitive_group_edge_requires_an_existing_slot(validator: Callable) -> None:
+    workflow = {
+        "id": "workflow",
+        "nodes": [
+            {
+                "id": "one",
+                "type": "default",
+                "data": {
+                    "nodeType": "StartNode",
+                    "config": {},
+                    "primitiveSlots": [
+                        {"id": "s1", "name": "anything", "primitiveType": "STRING", "value": "hello"},
+                    ],
+                },
+            },
+            {"id": "two", "data": {"nodeType": "AnythingToString", "config": {}}},
+        ],
+        "edges": [{"source": "one", "target": "two", "sourceHandle": "s9", "targetHandle": "anything"}],
+    }
+
+    valid, errors = validator(workflow, node_info=NODE_INFO)
+
+    assert not valid
+    assert any("unknown StartNode property 's9'" in error for error in errors)
+
+
+def test_primitive_group_slot_type_must_match_target(validator: Callable) -> None:
+    workflow = {
+        "id": "workflow",
+        "nodes": [
+            {
+                "id": "one",
+                "type": "default",
+                "data": {
+                    "nodeType": "StartNode",
+                    "config": {},
+                    "primitiveSlots": [
+                        {"id": "s1", "name": "text", "primitiveType": "INT", "value": 3},
+                    ],
+                },
+            },
+            {"id": "two", "data": {"nodeType": "StringSink", "config": {}}},
+        ],
+        "edges": [{"source": "one", "target": "two", "sourceHandle": "s1", "targetHandle": "text"}],
+    }
+
+    valid, errors = validator(workflow, node_info=NODE_INFO)
+
+    assert not valid
+    assert any("Type mismatch between StartNode property 's1'" in error for error in errors)
+
+    workflow["nodes"][0]["data"]["primitiveSlots"][0].update(
+        {"primitiveType": "STRING", "value": "ok"}
+    )
+    valid, errors = validator(workflow, node_info=NODE_INFO)
+    assert valid, errors
+
+
 def test_incompatible_connected_types_are_rejected(validator: Callable) -> None:
     workflow = _from_dsl(
         'first = AnythingToString(id="one", anything="sdk-readonly-check")\n'

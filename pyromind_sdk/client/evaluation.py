@@ -174,6 +174,21 @@ class EvaluationClient(PyroMindClient):
         """
         return self._data(self.get("/evaluations/workflows"))
 
+    def list_workflow_nodes(self, workflow_name: str) -> JsonDict:
+        """GET /evaluations/workflow_nodes?workflow_name=...
+
+        Returns ``items`` with ``value`` (template node id) and ``label`` for
+        every executable node. Local value nodes (PrimitiveNode / StartNode)
+        are excluded; their ids cannot be used as ``extra_params.output_node_id``.
+        """
+        name = str(workflow_name or "").strip()
+        if not name:
+            raise ValueError("workflow_name must be a non-empty string")
+        return self._data(self.get(
+            "/evaluations/workflow_nodes",
+            params={"workflow_name": name},
+        ))
+
     def list_jobs(
         self,
         project_id: Optional[str] = None,
@@ -393,6 +408,16 @@ class AsyncEvaluationClient(PyroMindAsyncClient):
     async def list_workflows(self) -> JsonDict:
         """GET /evaluations/workflows"""
         return self._data(await self.get("/evaluations/workflows"))
+
+    async def list_workflow_nodes(self, workflow_name: str) -> JsonDict:
+        """GET /evaluations/workflow_nodes?workflow_name=..."""
+        name = str(workflow_name or "").strip()
+        if not name:
+            raise ValueError("workflow_name must be a non-empty string")
+        return self._data(await self.get(
+            "/evaluations/workflow_nodes",
+            params={"workflow_name": name},
+        ))
 
     async def list_jobs(
         self,
