@@ -392,6 +392,7 @@ async def start_kube_environment(
     # 日志里看不到挂载盘）。``-`` 表示该维度为空，而不是"忘了打"。
     logger.info(
         "Starting k8s-middleware sandbox image=%s name=%s namespace=%s cmd=%s "
+        "entrypoint=%s "
         "env=%d memory=%s(req %s) cpu=%s(req %s) gpu=%s/card:%s "
         "bind=%s mount=%s tmpfs=%s ports=%s exposed=%s publish_all=%s "
         "pull_secrets=%s timeout=%s",
@@ -399,6 +400,7 @@ async def start_kube_environment(
         container_name or hostname or "-",
         namespace,
         list(command or []),
+        list(entrypoint) if entrypoint is not None else "-",
         len(env or {}),
         memory_limit or "-",
         memory_request or "-",

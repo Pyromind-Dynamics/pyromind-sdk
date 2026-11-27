@@ -150,12 +150,18 @@ class _FakeBuildSandbox:
         responses: list[dict[str, Any]] | None = None,
         staged_bytes: int | None = None,
         stage_in_error: str = "",
+        stage_in_returncode: int | None = None,
+        launch_returncode: int = 0,
         raise_on_stage_in: Exception | None = None,
         raise_on_connect: Exception | None = None,
     ) -> None:
         self.sandbox_id = "sb-build-1"
         self.staged_bytes = staged_bytes
         self.stage_in_error = stage_in_error
+        #: 覆盖 stage-in 的退出帧（预发网关抖动时会偶发回错，见 2026-11-27 现场）。
+        self.stage_in_returncode = stage_in_returncode
+        #: 启动器 exec 的退出帧（网关抖动会错报 1，标记才是判据）。
+        self.launch_returncode = launch_returncode
         self.raise_on_stage_in = raise_on_stage_in
         self.raise_on_connect = raise_on_connect
         self.stdout = stdout
@@ -234,11 +240,19 @@ class _FakeBuildSandbox:
             # size its verification step compares against.
             response = {
                 "stdout": f"{context_staging.SIZE_MARKER}{self.staged_bytes}\n",
-                "returncode": 9 if self.stage_in_error else 0,
+                "returncode": (
+                    self.stage_in_returncode
+                    if self.stage_in_returncode is not None
+                    else (9 if self.stage_in_error else 0)
+                ),
                 "stderr": self.stage_in_error,
             }
         elif len(self.calls) == 1:
-            response = {"stderr": "docker-rt-status: launched\n"}
+            # ``launch_returncode`` 模拟网关抖动把"已启动"的启动器错报成非 0。
+            response = {
+                "stderr": "docker-rt-status: launched\n",
+                "returncode": self.launch_returncode,
+            }
         else:
             response = {
                 "stdout": self.stdout,
@@ -2486,6 +2500,68 @@ async def test_storage_mode_fails_when_the_mount_is_refused(
     assert len(attempts) == 1
     assert sandbox.archives == []
     # What was already uploaded still has to go.
+    assert staging.stager.cleaned_ok is True
+
+
+@pytest.mark.asyncio
+async def test_a_flaky_launcher_exit_frame_still_starts_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """启动器打印 launched 标记后、退出帧被错报成 1（2026-11-27 pre 网关抖动）。
+
+    启动器是"先 fork、再打标记"，标记到了就说明 worker 已在跑；不能因为退出码
+    1 把已经启动的构建判死。
+    """
+    from ..backend import build_sandbox
+
+    sandbox = _FakeBuildSandbox(stdout=_STAGED_STDOUT, launch_returncode=1)
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=_context_tar(), tags=["myapp"], namespace="ns"
+        )
+    )
+    text = "".join(event.get("stream", "") for event in events)
+
+    assert not [event for event in events if event.get("error")]
+    assert "launched marker (gateway/stream blip)" in text
+    assert len(sandbox.calls) >= 2  # 启动 + 至少一次状态轮询
+
+
+@pytest.mark.asyncio
+async def test_a_flaky_exit_frame_after_the_size_marker_still_builds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """rift exec 偶发把已经干完活的 stage-in 报成 rc=1（2026-11-27 pre 网关抖动）。
+
+    尺寸标记只在 cp、尺寸比对、rm 都成功后打印，是唯一可信的证据；只看退出码
+    会把成功的拷贝判死。构建必须继续，并在进度里说明这次抖动。
+    """
+    from ..backend import build_sandbox
+
+    _staging_ready(monkeypatch)
+    context = _context_tar()
+    packed = build_sandbox.pack_build_context(context)
+    staging = _install_staging(monkeypatch)
+    sandbox = _FakeBuildSandbox(
+        stdout=_STAGED_STDOUT,
+        staged_bytes=len(packed),
+        stage_in_returncode=1,
+    )
+    _install_fake(monkeypatch, sandbox)
+
+    events = await _collect(
+        build_sandbox.build_in_sandbox(
+            tar_bytes=context, tags=["myapp"], namespace="ns"
+        )
+    )
+    text = "".join(event.get("stream", "") for event in events)
+
+    assert not [event for event in events if event.get("error")]
+    assert "gateway/stream blip" in text
+    # 构建确实继续了：launcher 与轮询 exec 都发生过。
+    assert len(sandbox.calls) >= 3
     assert staging.stager.cleaned_ok is True
 
 

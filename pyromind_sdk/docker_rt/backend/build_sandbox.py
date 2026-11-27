@@ -1937,12 +1937,14 @@ async def _build_once(
             )
             if checked is None:
                 reason = "the check did not complete"
+            elif entries is not None:
+                # 条目标记只在目录存在且非空后打印，是唯一可信证据；退出码会被
+                # 网关抖动错报成 1（2026-11-27 实测），不能拿它判死。
+                reason = ""
             elif checked.returncode != 0:
                 reason = checked.stderr.strip() or f"exit code {checked.returncode}"
-            elif entries is None:
-                reason = "the check reported nothing"
             else:
-                reason = ""
+                reason = "the check reported nothing"
             if reason:
                 if context_staging.staging_mode() == "local":
                     yield buildkit.error_event(
@@ -2007,17 +2009,40 @@ async def _build_once(
             # or not actually the workspace produces a short file, and a
             # truncated context.tar.gz would only surface much later as an
             # unrelated kaniko error.
+            #
+            # 尺寸标记是**唯一可信的成功证据**：脚本只在 cp、尺寸比对、rm 都
+            # 走完以后才打印它。退出码反而不可靠——2026-11-27 实测：pre 网关
+            # 抖动时，同一条把活干完的 exec 会偶发回 exit 1（甚至 -1），
+            # 只看退出码会把成功的拷贝判死。
+            size_marker_ok = (
+                staged_bytes is not None and staged_bytes == len(packed or b"")
+            )
+            detail = copied.stderr.strip() or copied.stdout.strip() if copied else ""
             if copied is None:
                 reason = "the copy did not complete"
-            elif copied.returncode != 0:
-                reason = copied.stderr.strip() or f"exit code {copied.returncode}"
-            elif staged_bytes is None:
-                reason = "the copy reported no size"
-            elif staged_bytes != len(packed or b""):
-                reason = f"size mismatch ({staged_bytes} of {len(packed)} bytes)"
-            else:
+            elif size_marker_ok:
+                # 标记+尺寸都过：以它们为准，退出码不作数。
                 reason = ""
+            elif staged_bytes is None:
+                # 只报 "exit code N" 时无从下手：rift exec 的 stderr 偶尔会丢尾部，
+                # 部分 shell/命令把错误写到 stdout。两个通道都带上（截断尾部）。
+                reason = "the copy reported no size"
+                if detail:
+                    reason += f": {detail[-400:]}"
+            elif copied.returncode != 0 and detail:
+                reason = detail[-400:]
+            else:
+                reason = f"size mismatch ({staged_bytes} of {len(packed)} bytes)"
             if reason:
+                # 失败时把 exec 的完整结果落日志：事后 staging 目录会被 cleanup
+                # 删掉，只有这两个通道能说明"到底哪一步退出了"（2026-11-27 现场
+                # 只看到 exit code 1、stderr 为空，无法定位）。
+                logger.warning(
+                    "stage-in failed: rc=%s stdout=%r stderr=%r",
+                    getattr(copied, "returncode", None),
+                    ((copied.stdout or "")[-400:] if copied else ""),
+                    ((copied.stderr or "")[-400:] if copied else ""),
+                )
                 # Same reasoning as the refused mount above: a staged context
                 # that did not survive the copy is a failure. Re-uploading it
                 # would hide a broken mount behind a build that happens to work.
@@ -2030,6 +2055,12 @@ async def _build_once(
                     yield stage(
                         "The copy's exit frame was lost, but the size marker had "
                         f"already arrived ({staged_bytes} bytes) — continuing"
+                    )
+                elif copied.returncode != 0:
+                    yield stage(
+                        f"stage-in reported exit {copied.returncode} after the "
+                        f"{staged_bytes}-byte size marker (gateway/stream blip) — "
+                        "continuing"
                     )
                 yield stage(
                     f"Build context copied in {time.monotonic() - copy_started:.1f}s"
@@ -2109,12 +2140,21 @@ async def _build_once(
         if launched is None:  # pragma: no cover - the loop returns or breaks
             yield buildkit.error_event("cannot start the build in the sandbox")
             return
-        if launched.returncode != 0:
+        launch_marker = f"{kaniko.STATUS_MARKER} launched"
+        marker_seen = launch_marker in (launched.stderr or "")
+        if launched.returncode != 0 and not marker_seen:
             yield buildkit.error_event(
                 "cannot start the build in the sandbox: launcher exited with code "
                 f"{launched.returncode}"
             )
             return
+        if launched.returncode != 0:
+            # 启动器是"先 fork、再打标记"：标记到了就说明 worker 已在跑，退出帧
+            # 是网关抖动错报的（2026-11-27 现场：同一环境 echo 都会偶发 rc=1）。
+            yield stage(
+                f"launcher reported exit {launched.returncode} after printing its "
+                "launched marker (gateway/stream blip) — continuing"
+            )
         logger.debug(
             "launcher rc=%s stdout=%r stderr=%r",
             launched.returncode,

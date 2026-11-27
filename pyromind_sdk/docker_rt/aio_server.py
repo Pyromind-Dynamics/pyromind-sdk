@@ -6091,6 +6091,9 @@ async def _hijack_rift_terminal(
 
     session_over = asyncio.Event()
     exit_code = [0]
+    #: 有没有收到 rift 的 exit 帧。旧 rift-client 在命令启动失败时只把错误作为
+    #: gRPC 流错误返回，客户端这边看起来就是"流正常结束、退出码 0"。
+    got_exit = [False]
     #: 真实流量（stdin / PTY 输出 / resize）的时间戳；心跳帧不算 —— 空闲判据和平台
     #: 终端一致，否则 20s 一次的心跳会让 30 分钟永远不到期。
     last_activity = [time.monotonic()]
@@ -6121,6 +6124,7 @@ async def _hijack_rift_terminal(
                     await resp.write(frame_stderr(frame.stderr))
                     await resp.drain()
                 elif body == "exit":
+                    got_exit[0] = True
                     exit_code[0] = int(frame.exit.code)
                     return
                 # "ping": 网关/rift-client 的心跳，不是给用户的数据。
@@ -6193,6 +6197,14 @@ async def _hijack_rift_terminal(
     finally:
         session.running = False
         session.exit_code = exit_code[0]
+        if not got_exit[0] and not idle_expired.is_set():
+            logger.warning(
+                "rift terminal stream ended without an exit frame id=%s sandbox=%s "
+                "cmd=%s (the command may never have started)",
+                getattr(session, "id", "")[:12],
+                kube_env.sandbox_id,
+                argv,
+            )
         if idle_expired.is_set() and tty:
             # 非 tty 的 stdout 会被管道消费，掺一句人话等于污染数据。
             try:
