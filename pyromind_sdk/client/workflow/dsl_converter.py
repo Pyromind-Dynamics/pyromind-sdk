@@ -6,10 +6,34 @@ DSL format uses object.property syntax: var = NodeType(id=N, param=ref.output)
 """
 import ast
 import json
+import keyword
 import re
 import uuid
 from collections import defaultdict, deque
-from typing import Dict, List, Any, Optional
+from typing import Any, Dict, List, Optional
+
+
+def _require_dsl_identifier(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not value.isidentifier() or keyword.iskeyword(value):
+        raise ValueError(f"Invalid Python DSL identifier for {field}")
+    return value
+
+
+def _resolve_source_handle(handle: Any, output_names: Any) -> str:
+    if type(handle) is int or (
+        isinstance(handle, str) and handle.isascii() and handle.isdecimal()
+    ):
+        index = int(handle)
+        if isinstance(output_names, (list, tuple)) and 0 <= index < len(output_names):
+            handle = output_names[index]
+    return _require_dsl_identifier(handle, field="edge source handle")
+
+
+def _format_workflow_header(name: Any) -> str:
+    title = " ".join(str(name).replace("\x00", "\\0").splitlines())
+    # A coding declaration in the first comment can change Python's source encoding.
+    title = re.sub(r"coding(?=[:=])", "coding ", title)
+    return "# workflow: " + title
 
 
 def _get_node_type(node: dict) -> str:
@@ -60,29 +84,31 @@ class DslConverter:
         used_vars = set()
         node_var = {}
         node_outputs = {}
+        node_types = {}
         for nid in sorted_ids:
             node = node_by_id[nid]
             node_def = node.get("data", {}).get("nodeDefinition") or {}
+            node_type = _require_dsl_identifier(_get_node_type(node), field="node type")
+            node_types[nid] = node_type
             names = node_def.get("output_name", [])
-            if not names:
-                node_type = _get_node_type(node)
-                if node_type in self.node_info:
-                    names = self.node_info[node_type].get("output_name", [])
+            if not names and node_type in self.node_info:
+                names = self.node_info[node_type].get("output_name", [])
             node_outputs[nid] = names
             node_var[nid] = self._generate_var_name(node, names, used_vars)
 
         incoming = defaultdict(dict)
         for e in edges:
             src, tgt = e["source"], e["target"]
-            sh, th = e["sourceHandle"], e["targetHandle"]
+            sh = _resolve_source_handle(e["sourceHandle"], node_outputs[src])
+            th = _require_dsl_identifier(e["targetHandle"], field="edge target handle")
             src_var = node_var[src]
             incoming[tgt][th] = f"{src_var}.{sh}"
 
-        lines = [f"# workflow: {workflow.get('name', '')}"]
+        lines = [_format_workflow_header(workflow.get("name", ""))]
         for nid in sorted_ids:
             node = node_by_id[nid]
             data = node.get("data", {})
-            node_type = _get_node_type(node)
+            node_type = node_types[nid]
             node_def = data.get("nodeDefinition") or {}
             defaults = _get_defaults(node_def) if node_def else {}
             config = data.get("config", {}) or {}
@@ -96,11 +122,14 @@ class DslConverter:
             if not inp and node_type in self.node_info:
                 inp = self.node_info[node_type].get("input", {})
             ordered = list(inp.get("required", {})) + list(inp.get("optional", {}))
+            for param in ordered:
+                _require_dsl_identifier(param, field="node input")
 
             if not ordered and config:
                 for k, v in config.items():
                     if k == "controlMode":
                         continue
+                    _require_dsl_identifier(k, field="config parameter")
                     if v not in ("", None):
                         args.append(f"{k}={self._to_literal(v)}")
             else:
