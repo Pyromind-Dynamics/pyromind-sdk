@@ -247,14 +247,25 @@ class TestInferenceStartupArgs:
 
 # --- control plane vs data plane ---
 
-class TestNonProdRequiresPortal:
-    def test_pre_cluster_without_base_url_fails_fast(self, monkeypatch):
-        """非 prod 集群 + 未设 PYROMIND_BASE_URL：显式失败，不能落到 prod 门户。"""
+class TestEnvironmentPortalSelection:
+    def test_pre_cluster_uses_the_pre_portal(self, monkeypatch):
+        """选中 pre 集群时直接使用 pre 门户，不需要显式基址。"""
         monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
-        with pytest.raises(ValueError, match="PYROMIND_BASE_URL"):
-            PyroMindClient(api_key="test-key", cluster="us-west-2#pre")
+        client = PyroMindClient(api_key="test-key", cluster="us-west-2#pre")
+        try:
+            assert client.base_url == "https://pre-api-portal.pyromind.ai/api/v1"
+        finally:
+            client.close()
 
-    def test_pre_cluster_with_base_url_is_ok(self, monkeypatch):
+    def test_pre2_cluster_uses_the_pre2_portal(self, monkeypatch):
+        monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
+        client = PyroMindClient(api_key="test-key", cluster="us-west-2#pre2")
+        try:
+            assert client.base_url == "https://pre2-api-portal.pyromind.ai/api/v1"
+        finally:
+            client.close()
+
+    def test_explicit_base_url_wins_for_pre_cluster(self, monkeypatch):
         monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
         client = PyroMindClient(
             api_key="test-key",
@@ -265,6 +276,11 @@ class TestNonProdRequiresPortal:
             assert client.exchange_base_url.startswith("https://pre-api-portal")
         finally:
             client.close()
+
+    def test_unknown_environment_fails_fast(self, monkeypatch):
+        monkeypatch.delenv("PYROMIND_BASE_URL", raising=False)
+        with pytest.raises(ValueError, match="unknown cluster environment"):
+            PyroMindClient(api_key="test-key", cluster="us-west-2#staging")
 
 
 class TestProfileClientBaseUrl:

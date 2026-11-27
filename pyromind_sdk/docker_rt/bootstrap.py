@@ -19,6 +19,12 @@ except ImportError:
     pass
 from typing import Any
 
+from ..common.utils import (
+    DEFAULT_API_BASE_URL,
+    api_base_url_for_cluster,
+    cluster_value,
+    normalise_cluster,
+)
 from ..log_redaction import mask_secret
 
 logger = logging.getLogger("docker_rt.bootstrap")
@@ -45,28 +51,6 @@ _RESET = "\033[0m"
 _PRE_ENVS = ("pre", "pre2")
 
 _PRE_PORTAL_HINT = "https://pre-api-portal.pyromind.ai/api/v1"
-
-
-def _cluster_value(code: str, env: str) -> str:
-    """门户的 ``code#env`` → docker-rt 使用的集群名。
-
-    prod 是默认环境，裸集群名即可；只有非 prod 才保留 ``#env`` 后缀。
-    """
-    return code if env == "prod" else f"{code}#{env}"
-
-
-def normalise_cluster(raw: str) -> str:
-    """把 ``code#prod`` / 空后缀归一化成裸集群名，其它环境原样保留。"""
-    value = (raw or "").strip()
-    code, sep, env = value.partition("#")
-    code = code.strip()
-    env = env.strip().lower()
-    if not code:
-        return value
-    if not sep or not env or env == "prod":
-        return code
-    return f"{code}#{env}"
-
 
 def check_docker_cli(*, stderr: Any | None = None) -> bool:
     """Return True when a Docker CLI binary is available on PATH."""
@@ -129,7 +113,7 @@ def _cluster_choices_from_discovery(
         env = env.strip().lower() or "prod"
         if not code:
             continue
-        value = _cluster_value(code, env)
+        value = cluster_value(code, env)
         if value not in entries:
             entries.append(value)
         envs = envs_by_code.setdefault(code, [])
@@ -205,7 +189,7 @@ def _ask_cluster(
     输入必须与其中某一条完全一致；选中的值原样作为 ``PYROMIND_CLUSTER``。
     ``clusters`` 传入时复用调用方已经查到的结果（校验失败后重选，避免重复请求）。
     """
-    from ..client.base import DEFAULT_API_BASE_URL, ENV_BASE_URL
+    from ..client.base import ENV_BASE_URL
     from ..token import fetch_cluster_hosts
 
     if clusters is None:
@@ -242,9 +226,16 @@ def _ask_cluster(
         if candidate in envs_by_code:
             envs = envs_by_code[candidate]
             if len(envs) == 1:
-                return _cluster_value(candidate, envs[0])
+                return cluster_value(candidate, envs[0])
             env = _ask_environment(envs, stdin=stdin, stdout=stdout, color=color)
-            return _cluster_value(candidate, env)
+            return cluster_value(candidate, env)
+        code, _, env = candidate.partition("#")
+        code = code.strip()
+        env = env.strip().lower()
+        if env and code in envs_by_code:
+            # 线上集群是裸名；带环境后缀就是预发，直接切到对应门户，
+            # 不再要求用户手填 PYROMIND_BASE_URL。
+            return cluster_value(code, env)
         _reject_cluster_choice(
             candidate, envs_by_code=envs_by_code, stdout=stdout
         )
@@ -471,6 +462,17 @@ def prepare_env(
         )
         os.environ["PYROMIND_CLUSTER"] = cluster
 
+    if cluster:
+        from ..client.base import ENV_BASE_URL
+
+        configured_base = (os.getenv(ENV_BASE_URL) or "").strip()
+        # 默认 prod 门户不足以覆盖 pre/pre2 集群；选到预发环境时自动切到
+        # 对应门户。显式配置的自定义基址始终优先。
+        if not configured_base or (
+            configured_base.rstrip("/") == DEFAULT_API_BASE_URL.rstrip("/")
+        ):
+            os.environ[ENV_BASE_URL] = api_base_url_for_cluster(cluster)
+
     result["api_key"] = api_key
     result["cluster"] = cluster
     return result
@@ -490,15 +492,18 @@ async def check_connection(
 ) -> int:
     """Verify PyroMind API access and return the number of visible sandboxes."""
     from pyromind_sdk.client.async_sandbox import AsyncSandboxClient
-    from pyromind_sdk.client.base import DEFAULT_API_BASE_URL, ENV_BASE_URL
+    from pyromind_sdk.client.base import ENV_BASE_URL
 
+    selected_cluster = cluster or os.getenv("PYROMIND_CLUSTER") or ""
     owns_client = client is None
     client = client or AsyncSandboxClient(
         api_key=api_key or os.getenv("PYROMIND_API_KEY"),
-        cluster=cluster or os.getenv("PYROMIND_CLUSTER"),
+        cluster=selected_cluster,
         # Every request starts at the portal: it hands back the token and the
         # cluster-direct address this daemon will talk to afterwards.
-        base_url=(os.getenv(ENV_BASE_URL) or DEFAULT_API_BASE_URL),
+        base_url=api_base_url_for_cluster(
+            selected_cluster, os.getenv(ENV_BASE_URL)
+        ),
         timeout=_CONNECTION_CHECK_TIMEOUT_S,
     )
     try:

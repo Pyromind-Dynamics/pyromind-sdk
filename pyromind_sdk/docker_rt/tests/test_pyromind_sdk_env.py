@@ -108,7 +108,7 @@ def test_shared_async_client_starts_at_the_portal(
 
     client = env_mod.new_sandbox_client()
 
-    assert client.base_url == "https://api-portal.pyromind.ai/api/v1"
+    assert client.base_url == "https://pre-api-portal.pyromind.ai/api/v1"
     assert client.exchange_base_url == client.base_url
     # token 交换需要环境后缀（中间件按 #pre 选集群），原样保留
     assert client.cluster == "us-west-1#pre"

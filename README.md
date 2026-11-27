@@ -233,6 +233,15 @@ The async client exposes this service as `client.instances`.
 
 `ProfileClient` is available only on the synchronous top-level client.
 
+### Storage API (`client.storage_api`)
+
+| Method | Purpose |
+| --- | --- |
+| `file_shares` / `shares` | Access same-cluster file share tasks. |
+| `transfers` / `transfer` | Access cross-cluster file transfer tasks. |
+| `submit()` / `list_page()` / `list()` | Submit and list cross-cluster transfers. |
+| `cancel()` / `delete()` / `clear_finished()` | Cancel, delete, or clear finished transfers. |
+
 ### Storage (`StorageClient`)
 
 | Method | Purpose |
