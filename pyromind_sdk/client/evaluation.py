@@ -349,14 +349,33 @@ class EvaluationClient(PyroMindClient):
     def read_atif(self, run_id: int) -> JsonDict:
         """GET /evaluations/runs/{run_id}/atif
 
-        Returns ``{"run": ..., "atif": ...}``. Read the trajectory with
-        ``result["atif"]``. A missing result is HTTP 404. A file over 20 MB is HTTP 413.
+        Returns ``{"run": ..., "atif": ..., "atif_count": n}``. Read the trajectory with
+        ``result["atif"]``. When a run produced several ATIF files this is the
+        first one; use ``read_atifs`` for all of them. A missing result is
+        HTTP 404. A file over 20 MB is HTTP 413.
         """
         run_id = _resource_id(run_id, "run_id")
         data = self._data(self.get(f"/evaluations/runs/{run_id}/atif"))
         if not isinstance(data, dict):
             raise PyroMindAPIError(
                 message=f"GET /evaluations/runs/{run_id}/atif returned no ATIF payload",
+                status_code=None,
+            )
+        return data
+
+    def read_atifs(self, run_id: int) -> JsonDict:
+        """GET /evaluations/runs/{run_id}/atifs
+
+        Returns ``{"run": ..., "atifs": [...], "total": n}``. Each item is
+        ``{"index", "name", "path", "atif"}`` in the order the script reported
+        them. A run with one ATIF returns a one-item list. Files are capped at
+        20 MB each and 50 MB combined (HTTP 413).
+        """
+        run_id = _resource_id(run_id, "run_id")
+        data = self._data(self.get(f"/evaluations/runs/{run_id}/atifs"))
+        if not isinstance(data, dict) or not isinstance(data.get("atifs"), list):
+            raise PyroMindAPIError(
+                message=f"GET /evaluations/runs/{run_id}/atifs returned no ATIF list",
                 status_code=None,
             )
         return data
@@ -535,6 +554,17 @@ class AsyncEvaluationClient(PyroMindAsyncClient):
         if not isinstance(data, dict):
             raise PyroMindAsyncAPIError(
                 message=f"GET /evaluations/runs/{run_id}/atif returned no ATIF payload",
+                status_code=None,
+            )
+        return data
+
+    async def read_atifs(self, run_id: int) -> JsonDict:
+        """GET /evaluations/runs/{run_id}/atifs"""
+        run_id = _resource_id(run_id, "run_id")
+        data = self._data(await self.get(f"/evaluations/runs/{run_id}/atifs"))
+        if not isinstance(data, dict) or not isinstance(data.get("atifs"), list):
+            raise PyroMindAsyncAPIError(
+                message=f"GET /evaluations/runs/{run_id}/atifs returned no ATIF list",
                 status_code=None,
             )
         return data

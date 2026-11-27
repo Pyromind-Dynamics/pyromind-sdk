@@ -100,7 +100,7 @@ client.evaluations.create_job({
 | `html_template` | HTML 全文这串文字，里面要有 `<html` 或 `<!doctype html`，最大 2 MB。不是文件路径 |
 | `script_source` | `"builtin"` 时再传 `script_id`：`"external_chat"`、`"local_chat"` 或 `"atif_replay"`。自己写执行脚本时改为上一节的四个脚本字段 |
 
-页面从 `window.__PYROMIND_EVALUATION__` 读取 `atif`、`runId`、`displayType`。运行目录里的文件用 `pyromindAsset("assets/相对路径")`。
+页面从 `window.__PYROMIND_EVALUATION__` 读取 `atifs`（本次运行的全部 ATIF，每项 `{index, name, path, atif}`）、`atif`（等于第一份）、`runId`、`displayType`。数据在模板脚本执行前已注入，模板不需要自己请求接口。运行目录里的文件用 `pyromindAsset("assets/相对路径")`。一次运行产出多份 ATIF 的写法见 [evaluation-sdk.md](evaluation-sdk.md) 的「一次运行产出多份 ATIF」。
 
 ```python
 client.evaluations.create_job({

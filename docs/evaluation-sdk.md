@@ -92,7 +92,8 @@ atif = client.evaluations.read_atif(done["id"])["atif"]
 | `wait_run(run_id, timeout=3600, interval=5)` | 反复 `GET /evaluations/runs/{run_id}` | `live` 为假后的运行 |
 | `stop_run(run_id)` | `POST /evaluations/runs/{run_id}/stop` | 停止后的运行。运行已结束时返回 409 |
 | `delete_run(run_id, force=False)` | `DELETE /evaluations/runs/{run_id}` | `{"deleted": true}`。活动运行且 `force` 为假时返回 409 |
-| `read_atif(run_id)` | `GET /evaluations/runs/{run_id}/atif` | `{"run", "atif"}`。还没有结果时 404，文件超过 20 MB 时 413 |
+| `read_atif(run_id)` | `GET /evaluations/runs/{run_id}/atif` | `{"run", "atif", "atif_count"}`。多份 ATIF 时 `atif` 是第一份。还没有结果时 404，文件超过 20 MB 时 413 |
+| `read_atifs(run_id)` | `GET /evaluations/runs/{run_id}/atifs` | `{"run", "atifs", "total"}`。`atifs` 每项 `{index, name, path, atif}`，单份 ATIF 也返回一项。单个文件 20 MB、合计 50 MB 上限（413） |
 | `read_asset(run_id, path)` | `GET /evaluations/runs/{run_id}/asset?path=` | `EvaluationAsset`。这是文件字节，不是 JSON |
 
 `list_workflows` 只列出用户自己保存的工作流。不传 `workflow_name` 时，服务端使用内置工作流 `builtin/{display_type}`，不必先出现在这个列表里。
@@ -413,7 +414,40 @@ client.evaluations.create_job({
 
 ### 自定义 HTML
 
-页面不走内置的 ATIF 视图。任务必须带完整 HTML 和文件名。HTML 从 `window.__PYROMIND_EVALUATION__` 读取 `{atif, runId, displayType}`，用 `pyromindAsset("assets/相对路径")` 读取运行目录里的文件。
+页面不走内置的 ATIF 视图，结果页把 HTML 放进隔离的 iframe（`sandbox="allow-scripts"`），并在模板**任何脚本之前**注入数据：
+
+```js
+window.__PYROMIND_EVALUATION__ = {
+  atifs: [                      // 本次运行的全部 ATIF，按脚本上报的顺序
+    { index: 0, name: "a.atif.json", path: "/workspace/.../a.atif.json", atif: { ... } },
+    { index: 1, name: "b.atif.json", path: "/workspace/.../b.atif.json", atif: { ... } },
+  ],
+  atif: { ... },                // 等于 atifs[0].atif，给只读单份的旧模板用
+  runId: 12,
+  displayType: "custom_html",
+};
+```
+
+模板约定：
+
+- **直接读 `window.__PYROMIND_EVALUATION__.atifs`**，不需要自己请求接口、也拿不到登录态（iframe 是隔离源）。一份 ATIF 时数组只有一项。
+- 数据在模板脚本执行前已经就绪，可以同步读取。需要等 DOM 的话监听 `pyromind-evaluation-ready` 事件（`DOMContentLoaded` 之后触发）。
+- 运行目录里的图片等文件用 `await pyromindAsset("assets/相对路径")` 取回，得到可直接用于 `<img src>` 的 blob URL。相对路径以**结果文件所在目录**为基准，不能含 `..`。
+- HTML 必须是 HTML 文档：开头 8 KB 内要有 `<!doctype html>` 或 `<html`，否则 `create_job` 拒绝。`<head>` 可以省略，结果页会把数据注入到 `<html>` 后面；不需要也不应该自己写数据加载逻辑。最大 2 MB。
+
+```html
+<!DOCTYPE html>
+<html>
+<body>
+<div id="app"></div>
+<script>
+  var data = window.__PYROMIND_EVALUATION__;
+  document.getElementById("app").textContent =
+    data.atifs.map(function (item) { return item.name + ": " + (item.atif.steps || []).length + " steps"; }).join("\n");
+</script>
+</body>
+</html>
+```
 
 对话脚本、回放和自定义脚本都可以给它供数。
 
@@ -434,7 +468,19 @@ client.evaluations.create_job({
 })
 ```
 
-跑完后用 `read_atif` 取轨迹，用 `get_job(job["id"])["html_template"]` 取 HTML 正文。
+跑完后用 `read_atifs` 取全部轨迹（与页面注入的 `atifs` 相同），用 `get_job(job["id"])["html_template"]` 取 HTML 正文。
+
+#### 一次运行产出多份 ATIF
+
+自定义脚本把每份 ATIF 写到运行目录，再在 `runner_result_path` 里用 `result_atif_paths` 列出（相对路径以 `output_path` 为基准）：
+
+```json
+{"result_atif_paths": ["a.atif.json", "b.atif.json"], "result_display_type": "custom_html"}
+```
+
+运行器逐个检查文件存在；有任何一份缺失，这次运行判失败。多于一份时运行器在 `output_path` 写出清单 `atif_manifest.json`（`{"atif_files": [...]}`），运行记录的 `result_atif_path` 指向清单；只有一份时直接指向该文件。`result_atif_paths` 与 `result_atif_path` 同时出现时以前者为准。
+
+清单最多 50 项；清单里的路径不能含 `..`，也不能指向另一份清单。
 
 ### 可选的渲染脚本
 
